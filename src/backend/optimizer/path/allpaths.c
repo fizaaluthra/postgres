@@ -10,6 +10,22 @@
  * IDENTIFICATION
  *	  src/backend/optimizer/path/allpaths.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugabyteDB development.
+ *
+ * Portions Copyright (c) YugabyteDB, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 
@@ -50,6 +66,15 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+#include "catalog/pg_database.h"
+#include "executor/ybExpr.h"
+#include "miscadmin.h"
+#include "nodes/pg_list.h"
+#include "pg_yb_utils.h"
+#include <utils/rel.h>
+
 
 /* Bitmask flags for pushdown_safety_info.unsafeFlags */
 #define UNSAFE_HAS_VOLATILE_FUNC		(1 << 0)
@@ -82,6 +107,9 @@ bool		enable_geqo = false;	/* just in case GUC doesn't set it */
 int			geqo_threshold;
 int			min_parallel_table_scan_size;
 int			min_parallel_index_scan_size;
+
+bool		yb_enable_planner_trace;
+char	   *yb_hinted_uids;
 
 /* Hook for plugins to get control in set_rel_pathlist() */
 set_rel_pathlist_hook_type set_rel_pathlist_hook = NULL;
@@ -125,7 +153,6 @@ static Path *get_cheapest_parameterized_child_path(PlannerInfo *root,
 static void accumulate_append_subpath(Path *path,
 									  List **subpaths,
 									  List **special_subpaths);
-static Path *get_singleton_append_subpath(Path *path);
 static void set_dummy_rel_pathlist(RelOptInfo *rel);
 static void set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 								  Index rti, RangeTblEntry *rte);
@@ -163,6 +190,9 @@ static void recurse_push_qual(Node *setOp, Query *topquery,
 static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel,
 										   Bitmapset *extra_used_attrs);
 
+/* YB declarations */
+static int	ybCmpRelOptInfo(const void *p1, const void *p2);
+
 
 /*
  * make_one_rel
@@ -195,6 +225,32 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 			continue;
 
 		root->all_baserels = bms_add_member(root->all_baserels, brel->relid);
+	}
+
+	if (IsYugaByteEnabled())
+	{
+		for (rti = 1; rti < root->simple_rel_array_size; rti++)
+		{
+			RelOptInfo *relation = root->simple_rel_array[rti];
+
+			if (relation != NULL && relation->rtekind == RTE_RELATION)
+			{
+				RangeTblEntry *rte = root->simple_rte_array[rti];
+
+				if (IsYBRelationById(rte->relid))
+				{
+					ListCell   *lc;
+
+					relation->is_yb_relation = true;
+					foreach(lc, relation->baserestrictinfo)
+					{
+						RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+						ri->yb_pushable = YbCanPushdownExpr(ri->clause, NULL, rte->relid);
+					}
+				}
+			}
+		}
 	}
 
 	/* Mark base rels as to whether we care about fast-start plans */
@@ -424,13 +480,30 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				}
 				else if (rte->tablesample != NULL)
 				{
+					if (IsYBRelationById(rte->relid))
+					{
+						/* TODO we don't support tablesample queries yet. */
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("'TABLESAMPLE' clause is not yet "
+										"supported by YugaByte")));
+					}
+
 					/* Sampled relation */
 					set_tablesample_rel_size(root, rel, rte);
 				}
 				else
 				{
 					/* Plain relation */
-					set_plain_rel_size(root, rel, rte);
+					if (IsYBRelationById(rte->relid))
+					{
+						set_foreign_size(root, rel, rte);
+					}
+					else
+					{
+						/* Use regular scan for initdb tables. */
+						set_plain_rel_size(root, rel, rte);
+					}
 				}
 				break;
 			case RTE_SUBQUERY:
@@ -512,6 +585,15 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				}
 				else if (rte->tablesample != NULL)
 				{
+					if (IsYBRelationById(rte->relid))
+					{
+						/* TODO we don't support tablesample queries yet. */
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("'TABLESAMPLE' clause is not yet "
+										"supported by YugaByte")));
+					}
+
 					/* Sampled relation */
 					set_tablesample_rel_pathlist(root, rel, rte);
 				}
@@ -578,8 +660,20 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		!bms_equal(rel->relids, root->all_baserels))
 		generate_useful_gather_paths(root, rel, false);
 
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		ybTraceRelOptInfo(root, rel, "set_rel_pathlist :");
+		ybTracePathList(root, rel->pathlist, "all paths");
+		ybTracePathList(root, rel->partial_pathlist, "partial paths");
+	}
+
 	/* Now find the cheapest of the paths for this rel */
 	set_cheapest(rel);
+
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		ybTraceCheapestPaths(rel, "set_rel_pathlist");
+	}
 
 #ifdef OPTIMIZER_DEBUG
 	debug_print_rel(root, rel);
@@ -672,6 +766,10 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 					return;
 			}
 
+			if (rel->is_yb_relation)
+			{
+				/* TODO(#19470) check YB specific conditions */
+			}
 			/*
 			 * There are additional considerations for appendrels, which we'll
 			 * deal with in set_append_rel_size and set_append_rel_pathlist.
@@ -817,8 +915,20 @@ create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel)
 {
 	int			parallel_workers;
 
-	parallel_workers = compute_parallel_worker(rel, rel->pages, -1,
-											   max_parallel_workers_per_gather);
+	if (rel->is_yb_relation)
+	{
+		Assert(rel->relid > 0);
+		RangeTblEntry *rte = root->simple_rte_array[rel->relid];
+
+		parallel_workers =
+			yb_compute_parallel_worker(rel,
+									   YbGetTableDistribution(rte->relid),
+									   max_parallel_workers_per_gather);
+	}
+	else
+		parallel_workers =
+			compute_parallel_worker(rel, rel->pages, -1,
+									max_parallel_workers_per_gather);
 
 	/* If any limit was set to zero, the user doesn't want a parallel scan. */
 	if (parallel_workers <= 0)
@@ -927,7 +1037,11 @@ set_foreign_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	set_foreign_size_estimates(root, rel);
 
 	/* Let FDW adjust the size estimates, if it can */
-	rel->fdwroutine->GetForeignRelSize(root, rel, rte->relid);
+	/* YB: for YB relations, use legacy code instead */
+	if (rel->is_yb_relation)
+		ybcGetForeignRelSize(root, rel, rte->relid);
+	else
+		rel->fdwroutine->GetForeignRelSize(root, rel, rte->relid);
 
 	/* ... but do not let it set the rows estimate to zero */
 	rel->rows = clamp_row_est(rel->rows);
@@ -1133,6 +1247,9 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 
 		/* We have at least one live child. */
 		has_live_children = true;
+
+		if (!childRTE->inh)
+			root->yb_num_referenced_relations++;
 
 		/*
 		 * If any live child is not parallel-safe, treat the whole appendrel
@@ -1624,11 +1741,15 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			accumulate_append_subpath(subpath, &subpaths, NULL);
 		}
 
+		subpaths_valid &= yb_has_same_batching_reqs(subpaths);
+
 		if (subpaths_valid)
 			add_path(rel, (Path *)
 					 create_append_path(root, rel, subpaths, NIL,
 										NIL, required_outer, 0, false,
 										-1));
+		else
+			break;
 	}
 
 	/*
@@ -2096,7 +2217,7 @@ accumulate_append_subpath(Path *path, List **subpaths, List **special_subpaths)
  *
  * Note: 'path' must not be a parallel-aware path.
  */
-static Path *
+Path *
 get_singleton_append_subpath(Path *path)
 {
 	Assert(!path->parallel_aware);
@@ -3334,6 +3455,11 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		initial_rels = lappend(initial_rels, thisrel);
 	}
 
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		ybTraceRelOptInfoList(root, initial_rels, "make_rel_from_joinlist : initial rels");
+	}
+
 	if (levels_needed == 1)
 	{
 		/*
@@ -3453,12 +3579,138 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 			if (!bms_equal(rel->relids, root->all_baserels))
 				generate_useful_gather_paths(root, rel, false);
 
+			if (IsYugaByteEnabled() && yb_enable_planner_trace)
+			{
+				ybTraceRelOptInfo(root, rel, "standard_join_search :");
+				ybTracePathList(root, rel->pathlist, "all paths");
+			}
+
 			/* Find and save the cheapest paths for this rel */
 			set_cheapest(rel);
+
+			if (IsYugaByteEnabled() && yb_enable_planner_trace)
+			{
+				ybTraceCheapestPaths(rel, "standard_join_search");
+			}
 
 #ifdef OPTIMIZER_DEBUG
 			debug_print_rel(root, rel);
 #endif
+		}
+
+		if (IsYugaByteEnabled() && root->ybHintedJoinsOuter != NULL)
+		{
+			/*
+			 * There is a Leading hint so sweep all joins at this level
+			 * and look for disabled and non-disabled joins. Also determine
+			 * if some join at this level has been hinted. If so, it is safe to
+			 * prune non-hinted joins.
+			 */
+			List	   *ybLevelJoinRels = NIL;
+			bool		ybFoundDisabledRel = false;
+			bool		ybFoundHintedJoin = false;
+
+			ListCell   *lc2;
+
+			foreach(lc2, root->join_rel_level[lev])
+			{
+				RelOptInfo *ybRel = (RelOptInfo *) lfirst(lc2);
+
+				Assert(IS_JOIN_REL(ybRel));
+
+				/*
+				 * Assuming that only join paths exist in the space
+				 * of enumerated joins.
+				 */
+				switch (ybRel->cheapest_total_path->type)
+				{
+					case T_NestPath:
+					case T_MergePath:
+					case T_HashPath:
+						break;
+					default:
+						ereport(ERROR,
+								(errmsg("expected a join path (%u)",
+										ybRel->cheapest_total_path->ybUniqueId)));
+						break;
+				}
+
+				if (ybRel->cheapest_total_path->ybIsHinted ||
+					ybRel->cheapest_total_path->ybHasHintedUid)
+				{
+					ybFoundHintedJoin = true;
+				}
+
+				if (ybRel->cheapest_total_path->total_cost < disable_cost ||
+					ybRel->cheapest_total_path->ybIsHinted ||
+					ybRel->cheapest_total_path->ybHasHintedUid)
+				{
+					/*
+					 * Found a join with cost < disable cost,
+					 * or whose cost could be >= disable cost because the join is
+					 * really expensive. But it is in a Leading hint, or
+					 * has been hinted using its UID so add it to the list
+					 * of joins we want to keep at this level.
+					 */
+					ybLevelJoinRels = lappend(ybLevelJoinRels, ybRel);
+				}
+				else
+				{
+					/*
+					 * Found a join that has been disabled,
+					 * or that perhaps has a "true" cost > disable cost.
+					 * It is a join and is not hinted so set a flag so we can
+					 * try pruning below.
+					 */
+					ybFoundDisabledRel = true;
+				}
+			}
+
+			/*
+			 * Now look for a mix of enabled and disabled join paths at this level,
+			 * but only do this if some join at this level has been hinted.
+			 */
+			if (ybLevelJoinRels != NIL && ybFoundDisabledRel && ybFoundHintedJoin)
+			{
+				if (yb_enable_planner_trace)
+				{
+					StringInfoData dropMsg;
+
+					initStringInfo(&dropMsg);
+					appendStringInfo(&dropMsg, "\n++ Level %d DROP rel", lev);
+
+					StringInfoData keepMsg;
+
+					initStringInfo(&keepMsg);
+					appendStringInfo(&keepMsg, "\n++ Level %d KEEP rel", lev);
+
+					foreach(lc2, root->join_rel_level[lev])
+					{
+						RelOptInfo *rel = (RelOptInfo *) lfirst(lc2);
+
+						if (!list_member_ptr(ybLevelJoinRels, rel))
+						{
+							ybTraceRelOptInfo(root, rel, dropMsg.data);
+						}
+					}
+
+					foreach(lc2, ybLevelJoinRels)
+					{
+						RelOptInfo *rel = (RelOptInfo *) lfirst(lc2);
+
+						ybTraceRelOptInfo(root, rel, keepMsg.data);
+					}
+
+					pfree(dropMsg.data);
+					pfree(keepMsg.data);
+				}
+
+				/*
+				 * Keep only the non-disabled joins since the disabled ones
+				 * cannot be part of the best plan.
+				 */
+				root->join_rel_level[lev] = ybLevelJoinRels;
+			}
 		}
 	}
 
@@ -3472,6 +3724,16 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 	rel = (RelOptInfo *) linitial(root->join_rel_level[levels_needed]);
 
 	root->join_rel_level = NULL;
+
+	if (IsYugaByteEnabled() && yb_enable_planner_trace)
+	{
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+		appendStringInfo(&buf, "final rel Level %d :", levels_needed);
+		ybTraceRelOptInfo(root, rel, buf.data);
+		pfree(buf.data);
+	}
 
 	return rel;
 }
@@ -4158,14 +4420,25 @@ create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
 	pages_fetched = compute_bitmap_pages(root, rel, bitmapqual, 1.0,
 										 NULL, NULL);
 
-	parallel_workers = compute_parallel_worker(rel, pages_fetched, -1,
-											   max_parallel_workers_per_gather);
+	/*
+	 * Even if we support bitmap scan of YB tables, no PQ until explicitly
+	 * validated.
+	 */
+	if (!rel->is_yb_relation)
+		parallel_workers = compute_parallel_worker(rel, pages_fetched, -1,
+												   max_parallel_workers_per_gather);
+	else
+		parallel_workers = 0;
 
 	if (parallel_workers <= 0)
 		return;
 
-	add_partial_path(rel, (Path *) create_bitmap_heap_path(root, rel,
-														   bitmapqual, rel->lateral_relids, 1.0, parallel_workers));
+	if (IsYugaByteEnabled() && rel->is_yb_relation)
+		/* TODO(#20575): support parallel bitmap scans */
+		return;
+	else
+		add_partial_path(rel, (Path *) create_bitmap_heap_path(root, rel,
+															   bitmapqual, rel->lateral_relids, 1.0, parallel_workers));
 }
 
 /*
@@ -4195,7 +4468,16 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 	 */
 	if (rel->rel_parallel_workers != -1)
 		parallel_workers = rel->rel_parallel_workers;
-	else
+	/*
+	 * For YB relations yb_compute_parallel_worker should be used.
+	 * However, there may be cases (notable example - PG extensions) when
+	 * compute_parallel_worker is called on a YB relation.
+	 * There's no good way here to figure out relid to provide
+	 * YbTableDistribution and forwad the call to yb_compute_parallel_worker.
+	 * Hence leave parallel_workers at 0 and disable parallelism.
+	 * For non-YB relations use standard calculation, provided by postgres.
+	 */
+	else if (!rel->is_yb_relation)
 	{
 		/*
 		 * If the number of pages being scanned is insufficient to justify a
@@ -4253,6 +4535,49 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 				parallel_workers = Min(parallel_workers, index_parallel_workers);
 			else
 				parallel_workers = index_parallel_workers;
+		}
+	}
+
+	/* In no case use more than caller supplied maximum number of workers */
+	parallel_workers = Min(parallel_workers, max_workers);
+
+	return parallel_workers;
+}
+
+/*
+ * Compute the number of parallel workers to scan a YB relation.
+ *
+ * Function has the same purpose as the compute_parallel_worker, but calculation
+ * criteria is quite different. YB tables have no pages, calculations depend on
+ * estimated number of tuples, as well as distribution type
+ *
+ * Rules and limitations implemented in compute_parallel_worker are still apply:
+ * user specified number of workers takes precedence and result would
+ * not exceed "max_workers", typically coming from a GUC.
+ */
+int
+yb_compute_parallel_worker(RelOptInfo *rel,
+						   YbTableDistribution yb_dist, int max_workers)
+{
+	int			parallel_workers = 0;
+
+	/*
+	 * If the user has set the parallel_workers reloption, use that; otherwise
+	 * select a default number of workers.
+	 */
+	if (rel->rel_parallel_workers != -1)
+		parallel_workers = rel->rel_parallel_workers;
+	else
+	{
+		/*
+		 * Parallel query may be enabled or disabled for specific distribution types
+		 */
+		if ((yb_dist == YB_COLOCATED && yb_enable_parallel_scan_colocated) ||
+			(yb_dist == YB_HASH_SHARDED && yb_enable_parallel_scan_hash_sharded) ||
+			(yb_dist == YB_RANGE_SHARDED && yb_enable_parallel_scan_range_sharded) ||
+			(yb_dist == YB_SYSTEM && yb_enable_parallel_scan_system))
+		{
+			parallel_workers = ybParallelWorkers(rel->tuples);
 		}
 	}
 
@@ -4322,6 +4647,11 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 		/* Else, identify the cheapest path for it. */
 		set_cheapest(child_rel);
 
+		if (IsYugaByteEnabled() && yb_enable_planner_trace)
+		{
+			ybTraceCheapestPaths(rel, "generate_partitionwise_join_paths");
+		}
+
 		/* Dummy children need not be scanned, so ignore those. */
 		if (IS_DUMMY_REL(child_rel))
 			continue;
@@ -4345,6 +4675,665 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 	list_free(live_children);
 }
 
+#define YB_UID_STR_WRITE sprintf(ybMsgBuf, "(UID %u) ", ybGetNextUid(root->glob))
+
+#define YB_UID_STR \
+	char ybMsgBuf[30]; \
+	YB_UID_STR_WRITE
+
+/*
+ * Look into (parallel) lists for a join method ('joinTag') for a set of relations ('joinRelids')
+ * that is specifially prohibited. E.g. if the query and hints are
+ *
+ *		Leading(((t1 t2) t3)) noNestLoop(t1 t2) : SELECT MAX(a1) FROM t1 JOIN t2 ON a1<a2 JOIN t3 ON a1=a3
+ *
+ * then the NL join t1-t2 will get penalized even though it is hinted. In this case the 2 lists would contain
+ *
+ *		ybProhibitedJoinTypes : T_NestLoop
+ *		ybProhibitedJoins : (<t1 relid>, <t2 relid>)
+ *
+ */
+bool
+ybFindProhibitedJoin(PlannerInfo *root, NodeTag joinTag, Relids joinRelids)
+{
+	bool		foundProhibitedJoin = false;
+
+	ListCell   *lc1,
+			   *lc2;
+
+	forboth(lc1, root->ybProhibitedJoinTypes, lc2, root->ybProhibitedJoins)
+	{
+		NodeTag		prohibitedJoinTag = (NodeTag) lfirst_int(lc1);
+		Relids		prohibitedJoinRelids = (Relids) lfirst(lc2);
+
+		if (joinTag == prohibitedJoinTag && bms_equal(prohibitedJoinRelids, joinRelids))
+		{
+			foundProhibitedJoin = true;
+			break;
+		}
+	}
+
+	if (foundProhibitedJoin)
+	{
+		if (yb_enable_planner_trace)
+		{
+			YB_UID_STR;
+			ereport(DEBUG1,
+					(errmsg("\n%s found prohibited join : tag %d\n",
+							ybMsgBuf,
+							joinTag)));
+			ybTraceRelds(root, joinRelids, "join relids");
+		}
+	}
+
+	return foundProhibitedJoin;
+}
+
+/*
+ * Look for a join that has been hinted using a Leading hint. E.g. if the join hint is
+ *
+ *		Leading(((t2 t1) t3))
+ *
+ * then the 2 (parallel) lists will contain
+ *
+ *		ybHintedJoinsOuter : (<t2 relid>) , (<t2 relid>, <t1 relid>)
+ *		ybHintedJoinsInner : (<t1 relid>) . (<t3 relid>)
+ *
+ * If 'trySwapped' is true then we try matching both outer-to-outer and outer-to-inner.
+ * This is used to find a logical join ordering vs a physical one (for Paths). E.g., if the join enumerator
+ * is considering joining t1-t2 (logically) then the function should return true. Any join path t1-t2 would
+ * be rejected but join paths t2-t1 would not.
+ *
+ * 'outerRelids' and 'innerRelids' should be copies unless they are guaranteed to not be freed too early.
+ */
+bool
+ybFindHintedJoin(PlannerInfo *root, Relids outerRelids, Relids innerRelids, bool trySwapped)
+{
+	bool		foundHintedJoin = false;
+
+	ListCell   *lc1,
+			   *lc2;
+
+	forboth(lc1, root->ybHintedJoinsOuter, lc2, root->ybHintedJoinsInner)
+	{
+		Relids		hintedJoinOuterRelids = (Relids) lfirst(lc1);
+		Relids		hintedJoinInnerRelids = (Relids) lfirst(lc2);
+
+		if ((bms_equal(outerRelids, hintedJoinOuterRelids) && bms_equal(innerRelids, hintedJoinInnerRelids)) ||
+			(trySwapped && bms_equal(outerRelids, hintedJoinInnerRelids) && bms_equal(innerRelids, hintedJoinOuterRelids)))
+		{
+			foundHintedJoin = true;
+		}
+		else if (outerRelids == NULL)
+		{
+			if ((bms_equal(innerRelids, hintedJoinInnerRelids)) ||
+				(trySwapped && bms_equal(innerRelids, hintedJoinOuterRelids)))
+			{
+				foundHintedJoin = true;
+			}
+		}
+		else if (innerRelids == NULL)
+		{
+			if ((bms_equal(outerRelids, hintedJoinOuterRelids)) ||
+				(trySwapped && bms_equal(outerRelids, hintedJoinInnerRelids)))
+			{
+				foundHintedJoin = true;
+			}
+		}
+
+		if (foundHintedJoin)
+		{
+			if (yb_enable_planner_trace)
+			{
+				YB_UID_STR;
+				ereport(DEBUG1,
+						(errmsg("\n%s found hinted join\n", ybMsgBuf)));
+				ybTraceRelds(root, outerRelids, "\nouter relids");
+				ybTraceRelds(root, innerRelids, "\ninner relids");
+			}
+
+			break;
+		}
+	}
+
+	return foundHintedJoin;
+}
+
+/*
+ * A simple comparison function to allow arrays of RelOptInfos to be sorted for consistent
+ * ordering.
+ */
+static int
+ybCmpRelOptInfo(const void *p1, const void *p2)
+{
+	RelOptInfo *rel1 = *(RelOptInfo **) p1;
+	RelOptInfo *rel2 = *(RelOptInfo **) p1;
+
+	int			cmp;
+
+	if (rel1 == NULL)
+	{
+		if (rel2 == NULL)
+		{
+			cmp = 0;
+		}
+		else
+		{
+			cmp = 1;
+		}
+	}
+	else if (rel2 == NULL)
+	{
+		cmp = -1;
+	}
+	else if (rel1->ybHintAlias != NULL)
+	{
+		if (rel2->ybHintAlias != NULL)
+		{
+			cmp = strcmp(rel1->ybHintAlias, rel2->ybHintAlias);
+		}
+		else
+		{
+			cmp = -1;
+		}
+	}
+	else
+	{
+		if (rel2->ybHintAlias != NULL)
+		{
+			cmp = 1;
+		}
+		else
+		{
+			if (rel1->ybUniqueBaseId < rel2->ybUniqueBaseId)
+			{
+				cmp = -1;
+			}
+			else if (rel2->ybUniqueBaseId < rel1->ybUniqueBaseId)
+			{
+				cmp = 1;
+			}
+			else
+			{
+				cmp = (rel1->relid < rel2->relid);
+			}
+		}
+	}
+
+	return cmp;
+}
+
+void
+ybBuildRelidsString(PlannerInfo *root, Relids relids, StringInfoData *buf)
+{
+	if (relids == NULL)
+	{
+		appendStringInfo(buf, "<null>");
+	}
+	else
+	{
+		int			pos;
+		bool		first = true;
+
+		size_t		arrSize = root->simple_rel_array_size * sizeof(RelOptInfo *);
+		RelOptInfo **copy_simple_rel_array = (RelOptInfo **) palloc(arrSize);
+
+		memcpy(copy_simple_rel_array, root->simple_rel_array, arrSize);
+		qsort(copy_simple_rel_array, root->simple_rel_array_size, sizeof(RelOptInfo *), ybCmpRelOptInfo);
+
+		pos = -1;
+		while ((pos = bms_next_member(relids, pos)) >= 0)
+		{
+			if (!first)
+			{
+				appendStringInfoSpaces(buf, 1);
+			}
+
+			bool		printed = false;
+
+			if (pos < root->simple_rel_array_size)
+			{
+				RelOptInfo *rel = copy_simple_rel_array[pos];
+
+				if (rel != NULL && rel->ybHintAlias != NULL)
+				{
+					appendStringInfo(buf, "%s", rel->ybHintAlias);
+					printed = true;
+				}
+				else if (root->simple_rte_array[pos] != NULL)
+				{
+					appendStringInfo(buf, "%s", root->simple_rte_array[pos]->eref->aliasname);
+					printed = true;
+				}
+			}
+
+			if (!printed)
+			{
+				appendStringInfo(buf, "%d", pos);
+			}
+
+			first = false;
+		}
+
+		pfree(copy_simple_rel_array);
+	}
+}
+
+void
+ybBuildRelOptInfoString(PlannerInfo *root, RelOptInfo *relOptInfo, StringInfoData *buf)
+{
+	if (relOptInfo->ybUniqueBaseId > 0)
+	{
+		appendStringInfo(buf, "table %s, block %d, UID = %d, relid = %d",
+						 relOptInfo->ybHintAlias, relOptInfo->ybBlockId, relOptInfo->ybUniqueBaseId, relOptInfo->relid);
+	}
+	else
+	{
+		ybBuildRelidsString(root, relOptInfo->relids, buf);
+	}
+}
+
+void
+ybTraceRelOptInfo(PlannerInfo *root, RelOptInfo *relOptInfo, char *msg)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (msg != NULL)
+	{
+		appendStringInfo(&buf, "%s :\n  ", msg);
+	}
+
+	ybBuildRelOptInfoString(root, relOptInfo, &buf);
+
+	YB_UID_STR;
+	ereport(DEBUG1,
+			(errmsg("\n%s %s\n", ybMsgBuf, buf.data)));
+
+	if (relOptInfo->cheapest_total_path != NULL)
+	{
+		ybTracePath(root, relOptInfo->cheapest_total_path, "Cheapest total path");
+	}
+	else
+	{
+		YB_UID_STR;
+		ereport(DEBUG1,
+				(errmsg("\n%s Cheapest total path is NULL\n", ybMsgBuf)));
+
+		Path	   *bestCurrentPath = NULL;
+		ListCell   *lc;
+
+		foreach(lc, relOptInfo->pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+
+			if (bestCurrentPath == NULL || compare_path_costs(path, bestCurrentPath, TOTAL_COST) == -1)
+			{
+				bestCurrentPath = path;
+			}
+		}
+
+		if (bestCurrentPath != NULL)
+		{
+			ybTracePath(root, bestCurrentPath, "Current cheapest total path");
+		}
+	}
+
+	pfree(buf.data);
+}
+
+void
+ybTraceRelds(PlannerInfo *root, Relids relids, char *msg)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (msg != NULL)
+	{
+		appendStringInfo(&buf, "%s : \n  ", msg);
+	}
+
+	ybBuildRelidsString(root, relids, &buf);
+
+	YB_UID_STR;
+	ereport(DEBUG1,
+			(errmsg("%s %s\n", ybMsgBuf, buf.data)));
+
+	pfree(buf.data);
+}
+
+void
+ybTraceRelOptInfoList(PlannerInfo *root, List *relOptInfoList, char *msg)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (msg != NULL)
+	{
+		appendStringInfo(&buf, "%s : \n  ", msg);
+	}
+
+	appendStringInfoString(&buf, "begin rels\n");
+
+	bool		first = true;
+	ListCell   *lc;
+
+	foreach(lc, relOptInfoList)
+	{
+		if (!first)
+		{
+			appendStringInfoString(&buf, "\n");
+		}
+		RelOptInfo *relOptInfo = (RelOptInfo *) lfirst(lc);
+
+		appendStringInfoSpaces(&buf, 4);
+		ybBuildRelOptInfoString(root, relOptInfo, &buf);
+		first = false;
+	}
+
+	if (msg != NULL)
+	{
+		appendStringInfoString(&buf, "  ");
+	}
+
+	appendStringInfoString(&buf, "\n  end rels");
+
+	YB_UID_STR;
+	ereport(DEBUG1,
+			(errmsg("\n%s %s\n", ybMsgBuf, buf.data)));
+
+	pfree(buf.data);
+}
+
+void
+ybTracePathList(PlannerInfo *root, List *pathList, char *msg)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (msg != NULL)
+	{
+		YB_UID_STR;
+		ereport(DEBUG1,
+				(errmsg("\n%s %s :\n", ybMsgBuf, msg)));
+	}
+
+	int			cnt = 0;
+	ListCell   *lc;
+
+	foreach(lc, pathList)
+	{
+		resetStringInfo(&buf);
+		appendStringInfo(&buf, "\npath %d", cnt);
+		Path	   *path = (Path *) lfirst(lc);
+
+		ybTracePath(root, path, buf.data);
+		++cnt;
+	}
+
+	pfree(buf.data);
+}
+
+void
+ybTracePath(PlannerInfo *root, Path *path, char *msg)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (msg != NULL)
+	{
+		appendStringInfo(&buf, "%s :\n  ", msg);
+	}
+
+	const char *ptype;
+	bool		join = false;
+	bool		index = false;
+
+	switch (nodeTag(path))
+	{
+		case T_Path:
+			switch (path->pathtype)
+			{
+				case T_SeqScan:
+					ptype = "SeqScan";
+					break;
+				case T_SampleScan:
+					ptype = "SampleScan";
+					break;
+				case T_FunctionScan:
+					ptype = "FunctionScan";
+					break;
+				case T_TableFuncScan:
+					ptype = "TableFuncScan";
+					break;
+				case T_ValuesScan:
+					ptype = "ValuesScan";
+					break;
+				case T_CteScan:
+					ptype = "CteScan";
+					break;
+				case T_NamedTuplestoreScan:
+					ptype = "NamedTuplestoreScan";
+					break;
+				case T_Result:
+					ptype = "Result";
+					break;
+				case T_WorkTableScan:
+					ptype = "WorkTableScan";
+					break;
+				default:
+					ptype = "???Path";
+					break;
+			}
+			break;
+		case T_IndexPath:
+			ptype = "IdxScan";
+			index = true;
+			break;
+		case T_BitmapHeapPath:
+			ptype = "BitmapHeapScan";
+			break;
+		case T_YbBitmapTablePath:
+			ptype = "YbBitmapTableScan";
+			break;
+		case T_BitmapAndPath:
+			ptype = "BitmapAndPath";
+			break;
+		case T_BitmapOrPath:
+			ptype = "BitmapOrPath";
+			break;
+		case T_TidPath:
+			ptype = "TidScan";
+			break;
+		case T_SubqueryScanPath:
+			ptype = "SubqueryScan";
+			break;
+		case T_ForeignPath:
+			ptype = "ForeignScan";
+			break;
+		case T_CustomPath:
+			ptype = "CustomScan";
+			break;
+		case T_NestPath:
+			ptype = "NestLoop";
+			join = true;
+			break;
+		case T_MergePath:
+			ptype = "MergeJoin";
+			join = true;
+			break;
+		case T_HashPath:
+			ptype = "HashJoin";
+			join = true;
+			break;
+		case T_AppendPath:
+			ptype = "Append";
+			break;
+		case T_MergeAppendPath:
+			ptype = "MergeAppend";
+			break;
+		case T_GroupResultPath:
+			ptype = "GroupResult";
+			break;
+		case T_MaterialPath:
+			ptype = "Material";
+			break;
+		case T_MemoizePath:
+			ptype = "Memoize";
+			break;
+		case T_UniquePath:
+			ptype = "Unique";
+			break;
+		case T_GatherPath:
+			ptype = "Gather";
+			break;
+		case T_GatherMergePath:
+			ptype = "GatherMerge";
+			break;
+		case T_ProjectionPath:
+			ptype = "Projection";
+			break;
+		case T_ProjectSetPath:
+			ptype = "ProjectSet";
+			break;
+		case T_SortPath:
+			ptype = "Sort";
+			break;
+		case T_IncrementalSortPath:
+			ptype = "IncrementalSort";
+			break;
+		case T_GroupPath:
+			ptype = "Group";
+			break;
+		case T_UpperUniquePath:
+			ptype = "UpperUnique";
+			break;
+		case T_AggPath:
+			ptype = "Agg";
+			break;
+		case T_GroupingSetsPath:
+			ptype = "GroupingSets";
+			break;
+		case T_MinMaxAggPath:
+			ptype = "MinMaxAgg";
+			break;
+		case T_WindowAggPath:
+			ptype = "WindowAgg";
+			break;
+		case T_SetOpPath:
+			ptype = "SetOp";
+			break;
+		case T_RecursiveUnionPath:
+			ptype = "RecursiveUnion";
+			break;
+		case T_LockRowsPath:
+			ptype = "LockRows";
+			break;
+		case T_ModifyTablePath:
+			ptype = "ModifyTable";
+			break;
+		case T_LimitPath:
+			ptype = "Limit";
+			break;
+		default:
+			ptype = "???Path";
+			break;
+	}
+
+	appendStringInfoSpaces(&buf, 2);
+	appendStringInfo(&buf, "%s (NODE %u , hinted = %s)\n", ptype, path->ybUniqueId, path->ybIsHinted ? "true" : "false");
+
+	if (index)
+	{
+		IndexPath  *indexPath = (IndexPath *) path;
+		char	   *indexName = get_rel_name(indexPath->indexinfo->indexoid);
+
+		appendStringInfoSpaces(&buf, 4);
+		appendStringInfo(&buf, "index name : %s\n", indexName);
+	}
+
+	appendStringInfoSpaces(&buf, 4);
+	appendStringInfo(&buf, "parallel aware = %s , parallel safe = %s, parallel workers = %d\n",
+					 path->parallel_aware ? "true" : "false", path->parallel_safe ? "true" : "false", path->parallel_workers);
+
+	if (path->parent != NULL)
+	{
+		appendStringInfoSpaces(&buf, 4);
+		appendStringInfoString(&buf, "parent relids : [");
+		ybBuildRelidsString(root, path->parent->relids, &buf);
+		appendStringInfoString(&buf, "]\n");
+	}
+
+	if (path->param_info != NULL)
+	{
+		appendStringInfoSpaces(&buf, 4);
+		appendStringInfoString(&buf, "required outer relids : [");
+		ybBuildRelidsString(root, path->param_info->ppi_req_outer, &buf);
+		appendStringInfoString(&buf, "]\n");
+	}
+
+	appendStringInfoSpaces(&buf, 4);
+	appendStringInfo(&buf, "rows = %.0f cost = %.2f..%.2f\n",
+					 path->rows, path->startup_cost, path->total_cost);
+
+	if (join)
+	{
+		JoinPath   *jp = (JoinPath *) path;
+
+		appendStringInfoSpaces(&buf, 4);
+		appendStringInfo(&buf, "outer join path : NODE %u\n", jp->outerjoinpath->ybUniqueId);
+		StringInfoData buf2;
+
+		initStringInfo(&buf2);
+		ybBuildRelidsString(root, jp->outerjoinpath->parent->relids, &buf2);
+		appendStringInfoSpaces(&buf, 6);
+		appendStringInfo(&buf, "rels : [%s]\n", buf2.data);
+		resetStringInfo(&buf2);
+		appendStringInfoSpaces(&buf, 4);
+		appendStringInfo(&buf, "inner join path : NODE %u\n", jp->innerjoinpath->ybUniqueId);
+		ybBuildRelidsString(root, jp->innerjoinpath->parent->relids, &buf2);
+		appendStringInfoSpaces(&buf, 6);
+		appendStringInfo(&buf, "rels : [%s]\n", buf2.data);
+		pfree(buf2.data);
+	}
+
+	YB_UID_STR;
+	ereport(DEBUG1,
+			(errmsg("\n%s %s", ybMsgBuf, buf.data)));
+
+	pfree(buf.data);
+}
+
+void
+ybTraceCheapestPaths(RelOptInfo *rel, char *msg)
+{
+	ereport(DEBUG1,
+			(errmsg("\n%s : cheapest total : NODE %d\n",
+					msg, rel->cheapest_total_path->ybUniqueId)));
+
+	ListCell   *lc;
+	int			cnt = 0;
+
+	foreach(lc, rel->cheapest_parameterized_paths)
+	{
+		Path	   *paramPath = (Path *) lfirst(lc);
+
+		ereport(DEBUG1,
+				(errmsg("\n%s : cheapest param path %d : NODE %d\n",
+						msg, cnt, paramPath->ybUniqueId)));
+		++cnt;
+	}
+
+	return;
+}
+
+#undef YB_UID_STR_WRITE
+#undef YB_UID_STR
 
 /*****************************************************************************
  *			DEBUG SUPPORT
@@ -4437,6 +5426,9 @@ print_path(PlannerInfo *root, Path *path, int indent)
 			break;
 		case T_BitmapHeapPath:
 			ptype = "BitmapHeapScan";
+			break;
+		case T_YbBitmapTablePath:
+			ptype = "YbBitmapTableScan";
 			break;
 		case T_BitmapAndPath:
 			ptype = "BitmapAndPath";

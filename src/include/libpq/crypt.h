@@ -44,4 +44,10 @@ extern int	plain_crypt_verify(const char *role, const char *shadow_pass,
 							   const char *client_pass,
 							   const char **logdetail);
 
+/* YB */
+extern bool yb_get_role_password(const char *role, const char **logdetail,
+								 uint64_t *auth_key);
+extern int	yb_plain_key_verify(const char *role, const uint64_t server_auth_key,
+								const uint64_t client_auth_key, const char **logdetail);
+
 #endif

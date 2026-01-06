@@ -89,4 +89,7 @@ extern bool PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2);
 extern void PGSharedMemoryDetach(void);
 extern void GetHugePageSize(Size *hugepagesize, int *mmap_flags);
 
+/* YB */
+extern void YbRemoveSharedMemory();
+
 #endif							/* PG_SHMEM_H */

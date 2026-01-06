@@ -33,6 +33,12 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "storage/procsignal.h"
+#include "utils/catcache.h"
+#include "yb_tcmalloc_utils.h"
+
 /*
  * The SIGUSR1 signal is multiplexed to support signaling multiple event
  * types. The specific reason is communicated via flags in shared memory.
@@ -202,6 +208,34 @@ ProcSignalInit(int pss_idx)
 	on_shmem_exit(CleanupProcSignalState, Int32GetDatum(pss_idx));
 }
 
+/* CleanupProcSignalStateInternal
+ * 		Remove the given process from ProcSignalSlots
+ */
+static void
+CleanupProcSignalStateInternal(PGPROC *proc, int pss_idx, ProcSignalSlot *slot)
+{
+	/* sanity check */
+	if (slot->pss_pid != proc->pid)
+	{
+		/*
+		 * don't ERROR here. We're exiting anyway, and don't want to get into
+		 * infinite loop trying to exit
+		 */
+		elog(LOG, "process %d releasing ProcSignal slot %d, but it contains %d",
+			 proc->pid, pss_idx, (int) slot->pss_pid);
+		return;					/* XXX better to zero the slot anyway? */
+	}
+
+	/*
+	 * Make this slot look like it's absorbed all possible barriers, so that
+	 * no barrier waits block on it.
+	 */
+	pg_atomic_write_u64(&slot->pss_barrierGeneration, PG_UINT64_MAX);
+	YbConditionVariableBroadcastForProc(&slot->pss_barrierCV, proc);
+
+	slot->pss_pid = 0;
+}
+
 /*
  * CleanupProcSignalState
  *		Remove current process from ProcSignal mechanism
@@ -224,26 +258,25 @@ CleanupProcSignalState(int status, Datum arg)
 	 */
 	MyProcSignalSlot = NULL;
 
-	/* sanity check */
-	if (slot->pss_pid != MyProcPid)
-	{
-		/*
-		 * don't ERROR here. We're exiting anyway, and don't want to get into
-		 * infinite loop trying to exit
-		 */
-		elog(LOG, "process %d releasing ProcSignal slot %d, but it contains %d",
-			 MyProcPid, pss_idx, (int) slot->pss_pid);
-		return;					/* XXX better to zero the slot anyway? */
-	}
+	CleanupProcSignalStateInternal(MyProc, pss_idx, slot);
+}
 
-	/*
-	 * Make this slot look like it's absorbed all possible barriers, so that
-	 * no barrier waits block on it.
-	 */
-	pg_atomic_write_u64(&slot->pss_barrierGeneration, PG_UINT64_MAX);
-	ConditionVariableBroadcast(&slot->pss_barrierCV);
+/*
+ * CleanupProcSignalStateForProc
+ *		Remove the given process from ProcSignalSlots
+ *
+ * This function is called from reaper() when the parent is notified that its
+ * child died unexpectedly.
+ */
+void
+CleanupProcSignalStateForProc(PGPROC *proc)
+{
+	int			pss_idx = proc->backendId;
+	ProcSignalSlot *slot;
 
-	slot->pss_pid = 0;
+	slot = &ProcSignal->psh_slot[pss_idx - 1];
+
+	CleanupProcSignalStateInternal(proc, pss_idx, slot);
 }
 
 /*
@@ -656,6 +689,15 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_LOG_MEMORY_CONTEXT))
 		HandleLogMemoryContextInterrupt();
+
+	if (CheckProcSignal(PROCSIG_LOG_HEAP_SNAPSHOT))
+		HandleLogHeapSnapshotInterrupt();
+
+	if (CheckProcSignal(PROCSIG_LOG_HEAP_SNAPSHOT_PEAK))
+		HandleLogHeapSnapshotPeakInterrupt();
+
+	if (CheckProcSignal(YB_PROCSIG_LOG_CATCACHE_STATS))
+		YbHandleLogCatcacheStatsInterrupt();
 
 	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
 		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);

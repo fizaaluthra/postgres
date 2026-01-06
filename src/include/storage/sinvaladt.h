@@ -41,4 +41,8 @@ extern void SIResetAll(void);
 
 extern LocalTransactionId GetNextLocalTransactionId(void);
 
+/* YB */
+extern void CleanupInvalidationState(int status, Datum arg);
+extern void CleanupInvalidationStateForProc(PGPROC *proc);
+
 #endif							/* SINVALADT_H */

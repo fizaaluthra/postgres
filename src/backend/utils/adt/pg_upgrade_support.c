@@ -23,7 +23,7 @@
 
 #define CHECK_IS_BINARY_UPGRADE									\
 do {															\
-	if (!IsBinaryUpgrade)										\
+	if (!IsBinaryUpgrade && !yb_binary_restore)					\
 		ereport(ERROR,											\
 				(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),	\
 				 errmsg("function can only be called when server is in binary upgrade mode"))); \
@@ -162,12 +162,34 @@ binary_upgrade_set_next_pg_enum_oid(PG_FUNCTION_ARGS)
 }
 
 Datum
+yb_binary_upgrade_set_next_pg_enum_sortorder(PG_FUNCTION_ARGS)
+{
+	float4		enumsortorder = PG_GETARG_FLOAT4(0);
+
+	CHECK_IS_BINARY_UPGRADE;
+	yb_binary_upgrade_next_pg_enum_sortorder = enumsortorder;
+
+	PG_RETURN_VOID();
+}
+
+Datum
 binary_upgrade_set_next_pg_authid_oid(PG_FUNCTION_ARGS)
 {
 	Oid			authoid = PG_GETARG_OID(0);
 
 	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_pg_authid_oid = authoid;
+	PG_RETURN_VOID();
+}
+
+Datum
+yb_binary_upgrade_set_next_colocation_id(PG_FUNCTION_ARGS)
+{
+	Oid			colocation_id = PG_GETARG_OID(0);
+
+	CHECK_IS_BINARY_UPGRADE;
+	yb_binary_upgrade_next_colocation_id = colocation_id;
+
 	PG_RETURN_VOID();
 }
 
@@ -260,6 +282,28 @@ binary_upgrade_set_missing_value(PG_FUNCTION_ARGS)
 
 	CHECK_IS_BINARY_UPGRADE;
 	SetAttrMissing(table_id, cattname, cvalue);
+
+	PG_RETURN_VOID();
+}
+
+Datum
+binary_upgrade_set_next_tablegroup_oid(PG_FUNCTION_ARGS)
+{
+	Oid			tablegroup_oid = PG_GETARG_OID(0);
+
+	CHECK_IS_BINARY_UPGRADE;
+	binary_upgrade_next_tablegroup_oid = tablegroup_oid;
+
+	PG_RETURN_VOID();
+}
+
+Datum
+binary_upgrade_set_next_tablegroup_default(PG_FUNCTION_ARGS)
+{
+	bool		next_tablegroup_default = PG_GETARG_BOOL(0);
+
+	CHECK_IS_BINARY_UPGRADE;
+	binary_upgrade_next_tablegroup_default = next_tablegroup_default;
 
 	PG_RETURN_VOID();
 }

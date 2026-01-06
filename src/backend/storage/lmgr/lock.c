@@ -50,6 +50,10 @@
 #include "utils/ps_status.h"
 #include "utils/resowner_private.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/timeout.h"
+
 
 /* This configuration variable is used to set the lock table size */
 int			max_locks_per_xact; /* set by guc.c */
@@ -376,6 +380,17 @@ static void LockRefindAndRelease(LockMethod lockMethodTable, PGPROC *proc,
 static void GetSingleProcBlockerStatusData(PGPROC *blocked_proc,
 										   BlockedProcsData *data);
 
+static YbcObjectLockId
+GetYBObjectLockId(const LOCKTAG *locktag)
+{
+	return (YbcObjectLockId)
+	{
+		.db_oid = locktag->locktag_field1,
+			.relation_oid = locktag->locktag_field2,
+			.object_oid = locktag->locktag_field3,
+			.object_sub_oid = locktag->locktag_field4,
+	};
+}
 
 /*
  * InitLocks -- Initialize the lock manager's data structures.
@@ -664,6 +679,16 @@ LockHasWaiters(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	LWLock	   *partitionLock;
 	bool		hasWaiters = false;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * When object locking in YB is enabled, signaling logic is executed
+		 * on the tserver side. And when object locking is disabled, we revert
+		 * back to older behavior of skipping the signal.
+		 */
+		return false;
+	}
+
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
 	lockMethodTable = LockMethods[lockmethodid];
@@ -815,6 +840,31 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	lockMethodTable = LockMethods[lockmethodid];
 	if (lockmode <= 0 || lockmode > lockMethodTable->numLockModes)
 		elog(ERROR, "unrecognized lock mode: %d", lockmode);
+
+	if (!YBIsPgLockingEnabled())
+	{
+		int			log_level = (locktag->locktag_field2 >= FirstNormalObjectId) ?
+			((lockmode >= ShareUpdateExclusiveLock) ? DEBUG1 : DEBUG2) : DEBUG4;
+
+		elog(log_level, "LockAcquire start: lock [%u,%u] mode: %s",
+			 locktag->locktag_field1, locktag->locktag_field2, lockMethodTable->lockModeNames[lockmode]);
+
+		if (LockTimeout > 0)
+			enable_timeout_after(LOCK_TIMEOUT, LockTimeout);
+
+		 YbcStatus status = YBCAcquireObjectLock(GetYBObjectLockId(locktag), (YbcObjectLockMode) lockmode);
+
+		 CHECK_FOR_INTERRUPTS();
+
+		if (LockTimeout > 0)
+			disable_timeout(LOCK_TIMEOUT, false);
+
+		HandleYBStatus(status);
+
+		elog(log_level, "LockAcquired: lock [%u,%u] mode: %s",
+			 locktag->locktag_field1, locktag->locktag_field2, lockMethodTable->lockModeNames[lockmode]);
+		return LOCKACQUIRE_OK;
+	}
 
 	if (RecoveryInProgress() && !InRecovery &&
 		(locktag->locktag_type == LOCKTAG_OBJECT ||
@@ -1808,6 +1858,16 @@ GrantAwaitedLock(void)
 void
 MarkLockClear(LOCALLOCK *locallock)
 {
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * When object locking in YB is enabled, tserver catalog cache is
+		 * refreshed on exclusive lock release path. When disabled, we revert
+		 * to older behavior of ignoring it.
+		 */
+		return;
+	}
+
 	Assert(locallock->nLocks > 0);
 	locallock->lockCleared = true;
 }
@@ -1992,6 +2052,16 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	PROCLOCK   *proclock;
 	LWLock	   *partitionLock;
 	bool		wakeupNeeded;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * When object locking in YB is enabled, YB releases all object
+		 * locks on transaction finish. When disbaled, we revert to older
+		 * behavior of skipping all object lock/release operations.
+		 */
+		return true;
+	}
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
@@ -2198,6 +2268,16 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 	PROCLOCK   *proclock;
 	int			partition;
 	bool		have_fast_path_lwlock = false;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * When object locking in YB is enabled, we release all object locks
+		 * on transaction finish. When disbaled, we revert back to older
+		 * behavior of skipping all object lock/release operations.
+		 */
+		return;
+	}
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
@@ -2476,6 +2556,15 @@ LockReleaseSession(LOCKMETHODID lockmethodid)
 	HASH_SEQ_STATUS status;
 	LOCALLOCK  *locallock;
 
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * TODO(#27120): Propagate call to tserver once support for session
+		 * object locking is enabled.
+		 */
+		return;
+	}
+
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
 
@@ -2503,6 +2592,16 @@ LockReleaseSession(LOCKMETHODID lockmethodid)
 void
 LockReleaseCurrentOwner(LOCALLOCK **locallocks, int nlocks)
 {
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * TODO(#27156): In YB, locks are managed at the tserver. Figure out
+		 * a mechanism to acheive the same functionality as below when object
+		 * locking feature is enabled.
+		 */
+		return;
+	}
+
 	if (locallocks == NULL)
 	{
 		HASH_SEQ_STATUS status;
@@ -2598,6 +2697,19 @@ ReleaseLockIfHeld(LOCALLOCK *locallock, bool sessionLock)
 void
 LockReassignCurrentOwner(LOCALLOCK **locallocks, int nlocks)
 {
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * When object locking in YB is enabled, object locks are tied to a
+		 * docdb transaction. There is no way to reassign locks, will need
+		 * some rework if we deem this to be necessary at some point. When
+		 * disbaled, we revert back to older behavior of skipping all object
+		 * lock/release operations.
+		 */
+		return;
+	}
+
 	ResourceOwner parent = ResourceOwnerGetParent(CurrentResourceOwner);
 
 	Assert(parent != NULL);
@@ -2944,6 +3056,21 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 	LWLock	   *partitionLock;
 	int			count = 0;
 	int			fast_count = 0;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * TODO(#27119): When object locking is enabled in YB, we could still
+		 * return an empty set if the upstream code calls the tserver with the
+		 * intended lock mode to wait on. When disabled, we revert back to
+		 * older behavior of skipping all object lock/release operations.
+		 */
+		vxids = (VirtualTransactionId *)
+			palloc0(sizeof(VirtualTransactionId));
+		vxids[0].backendId = InvalidBackendId;
+		vxids[0].localTransactionId = InvalidLocalTransactionId;
+		return vxids;
+	}
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
@@ -3342,6 +3469,16 @@ AtPrepare_Locks(void)
 {
 	HASH_SEQ_STATUS status;
 	LOCALLOCK  *locallock;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * TODO(#27156): In YB, locks are managed at the tserver. Figure out
+		 * a mechanism to acheive the same functionality as below when object
+		 * locking feature is enabled.
+		 */
+		return;
+	}
 
 	/* First, verify there aren't locks of both xact and session level */
 	CheckForSessionAndXactLocks();
@@ -4495,6 +4632,14 @@ lock_twophase_postabort(TransactionId xid, uint16 info,
 void
 VirtualXactLockTableInsert(VirtualTransactionId vxid)
 {
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * Immaterial of whether object locking is enabled in YB or not, we
+		 * don't acquire locks on any shared memory structures.
+		 */
+		return;
+	}
 	Assert(VirtualTransactionIdIsValid(vxid));
 
 	LWLockAcquire(&MyProc->fpInfoLock, LW_EXCLUSIVE);
@@ -4520,6 +4665,15 @@ VirtualXactLockTableCleanup(void)
 {
 	bool		fastpath;
 	LocalTransactionId lxid;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * Immaterial of whether object locking is enabled in YB or not, we
+		 * don't acquire locks on any shared memory structures.
+		 */
+		return;
+	}
 
 	Assert(MyProc->backendId != InvalidBackendId);
 
@@ -4621,6 +4775,15 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	LOCKTAG		tag;
 	PGPROC	   *proc;
 	TransactionId xid = InvalidTransactionId;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * Immaterial of whether object locking is enabled in YB or not, we
+		 * don't acquire locks on any shared memory structures.
+		 */
+		return false;
+	}
 
 	Assert(VirtualTransactionIdIsValid(vxid));
 
@@ -4735,6 +4898,15 @@ LockWaiterCount(const LOCKTAG *locktag)
 	uint32		hashcode;
 	LWLock	   *partitionLock;
 	int			waiters = 0;
+
+	if (!YBIsPgLockingEnabled())
+	{
+		/*
+		 * TODO(#27156): In YB, locks are managed at the tserver. Figure out
+		 * if this function needs to be supported at the first place.
+		 */
+		return 0;
+	}
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);

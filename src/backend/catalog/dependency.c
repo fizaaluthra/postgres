@@ -86,6 +86,16 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "commands/yb_cmds.h"
+#include "commands/yb_profile.h"
+#include "commands/yb_tablegroup.h"
+#include "miscadmin.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 
 /*
  * Deletion processing requires additional state for each ObjectAddress that
@@ -187,7 +197,12 @@ static const Oid object_classes[] = {
 	PublicationRelationId,		/* OCLASS_PUBLICATION */
 	PublicationRelRelationId,	/* OCLASS_PUBLICATION_REL */
 	SubscriptionRelationId,		/* OCLASS_SUBSCRIPTION */
-	TransformRelationId			/* OCLASS_TRANSFORM */
+	TransformRelationId,		/* OCLASS_TRANSFORM */
+
+	/* YB items */
+	YbProfileRelationId,		/* OCLASS_YBPROFILE */
+	YbRoleProfileRelationId,	/* OCLASS_YBROLE_PROFILE */
+	YbTablegroupRelationId,		/* OCLASS_YBTBLGROUP */
 };
 
 
@@ -202,9 +217,10 @@ static void reportDependentObjects(const ObjectAddresses *targetObjects,
 								   DropBehavior behavior,
 								   int flags,
 								   const ObjectAddress *origObject);
-static void deleteOneObject(const ObjectAddress *object,
-							Relation *depRel, int32 flags);
-static void doDeletion(const ObjectAddress *object, int flags);
+static void deleteOneObject(const ObjectAddress *object, Relation *depRel,
+							int32 flags, bool ybOriginalObject);
+static void doDeletion(const ObjectAddress *object, int flags,
+					   bool ybOriginalObject);
 static bool find_expr_references_walker(Node *node,
 										find_expr_references_context *context);
 static void process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
@@ -274,7 +290,8 @@ deleteObjectsInList(ObjectAddresses *targetObjects, Relation *depRel,
 			(thisextra->flags & DEPFLAG_ORIGINAL))
 			continue;
 
-		deleteOneObject(thisobj, depRel, flags);
+		deleteOneObject(thisobj, depRel, flags,
+						thisextra->flags & DEPFLAG_ORIGINAL);
 	}
 }
 
@@ -639,9 +656,9 @@ findDependentObjects(const ObjectAddress *object,
 
 				/* Otherwise, treat this like an internal dependency */
 				/* FALL THRU */
+				yb_switch_fallthrough();
 
 			case DEPENDENCY_INTERNAL:
-
 				/*
 				 * This object is part of the internal implementation of
 				 * another object, or is part of the extension that is the
@@ -1190,6 +1207,9 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 												 numNotReportedClient),
 						 numNotReportedClient);
 
+	if (IsYugaByteEnabled() && clientdetail.data != NULL)
+		clientdetail.data = YBDetailSorted(clientdetail.data);
+
 	if (!ok)
 	{
 		if (origObject)
@@ -1254,7 +1274,7 @@ DropObjectById(const ObjectAddress *object)
 			elog(ERROR, "cache lookup failed for %s %u",
 				 get_object_class_descr(object->classId), object->objectId);
 
-		CatalogTupleDelete(rel, &tup->t_self);
+		CatalogTupleDelete(rel, tup);
 
 		ReleaseSysCache(tup);
 	}
@@ -1277,7 +1297,7 @@ DropObjectById(const ObjectAddress *object)
 			elog(ERROR, "could not find tuple for %s %u",
 				 get_object_class_descr(object->classId), object->objectId);
 
-		CatalogTupleDelete(rel, &tup->t_self);
+		CatalogTupleDelete(rel, tup);
 
 		systable_endscan(scan);
 	}
@@ -1291,12 +1311,16 @@ DropObjectById(const ObjectAddress *object)
  * *depRel is the already-open pg_depend relation.
  */
 static void
-deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
+deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags,
+				bool ybOriginalObject)
 {
 	ScanKeyData key[3];
 	int			nkeys;
 	SysScanDesc scan;
 	HeapTuple	tup;
+	ObjectAddress implicit_tablegroup;
+	bool		is_colocated_tables_with_tablespace_enabled =
+		*YBCGetGFlags()->ysql_enable_colocated_tables_with_tablespaces;
 
 	/* DROP hook of the objects being removed */
 	InvokeObjectDropHookArg(object->classId, object->objectId,
@@ -1319,7 +1343,7 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 	 * updates before calling doDeletion() --- they'd get committed right
 	 * away, which is not cool if the deletion then fails.
 	 */
-	doDeletion(object, flags);
+	doDeletion(object, flags, ybOriginalObject);
 
 	/*
 	 * Reopen depRel if we closed it above
@@ -1356,13 +1380,37 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
 	scan = systable_beginscan(*depRel, DependDependerIndexId, true,
 							  NULL, nkeys, key);
 
+	implicit_tablegroup.objectId = InvalidOid;
+
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		CatalogTupleDelete(*depRel, &tup->t_self);
+		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+
+		CatalogTupleDelete(*depRel, tup);
+
+		if (MyDatabaseColocated &&
+			depform->refclassid == YbTablegroupRelationId &&
+			!tablegroupHasDependents(depform->refobjid))
+		{
+			implicit_tablegroup.classId = depform->refclassid;
+			implicit_tablegroup.objectId = depform->refobjid;
+			implicit_tablegroup.objectSubId = depform->refobjsubid;
+		}
 	}
 
 	systable_endscan(scan);
 
+	/*
+	 * YB: Check if implicit tablegroup has any more tables in it.
+	 * If not delete it.
+	 */
+	if (is_colocated_tables_with_tablespace_enabled &&
+		OidIsValid(implicit_tablegroup.objectId))
+	{
+		deleteSharedDependencyRecordsFor(implicit_tablegroup.classId, implicit_tablegroup.objectId,
+										 implicit_tablegroup.objectSubId);
+		RemoveTablegroupById(implicit_tablegroup.objectId, true);
+	}
 	/*
 	 * Delete shared dependency references related to this object.  Again, if
 	 * subId = 0, remove records for sub-objects too.
@@ -1397,7 +1445,7 @@ deleteOneObject(const ObjectAddress *object, Relation *depRel, int flags)
  * doDeletion: actually delete a single object
  */
 static void
-doDeletion(const ObjectAddress *object, int flags)
+doDeletion(const ObjectAddress *object, int flags, bool ybOriginalObject)
 {
 	switch (getObjectClass(object))
 	{
@@ -1412,15 +1460,54 @@ doDeletion(const ObjectAddress *object, int flags)
 					bool		concurrent_lock_mode = ((flags & PERFORM_DELETION_CONCURRENT_LOCK) != 0);
 
 					Assert(object->objectSubId == 0);
+
+					Relation	index = RelationIdGetRelation(object->objectId);
+
+					if (IsYBRelation(index) && !index->rd_index->indisprimary)
+						YBCDropIndex(index);
+
+					RelationClose(index);
+
 					index_drop(object->objectId, concurrent, concurrent_lock_mode);
 				}
 				else
 				{
 					if (object->objectSubId != 0)
+					{
+						Relation	yb_rel =
+							RelationIdGetRelation(object->objectId);
+
+						/* YB note: perform YBCDropColumn() */
+						if (IsYBRelation(yb_rel))
+						{
+							bool		skip_if_original =
+								(flags & YB_SKIP_YB_DROP_ORIGNAL_COLUMN) &&
+								ybOriginalObject;
+							bool		skip_if_pk =
+								(flags & YB_SKIP_YB_DROP_PK_COLUMN) &&
+								YbIsAttrPrimaryKeyColumn(yb_rel,
+														 object->objectSubId);
+
+							if (!skip_if_original && !skip_if_pk)
+								YBCDropColumn(yb_rel, object->objectSubId);
+						}
+
+						RelationClose(yb_rel);
+
 						RemoveAttributeById(object->objectId,
 											object->objectSubId);
+					}
 					else
+					{
+						Relation	rel = RelationIdGetRelation(object->objectId);
+
+						if (IsYBRelation(rel))
+							YBCDropTable(rel);
+
+						RelationClose(rel);
+
 						heap_drop_with_catalog(object->objectId);
+					}
 				}
 
 				/*
@@ -1514,6 +1601,10 @@ doDeletion(const ObjectAddress *object, int flags)
 			DropObjectById(object);
 			break;
 
+		case OCLASS_YBTBLGROUP:
+			RemoveTablegroupById(object->objectId, false);
+			break;
+
 			/*
 			 * These global object types are not supported here.
 			 */
@@ -1522,6 +1613,8 @@ doDeletion(const ObjectAddress *object, int flags)
 		case OCLASS_TBLSPACE:
 		case OCLASS_SUBSCRIPTION:
 		case OCLASS_PARAMETER_ACL:
+		case OCLASS_YBPROFILE:
+		case OCLASS_YBROLE_PROFILE:
 			elog(ERROR, "global objects cannot be deleted by doDeletion");
 			break;
 
@@ -2972,6 +3065,16 @@ getObjectClass(const ObjectAddress *object)
 
 		case TransformRelationId:
 			return OCLASS_TRANSFORM;
+
+			/* YB cases */
+		case YbProfileRelationId:
+			return OCLASS_YBPROFILE;
+
+		case YbRoleProfileRelationId:
+			return OCLASS_YBROLE_PROFILE;
+
+		case YbTablegroupRelationId:
+			return OCLASS_YBTBLGROUP;
 	}
 
 	/* shouldn't get here */
@@ -3016,7 +3119,7 @@ DeleteInitPrivs(const ObjectAddress *object)
 							  NULL, nkeys, key);
 
 	while (HeapTupleIsValid(oldtuple = systable_getnext(scan)))
-		CatalogTupleDelete(relation, &oldtuple->t_self);
+		CatalogTupleDelete(relation, oldtuple);
 
 	systable_endscan(scan);
 

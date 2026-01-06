@@ -39,6 +39,13 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "catalog/pg_yb_role_profile.h"
+#include "commands/yb_profile.h"
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include <assert.h>
+
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_pg_authid_oid = InvalidOid;
 
@@ -264,10 +271,11 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	}
 	else if (bypassrls)
 	{
-		if (!superuser())
+		if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to create bypassrls users")));
+					 errmsg("must be superuser or a member of the yb_db_admin "
+							"role to create bypassrls users")));
 	}
 	else
 	{
@@ -397,7 +405,7 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	 * pg_largeobject_metadata contains pg_authid.oid's, so we use the
 	 * binary-upgrade override.
 	 */
-	if (IsBinaryUpgrade)
+	if (IsBinaryUpgrade && !yb_binary_restore)
 	{
 		if (!OidIsValid(binary_upgrade_next_pg_authid_oid))
 			ereport(ERROR,
@@ -481,6 +489,66 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	return roleid;
 }
 
+/*
+ * This function must be kept in sync with the struct FormData_pg_authid.
+ * C provides no language facilities to do struct equality check so we
+ * compare each structure member by member.
+ */
+static bool
+YbIsPgAuthTupleEqual(TupleDesc pg_authid_dsc,
+					 HeapTuple auth_tup1,
+					 HeapTuple auth_tup2)
+{
+	static_assert(sizeof(*(Form_pg_authid) 0) == 80, "size mismatch");
+	Form_pg_authid authform1 = (Form_pg_authid) GETSTRUCT(auth_tup1);
+	Form_pg_authid authform2 = (Form_pg_authid) GETSTRUCT(auth_tup2);
+
+	/* All these struct members have a not null constraint. */
+	if (authform1->oid != authform2->oid ||
+		authform1->rolsuper != authform2->rolsuper ||
+		authform1->rolinherit != authform2->rolinherit ||
+		authform1->rolcreaterole != authform2->rolcreaterole ||
+		authform1->rolcreatedb != authform2->rolcreatedb ||
+		authform1->rolcanlogin != authform2->rolcanlogin ||
+		authform1->rolreplication != authform2->rolreplication ||
+		authform1->rolbypassrls != authform2->rolbypassrls ||
+		authform1->rolconnlimit != authform2->rolconnlimit)
+		return false;
+	if (strcmp(NameStr(authform1->rolname), NameStr(authform2->rolname)))
+		return false;
+#ifdef CATALOG_VARLEN
+#error "need to compare extra members"
+#endif
+	Datum		datum1,
+				datum2;
+	bool		isnull1,
+				isnull2;
+
+	/* Check rolpassword (SQL type text), can be null. */
+	datum1 = heap_getattr(auth_tup1, Anum_pg_authid_rolpassword,
+						  pg_authid_dsc, &isnull1);
+	datum2 = heap_getattr(auth_tup2, Anum_pg_authid_rolpassword,
+						  pg_authid_dsc, &isnull2);
+	if (isnull1 != isnull2)
+		return false;
+	if (!isnull1 &&
+		strcmp(TextDatumGetCString(datum1), TextDatumGetCString(datum2)))
+		return false;
+
+	/*
+	 * Check rolvaliduntil (SQL type timestamp with time zone, can be null.
+	 */
+	datum1 = heap_getattr(auth_tup1, Anum_pg_authid_rolvaliduntil,
+						  pg_authid_dsc, &isnull1);
+	datum2 = heap_getattr(auth_tup2, Anum_pg_authid_rolvaliduntil,
+						  pg_authid_dsc, &isnull2);
+	if (isnull1 != isnull2)
+		return false;
+	if (!isnull1 && DatumGetTimestampTz(datum1) != DatumGetTimestampTz(datum2))
+		return false;
+	return true;
+}
+
 
 /*
  * ALTER ROLE
@@ -519,6 +587,12 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 	DefElem    *dvalidUntil = NULL;
 	DefElem    *dbypassRLS = NULL;
 	Oid			roleid;
+
+	char	   *profile = NULL;
+	int			unlocked = -1;
+	DefElem    *dprofile = NULL;
+	DefElem    *dnoprofile = NULL;
+	DefElem    *dunlocked = NULL;
 
 	check_rolespec_name(stmt->role,
 						_("Cannot alter reserved roles."));
@@ -595,6 +669,33 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 				errorConflictingDefElem(defel, pstate);
 			dbypassRLS = defel;
 		}
+		/* YB */
+		else if (strcmp(defel->defname, "profile") == 0)
+		{
+			if (dprofile)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dprofile = defel;
+		}
+		/* YB */
+		else if (strcmp(defel->defname, "noprofile") == 0)
+		{
+			if (dnoprofile)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dnoprofile = defel;
+		}
+		/* YB */
+		else if (strcmp(defel->defname, "unlocked") == 0)
+		{
+			if (dunlocked)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dunlocked = defel;
+		}
 		else
 			elog(ERROR, "option \"%s\" not recognized",
 				 defel->defname);
@@ -612,6 +713,11 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 	}
 	if (dvalidUntil)
 		validUntil = strVal(dvalidUntil->arg);
+
+	if (dprofile && dprofile->arg)
+		profile = strVal(dprofile->arg);
+	if (dunlocked && dunlocked->arg)
+		unlocked = intVal(dunlocked->arg);
 
 	/*
 	 * Scan the pg_authid relation to be certain the user exists.
@@ -646,10 +752,19 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 	}
 	else if (dbypassRLS)
 	{
-		if (!superuser())
+		if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to change bypassrls attribute")));
+					 errmsg("must be superuser or a member of the yb_db_admin "
+							"role to change bypassrls attribute")));
+	}
+	else if (profile != NULL || dnoprofile != NULL || dunlocked != NULL)
+	{
+		if (!superuser() && !IsYbDbAdminUser(GetUserId()))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser or a member of the yb_db_admin "
+							"role to change profile configuration")));
 	}
 	else if (!have_createrole_privilege())
 	{
@@ -659,6 +774,26 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied")));
+	}
+
+	if (profile != NULL || dnoprofile != NULL || dunlocked != NULL)
+	{
+		if (profile != NULL)
+			YbCreateRoleProfile(roleid, rolename, profile);
+		else if (dunlocked != NULL)
+			YbSetRoleProfileStatus(roleid, rolename,
+								   (unlocked == 0 ?
+									YB_ROLPRFSTATUS_LOCKED :
+									YB_ROLPRFSTATUS_OPEN));
+		else
+		{
+			Assert(dnoprofile);
+			YbRemoveRoleProfileForRoleIfExists(roleid);
+		}
+
+		ReleaseSysCache(tuple);
+		table_close(pg_authid_rel, NoLock);
+		return roleid;
 	}
 
 	/* Convert validuntil to internal form */
@@ -736,6 +871,12 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 
 	if (dconnlimit)
 	{
+		/* YB: Check connection limit for postgres. */
+		if (roleid == 10 && connlimit != -1)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("cannot set connection limit for postgres"),
+					 errhint("Did you mean ALTER ROLE %s CONNECTION LIMIT -1.", rolename)));
 		new_record[Anum_pg_authid_rolconnlimit - 1] = Int32GetDatum(connlimit);
 		new_record_repl[Anum_pg_authid_rolconnlimit - 1] = true;
 	}
@@ -785,7 +926,19 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 
 	new_tuple = heap_modify_tuple(tuple, pg_authid_dsc, new_record,
 								  new_record_nulls, new_record_repl);
-	CatalogTupleUpdate(pg_authid_rel, &tuple->t_self, new_tuple);
+	/*
+	 * YB: The new_record_repl means which attribute of the tuple this ALTER
+	 * ROLE statement has provided a value, new_record_repl[i] is true does not
+	 * mean the provided value is different from the current value. Also
+	 * sometimes PG just sets new_record_repl[i] to true to indicate that an
+	 * attribute as changed even if it no value is provided in the ALTER ROLE
+	 * statement (e.g., for Anum_pg_authid_rolvaliduntil). So we do the deep
+	 * comparison to check whether there is any real change in new_tuple.
+	 */
+	if (!IsYugaByteEnabled() ||
+		!yb_enable_nop_alter_role_optimization ||
+		!YbIsPgAuthTupleEqual(pg_authid_dsc, tuple, new_tuple))
+		CatalogTupleUpdate(pg_authid_rel, &tuple->t_self, new_tuple);
 
 	InvokeObjectPostAlterHook(AuthIdRelationId, roleid, 0);
 
@@ -1000,17 +1153,30 @@ DropRole(DropRoleStmt *stmt)
 		/* Check for pg_shdepend entries depending on this role */
 		if (checkSharedDependencies(AuthIdRelationId, roleid,
 									&detail, &detail_log))
+		{
+			if (IsYugaByteEnabled() && detail != NULL)
+			{
+				detail = YBDetailSorted(detail);
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("role \"%s\" cannot be dropped because some objects depend on it",
 							role),
 					 errdetail_internal("%s", detail),
 					 errdetail_log("%s", detail_log)));
+		}
+
+		/*
+		 * YB: If the role is attached to a profile, auto-remove that
+		 * association.
+		 */
+		if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+			YbRemoveRoleProfileForRoleIfExists(roleid);
 
 		/*
 		 * Remove the role from the pg_authid table
 		 */
-		CatalogTupleDelete(pg_authid_rel, &tuple->t_self);
+		CatalogTupleDelete(pg_authid_rel, tuple);
 
 		ReleaseSysCache(tuple);
 
@@ -1030,7 +1196,7 @@ DropRole(DropRoleStmt *stmt)
 
 		while (HeapTupleIsValid(tmp_tuple = systable_getnext(sscan)))
 		{
-			CatalogTupleDelete(pg_auth_members_rel, &tmp_tuple->t_self);
+			CatalogTupleDelete(pg_auth_members_rel, tmp_tuple);
 		}
 
 		systable_endscan(sscan);
@@ -1045,7 +1211,7 @@ DropRole(DropRoleStmt *stmt)
 
 		while (HeapTupleIsValid(tmp_tuple = systable_getnext(sscan)))
 		{
-			CatalogTupleDelete(pg_auth_members_rel, &tmp_tuple->t_self);
+			CatalogTupleDelete(pg_auth_members_rel, tmp_tuple);
 		}
 
 		systable_endscan(sscan);
@@ -1146,6 +1312,14 @@ RenameRole(const char *oldname, const char *newname)
 				 errmsg("role name \"%s\" is reserved",
 						newname),
 				 errdetail("Role names starting with \"pg_\" are reserved.")));
+
+	/* YB: Check whether postgres is being renamed. */
+	if (roleid == 10 && strcmp(newname, "postgres") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cannot rename postgres"),
+				 strcmp(oldname, "postgres") != 0 ?
+				 errhint("ALTER ROLE %s RENAME TO postgres", oldname) : 0));
 
 	/*
 	 * If built with appropriate switch, whine when regression-testing
@@ -1320,16 +1494,25 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 	{
 		Oid			roleid = lfirst_oid(cell);
 
-		if (!has_privs_of_role(GetUserId(), roleid))
+		if (!has_privs_of_role(GetUserId(), roleid) &&
+			!IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to reassign objects")));
+
+		/* YB */
+		if (superuser_arg(roleid) && !superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("non-superuser cannot reassign objects "
+							"from superuser")));
 	}
 
 	/* Must have privileges on the receiving side too */
 	newrole = get_rolespec_oid(stmt->newrole, false);
 
-	if (!has_privs_of_role(GetUserId(), newrole))
+	if (!has_privs_of_role(GetUserId(), newrole) &&
+		!IsYbDbAdminUser(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to reassign objects")));
@@ -1430,6 +1613,16 @@ AddRoleMems(const char *rolename, Oid roleid,
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to set grantor")));
+
+	if (!superuser() && *YBCGetGFlags()->ysql_block_dangerous_roles &&
+		(roleid == ROLE_PG_EXECUTE_SERVER_PROGRAM ||
+		 roleid == ROLE_PG_READ_ALL_DATA ||
+		 roleid == ROLE_PG_READ_SERVER_FILES ||
+		 roleid == ROLE_PG_WRITE_ALL_DATA ||
+		 roleid == ROLE_PG_WRITE_SERVER_FILES))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("read/write data/files roles are disabled")));
 
 	pg_authmem_rel = table_open(AuthMemRelationId, RowExclusiveLock);
 	pg_authmem_dsc = RelationGetDescr(pg_authmem_rel);
@@ -1608,7 +1801,7 @@ DelRoleMems(const char *rolename, Oid roleid,
 		if (!admin_opt)
 		{
 			/* Remove the entry altogether */
-			CatalogTupleDelete(pg_authmem_rel, &authmem_tuple->t_self);
+			CatalogTupleDelete(pg_authmem_rel, authmem_tuple);
 		}
 		else
 		{

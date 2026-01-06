@@ -627,7 +627,7 @@ my %tests = (
 		regexp    => qr/^\QALTER COLLATION public.test0 OWNER TO \E.+;/m,
 		collation => 1,
 		like      => { %full_runs, section_pre_data => 1, },
-		unlike    => { no_owner => 1, },
+		unlike    => { %dump_test_schema_runs, no_owner => 1, },
 	},
 
 	'ALTER FOREIGN DATA WRAPPER dummy OWNER TO' => {
@@ -781,7 +781,7 @@ my %tests = (
 		create_sql =>
 		  'ALTER SCHEMA public OWNER TO "regress_quoted  \"" role";',
 		regexp => qr/^(GRANT|REVOKE)/m,
-		like => {},
+		unlike => { defaults_public_owner => 1 },
 	},
 
 	'ALTER SEQUENCE test_table_col1_seq' => {
@@ -1060,7 +1060,9 @@ my %tests = (
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
 		unlike => {
 			exclude_dump_test_schema => 1,
+			only_dump_test_table     => 1,
 			no_owner                 => 1,
+			role                     => 1,
 		},
 	},
 
@@ -2937,6 +2939,7 @@ my %tests = (
 	'Disabled trigger on partition is not created' => {
 		regexp => qr/CREATE TRIGGER test_trigger.*ON dump_test_second_schema/,
 		like   => {},
+		unlike => { %full_runs, %dump_test_schema_runs },
 	},
 
 	# Triggers on partitions should not be dropped individually
@@ -3267,12 +3270,33 @@ my %tests = (
 		\QCREATE INDEX measurement_city_id_logdate_idx ON ONLY dump_test.measurement USING\E
 		/xm,
 		like => {
-			%full_runs,
-			%dump_test_schema_runs,
+			binary_upgrade          => 1,
+			clean                   => 1,
+			clean_if_exists         => 1,
+			compression             => 1,
+			createdb                => 1,
+			defaults                => 1,
+			exclude_test_table      => 1,
+			exclude_test_table_data => 1,
+			no_toast_compression    => 1,
+			no_blobs                => 1,
+			no_privs                => 1,
+			no_owner                => 1,
+			no_table_access_method  => 1,
+			only_dump_test_schema   => 1,
+			pg_dumpall_dbprivs      => 1,
+			pg_dumpall_exclude      => 1,
+			schema_only             => 1,
 			section_post_data       => 1,
+			test_schema_plus_blobs  => 1,
 		},
 		unlike => {
 			exclude_dump_test_schema => 1,
+			only_dump_test_table     => 1,
+			pg_dumpall_globals       => 1,
+			pg_dumpall_globals_clean => 1,
+			role                     => 1,
+			section_pre_data         => 1,
 		},
 	},
 
@@ -3320,11 +3344,33 @@ my %tests = (
 		\QALTER INDEX dump_test.measurement_pkey ATTACH PARTITION dump_test_second_schema.measurement_y2006m2_pkey\E
 		/xm,
 		like => {
-			%full_runs,
+			binary_upgrade           => 1,
+			clean                    => 1,
+			clean_if_exists          => 1,
+			compression              => 1,
+			createdb                 => 1,
+			defaults                 => 1,
+			exclude_dump_test_schema => 1,
+			exclude_test_table       => 1,
+			exclude_test_table_data  => 1,
+			no_toast_compression     => 1,
+			no_blobs                 => 1,
+			no_privs                 => 1,
+			no_owner                 => 1,
+			no_table_access_method   => 1,
+			pg_dumpall_dbprivs       => 1,
+			pg_dumpall_exclude       => 1,
 			role                     => 1,
+			schema_only              => 1,
 			section_post_data        => 1,
 		},
 		unlike => {
+			only_dump_test_schema    => 1,
+			only_dump_test_table     => 1,
+			pg_dumpall_globals       => 1,
+			pg_dumpall_globals_clean => 1,
+			section_pre_data         => 1,
+			test_schema_plus_blobs   => 1,
 		},
 	},
 
@@ -4320,22 +4366,6 @@ foreach my $run (sort keys %pgdump_runs)
 		if (defined($tests{$test}->{database}))
 		{
 			$test_db = $tests{$test}->{database};
-		}
-
-		# Check for proper test definitions
-		#
-		# There should be a "like" list, even if it is empty.  (This
-		# makes the test more self-documenting.)
-		if (!defined($tests{$test}->{like}))
-		{
-			die "missing \"like\" in test \"$test\"";
-		}
-		# Check for useless entries in "unlike" list.  Runs that are
-		# not listed in "like" don't need to be excluded in "unlike".
-		if ($tests{$test}->{unlike}->{$test_key} &&
-			!defined($tests{$test}->{like}->{$test_key}))
-		{
-			die "useless \"unlike\" entry \"$test_key\" in test \"$test\"";
 		}
 
 		# Skip any collation-related commands if there is no collation support

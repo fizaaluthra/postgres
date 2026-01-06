@@ -31,6 +31,10 @@ typedef struct ReorderBufferTupleBuf
 	/* pre-allocated size of tuple buffer, different from tuple size */
 	Size		alloc_tuple_size;
 
+	/* YB: allocated separately but in the reorder buffer memory context. */
+	bool	   *yb_is_omitted;
+	int			yb_is_omitted_size;
+
 	/* actual tuple data follows */
 } ReorderBufferTupleBuf;
 
@@ -108,6 +112,9 @@ typedef struct ReorderBufferChange
 			ReorderBufferTupleBuf *oldtuple;
 			/* valid for INSERT || UPDATE */
 			ReorderBufferTupleBuf *newtuple;
+
+			/* YB */
+			Oid			yb_table_oid;
 		}			tp;
 
 		/*
@@ -504,6 +511,10 @@ typedef void (*ReorderBufferStreamTruncateCB) (
 											   Relation relations[],
 											   ReorderBufferChange *change);
 
+typedef void (*YBReorderBufferSchemaChangeCB) (
+											   ReorderBuffer *rb,
+											   Oid relid);
+
 struct ReorderBuffer
 {
 	/*
@@ -541,6 +552,8 @@ struct ReorderBuffer
 	ReorderBufferApplyTruncateCB apply_truncate;
 	ReorderBufferCommitCB commit;
 	ReorderBufferMessageCB message;
+
+	YBReorderBufferSchemaChangeCB yb_schema_change;
 
 	/*
 	 * Callbacks to be called when streaming a transaction at prepare time.
@@ -681,5 +694,13 @@ extern TransactionId ReorderBufferGetOldestXmin(ReorderBuffer *rb);
 extern void ReorderBufferSetRestartPoint(ReorderBuffer *, XLogRecPtr ptr);
 
 extern void StartupReorderBuffer(void);
+
+/*
+ * YB: Return a palloc'd array of bool allocated in the reorderbuffer's memory
+ * context to be used for storing yb_is_omitted values for each attribute.
+ */
+bool	   *YBAllocateIsOmittedArray(ReorderBuffer *rb, int nattrs);
+
+void		YBReorderBufferSchemaChange(ReorderBuffer *, Oid relid);
 
 #endif

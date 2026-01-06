@@ -52,6 +52,10 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/util/ybc_util.h"
+
 /*
  * All plpgsql function executions within a single transaction share the same
  * executor EState for evaluating "simple" expressions.  Each function call
@@ -457,6 +461,11 @@ static char *format_preparedparamsdata(PLpgSQL_execstate *estate,
 									   ParamListInfo paramLI);
 static PLpgSQL_variable *make_callstmt_target(PLpgSQL_execstate *estate,
 											  PLpgSQL_expr *expr);
+
+static bool YbIsFlushRequiredForPlStmt(PLpgSQL_stmt_type cmd_type);
+static bool YbIsFlushRequiredForCommandTag(CommandTag commandTag);
+
+static int	yb_exception_block_nesting = 0;
 
 
 /* ----------
@@ -1760,6 +1769,7 @@ exec_stmt_block(PLpgSQL_execstate *estate, PLpgSQL_stmt_block *block)
 		ExprContext *old_eval_econtext = estate->eval_econtext;
 		ErrorData  *save_cur_error = estate->cur_error;
 		MemoryContext stmt_mcontext;
+		int			yb_saved_exception_block_nesting = yb_exception_block_nesting;
 
 		estate->err_text = gettext_noop("during statement block entry");
 
@@ -1777,6 +1787,12 @@ exec_stmt_block(PLpgSQL_execstate *estate, PLpgSQL_stmt_block *block)
 		BeginInternalSubTransaction(NULL);
 		/* Want to run statements inside function's memory context */
 		MemoryContextSwitchTo(oldcontext);
+
+		/*
+		 * YB: Mark the following statements as running within an exception
+		 * block
+		 */
+		yb_exception_block_nesting++;
 
 		PG_TRY();
 		{
@@ -1842,6 +1858,12 @@ exec_stmt_block(PLpgSQL_execstate *estate, PLpgSQL_stmt_block *block)
 			RollbackAndReleaseCurrentSubTransaction();
 			MemoryContextSwitchTo(oldcontext);
 			CurrentResourceOwner = oldowner;
+
+			/*
+			 * YB: Restore the nesting level to the value it had before the
+			 * block was entered.
+			 */
+			yb_exception_block_nesting = yb_saved_exception_block_nesting;
 
 			/*
 			 * Set up the stmt_mcontext stack as though we had restored our
@@ -1931,6 +1953,13 @@ exec_stmt_block(PLpgSQL_execstate *estate, PLpgSQL_stmt_block *block)
 		}
 		PG_END_TRY();
 
+		/*
+		 * YB: Restore the nesting level to the value it had before the block
+		 * was entered. This ensures that the nesting level is correct irrespective
+		 * of whether an exception was caught and handled.
+		 */
+		yb_exception_block_nesting = yb_saved_exception_block_nesting;
+
 		Assert(save_cur_error == estate->cur_error);
 	}
 	else
@@ -2001,6 +2030,10 @@ exec_stmts(PLpgSQL_execstate *estate, List *stmts)
 	{
 		PLpgSQL_stmt *stmt = (PLpgSQL_stmt *) lfirst(s);
 		int			rc;
+
+		/* YB: Check if flush is required before executing statement. */
+		if (YbIsFlushRequiredForPlStmt(stmt->cmd_type))
+			YBFlushBufferedOperations(YBCMakeFlushDebugContextUnbatchablePlStmt(plpgsql_stmt_typename(stmt), estate->func->fn_signature));
 
 		estate->err_stmt = stmt;
 
@@ -2831,7 +2864,8 @@ exec_stmt_fors(PLpgSQL_execstate *estate, PLpgSQL_stmt_fors *stmt)
 	/*
 	 * Execute the loop
 	 */
-	rc = exec_for_query(estate, (PLpgSQL_stmt_forq *) stmt, portal, true);
+	rc = exec_for_query(estate, (PLpgSQL_stmt_forq *) stmt, portal,
+						!yb_plpgsql_disable_prefetch_in_for_query);
 
 	/*
 	 * Close the implicit cursor
@@ -3214,6 +3248,7 @@ exec_stmt_return(PLpgSQL_execstate *estate, PLpgSQL_stmt_return *stmt)
 				plpgsql_fulfill_promise(estate, (PLpgSQL_var *) retvar);
 
 				/* FALL THRU */
+				yb_switch_fallthrough();
 
 			case PLPGSQL_DTYPE_VAR:
 				{
@@ -3360,6 +3395,7 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 				plpgsql_fulfill_promise(estate, (PLpgSQL_var *) retvar);
 
 				/* FALL THRU */
+				yb_switch_fallthrough();
 
 			case PLPGSQL_DTYPE_VAR:
 				{
@@ -4215,6 +4251,10 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 	int			rc;
 	PLpgSQL_expr *expr = stmt->sqlstmt;
 	int			too_many_rows_level = 0;
+	SPIExecuteOptions yb_options;
+	CommandTag	yb_flush_before_command_tag = CMDTAG_UNKNOWN;
+
+	memset(&yb_options, 0, sizeof(yb_options));
 
 	if (plpgsql_extra_errors & PLPGSQL_XCHECK_TOOMANYROWS)
 		too_many_rows_level = ERROR;
@@ -4233,9 +4273,16 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 		ListCell   *l;
 
 		stmt->mod_stmt = false;
+		stmt->yb_flush_before_stmt = false;
 		foreach(l, SPI_plan_get_plan_sources(expr->plan))
 		{
 			CachedPlanSource *plansource = (CachedPlanSource *) lfirst(l);
+
+			if (!stmt->yb_flush_before_stmt)
+			{
+				stmt->yb_flush_before_stmt = YbIsFlushRequiredForCommandTag(plansource->commandTag);
+				yb_flush_before_command_tag = plansource->commandTag;
+			}
 
 			/*
 			 * We could look at the raw_parse_tree, but it seems simpler to
@@ -4250,11 +4297,18 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 				plansource->commandTag == CMDTAG_MERGE)
 			{
 				stmt->mod_stmt = true;
-				break;
 			}
+
+			if (stmt->mod_stmt && stmt->yb_flush_before_stmt)
+				break;
 		}
 		stmt->mod_stmt_set = true;
+		stmt->yb_flush_before_stmt_set = true;
 	}
+
+	Assert(stmt->yb_flush_before_stmt_set);
+	if (stmt->yb_flush_before_stmt)
+		YBFlushBufferedOperations(YBCMakeFlushDebugContextUnbatchableStmtInPlFunc(GetCommandTagName(yb_flush_before_command_tag), estate->func->fn_signature));
 
 	/*
 	 * Set up ParamListInfo to pass to executor
@@ -4286,8 +4340,28 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 	/*
 	 * Execute the plan
 	 */
-	rc = SPI_execute_plan_with_paramlist(expr->plan, paramLI,
-										 estate->readonly_func, tcount);
+	yb_options.params = paramLI;
+	yb_options.read_only = estate->readonly_func;
+	yb_options.tcount = tcount;
+	/*
+	 * YB: In read committed isolation, if we want to reap the benefits of
+	 * buffering multiple statements together, the statements all have to use
+	 * the same snapshot. Using a fresh snapshot for each new statement
+	 * automatically results in flushing because we don't support buffering
+	 * operations across snapshots.
+	 * Note: A statement that requires a flush before execution can use a new
+	 * new snapshot in Read Committed mode since it results in fewer
+	 * serialization errors.
+	 * Note 2: If the statement being executed involves multiple plans and the
+	 * statement requires a flush before execution, then we do not batch the
+	 * writes across plans in the statement. This is a potential source of
+	 * inefficiency and needs more investigation.
+	 */
+	yb_options.yb_reuse_existing_snapshot_in_read_committed =
+		yb_speculatively_execute_pl_statements &&
+		YbIsReadCommittedTxn() &&
+		!stmt->yb_flush_before_stmt;
+	rc = SPI_execute_plan_extended(expr->plan, &yb_options);
 
 	/*
 	 * Check for error, and set FOUND if appropriate (for historical reasons
@@ -4342,7 +4416,7 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 			break;
 
 		default:
-			elog(ERROR, "SPI_execute_plan_with_paramlist failed executing query \"%s\": %s",
+			elog(ERROR, "SPI_execute_plan_extended failed executing query \"%s\": %s",
 				 expr->query, SPI_result_code_string(rc));
 			break;
 	}
@@ -5315,6 +5389,7 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 			plpgsql_fulfill_promise(estate, (PLpgSQL_var *) datum);
 
 			/* FALL THRU */
+			yb_switch_fallthrough();
 
 		case PLPGSQL_DTYPE_VAR:
 			{
@@ -7401,6 +7476,7 @@ deconstruct_composite_datum(Datum value, HeapTupleData *tmptup)
 	tmptup->t_len = HeapTupleHeaderGetDatumLength(td);
 	ItemPointerSetInvalid(&(tmptup->t_self));
 	tmptup->t_tableOid = InvalidOid;
+	HEAPTUPLE_YBCTID(tmptup) = (Datum) 0;
 	tmptup->t_data = td;
 
 	/* Extract rowtype info and find a tupdesc */
@@ -7575,6 +7651,7 @@ exec_move_row_from_datum(PLpgSQL_execstate *estate,
 		tmptup.t_len = HeapTupleHeaderGetDatumLength(td);
 		ItemPointerSetInvalid(&(tmptup.t_self));
 		tmptup.t_tableOid = InvalidOid;
+		HEAPTUPLE_YBCTID(&tmptup) = (Datum) 0;
 		tmptup.t_data = td;
 
 		/* Extract rowtype info */
@@ -8885,4 +8962,164 @@ format_preparedparamsdata(PLpgSQL_execstate *estate,
 	MemoryContextSwitchTo(oldcontext);
 
 	return paramstr.data;
+}
+
+/*
+ * YbIsFlushRequiredForPlStmt - check if a flush of buffered operations is
+ * required before executing the give PL command type (control structures). A
+ * statement may have non-transactional side-effects that won't be reverted
+ * in case the buffered operations (i.e., from previous statements) lead to an
+ * exception. In other words, the given statement requires flushing of previously
+ * buffered operations if the given statement's execution is dependent on the
+ * successful completion of the buffered operations. This is applicable to
+ * conditional statements such as IF/ELSE blocks, loops, exception handling blocks.
+ * TODO: By examining the expression associated with such conditional statements,
+ * it may be possible to determine their independence from previously buffered
+ * operations. This is intentionally left as a future optimization.
+
+ * Determination of whether flushing is required happens in two phases:
+ * 1. For PL control structures, this function gives a definitive result
+ * 2. For SQL statements (PLPGSQL_STMT_EXECSQL), YbIsFlushRequiredForCommandTag
+ *    is the source of truth.
+ */
+static bool
+YbIsFlushRequiredForPlStmt(PLpgSQL_stmt_type cmd_type)
+{
+	if (cmd_type == PLPGSQL_STMT_EXECSQL)
+		return false;
+
+	if (!yb_speculatively_execute_pl_statements)
+		return true;
+
+	/*
+	 * When executing within an exception block, flushing is required to ensure
+	 * that any exceptions raised by previously buffered statements are handled
+	 * before exceptions raised by statements that are speculatively executed.
+	 * This ensures that the exceptions are processed in the order they are
+	 * raised.
+	 */
+	Assert(yb_exception_block_nesting >= 0);
+	if (yb_exception_block_nesting > 0)
+		return true;
+
+	switch (cmd_type)
+	{
+			/*
+			 * A block is a meta statement that is used to demarcate a groups of
+			 * statements. Need for flushing is evaluated for each of the statements
+			 * in the block individually. So, it does not make sense to require
+			 * flushing for the block statement itself.
+			 */
+		case PLPGSQL_STMT_BLOCK:
+			yb_switch_fallthrough();
+			/* Return statements are executed unconditionally. */
+		case PLPGSQL_STMT_RETURN:
+			yb_switch_fallthrough();
+			/*
+			 * Variable assignments are executed unconditionally and are in-memory.
+			 * If the preceding buffered operations produced any exceptions, the
+			 * memory context holding them will be discarded.
+			 */
+		case PLPGSQL_STMT_ASSIGN:
+			return false;
+
+			/*
+			 * PERFORM runs a SELECT query and discards the result. The SELECT query
+			 * will cause a flush if it requires a storage lookup.
+			 */
+		case PLPGSQL_STMT_PERFORM:
+			yb_switch_fallthrough();
+			/*
+			 * CALL is used to invoke stored procedure. Need for flushing is
+			 * evaluated for each of the statements within the stored procedure. So,
+			 * it does not make sense to require flushing for the invocation itself.
+			 */
+		case PLPGSQL_STMT_CALL:
+			return !yb_whitelist_extra_stmts_for_pl_speculative_execution;
+
+		default:
+			break;
+	}
+
+	return true;
+}
+
+/*
+ * YbIsFlushRequiredForCommandTag - check if a flush of buffered operations is
+ * required before executing the given command tag. If the given statement has
+ * multiple plans/command tags, this function must be invoked for each of them.
+ *
+ * A flush may be required before executing a new statement since the statement
+ * might have non-transactional side-effects that won't be reverted in case
+ * the buffered operations (i.e., from previous statements) lead to an exception.
+ * In general, flushing can be skipped for non-DDL commands that have only
+ * transactional side effects. This includes variants of SELECTs and
+ * data-modifying commands (INSERT/UPDATE/DELETE/MERGE). If the execution of
+ * such commands requires a read operation, previously buffered statements will
+ * be flushed anyway. This allows us to avoid unnecessary flushes when data is
+ * stored locally, such as in a table tables, pg_stat* or the config.
+ */
+static bool
+YbIsFlushRequiredForCommandTag(CommandTag commandTag)
+{
+	switch (commandTag)
+	{
+			/*
+			 * DML statements
+			 * If we know that the new statement is an INSERT, UPDATE or DELETE, we
+			 * can skip flushing since these statements have only transactional
+			 * effects. And an exception that occurs later due to previously buffered
+			 * operations (i.e., from previous statements) will lead to reverting
+			 * of the transactional effects of the new statement too.
+			 */
+		case CMDTAG_DELETE:
+			yb_switch_fallthrough();
+		case CMDTAG_INSERT:
+			yb_switch_fallthrough();
+		case CMDTAG_MERGE:
+			yb_switch_fallthrough();
+		case CMDTAG_UPDATE:
+			return false;
+
+			/* Variants of SELECT statements */
+		case CMDTAG_SELECT:
+			yb_switch_fallthrough();
+		case CMDTAG_SELECT_INTO:
+			return !yb_speculatively_execute_pl_statements;
+
+			/* Command types that involve a SELECT in some form */
+		case CMDTAG_DO:
+			yb_switch_fallthrough();
+		case CMDTAG_CALL:
+			yb_switch_fallthrough();
+		case CMDTAG_SELECT_FOR_KEY_SHARE:
+			yb_switch_fallthrough();
+		case CMDTAG_SELECT_FOR_NO_KEY_UPDATE:
+			yb_switch_fallthrough();
+		case CMDTAG_SELECT_FOR_SHARE:
+			yb_switch_fallthrough();
+		case CMDTAG_SELECT_FOR_UPDATE:
+			yb_switch_fallthrough();
+
+			/*
+			 * Utility statements
+			 * EXPLAIN cannot be used to describe utility statements (like DDLs).
+			 * It can only be used in conjunction with one of the already whitelisted
+			 * statements above.
+			 */
+		case CMDTAG_EXPLAIN:
+			yb_switch_fallthrough();
+			/*
+			 * SHOW returns the value of a runtime parameter from the config. This
+			 * does not require a storage lookup.
+			 */
+		case CMDTAG_SHOW:
+			return !(yb_speculatively_execute_pl_statements &&
+					 yb_whitelist_extra_stmts_for_pl_speculative_execution);
+
+		default:
+			break;
+	}
+
+	return true;
 }

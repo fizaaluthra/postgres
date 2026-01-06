@@ -39,6 +39,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 typedef struct
 {
@@ -48,6 +51,9 @@ typedef struct
 
 /* Internal functions */
 static void import_error_callback(void *arg);
+
+/* YB functions */
+static void yb_validate_server_options(ForeignDataWrapper *fdw, Datum options, Datum old_options);
 
 
 /*
@@ -215,20 +221,22 @@ AlterForeignDataWrapperOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerI
 	form = (Form_pg_foreign_data_wrapper) GETSTRUCT(tup);
 
 	/* Must be a superuser to change a FDW owner */
-	if (!superuser())
+	if (!IsYbFdwUser(GetUserId()) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to change owner of foreign-data wrapper \"%s\"",
 						NameStr(form->fdwname)),
-				 errhint("Must be superuser to change owner of a foreign-data wrapper.")));
+				 errhint("Must be superuser or a member of the yb_fdw "
+						 "role to change owner of a foreign-data wrapper.")));
 
 	/* New owner must also be a superuser */
-	if (!superuser_arg(newOwnerId))
+	if (!IsYbFdwUser(newOwnerId) && !superuser_arg(newOwnerId))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to change owner of foreign-data wrapper \"%s\"",
 						NameStr(form->fdwname)),
-				 errhint("The owner of a foreign-data wrapper must be a superuser.")));
+				 errhint("Must be superuser or a member of the yb_fdw "
+						 "role to change owner of a foreign-data wrapper.")));
 
 	if (form->fdwowner != newOwnerId)
 	{
@@ -350,7 +358,7 @@ AlterForeignServerOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 	if (form->srvowner != newOwnerId)
 	{
 		/* Superusers can always do it */
-		if (!superuser())
+		if (!IsYbFdwUser(GetUserId()) && !superuser())
 		{
 			Oid			srvId;
 			AclResult	aclresult;
@@ -574,12 +582,13 @@ CreateForeignDataWrapper(ParseState *pstate, CreateFdwStmt *stmt)
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
 	/* Must be superuser */
-	if (!superuser())
+	if (!IsYbFdwUser(GetUserId()) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create foreign-data wrapper \"%s\"",
 						stmt->fdwname),
-				 errhint("Must be superuser to create a foreign-data wrapper.")));
+				 errhint("Must be superuser or a member of the yb_fdw "
+						 "role to create a foreign-data wrapper.")));
 
 	/* For now the owner cannot be specified on create. Use effective user ID. */
 	ownerId = GetUserId();
@@ -691,12 +700,13 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
 	/* Must be superuser */
-	if (!superuser())
+	if (!IsYbFdwUser(GetUserId()) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to alter foreign-data wrapper \"%s\"",
 						stmt->fdwname),
-				 errhint("Must be superuser to alter a foreign-data wrapper.")));
+				 errhint("Must be superuser or a member of the yb_fdw role to "
+						 "alter a foreign-data wrapper.")));
 
 	tp = SearchSysCacheCopy1(FOREIGNDATAWRAPPERNAME,
 							 CStringGetDatum(stmt->fdwname));
@@ -932,6 +942,8 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 										 stmt->options,
 										 fdw->fdwvalidator);
 
+	yb_validate_server_options(fdw, srvoptions, (Datum) 0 /* old_options */ );
+
 	if (PointerIsValid(DatumGetPointer(srvoptions)))
 		values[Anum_pg_foreign_server_srvoptions - 1] = srvoptions;
 	else
@@ -1024,21 +1036,24 @@ AlterForeignServer(AlterForeignServerStmt *stmt)
 	{
 		ForeignDataWrapper *fdw = GetForeignDataWrapper(srvForm->srvfdw);
 		Datum		datum;
+		Datum		yb_old_options;
 		bool		isnull;
 
 		/* Extract the current srvoptions */
-		datum = SysCacheGetAttr(FOREIGNSERVEROID,
-								tp,
-								Anum_pg_foreign_server_srvoptions,
-								&isnull);
+		yb_old_options = SysCacheGetAttr(FOREIGNSERVEROID,
+										 tp,
+										 Anum_pg_foreign_server_srvoptions,
+										 &isnull);
 		if (isnull)
-			datum = PointerGetDatum(NULL);
+			yb_old_options = PointerGetDatum(NULL);
 
 		/* Prepare the options array */
 		datum = transformGenericOptions(ForeignServerRelationId,
-										datum,
+										yb_old_options,
 										stmt->options,
 										fdw->fdwvalidator);
+
+		yb_validate_server_options(fdw, datum, yb_old_options);
 
 		if (PointerIsValid(DatumGetPointer(datum)))
 			repl_val[Anum_pg_foreign_server_srvoptions - 1] = datum;
@@ -1614,4 +1629,80 @@ import_error_callback(void *arg)
 	if (callback_arg->tablename)
 		errcontext("importing foreign table \"%s\"",
 				   callback_arg->tablename);
+}
+
+static void
+yb_validate_postgres_fdw(Datum options, Datum old_options)
+{
+	List	   *new_options_list = untransformRelOptions(options);
+	List	   *old_options_list = untransformRelOptions(old_options);
+	ListCell   *cell;
+	const char *new_server_type = NULL;
+	const char *old_server_type = NULL;
+
+	foreach(cell, new_options_list)
+	{
+		DefElem    *defel = (DefElem *) lfirst(cell);
+
+		if (strcmp(defel->defname, "server_type") == 0)
+			new_server_type = defGetString(defel);
+	}
+
+	foreach(cell, old_options_list)
+	{
+		DefElem    *defel = (DefElem *) lfirst(cell);
+
+		if (strcmp(defel->defname, "server_type") == 0)
+			old_server_type = defGetString(defel);
+	}
+
+	/*
+	 * We know that the new server_type is valid. Allow users to configure
+	 * server_type as a one-time operation.
+	 */
+	if (!old_server_type && new_server_type)
+		return;
+
+	if (!new_server_type && !old_server_type)
+	{
+		ereport(NOTICE,
+				(errmsg("no server_type specified. Defaulting to PostgreSQL."),
+				 errhint("Use \"ALTER SERVER ... OPTIONS (ADD server_type \'<type>\')\" to explicitly set server_type.")));
+		return;
+	}
+
+	if (old_server_type && !new_server_type)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("dropping server_type is not supported.")));
+		return;
+	}
+
+	if (strcmp(old_server_type, new_server_type) != 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("changing server_type is not supported."),
+				 errhint("Use \"DROP SERVER <name>\" followed by \"CREATE SERVER <name> ... OPTIONS (server_type \'%s\')\" to change server_type.", new_server_type)));
+		return;
+	}
+}
+
+/*
+ * This function performs additional, context-specific validation of foreign
+ * server options after the values have been checked by the FDW validator.
+ * The FDW validator framework assumes that all options supplied to CREATE
+ * SERVER and ALTER SERVER statements are stateless: that is, they do not depend
+ * on the previous value of the option.
+ * Note: The cleanest way to implement this would be to allow FDWs to register
+ * a callback function similar to fdwvalidator, but with the signature similar
+ * to the one below.
+ * TODO: Consider doing this when more FDWs require this.
+ */
+static void
+yb_validate_server_options(ForeignDataWrapper *fdw, Datum options, Datum old_options)
+{
+	if (strcmp(fdw->fdwname, "postgres_fdw") == 0)
+		yb_validate_postgres_fdw(options, old_options);
 }

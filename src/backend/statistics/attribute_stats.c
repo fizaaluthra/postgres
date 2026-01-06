@@ -807,6 +807,16 @@ upsert_pg_statistic(Relation starel, HeapTuple oldtup,
 {
 	HeapTuple	newtup;
 
+	bool		yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBAddDdlTxnState(YB_DDL_MODE_BREAKING_CHANGE);
+		else
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_BREAKING_CHANGE);
+	}
+
 	if (HeapTupleIsValid(oldtup))
 	{
 		newtup = heap_modify_tuple(oldtup, RelationGetDescr(starel),
@@ -817,6 +827,14 @@ upsert_pg_statistic(Relation starel, HeapTuple oldtup,
 	{
 		newtup = heap_form_tuple(RelationGetDescr(starel), values, nulls);
 		CatalogTupleInsert(starel, newtup);
+	}
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBMergeDdlTxnState();
+		else
+			YBDecrementDdlNestingLevel();
 	}
 
 	heap_freetuple(newtup);
@@ -840,11 +858,29 @@ delete_pg_statistic(Oid reloid, AttrNumber attnum, bool stainherit)
 							 Int16GetDatum(attnum),
 							 BoolGetDatum(stainherit));
 
+	bool		yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBAddDdlTxnState(YB_DDL_MODE_BREAKING_CHANGE);
+		else
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_BREAKING_CHANGE);
+	}
+
 	if (HeapTupleIsValid(oldtup))
 	{
-		CatalogTupleDelete(sd, &oldtup->t_self);
+		CatalogTupleDelete(sd, oldtup);
 		ReleaseSysCache(oldtup);
 		result = true;
+	}
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBMergeDdlTxnState();
+		else
+			YBDecrementDdlNestingLevel();
 	}
 
 	table_close(sd, RowExclusiveLock);

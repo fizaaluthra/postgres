@@ -63,6 +63,10 @@
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
+/* YB includes */
+#include "utils/yb_tuplecache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 
 /* GUC variables */
 int			SessionReplicationRole = SESSION_REPLICATION_ROLE_ORIGIN;
@@ -106,6 +110,7 @@ static void AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 								  bool is_crosspart_update);
 static void AfterTriggerEnlargeQueryState(void);
 static bool before_stmt_triggers_fired(Oid relid, CmdType cmdType);
+static int	YbTriggerNameCmp(const void *a, const void *b);
 
 
 /*
@@ -352,9 +357,11 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 	{
 		aclresult = pg_class_aclcheck(RelationGetRelid(rel), GetUserId(),
 									  ACL_TRIGGER);
-		if (aclresult != ACLCHECK_OK)
+		if (aclresult != ACLCHECK_OK && !IsYbDbAdminUser(GetUserId()))
+		{
 			aclcheck_error(aclresult, get_relkind_objtype(rel->rd_rel->relkind),
 						   RelationGetRelationName(rel));
+		}
 
 		if (OidIsValid(constrrelid))
 		{
@@ -1000,6 +1007,11 @@ CreateTriggerFiringOn(CreateTrigStmt *stmt, const char *queryString,
 		HeapTuple	newtup;
 
 		newtup = heap_form_tuple(tgrel->rd_att, values, nulls);
+		/*
+		 * YB: On replace, pg_trigger's PK (oid) remains the same, hence ybctid
+		 * remains the same.
+		 */
+		HEAPTUPLE_YBCTID(newtup) = HEAPTUPLE_YBCTID(tuple);
 		CatalogTupleUpdate(tgrel, &tuple->t_self, newtup);
 		heap_freetuple(newtup);
 	}
@@ -1381,7 +1393,7 @@ RemoveTriggerById(Oid trigOid)
 	/*
 	 * Delete the pg_trigger tuple.
 	 */
-	CatalogTupleDelete(tgrel, &tup->t_self);
+	CatalogTupleDelete(tgrel, tup);
 
 	systable_endscan(tgscan);
 	table_close(tgrel, RowExclusiveLock);
@@ -1480,7 +1492,7 @@ RangeVarCallbackForRenameTrigger(const RangeVar *rv, Oid relid, Oid oldrelid,
 				 errdetail_relkind_not_supported(form->relkind)));
 
 	/* you must own the table to rename one of its triggers */
-	if (!pg_class_ownercheck(relid, GetUserId()))
+	if (!pg_class_ownercheck(relid, GetUserId()) && !IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)), rv->relname);
 	if (!allowSystemTableMods && IsSystemClass(relid, form))
 		ereport(ERROR,
@@ -1810,7 +1822,7 @@ EnableDisableTriggerNew2(Relation rel, const char *tgname, Oid tgparent,
 			/* system trigger ... ok to process? */
 			if (skip_system)
 				continue;
-			if (!superuser())
+			if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("permission denied: \"%s\" is a system trigger",
@@ -1922,7 +1934,7 @@ EnableDisableTrigger(Relation rel, const char *tgname,
  * structure into cache memory.
  */
 void
-RelationBuildTriggers(Relation relation)
+RelationBuildTriggers(Relation relation, const YbTupleCache *yb_pg_trigger_cache)
 {
 	TriggerDesc *trigdesc;
 	int			numtrigs;
@@ -1933,7 +1945,23 @@ RelationBuildTriggers(Relation relation)
 	SysScanDesc tgscan;
 	HeapTuple	htup;
 	MemoryContext oldContext;
+	MemoryContext ybSavedContext;
+	MemoryContext ybTriggerContext;
 	int			i;
+	YbTupleCacheIterator iter;
+
+	bool		use_yb_tuple_cache = (IsYugaByteEnabled() &&
+									  *YBCGetGFlags()->ysql_use_optimized_relcache_update &&
+									  yb_pg_trigger_cache);
+
+	if (IsYugaByteEnabled())
+	{
+		ybTriggerContext =
+			AllocSetContextCreate(CurrentMemoryContext,
+								  "RelationBuildTriggers context",
+								  ALLOCSET_DEFAULT_SIZES);
+		ybSavedContext = MemoryContextSwitchTo(ybTriggerContext);
+	}
 
 	/*
 	 * Allocate a working array to hold the triggers (the array is extended if
@@ -1943,22 +1971,33 @@ RelationBuildTriggers(Relation relation)
 	triggers = (Trigger *) palloc(maxtrigs * sizeof(Trigger));
 	numtrigs = 0;
 
+	tgrel = table_open(TriggerRelationId, AccessShareLock);
+
 	/*
 	 * Note: since we scan the triggers using TriggerRelidNameIndexId, we will
 	 * be reading the triggers in name order, except possibly during
 	 * emergency-recovery operations (ie, IgnoreSystemIndexes). This in turn
 	 * ensures that triggers will be fired in name order.
 	 */
-	ScanKeyInit(&skey,
-				Anum_pg_trigger_tgrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(RelationGetRelid(relation)));
+	if (use_yb_tuple_cache)
+	{
+		Oid			relid = RelationGetRelid(relation);
 
-	tgrel = table_open(TriggerRelationId, AccessShareLock);
-	tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true,
-								NULL, 1, &skey);
+		iter = YbTupleCacheIteratorBegin(yb_pg_trigger_cache, &relid);
+	}
+	else
+	{
+		ScanKeyInit(&skey,
+					Anum_pg_trigger_tgrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(RelationGetRelid(relation)));
+		tgscan = systable_beginscan(tgrel, TriggerRelidNameIndexId, true,
+									NULL, 1, &skey);
+	}
 
-	while (HeapTupleIsValid(htup = systable_getnext(tgscan)))
+	while (HeapTupleIsValid(htup = use_yb_tuple_cache ?
+							YbTupleCacheIteratorGetNext(iter) :
+							systable_getnext(tgscan)))
 	{
 		Form_pg_trigger pg_trigger = (Form_pg_trigger) GETSTRUCT(htup);
 		Trigger    *build;
@@ -2044,13 +2083,32 @@ RelationBuildTriggers(Relation relation)
 		numtrigs++;
 	}
 
-	systable_endscan(tgscan);
+	if (use_yb_tuple_cache)
+	{
+		YbTupleCacheIteratorEnd(iter);
+
+		/*
+		 * YB: Vanilla PG would have loaded the triggers in name order because
+		 * it does a partial scan on pg_trigger_tgrelid_tgname_index using
+		 * tgrelid. We aren't using that index so we need to sort the triggers
+		 * by name here.
+		 */
+		qsort(triggers, numtrigs, sizeof(Trigger), YbTriggerNameCmp);
+	}
+	else
+		systable_endscan(tgscan);
+
 	table_close(tgrel, AccessShareLock);
 
 	/* There might not be any triggers */
 	if (numtrigs == 0)
 	{
 		pfree(triggers);
+		if (IsYugaByteEnabled())
+		{
+			MemoryContextSwitchTo(ybSavedContext);
+			MemoryContextDelete(ybTriggerContext);
+		}
 		return;
 	}
 
@@ -2068,6 +2126,12 @@ RelationBuildTriggers(Relation relation)
 
 	/* Release working memory */
 	FreeTriggerDesc(trigdesc);
+
+	if (IsYugaByteEnabled())
+	{
+		MemoryContextSwitchTo(ybSavedContext);
+		MemoryContextDelete(ybTriggerContext);
+	}
 }
 
 /*
@@ -3550,7 +3614,7 @@ TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 		modified = false;
 		for (i = 0; i < trigger->tgnattr; i++)
 		{
-			if (bms_is_member(trigger->tgattr[i] - FirstLowInvalidHeapAttributeNumber,
+			if (bms_is_member(trigger->tgattr[i] - YBGetFirstLowInvalidAttributeNumber(relinfo->ri_RelationDesc),
 							  modifiedCols))
 			{
 				modified = true;
@@ -3736,6 +3800,8 @@ typedef struct AfterTriggerSharedData
 	CommandId	ats_firing_id;	/* ID for firing cycle */
 	struct AfterTriggersTableData *ats_table;	/* transition table access */
 	Bitmapset  *ats_modifiedcols;	/* modified columns */
+	Tuplestorestate *ybc_txn_fdw_tuplestore;	/* tuplestore for deferred
+												 * triggers */
 } AfterTriggerSharedData;
 
 typedef struct AfterTriggerEventData *AfterTriggerEvent;
@@ -3928,6 +3994,8 @@ typedef struct AfterTriggersData
 	/* per-subtransaction-level data: */
 	AfterTriggersTransData *trans_stack;	/* array of structs shown below */
 	int			maxtransdepth;	/* allocated len of above array */
+	List	   *ybc_txn_fdw_tuplestores;	/* list of transaction level
+											 * tuplestores */
 } AfterTriggersData;
 
 struct AfterTriggersQueryData
@@ -3935,6 +4003,8 @@ struct AfterTriggersQueryData
 	AfterTriggerEventList events;	/* events pending from this query */
 	Tuplestorestate *fdw_tuplestore;	/* foreign tuples for said events */
 	List	   *tables;			/* list of AfterTriggersTableData, see below */
+	Tuplestorestate *ybc_txn_fdw_tuplestore;	/* tuplestore for deferred
+												 * triggers */
 };
 
 struct AfterTriggersTransData
@@ -4009,37 +4079,69 @@ static SetConstraintState SetConstraintStateAddItem(SetConstraintState state,
 													Oid tgoid, bool tgisdeferred);
 static void cancel_prior_stmt_triggers(Oid relid, CmdType cmdType, int tgevent);
 
+/* YB declerations */
+static bool afterTriggerCheckState(AfterTriggerShared evtshared);
+
 
 /*
  * Get the FDW tuplestore for the current trigger query level, creating it
  * if necessary.
  */
 static Tuplestorestate *
-GetCurrentFDWTuplestore(void)
+GetCurrentFDWTuplestore(AfterTriggerShared evtshared)
 {
-	Tuplestorestate *ret;
+	/*
+	 * YB: Check trigger has transaction level tuplestore (deferred trigger).
+	 */
+	if (evtshared->ybc_txn_fdw_tuplestore)
+		return evtshared->ybc_txn_fdw_tuplestore;
 
-	ret = afterTriggers.query_stack[afterTriggers.query_depth].fdw_tuplestore;
+	Assert(afterTriggers.query_depth > -1);
+	AfterTriggersQueryData *trigger_data = &afterTriggers.query_stack[afterTriggers.query_depth];
+	const bool	is_deferred = IsYugaByteEnabled() && afterTriggerCheckState(evtshared);
+	Tuplestorestate *ret = (is_deferred ?
+							trigger_data->ybc_txn_fdw_tuplestore :
+							trigger_data->fdw_tuplestore);
+
 	if (ret == NULL)
 	{
-		MemoryContext oldcxt;
-		ResourceOwner saveResourceOwner;
-
 		/*
 		 * Make the tuplestore valid until end of subtransaction.  We really
 		 * only need it until AfterTriggerEndQuery().
+		 * If deferred, it needs to live longer, as the deferred triggers are
+		 * fired at the end of the top transaction.
 		 */
-		oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-		saveResourceOwner = CurrentResourceOwner;
-		CurrentResourceOwner = CurTransactionResourceOwner;
+		MemoryContext oldcxt;
+		ResourceOwner saveResourceOwner = CurrentResourceOwner;
+
+		if (is_deferred)
+		{
+			oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+			CurrentResourceOwner = TopTransactionResourceOwner;
+		}
+		else
+		{
+			oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+			CurrentResourceOwner = CurTransactionResourceOwner;
+		}
 
 		ret = tuplestore_begin_heap(false, false, work_mem);
 
+		if (is_deferred)
+		{
+			trigger_data->ybc_txn_fdw_tuplestore = ret;
+			afterTriggers.ybc_txn_fdw_tuplestores =
+				lappend(afterTriggers.ybc_txn_fdw_tuplestores, ret);
+		}
+		else
+			trigger_data->fdw_tuplestore = ret;
+
 		CurrentResourceOwner = saveResourceOwner;
 		MemoryContextSwitchTo(oldcxt);
-
-		afterTriggers.query_stack[afterTriggers.query_depth].fdw_tuplestore = ret;
 	}
+
+	if (is_deferred)
+		evtshared->ybc_txn_fdw_tuplestore = ret;
 
 	return ret;
 }
@@ -4205,11 +4307,25 @@ afterTriggerAddEvent(AfterTriggerEventList *events,
 		 (char *) newshared >= chunk->endfree;
 		 newshared--)
 	{
+		/*
+		 * YB: Deferred event migrates from one AfterTriggerEventList to
+		 * another. Tuple is written into tuplestore when event is stored in
+		 * one list, and read when event is migrated to another. This list may
+		 * already have same AfterTriggerShared data, but with different
+		 * ybc_txn_fdw_tuplestore. So ybc_txn_fdw_tuplestore must be checked
+		 * before reuse existing AfterTriggerShared data, in other case tuple
+		 * will be read from wrong tuplestore.
+		 *
+		 * Due to checking of the ybc_txn_fdw_tuplestore field postgres in YB
+		 * mode will reuse AfterTriggerShared objects less often than vanilla
+		 * postgres.
+		 */
 		/* compare fields roughly by probability of them being different */
 		if (newshared->ats_tgoid == evtshared->ats_tgoid &&
 			newshared->ats_event == evtshared->ats_event &&
 			newshared->ats_firing_id == 0 &&
 			newshared->ats_table == evtshared->ats_table &&
+			newshared->ybc_txn_fdw_tuplestore == evtshared->ybc_txn_fdw_tuplestore &&
 			newshared->ats_relid == evtshared->ats_relid &&
 			bms_equal(newshared->ats_modifiedcols,
 					  evtshared->ats_modifiedcols))
@@ -4419,7 +4535,7 @@ AfterTriggerExecute(EState *estate,
 	{
 		case AFTER_TRIGGER_FDW_FETCH:
 			{
-				Tuplestorestate *fdw_tuplestore = GetCurrentFDWTuplestore();
+				Tuplestorestate *fdw_tuplestore = GetCurrentFDWTuplestore(evtshared);
 
 				if (!tuplestore_gettupleslot(fdw_tuplestore, true, false,
 											 trig_tuple_slot1))
@@ -4432,6 +4548,7 @@ AfterTriggerExecute(EState *estate,
 					elog(ERROR, "failed to fetch tuple2 for AFTER trigger");
 			}
 			/* fall through */
+			yb_switch_fallthrough();
 		case AFTER_TRIGGER_FDW_REUSE:
 
 			/*
@@ -4580,6 +4697,8 @@ AfterTriggerExecute(EState *estate,
 	LocTriggerData.tg_event =
 		evtshared->ats_event & (TRIGGER_EVENT_OPMASK | TRIGGER_EVENT_ROW);
 	LocTriggerData.tg_relation = rel;
+	LocTriggerData.estate = estate;
+
 	if (TRIGGER_FOR_UPDATE(LocTriggerData.tg_trigger->tgtype))
 		LocTriggerData.tg_updatedcols = evtshared->ats_modifiedcols;
 
@@ -4793,7 +4912,12 @@ afterTriggerInvokeEvents(AfterTriggerEventList *events,
 						ExecDropSingleTupleTableSlot(slot2);
 						slot1 = slot2 = NULL;
 					}
-					if (rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+					/*
+					 * Need to create a tuple slot for both YugaByte tables and
+					 * foreign tables
+					 */
+					if (IsYBBackedRelation(rel) ||
+						rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 					{
 						slot1 = MakeSingleTupleTableSlot(rel->rd_att,
 														 &TTSOpsMinimalTuple);
@@ -5103,6 +5227,7 @@ AfterTriggerBeginXact(void)
 	Assert(afterTriggers.events.head == NULL);
 	Assert(afterTriggers.trans_stack == NULL);
 	Assert(afterTriggers.maxtransdepth == 0);
+	Assert(afterTriggers.ybc_txn_fdw_tuplestores == NULL);
 }
 
 
@@ -5240,7 +5365,12 @@ AfterTriggerFreeQuery(AfterTriggersQueryData *qs)
 	qs->fdw_tuplestore = NULL;
 	if (ts)
 		tuplestore_end(ts);
-
+	/*
+	 * Tuplestore pointed by ybc_txn_fdw_tuplestore is registered in
+	 * AfterTriggersData::ybc_txn_fdw_tuplestores list and will be closed at transaction end,
+	 * no need to do it here.
+	 */
+	qs->ybc_txn_fdw_tuplestore = NULL;
 	/* Release per-table subsidiary storage */
 	tables = qs->tables;
 	foreach(lc, tables)
@@ -5390,6 +5520,22 @@ AfterTriggerEndXact(bool isCommit)
 
 	/* No more afterTriggers manipulation until next transaction starts. */
 	afterTriggers.query_depth = -1;
+
+	if (IsYugaByteEnabled())
+	{
+		/* Close all transaction level tuplestores. */
+		ListCell   *lc;
+
+		foreach(lc, afterTriggers.ybc_txn_fdw_tuplestores)
+		{
+			Tuplestorestate *tuplestore = (Tuplestorestate *) lfirst(lc);
+
+			tuplestore_end(tuplestore);
+		}
+		afterTriggers.ybc_txn_fdw_tuplestores = NULL;
+	}
+	else
+		Assert(afterTriggers.ybc_txn_fdw_tuplestores == NULL);
 }
 
 /*
@@ -5672,6 +5818,7 @@ AfterTriggerEnlargeQueryState(void)
 		qs->events.tailfree = NULL;
 		qs->fdw_tuplestore = NULL;
 		qs->tables = NIL;
+		qs->ybc_txn_fdw_tuplestore = NULL;
 
 		++init_depth;
 	}
@@ -6176,6 +6323,7 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	int			tgtype_level;
 	int			i;
 	Tuplestorestate *fdw_tuplestore = NULL;
+	Tuplestorestate *ybc_txn_fdw_tuplestore = NULL;
 
 	/*
 	 * Check state.  We use a normal test not Assert because it is possible to
@@ -6354,8 +6502,12 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			break;
 	}
 
-	/* Determine flags */
-	if (!(relkind == RELKIND_FOREIGN_TABLE && row_trigger))
+	/*
+	 * Determine flags.
+	 * In YugaByte mode we (re)use the FDW trigger flags (since we also use the
+	 * FDW tuplestore).
+	 */
+	if (!((relkind == RELKIND_FOREIGN_TABLE || IsYBBackedRelation(rel)) && row_trigger))
 	{
 		if (row_trigger && event == TRIGGER_EVENT_UPDATE)
 		{
@@ -6414,11 +6566,17 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 							modifiedCols, oldslot, newslot))
 			continue;
 
-		if (relkind == RELKIND_FOREIGN_TABLE && row_trigger)
+		const bool	is_fk_trigger_on_yb_table = (IsYBBackedRelation(rel) &&
+												 RI_FKey_trigger_type(trigger->tgfoid) == RI_TRIGGER_FK);
+
+		if (estate->yb_es_is_fk_check_disabled && is_fk_trigger_on_yb_table)
+			continue;
+
+		if (!IsYugaByteEnabled() && relkind == RELKIND_FOREIGN_TABLE && row_trigger)
 		{
 			if (fdw_tuplestore == NULL)
 			{
-				fdw_tuplestore = GetCurrentFDWTuplestore();
+				fdw_tuplestore = GetCurrentFDWTuplestore(&new_shared);
 				new_event.ate_flags = AFTER_TRIGGER_FDW_FETCH;
 			}
 			else
@@ -6455,7 +6613,8 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 
 					/* Update or delete on trigger's PK table */
 					if (!RI_FKey_pk_upd_check_required(trigger, rel,
-													   oldslot, newslot))
+													   oldslot, newslot,
+													   &estate->yb_skip_entities))
 					{
 						/* skip queuing this event */
 						continue;
@@ -6477,7 +6636,8 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 					 */
 					if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
 						!RI_FKey_fk_upd_check_required(trigger, rel,
-													   oldslot, newslot))
+													   oldslot, newslot,
+													   &estate->yb_skip_entities))
 					{
 						/* skip queuing this event */
 						continue;
@@ -6500,6 +6660,17 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 					break;
 			}
 		}
+
+		/*
+		 * In YugaByte mode we also use the tuplestore to store/pass tuples
+		 * within a query execution.
+		 */
+		if ((IsYBBackedRelation(rel) || relkind == RELKIND_FOREIGN_TABLE) && row_trigger)
+			/*
+			 * Set flag to AFTER_TRIGGER_FDW_REUSE (0) by default.
+			 * AFTER_TRIGGER_FDW_FETCH flag will be added later if needed.
+			 */
+			new_event.ate_flags = AFTER_TRIGGER_FDW_REUSE;
 
 		/*
 		 * If the trigger is a deferred unique constraint check trigger, only
@@ -6532,6 +6703,48 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			new_shared.ats_table = NULL;
 		new_shared.ats_modifiedcols = modifiedCols;
 
+		/*
+		 * Set current ybc_txn_fdw_tuplestore (if any) to new_shared field
+		 * to reuse existing AfterTriggerShared object (is any)
+		 * because ybc_txn_fdw_tuplestore is checked.
+		 * In vanilla postgres ybc_txn_fdw_tuplestore is always NULL so reuse strategy of
+		 * AfterTriggerShared object will not be changed.
+		 */
+		new_shared.ybc_txn_fdw_tuplestore = NULL;
+		/*
+		 * In YugaByte mode we also use the tuplestore to store/pass tuples
+		 * within a query execution.
+		 */
+		if ((IsYBBackedRelation(rel) || relkind == RELKIND_FOREIGN_TABLE) && row_trigger)
+		{
+			if (IsYugaByteEnabled() && afterTriggerCheckState(&new_shared))
+			{
+				/* deferred trigger case */
+				if (!ybc_txn_fdw_tuplestore)
+				{
+					new_event.ate_flags |= AFTER_TRIGGER_FDW_FETCH;
+					ybc_txn_fdw_tuplestore = GetCurrentFDWTuplestore(&new_shared);
+					Assert(new_shared.ybc_txn_fdw_tuplestore == ybc_txn_fdw_tuplestore);
+				}
+				else
+					new_shared.ybc_txn_fdw_tuplestore = ybc_txn_fdw_tuplestore;
+			}
+			else if (!fdw_tuplestore)
+			{
+				new_event.ate_flags |= AFTER_TRIGGER_FDW_FETCH;
+				fdw_tuplestore = GetCurrentFDWTuplestore(&new_shared);
+			}
+		}
+
+		if (IsYBBackedRelation(rel) &&
+			RI_FKey_trigger_type(trigger->tgfoid) == RI_TRIGGER_FK)
+		{
+			const bool	is_deferred = new_shared.ybc_txn_fdw_tuplestore != NULL;
+
+			YbAddTriggerFKReferenceIntent(trigger, rel, newslot, estate,
+										  is_deferred);
+		}
+
 		afterTriggerAddEvent(&afterTriggers.query_stack[afterTriggers.query_depth].events,
 							 &new_event, &new_shared);
 	}
@@ -6540,8 +6753,29 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 	 * Finally, spool any foreign tuple(s).  The tuplestore squashes them to
 	 * minimal tuples, so this loses any system columns.  The executor lost
 	 * those columns before us, for an unrelated reason, so this is fine.
+	 *
+	 * YB: In case table has more than one trigger one can be deferred and
+	 * another non-deferred. In this case both fdw_tuplestore and
+	 * ybc_txn_fdw_tuplestore will be non NULL. Value should be written into
+	 * both tuplestores.
 	 */
-	if (fdw_tuplestore)
+	if (IsYBBackedRelation(rel))
+	{
+		Tuplestorestate *tuplestores[2] = {fdw_tuplestore, ybc_txn_fdw_tuplestore};
+
+		for (Tuplestorestate **tuplestore = tuplestores, **end = tuplestores + 2;
+			 tuplestore != end; ++tuplestore)
+		{
+			if (*tuplestore)
+			{
+				if (oldslot != NULL)
+					tuplestore_puttupleslot(*tuplestore, oldslot);
+				if (newslot != NULL)
+					tuplestore_puttupleslot(*tuplestore, newslot);
+			}
+		}
+	}
+	else if (fdw_tuplestore)
 	{
 		if (oldslot != NULL)
 			tuplestore_puttupleslot(fdw_tuplestore, oldslot);
@@ -6679,4 +6913,17 @@ Datum
 pg_trigger_depth(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(MyTriggerDepth);
+}
+
+
+/*
+ * qsort comparator to sort TriggerDesc entries by name
+ */
+static int
+YbTriggerNameCmp(const void *a, const void *b)
+{
+	const Trigger *ta = (const Trigger *) a;
+	const Trigger *tb = (const Trigger *) b;
+
+	return strcmp(ta->tgname, tb->tgname);
 }

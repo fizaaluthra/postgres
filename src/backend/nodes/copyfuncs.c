@@ -29,6 +29,9 @@
 #include "utils/datum.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "nodes/ybbitmatrix.h"
+
 
 /*
  * Macros to simplify copying of different kinds of fields.  Use these
@@ -109,6 +112,8 @@ _copyPlannedStmt(const PlannedStmt *from)
 	COPY_LOCATION_FIELD(stmt_location);
 	COPY_SCALAR_FIELD(stmt_len);
 
+	COPY_SCALAR_FIELD(yb_num_referenced_relations);
+
 	return newnode;
 }
 
@@ -136,6 +141,11 @@ CopyPlanFields(const Plan *from, Plan *newnode)
 	COPY_NODE_FIELD(initPlan);
 	COPY_BITMAPSET_FIELD(extParam);
 	COPY_BITMAPSET_FIELD(allParam);
+	COPY_STRING_FIELD(ybHintAlias);
+	COPY_SCALAR_FIELD(ybUniqueId);
+	COPY_STRING_FIELD(ybInheritedHintAlias);
+	COPY_SCALAR_FIELD(ybIsHinted);
+	COPY_SCALAR_FIELD(ybHasHintedUid);
 }
 
 /*
@@ -229,6 +239,13 @@ _copyModifyTable(const ModifyTable *from)
 	COPY_SCALAR_FIELD(exclRelRTI);
 	COPY_NODE_FIELD(exclRelTlist);
 	COPY_NODE_FIELD(mergeActionLists);
+
+	COPY_NODE_FIELD(ybPushdownTlist);
+	COPY_NODE_FIELD(ybReturningColumns);
+	COPY_NODE_FIELD(ybColumnRefs);
+	COPY_NODE_FIELD(yb_skip_entities);
+	COPY_NODE_FIELD(yb_update_affected_entities);
+	COPY_SCALAR_FIELD(no_row_trigger);
 
 	return newnode;
 }
@@ -455,6 +472,25 @@ _copySeqScan(const SeqScan *from)
 }
 
 /*
+ * _copyYbSeqScan
+ */
+static YbSeqScan *
+_copyYbSeqScan(const YbSeqScan *from)
+{
+	YbSeqScan  *newnode = makeNode(YbSeqScan);
+
+	/*
+	 * copy node superclass fields
+	 */
+	CopyScanFields((const Scan *) from, (Scan *) newnode);
+
+	COPY_NODE_FIELD(yb_pushdown.quals);
+	COPY_NODE_FIELD(yb_pushdown.colrefs);
+
+	return newnode;
+}
+
+/*
  * _copySampleScan
  */
 static SampleScan *
@@ -497,7 +533,14 @@ _copyIndexScan(const IndexScan *from)
 	COPY_NODE_FIELD(indexorderby);
 	COPY_NODE_FIELD(indexorderbyorig);
 	COPY_NODE_FIELD(indexorderbyops);
+	COPY_NODE_FIELD(indextlist);
 	COPY_SCALAR_FIELD(indexorderdir);
+	COPY_NODE_FIELD(yb_idx_pushdown.quals);
+	COPY_NODE_FIELD(yb_idx_pushdown.colrefs);
+	COPY_NODE_FIELD(yb_rel_pushdown.quals);
+	COPY_NODE_FIELD(yb_rel_pushdown.colrefs);
+	COPY_SCALAR_FIELD(yb_distinct_prefixlen);
+	COPY_SCALAR_FIELD(yb_lock_mechanism);
 
 	return newnode;
 }
@@ -524,6 +567,9 @@ _copyIndexOnlyScan(const IndexOnlyScan *from)
 	COPY_NODE_FIELD(indexorderby);
 	COPY_NODE_FIELD(indextlist);
 	COPY_SCALAR_FIELD(indexorderdir);
+	COPY_NODE_FIELD(yb_pushdown.quals);
+	COPY_NODE_FIELD(yb_pushdown.colrefs);
+	COPY_SCALAR_FIELD(yb_distinct_prefixlen);
 
 	return newnode;
 }
@@ -553,6 +599,35 @@ _copyBitmapIndexScan(const BitmapIndexScan *from)
 }
 
 /*
+ * _copyYbBitmapIndexScan
+ */
+static YbBitmapIndexScan *
+_copyYbBitmapIndexScan(const YbBitmapIndexScan *from)
+{
+	YbBitmapIndexScan *newnode = makeNode(YbBitmapIndexScan);
+
+	/*
+	 * copy node superclass fields
+	 */
+	CopyScanFields((const Scan *) from, (Scan *) newnode);
+
+	/*
+	 * copy remainder of node
+	 */
+	COPY_SCALAR_FIELD(indexid);
+	COPY_SCALAR_FIELD(isshared);
+	COPY_NODE_FIELD(indexqual);
+	COPY_NODE_FIELD(indexqualorig);
+
+	COPY_NODE_FIELD(indextlist);
+
+	COPY_NODE_FIELD(yb_idx_pushdown.quals);
+	COPY_NODE_FIELD(yb_idx_pushdown.colrefs);
+
+	return newnode;
+}
+
+/*
  * _copyBitmapHeapScan
  */
 static BitmapHeapScan *
@@ -574,6 +649,36 @@ _copyBitmapHeapScan(const BitmapHeapScan *from)
 }
 
 /*
+ * _copyBitmapHeapScan
+ */
+static YbBitmapTableScan *
+_copyYbBitmapTableScan(const YbBitmapTableScan *from)
+{
+	YbBitmapTableScan *newnode = makeNode(YbBitmapTableScan);
+
+	/*
+	 * copy node superclass fields
+	 */
+	CopyScanFields((const Scan *) from, (Scan *) newnode);
+
+	/*
+	 * copy remainder of node
+	 */
+	COPY_NODE_FIELD(rel_pushdown.quals);
+	COPY_NODE_FIELD(rel_pushdown.colrefs);
+
+	COPY_NODE_FIELD(recheck_pushdown.quals);
+	COPY_NODE_FIELD(recheck_pushdown.colrefs);
+	COPY_NODE_FIELD(recheck_local_quals);
+
+	COPY_NODE_FIELD(fallback_pushdown.quals);
+	COPY_NODE_FIELD(fallback_pushdown.colrefs);
+	COPY_NODE_FIELD(fallback_local_quals);
+
+	return newnode;
+}
+
+/*
  * _copyTidScan
  */
 static TidScan *
@@ -589,6 +694,8 @@ _copyTidScan(const TidScan *from)
 	/*
 	 * copy remainder of node
 	 */
+	COPY_NODE_FIELD(yb_rel_pushdown.quals);
+	COPY_NODE_FIELD(yb_rel_pushdown.colrefs);
 	COPY_NODE_FIELD(tidquals);
 
 	return newnode;
@@ -878,6 +985,47 @@ _copyNestLoop(const NestLoop *from)
 	 * copy remainder of node
 	 */
 	COPY_NODE_FIELD(nestParams);
+
+	return newnode;
+}
+
+/*
+ * _copyYbBatchedNestLoop
+ */
+static YbBatchedNestLoop *
+_copyYbBatchedNestLoop(const YbBatchedNestLoop *from)
+{
+	YbBatchedNestLoop *newnode = makeNode(YbBatchedNestLoop);
+
+	/*
+	 * copy node superclass fields
+	 */
+	CopyJoinFields((const Join *) from, (Join *) newnode);
+	COPY_NODE_FIELD(nl.nestParams);
+
+	/*
+	 * copy remainder of node
+	 */
+	COPY_SCALAR_FIELD(num_hashClauseInfos);
+
+	if (from->num_hashClauseInfos > 0)
+		COPY_POINTER_FIELD(hashClauseInfos,
+						   (from->num_hashClauseInfos *
+							sizeof(YbBNLHashClauseInfo)));
+
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].outerParamExpr = (Expr *)
+			copyObject(from->hashClauseInfos[i].outerParamExpr);
+
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].orig_expr = (Expr *)
+			copyObject(from->hashClauseInfos[i].orig_expr);
+
+	COPY_SCALAR_FIELD(numSortCols);
+	COPY_POINTER_FIELD(sortColIdx, from->numSortCols * sizeof(AttrNumber));
+	COPY_POINTER_FIELD(sortOperators, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(collations, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(nullsFirst, from->numSortCols * sizeof(bool));
 
 	return newnode;
 }
@@ -1253,6 +1401,7 @@ _copyNestLoopParam(const NestLoopParam *from)
 
 	COPY_SCALAR_FIELD(paramno);
 	COPY_NODE_FIELD(paramval);
+	COPY_SCALAR_FIELD(yb_batch_size);
 
 	return newnode;
 }
@@ -1334,6 +1483,17 @@ _copyPartitionPruneStepCombine(const PartitionPruneStepCombine *from)
 	COPY_SCALAR_FIELD(step.step_id);
 	COPY_SCALAR_FIELD(combineOp);
 	COPY_NODE_FIELD(source_stepids);
+
+	return newnode;
+}
+
+static YbPartitionPruneStepFuncOp *
+_copyYbPartitionPruneStepFuncOp(const YbPartitionPruneStepFuncOp *from)
+{
+	YbPartitionPruneStepFuncOp *newnode = makeNode(YbPartitionPruneStepFuncOp);
+
+	COPY_SCALAR_FIELD(step.step_id);
+	COPY_NODE_FIELD(exprs);
 
 	return newnode;
 }
@@ -3128,6 +3288,7 @@ _copyConstraint(const Constraint *from)
 	COPY_SCALAR_FIELD(old_pktable_oid);
 	COPY_SCALAR_FIELD(skip_validation);
 	COPY_SCALAR_FIELD(initially_valid);
+	COPY_NODE_FIELD(yb_index_params);
 
 	return newnode;
 }
@@ -3412,6 +3573,8 @@ _copyAlterTableCmd(const AlterTableCmd *from)
 	COPY_SCALAR_FIELD(behavior);
 	COPY_SCALAR_FIELD(missing_ok);
 	COPY_SCALAR_FIELD(recurse);
+	COPY_SCALAR_FIELD(yb_is_add_primary_key);
+	COPY_SCALAR_FIELD(yb_cascade);
 
 	return newnode;
 }
@@ -3572,6 +3735,18 @@ _copyCopyStmt(const CopyStmt *from)
 	return newnode;
 }
 
+static YbOptSplit *
+_copyYbOptSplit(const YbOptSplit *from)
+{
+	YbOptSplit *newnode = makeNode(YbOptSplit);
+
+	COPY_SCALAR_FIELD(split_type);
+	COPY_SCALAR_FIELD(num_tablets);
+	COPY_NODE_FIELD(split_points);
+
+	return newnode;
+}
+
 /*
  * CopyCreateStmtFields
  *
@@ -3591,8 +3766,10 @@ CopyCreateStmtFields(const CreateStmt *from, CreateStmt *newnode)
 	COPY_NODE_FIELD(options);
 	COPY_SCALAR_FIELD(oncommit);
 	COPY_STRING_FIELD(tablespacename);
+	COPY_STRING_FIELD(tablegroupname);
 	COPY_STRING_FIELD(accessMethod);
 	COPY_SCALAR_FIELD(if_not_exists);
+	COPY_NODE_FIELD(split_options);
 }
 
 static CreateStmt *
@@ -3726,6 +3903,7 @@ _copyIndexStmt(const IndexStmt *from)
 	COPY_SCALAR_FIELD(concurrent);
 	COPY_SCALAR_FIELD(if_not_exists);
 	COPY_SCALAR_FIELD(reset_default_tblspc);
+	COPY_NODE_FIELD(split_options);
 
 	return newnode;
 }
@@ -4287,6 +4465,39 @@ _copyDiscardStmt(const DiscardStmt *from)
 	return newnode;
 }
 
+static YbCreateProfileStmt *
+_copyCreateProfileStmt(const YbCreateProfileStmt *from)
+{
+	YbCreateProfileStmt *newnode = makeNode(YbCreateProfileStmt);
+
+	COPY_STRING_FIELD(prfname);
+	COPY_SCALAR_FIELD(prffailedloginattempts);
+	return newnode;
+}
+
+static YbDropProfileStmt *
+_copyDropProfileStmt(const YbDropProfileStmt *from)
+{
+	YbDropProfileStmt *newnode = makeNode(YbDropProfileStmt);
+
+	COPY_STRING_FIELD(prfname);
+	COPY_SCALAR_FIELD(missing_ok);
+	return newnode;
+}
+
+static YbCreateTableGroupStmt *
+_copyYbCreateTableGroupStmt(const YbCreateTableGroupStmt *from)
+{
+	YbCreateTableGroupStmt *newnode = makeNode(YbCreateTableGroupStmt);
+
+	COPY_STRING_FIELD(tablegroupname);
+	COPY_STRING_FIELD(tablespacename);
+	COPY_NODE_FIELD(owner);
+	COPY_NODE_FIELD(options);
+	COPY_SCALAR_FIELD(implicit);
+	return newnode;
+}
+
 static CreateTableSpaceStmt *
 _copyCreateTableSpaceStmt(const CreateTableSpaceStmt *from)
 {
@@ -4333,6 +4544,8 @@ _copyAlterTableMoveAllStmt(const AlterTableMoveAllStmt *from)
 	COPY_NODE_FIELD(roles);
 	COPY_STRING_FIELD(new_tablespacename);
 	COPY_SCALAR_FIELD(nowait);
+	COPY_NODE_FIELD(yb_relation);
+	COPY_SCALAR_FIELD(yb_cascade);
 
 	return newnode;
 }
@@ -5061,6 +5274,126 @@ _copyForeignKeyCacheInfo(const ForeignKeyCacheInfo *from)
 	COPY_ARRAY_FIELD(conkey);
 	COPY_ARRAY_FIELD(confkey);
 	COPY_ARRAY_FIELD(conpfeqop);
+	COPY_SCALAR_FIELD(ybconindid);
+
+	return newnode;
+}
+
+static YbBackfillIndexStmt *
+_copyYbBackfillIndexStmt(const YbBackfillIndexStmt *from)
+{
+	YbBackfillIndexStmt *newnode = makeNode(YbBackfillIndexStmt);
+
+	COPY_SCALAR_FIELD(oid_list);
+	COPY_NODE_FIELD(bfinfo);
+
+	return newnode;
+}
+
+static YbBackfillInfo *
+_copyYbBackfillInfo(const YbBackfillInfo *from)
+{
+	YbBackfillInfo *newnode = makeNode(YbBackfillInfo);
+
+	COPY_STRING_FIELD(bfinstr);
+	COPY_SCALAR_FIELD(read_time);
+	COPY_NODE_FIELD(row_bounds);
+
+	return newnode;
+}
+
+static YbRowBounds *
+_copyYbRowBounds(const YbRowBounds *from)
+{
+	YbRowBounds *newnode = makeNode(YbRowBounds);
+
+	COPY_STRING_FIELD(partition_key);
+	COPY_STRING_FIELD(row_key_start);
+	COPY_STRING_FIELD(row_key_end);
+
+	return newnode;
+}
+
+static YbExprColrefDesc *
+_copyYbExprColrefDesc(const YbExprColrefDesc *from)
+{
+	YbExprColrefDesc *newnode = makeNode(YbExprColrefDesc);
+
+	COPY_SCALAR_FIELD(attno);
+	COPY_SCALAR_FIELD(typid);
+	COPY_SCALAR_FIELD(typmod);
+	COPY_SCALAR_FIELD(collid);
+
+	return newnode;
+}
+
+static YbBatchedExpr *
+_copyYbBatchedExpr(const YbBatchedExpr *from)
+{
+	YbBatchedExpr *newnode = makeNode(YbBatchedExpr);
+
+	COPY_NODE_FIELD(orig_expr);
+
+	return newnode;
+}
+
+static YbUpdateAffectedEntities *
+_copyYbUpdateAffectedEntities(const YbUpdateAffectedEntities *from)
+{
+	YbUpdateAffectedEntities *newnode = makeNode(YbUpdateAffectedEntities);
+
+	COPY_POINTER_FIELD(entity_list, from->matrix.ncols * sizeof(struct YbUpdateEntity));
+	COPY_POINTER_FIELD(col_info_list, from->matrix.nrows * sizeof(struct YbUpdateColInfo));
+	YbCopyBitMatrix(&newnode->matrix, &from->matrix);
+
+	return newnode;
+}
+
+static YbSkippableEntities *
+_copyYbSkippableEntities(const YbSkippableEntities *from)
+{
+	YbSkippableEntities *newnode = makeNode(YbSkippableEntities);
+
+	COPY_NODE_FIELD(index_list);
+	COPY_NODE_FIELD(referencing_fkey_list);
+	COPY_NODE_FIELD(referenced_fkey_list);
+
+	return newnode;
+}
+
+static YbSaopMergeInfo *
+_copyYbSaopMergeInfo(const YbSaopMergeInfo *from)
+{
+	YbSaopMergeInfo *newnode = makeNode(YbSaopMergeInfo);
+
+	COPY_NODE_FIELD(saop_cols);
+	COPY_NODE_FIELD(sort_cols);
+
+	return newnode;
+}
+
+static YbSaopMergeSaopColInfo *
+_copyYbSaopMergeSaopColInfo(const YbSaopMergeSaopColInfo *from)
+{
+	YbSaopMergeSaopColInfo *newnode = makeNode(YbSaopMergeSaopColInfo);
+
+	COPY_NODE_FIELD(saop);
+	COPY_SCALAR_FIELD(indexcol);
+	COPY_SCALAR_FIELD(num_elems);
+
+	return newnode;
+}
+
+static YbSortInfo *
+_copyYbSortInfo(const YbSortInfo *from)
+{
+	YbSortInfo *newnode = makeNode(YbSortInfo);
+
+	COPY_SCALAR_FIELD(numCols);
+	COPY_POINTER_FIELD(sortColIdx, from->numCols * sizeof(AttrNumber));
+	COPY_POINTER_FIELD(sortOperators, from->numCols * sizeof(Oid));
+	COPY_POINTER_FIELD(collations, from->numCols * sizeof(Oid));
+	COPY_POINTER_FIELD(nullsFirst, from->numCols * sizeof(bool));
 
 	return newnode;
 }
@@ -5129,6 +5462,9 @@ copyObjectImpl(const void *from)
 		case T_SeqScan:
 			retval = _copySeqScan(from);
 			break;
+		case T_YbSeqScan:
+			retval = _copyYbSeqScan(from);
+			break;
 		case T_SampleScan:
 			retval = _copySampleScan(from);
 			break;
@@ -5141,8 +5477,14 @@ copyObjectImpl(const void *from)
 		case T_BitmapIndexScan:
 			retval = _copyBitmapIndexScan(from);
 			break;
+		case T_YbBitmapIndexScan:
+			retval = _copyYbBitmapIndexScan(from);
+			break;
 		case T_BitmapHeapScan:
 			retval = _copyBitmapHeapScan(from);
+			break;
+		case T_YbBitmapTableScan:
+			retval = _copyYbBitmapTableScan(from);
 			break;
 		case T_TidScan:
 			retval = _copyTidScan(from);
@@ -5182,6 +5524,9 @@ copyObjectImpl(const void *from)
 			break;
 		case T_NestLoop:
 			retval = _copyNestLoop(from);
+			break;
+		case T_YbBatchedNestLoop:
+			retval = _copyYbBatchedNestLoop(from);
 			break;
 		case T_MergeJoin:
 			retval = _copyMergeJoin(from);
@@ -5699,6 +6044,15 @@ copyObjectImpl(const void *from)
 		case T_DiscardStmt:
 			retval = _copyDiscardStmt(from);
 			break;
+		case T_YbCreateProfileStmt:
+			retval = _copyCreateProfileStmt(from);
+			break;
+		case T_YbDropProfileStmt:
+			retval = _copyDropProfileStmt(from);
+			break;
+		case T_YbCreateTableGroupStmt:
+			retval = _copyYbCreateTableGroupStmt(from);
+			break;
 		case T_CreateTableSpaceStmt:
 			retval = _copyCreateTableSpaceStmt(from);
 			break;
@@ -6005,12 +6359,62 @@ copyObjectImpl(const void *from)
 		case T_PublicationTable:
 			retval = _copyPublicationTable(from);
 			break;
+		case T_YbOptSplit:
+			retval = _copyYbOptSplit(from);
+			break;
 
 			/*
 			 * MISCELLANEOUS NODES
 			 */
 		case T_ForeignKeyCacheInfo:
 			retval = _copyForeignKeyCacheInfo(from);
+			break;
+
+			/*
+			 * YB NODES
+			 */
+		case T_YbPartitionPruneStepFuncOp:
+			retval = _copyYbPartitionPruneStepFuncOp(from);
+			break;
+
+		case T_YbBackfillIndexStmt:
+			retval = _copyYbBackfillIndexStmt(from);
+			break;
+
+		case T_YbBackfillInfo:
+			retval = _copyYbBackfillInfo(from);
+			break;
+
+		case T_YbRowBounds:
+			retval = _copyYbRowBounds(from);
+			break;
+
+		case T_YbExprColrefDesc:
+			retval = _copyYbExprColrefDesc(from);
+			break;
+
+		case T_YbBatchedExpr:
+			retval = _copyYbBatchedExpr(from);
+			break;
+
+		case T_YbSkippableEntities:
+			retval = _copyYbSkippableEntities(from);
+			break;
+
+		case T_YbUpdateAffectedEntities:
+			retval = _copyYbUpdateAffectedEntities(from);
+			break;
+
+		case T_YbSaopMergeInfo:
+			retval = _copyYbSaopMergeInfo(from);
+			break;
+
+		case T_YbSaopMergeSaopColInfo:
+			retval = _copyYbSaopMergeSaopColInfo(from);
+			break;
+
+		case T_YbSortInfo:
+			retval = _copyYbSortInfo(from);
 			break;
 
 		default:

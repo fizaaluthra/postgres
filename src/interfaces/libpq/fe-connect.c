@@ -224,7 +224,8 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"Database-Host-IP-Address", "", 45,
 	offsetof(struct pg_conn, pghostaddr)},
 
-	{"port", "PGPORT", DEF_PGPORT_STR, NULL,
+	/* Use YugaByte default port */
+	{"port", "PGPORT", DEF_YBPORT_STR, NULL,
 		"Database-Port", "", 6,
 	offsetof(struct pg_conn, pgport)},
 
@@ -343,6 +344,10 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		DefaultTargetSessionAttrs, NULL,
 		"Target-Session-Attrs", "", 15, /* sizeof("prefer-standby") = 15 */
 	offsetof(struct pg_conn, target_session_attrs)},
+
+	{"yb_auto_analyze", NULL, NULL, NULL,
+		"YB-Auto-Analyze", "", 6, /* sizeof("false") = 6 */
+	offsetof(struct pg_conn, yb_auto_analyze)},
 
 	/* Terminating entry --- MUST BE LAST */
 	{NULL, NULL, NULL, NULL,
@@ -1118,6 +1123,10 @@ connectOptions2(PGconn *conn)
 			if (ch->host)
 				free(ch->host);
 
+/* YugaByte use localhost instead of local socket */
+#pragma push_macro("HAVE_UNIX_SOCKETS")
+#undef HAVE_UNIX_SOCKETS
+
 			/*
 			 * This bit selects the default host location.  If you change
 			 * this, see also pg_regress.
@@ -1134,6 +1143,10 @@ connectOptions2(PGconn *conn)
 				ch->host = strdup(DefaultHost);
 				ch->type = CHT_HOST_NAME;
 			}
+
+#pragma pop_macro("HAVE_UNIX_SOCKETS")
+/* YugaByte end */
+
 			if (ch->host == NULL)
 				goto oom_error;
 		}
@@ -1190,7 +1203,8 @@ connectOptions2(PGconn *conn)
 	{
 		if (conn->pguser)
 			free(conn->pguser);
-		conn->pguser = pg_fe_getauthname(&conn->errorMessage);
+		/* YugaByte default username to "postgres" */
+		conn->pguser = strdup("postgres");
 		if (!conn->pguser)
 		{
 			conn->status = CONNECTION_BAD;
@@ -1205,7 +1219,7 @@ connectOptions2(PGconn *conn)
 	{
 		if (conn->dbName)
 			free(conn->dbName);
-		conn->dbName = strdup(conn->pguser);
+		conn->dbName = strdup("yugabyte");
 		if (!conn->dbName)
 			goto oom_error;
 	}
@@ -1726,7 +1740,8 @@ emitHostIdentityInfo(PGconn *conn, const char *host_addr)
 			displayed_host = conn->connhost[conn->whichhost].host;
 		displayed_port = conn->connhost[conn->whichhost].port;
 		if (displayed_port == NULL || displayed_port[0] == '\0')
-			displayed_port = DEF_PGPORT_STR;
+			/* Use YugaByte default port */
+			displayed_port = DEF_YBPORT_STR;
 
 		/*
 		 * If the user did not supply an IP address using 'hostaddr', and
@@ -2386,7 +2401,8 @@ keep_going:						/* We will come back to here until there is
 
 		/* Figure out the port number we're going to use. */
 		if (ch->port == NULL || ch->port[0] == '\0')
-			thisport = DEF_PGPORT;
+			/* Use YugaByte default port */
+			thisport = DEF_YBPORT;
 		else
 		{
 			if (!parse_int_param(ch->port, &thisport, conn, "port"))
@@ -4169,6 +4185,8 @@ freePGconn(PGconn *conn)
 		free(conn->rowBuf);
 	if (conn->target_session_attrs)
 		free(conn->target_session_attrs);
+	if (conn->yb_auto_analyze)
+		free(conn->yb_auto_analyze);
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 
@@ -6050,7 +6068,18 @@ conninfo_add_defaults(PQconninfoOption *options, PQExpBuffer errorMessage)
 		 */
 		if (strcmp(option->keyword, "user") == 0)
 		{
-			option->val = pg_fe_getauthname(NULL);
+			/* Yugabyte default username to "yugabyte" */
+			option->val = strdup("yugabyte");
+			continue;
+		}
+
+		/*
+		 * YB: Special handling for "dbname" option.
+		 */
+		if (strcmp(option->keyword, "dbname") == 0)
+		{
+			/* Yugabyte default dbname to "yugabyte" */
+			option->val = strdup("yugabyte");
 			continue;
 		}
 	}
@@ -7189,7 +7218,8 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 			hostname = DefaultHost;
 
 	if (port == NULL || port[0] == '\0')
-		port = DEF_PGPORT_STR;
+		/* Use YugaByte default port */
+		port = DEF_YBPORT_STR;
 
 	/* If password file cannot be opened, ignore it. */
 	if (stat(pgpassfile, &stat_buf) != 0)

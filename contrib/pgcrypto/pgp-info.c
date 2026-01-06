@@ -170,6 +170,7 @@ pgp_get_keyid(MBuf *pgp_data, char *dst)
 			case PGP_PKT_SYMENCRYPTED_SESSKEY:
 				got_symenc_key++;
 				/* fall through */
+				yb_switch_fallthrough();
 			case PGP_PKT_SIGNATURE:
 			case PGP_PKT_MARKER:
 			case PGP_PKT_TRUST:

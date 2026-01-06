@@ -51,6 +51,12 @@
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 
+/* YB includes */
+#include "commands/yb_cmds.h"
+#include "pg_yb_utils.h"
+#include "replication/walsender.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 /*
  * Replication slot on-disk data structure.
  */
@@ -99,6 +105,18 @@ ReplicationSlot *MyReplicationSlot = NULL;
 /* GUCs */
 int			max_replication_slots = 0;	/* the maximum number of replication
 										 * slots */
+
+/* YB: Constants for plugin names */
+const char *YB_OUTPUT_PLUGIN = "yboutput";
+const char *PG_OUTPUT_PLUGIN = "pgoutput";
+
+/* YB: Constants for replication slot LSN types */
+const char *LSN_TYPE_SEQUENCE = "SEQUENCE";
+const char *LSN_TYPE_HYBRID_TIME = "HYBRID_TIME";
+
+/* YB: Constants for replication slot ordering mode */
+const char *ORDERING_MODE_ROW = "ROW";
+const char *ORDERING_MODE_TRANSACTION = "TRANSACTION";
 
 static void ReplicationSlotShmemExit(int code, Datum arg);
 static void ReplicationSlotDropAcquired(void);
@@ -249,7 +267,12 @@ ReplicationSlotValidateName(const char *name, int elevel)
  */
 void
 ReplicationSlotCreate(const char *name, bool db_specific,
-					  ReplicationSlotPersistency persistency, bool two_phase)
+					  ReplicationSlotPersistency persistency, bool two_phase,
+					  char *yb_plugin_name,
+					  CRSSnapshotAction yb_snapshot_action,
+					  uint64_t *yb_consistent_snapshot_time,
+					  YbCRSLsnType lsn_type,
+					  YbCRSOrderingMode yb_ordering_mode)
 {
 	ReplicationSlot *slot = NULL;
 	int			i;
@@ -257,6 +280,57 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	Assert(MyReplicationSlot == NULL);
 
 	ReplicationSlotValidateName(name, ERROR);
+
+	/*
+	 * yb-master is the source of truth for replication slots. Skip the
+	 * ReplicationSlotCtl related stuff as it isn't applicable till we support
+	 * consuming replication slots via Walsender.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		int32_t		max_clock_skew;
+
+		/* TODO(#24025): This must be removed once we support two_phase. */
+		if (two_phase)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("two_phase is not supported")));
+
+		YBCCreateReplicationSlot(name, yb_plugin_name, yb_snapshot_action,
+								 yb_consistent_snapshot_time, lsn_type,
+								 yb_ordering_mode);
+
+		/*
+		 * The creation of a replication slot establishes a boundry between the
+		 * snapshot and change records. This is represented as a hybrid time.
+		 * This hybrid time can be chosen up to max_clock_skew us in the future.
+		 * We do not want to return the control back to the client before this
+		 * time passes otherwise the below scenario can cause confusion.
+		 *
+		 * T1: Slot creation (snapshot time chosen as Tsnap)
+		 *  ... command returns to the client before Tsnap is in the past.
+		 * T2: Insert operation where T2 < Tsnap
+		 *
+		 * The user would expect the insert operation to be part of the change
+		 * operations as it was done after the slot creation but it'll be
+		 * treated as snapshot operation. Sleeping here prevents that.
+		 *
+		 * Another scenario faced by the PG Debezium connector is that it
+		 * attempts to set the yb_read_time to the consistent snapshot time as
+		 * soon as the slot is created. Since this time is in the future
+		 * (without the sleep), such an attempt to set the yb_read_time to a
+		 * future time value can fail.
+		 *
+		 * It is fine to sleep like this because slot creation is not expected
+		 * to be a frequent operation.
+		 */
+		max_clock_skew = YBGetMaxClockSkewUsec();
+		elog(DEBUG1,
+			 "Sleeping for %d us after the slot creation to handle clock skew.",
+			 max_clock_skew);
+		pg_usleep(max_clock_skew);
+		return;
+	}
 
 	/*
 	 * If some other backend ran this code concurrently with us, we'd likely
@@ -456,6 +530,129 @@ ReplicationSlotAcquire(const char *name, bool nowait)
 retry:
 	Assert(MyReplicationSlot == NULL);
 
+	/*
+	 * Fetch the replication slot metadata from yb-master.
+	 * TODO(#20755): Support acquiring a replication slot exclusively in
+	 * yb-master.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YbcReplicationSlotDescriptor *yb_replication_slot;
+		int			replica_identity_idx = 0;
+		HTAB	   *replica_identities;
+		HASHCTL		ctl;
+
+		YBCGetReplicationSlot(name, &yb_replication_slot);
+
+		s = palloc(sizeof(ReplicationSlot));
+		namestrcpy(&s->data.name, yb_replication_slot->slot_name);
+		namestrcpy(&s->data.plugin, yb_replication_slot->output_plugin);
+		s->data.database = yb_replication_slot->database_oid;
+		s->data.persistency = RS_PERSISTENT;
+		strcpy(s->data.yb_stream_id, yb_replication_slot->stream_id);
+		s->active_pid = MyProcPid;
+
+		SpinLockInit(&s->mutex);
+		LWLockInitialize(&s->io_in_progress_lock,
+						 LWTRANCHE_REPLICATION_SLOT_IO);
+		ConditionVariableInit(&s->active_cv);
+
+		s->data.confirmed_flush = yb_replication_slot->confirmed_flush;
+		s->data.xmin = yb_replication_slot->xmin;
+		/*
+		 * Set catalog_xmin as xmin to make the PG Debezium connector work.
+		 * It is not used in our implementation.
+		 */
+		s->data.catalog_xmin = yb_replication_slot->xmin;
+		s->data.restart_lsn = yb_replication_slot->restart_lsn;
+		s->data.yb_last_pub_refresh_time = yb_replication_slot->last_pub_refresh_time;
+
+		/*
+		 * TODO(#24025): two_phase is not supported in YSQL logical replication.
+		 * This must be updated once/if we start supporting them.
+		 */
+		s->data.two_phase = false;
+		s->data.two_phase_at = InvalidXLogRecPtr;
+
+		s->data.yb_initial_record_commit_time_ht =
+			yb_replication_slot->record_id_commit_time_ht;
+
+		MyReplicationSlot = s;
+
+		/* Setup the per-table replica identity table. */
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		/*
+		 * We just need a char (1 byte) but the HTAB implementation requires
+		 * entrysize >= keysize. So we just end up storing both the table_oid
+		 * and the replica identity.
+		 */
+		ctl.entrysize = sizeof(YbcPgReplicaIdentityDescriptor);
+		ctl.hcxt = CurrentMemoryContext;
+
+		replica_identities = hash_create("yb_repl_slot_replica_identities",
+										 32,	/* start small and extend */
+										 &ctl, HASH_ELEM | HASH_BLOBS);
+		for (replica_identity_idx = 0;
+			 replica_identity_idx <
+			 yb_replication_slot->replica_identities_count;
+			 replica_identity_idx++)
+		{
+			YbcPgReplicaIdentityDescriptor *desc;
+			YbcPgReplicaIdentityDescriptor *value;
+
+			desc =
+				&yb_replication_slot->replica_identities[replica_identity_idx];
+
+			value = hash_search(replica_identities,
+								&desc->table_oid,
+								HASH_ENTER,
+								NULL);
+			value->table_oid = desc->table_oid;
+			value->identity_type = desc->identity_type;
+		}
+		s->data.yb_replica_identities = replica_identities;
+
+		pfree(yb_replication_slot);
+
+		/*
+		 * In PG, this is done as part of the slot creation and it is used to
+		 * store the stream metadata, snapshots and serialized transactions
+		 * (reorderbuffer). We cannot do this as part of the creation as one can
+		 * start the streaming on a different node than where the slot is
+		 * created from. So this has to be done at the start of the streaming.
+		 *
+		 * We just need this directory to allow the reorder buffer to store
+		 * serialized transactions on disk. We do not store the stream metadata
+		 * or exported snapshots here.
+		 */
+		CreateSlotOnDisk(s);
+
+		ReplicationSlot *slot_for_array = SearchNamedReplicationSlot(name, false);
+
+		if (!slot_for_array)
+		{
+			for (int i = 0; i < *YBCGetGFlags()->ysql_max_replication_slots; i++)
+			{
+				ReplicationSlot *temp_s = &ReplicationSlotCtl->replication_slots[i];
+
+				if (!temp_s->in_use)
+				{
+					slot_for_array = temp_s;
+					break;
+				}
+			}
+			memset(&slot_for_array->data, 0, sizeof(ReplicationSlotPersistentData));
+			namestrcpy(&slot_for_array->data.name, name);
+			pgstat_create_replslot(slot_for_array);
+		}
+
+		slot_for_array->in_use = true;
+		pgstat_acquire_replslot(slot_for_array);
+
+		return;
+	}
+
 	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 
 	/*
@@ -565,7 +762,8 @@ ReplicationSlotRelease(void)
 	 * Snapshots can only be exported while the initial snapshot is still
 	 * acquired.
 	 */
-	if (!TransactionIdIsValid(slot->data.xmin) &&
+	if (!IsYugaByteEnabled() &&
+		!TransactionIdIsValid(slot->data.xmin) &&
 		TransactionIdIsValid(slot->effective_xmin))
 	{
 		SpinLockAcquire(&slot->mutex);
@@ -586,6 +784,9 @@ ReplicationSlotRelease(void)
 		ConditionVariableBroadcast(&slot->active_cv);
 	}
 
+	if (IsYugaByteEnabled() && MyReplicationSlot->data.yb_replica_identities)
+		hash_destroy(MyReplicationSlot->data.yb_replica_identities);
+
 	MyReplicationSlot = NULL;
 
 	/* might not have been set when we've been a plain slot */
@@ -601,9 +802,17 @@ ReplicationSlotRelease(void)
 void
 ReplicationSlotCleanup(void)
 {
-	int			i;
-
 	Assert(MyReplicationSlot == NULL);
+	ReplicationSlotCleanupForProc(MyProc);
+}
+
+/*
+ * Cleanup all temporary slots created in current session.
+ */
+void
+ReplicationSlotCleanupForProc(PGPROC *proc)
+{
+	int			i;
 
 restart:
 	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
@@ -615,7 +824,7 @@ restart:
 			continue;
 
 		SpinLockAcquire(&s->mutex);
-		if (s->active_pid == MyProcPid)
+		if (s->active_pid == proc->pid)
 		{
 			Assert(s->data.persistency == RS_TEMPORARY);
 			SpinLockRelease(&s->mutex);
@@ -640,6 +849,35 @@ void
 ReplicationSlotDrop(const char *name, bool nowait)
 {
 	Assert(MyReplicationSlot == NULL);
+
+	/*
+	 * yb-master is the source of truth for replication slots. Skip the
+	 * ReplicationSlotCtl related stuff as it isn't applicable till we support
+	 * consuming replication slots via Walsender.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YbcReplicationSlotDescriptor *yb_replication_slot;
+
+		YBCGetReplicationSlot(name, &yb_replication_slot);
+
+		if (yb_replication_slot->active)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("replication slot \"%s\" is active", name)));
+
+		YBCDropReplicationSlot(name);
+
+		ReplicationSlot *slot_for_array = SearchNamedReplicationSlot(name, false);
+
+		if (slot_for_array)
+		{
+			slot_for_array->in_use = false;
+			memset(&slot_for_array->data, 0, sizeof(ReplicationSlotPersistentData));
+		}
+
+		return;
+	}
 
 	ReplicationSlotAcquire(name, nowait);
 
@@ -1127,7 +1365,8 @@ CheckSlotRequirements(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("replication slots can only be used if max_replication_slots > 0")));
 
-	if (wal_level < WAL_LEVEL_REPLICA)
+	/* YB NOTE: wal_level is not applicable to YSQL. */
+	if (!IsYugaByteEnabled() && wal_level < WAL_LEVEL_REPLICA)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("replication slots can only be used if wal_level >= replica")));
@@ -1504,8 +1743,17 @@ StartupReplicationSlots(void)
 			continue;
 		}
 
-		/* looks like a slot in a normal state, restore */
-		RestoreSlotFromDisk(replication_de->d_name);
+		/*
+		 * YB Note: We do not store the replication slot metadata on disk. This
+		 * directory is only used for storing spilled large txns by the
+		 * reorderbuffer. Our source of truth for replication slots is
+		 * yb-master, so we disable loading the slot from disk here.
+		 */
+		if (!YBIsEnabledInPostgresEnvVar())
+		{
+			/* looks like a slot in a normal state, restore */
+			RestoreSlotFromDisk(replication_de->d_name);
+		}
 	}
 	FreeDir(replication_dir);
 
@@ -1559,9 +1807,26 @@ CreateSlotOnDisk(ReplicationSlot *slot)
 						tmppath)));
 	fsync_fname(tmppath, true);
 
-	/* Write the actual state file. */
-	slot->dirty = true;			/* signal that we really need to write */
-	SaveSlotToPath(slot, tmppath, ERROR);
+	/*
+	 * YB NOTE: We do not need to store the metadata here as yb-master is the
+	 * source of truth. This directory is just created so that the reorderbuffer
+	 * can store the serialized transaction to it.
+	 */
+	if (!IsYugaByteEnabled())
+	{
+		/* Write the actual state file. */
+		slot->dirty = true;		/* signal that we really need to write */
+		SaveSlotToPath(slot, tmppath, ERROR);
+	}
+
+	/*
+	 * YB: Cleanup the directory if it was used previously. This isn't required
+	 * in PG as this function is called at the time of slot creation. In YB,
+	 * this is called as part of StartLogicalReplication, so we have to cleanup
+	 * here.
+	 */
+	if (IsYugaByteEnabled() && stat(path, &st) == 0)
+		rmtree(path, true);
 
 	/* Rename the directory into place. */
 	if (rename(tmppath, path) != 0)
@@ -1751,6 +2016,10 @@ RestoreSlotFromDisk(const char *name)
 	bool		restored = false;
 	int			readBytes;
 	pg_crc32c	checksum;
+
+	/* Should never be called in YSQL. */
+	if (IsYugaByteEnabled())
+		Assert(false);
 
 	/* no need to lock here, no concurrent access allowed yet */
 
@@ -1945,4 +2214,20 @@ RestoreSlotFromDisk(const char *name)
 		ereport(FATAL,
 				(errmsg("too many replication slots active before shutdown"),
 				 errhint("Increase max_replication_slots and try again.")));
+}
+
+char
+YBCGetReplicaIdentityForRelation(Oid relid)
+{
+	Assert(MyReplicationSlot);
+	Assert(MyReplicationSlot->data.yb_replica_identities);
+
+	bool		found;
+	YbcPgReplicaIdentityDescriptor *value;
+
+	value = hash_search(MyReplicationSlot->data.yb_replica_identities, &relid,
+						HASH_FIND, &found);
+
+	Assert(found);
+	return value->identity_type;
 }

@@ -13,6 +13,8 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
+	yb_bootstrap.o \
+	\
 	bootparse.o \
 	bootstrap.o
 

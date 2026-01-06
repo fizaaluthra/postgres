@@ -44,6 +44,10 @@ typedef enum EolType
  */
 typedef enum CopyInsertMethod
 {
+	/*
+	 * YB: for CIM_SINGLE, use YBCExecuteNonTxnInsert/YBCExecuteInsert for YB
+	 * relations
+	 */
 	CIM_SINGLE,					/* use table_tuple_insert or fdw routine */
 	CIM_MULTI,					/* always use table_multi_insert */
 	CIM_MULTI_CONDITIONAL		/* use table_multi_insert only if valid */

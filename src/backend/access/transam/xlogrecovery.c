@@ -1811,6 +1811,7 @@ PerformWalRecovery(void)
 					recoveryPausesHere(true);
 
 					/* drop into promote */
+					yb_switch_fallthrough();
 
 				case RECOVERY_TARGET_ACTION_PROMOTE:
 					break;

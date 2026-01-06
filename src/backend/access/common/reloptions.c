@@ -37,6 +37,11 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "access/transam.h"
+#include "commands/yb_tablegroup.h"
+#include "miscadmin.h"
+
 /*
  * Contents of pg_class.reloptions
  *
@@ -167,6 +172,43 @@ static relopt_bool boolRelOpts[] =
 										 * inserts */
 		},
 		true
+	},
+	{
+		{
+			"colocated",
+			"opt-out of using colocated tablet if set to false",
+			RELOPT_KIND_HEAP,
+			AccessExclusiveLock
+		},
+
+		/*
+		 * true by default so that table created in colocated database will be
+		 * colocated. This option will be ignored in non-colocated database.
+		 */
+		true
+	},
+	{
+		{
+			"colocation",
+			"opt-out of colocation if set to false",
+			RELOPT_KIND_HEAP | RELOPT_KIND_PARTITIONED,
+			AccessExclusiveLock
+		},
+
+		/*
+		 * true by default so that table created in colocated database will be
+		 * colocated. This option will be ignored in non-colocation database.
+		 */
+		true
+	},
+	{
+		{
+			"use_initdb_acl",
+			"Initialize view's permissions as if it was created by initdb via yb_system_views.sql",
+			RELOPT_KIND_VIEW,
+			AccessExclusiveLock
+		},
+		false
 	},
 	/* list terminator */
 	{{NULL}}
@@ -382,7 +424,47 @@ static relopt_int intRelOpts[] =
 		},
 		-1, 0, 1024
 	},
+	/* list terminator */
+	{{NULL}}
+};
 
+static yb_relopt_oid oidRelOpts[] =
+{
+	{
+		{
+			"colocation_id",
+			"Colocation ID to distinguish a table within a colocation group. Used during backup/restore.",
+			RELOPT_KIND_HEAP | RELOPT_KIND_INDEX | RELOPT_KIND_PARTITIONED,
+			AccessExclusiveLock
+		},
+		InvalidOid,
+		FirstNormalObjectId,
+		OID_MAX
+	},
+	{
+		{
+			"table_oid",
+			"Postgres table oid for this relation.",
+			RELOPT_KIND_HEAP | RELOPT_KIND_INDEX,
+			AccessExclusiveLock
+		},
+		InvalidOid,
+		1,						/* parse_utilcmd takes care of OID >=
+								 * FirstNormalObjectId for user tables */
+		OID_MAX
+	},
+	{
+		{
+			"row_type_oid",
+			"Postgres type oid for the new row type defined for this relation.",
+			RELOPT_KIND_HEAP | RELOPT_KIND_INDEX,
+			AccessExclusiveLock
+		},
+		InvalidOid,
+		1,						/* parse_utilcmd takes care of OID >=
+								 * FirstNormalObjectId for user tables */
+		OID_MAX
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -548,6 +630,32 @@ static relopt_enum enumRelOpts[] =
 
 static relopt_string stringRelOpts[] =
 {
+	{
+		{
+			"replica_placement",
+			"Json formatted string with array of placement policies",
+			RELOPT_KIND_YB_TABLESPACE,
+			AccessExclusiveLock
+		},
+		0,						/* default_len */
+		true,					/* default_isnull */
+		NULL,					/* validate_cb */
+		NULL,					/* fill_cb */
+		NULL					/* default_val */
+	},
+	{
+		{
+			"read_replica_placement",
+			"Json formatted string with array of placement policies",
+			RELOPT_KIND_YB_TABLESPACE,
+			AccessExclusiveLock
+		},
+		0,						/* default_len */
+		true,					/* default_isnull */
+		NULL,					/* validate_cb */
+		NULL,					/* fill_cb */
+		NULL					/* default_val */
+	},
 	/* list terminator */
 	{{NULL}}
 };
@@ -597,6 +705,12 @@ initialize_reloptions(void)
 								   intRelOpts[i].gen.lockmode));
 		j++;
 	}
+	for (i = 0; oidRelOpts[i].gen.name; i++)
+	{
+		Assert(DoLockModesConflict(oidRelOpts[i].gen.lockmode,
+								   oidRelOpts[i].gen.lockmode));
+		j++;
+	}
 	for (i = 0; realRelOpts[i].gen.name; i++)
 	{
 		Assert(DoLockModesConflict(realRelOpts[i].gen.lockmode,
@@ -635,6 +749,14 @@ initialize_reloptions(void)
 	{
 		relOpts[j] = &intRelOpts[i].gen;
 		relOpts[j]->type = RELOPT_TYPE_INT;
+		relOpts[j]->namelen = strlen(relOpts[j]->name);
+		j++;
+	}
+
+	for (i = 0; oidRelOpts[i].gen.name; i++)
+	{
+		relOpts[j] = &oidRelOpts[i].gen;
+		relOpts[j]->type = RELOPT_TYPE_OID;
 		relOpts[j]->namelen = strlen(relOpts[j]->name);
 		j++;
 	}
@@ -793,6 +915,9 @@ allocate_reloption(bits32 kinds, int type, const char *name, const char *desc,
 			break;
 		case RELOPT_TYPE_INT:
 			size = sizeof(relopt_int);
+			break;
+		case RELOPT_TYPE_OID:
+			size = sizeof(yb_relopt_oid);
 			break;
 		case RELOPT_TYPE_REAL:
 			size = sizeof(relopt_real);
@@ -1325,6 +1450,69 @@ transformRelOptions(Datum oldOptions, List *defList, const char *namspace,
 	return result;
 }
 
+/*
+ * Create a new reloptions list without YB-specific utility reloptions which
+ * we don't want to be persisted.
+ */
+Datum
+ybExcludeNonPersistentReloptions(Datum options)
+{
+	Datum		result = (Datum) 0;
+
+	/* Nothing to do if no options */
+	if (!PointerIsValid(DatumGetPointer(options)))
+		return result;
+
+	ArrayType  *array = DatumGetArrayTypeP(options);
+
+	Datum	   *optiondatums;
+	int			noptions;
+
+	deconstruct_array(array, TEXTOID, -1, false, 'i',
+					  &optiondatums, NULL, &noptions);
+
+	/* We build new array using accumArrayResult */
+	ArrayBuildState *astate = NULL;
+
+	for (int i = 0; i < noptions; i++)
+	{
+		char	   *s = TextDatumGetCString(optiondatums[i]);
+
+		char	   *p = strchr(s, '=');
+
+		if (p)
+			*p = '\0';
+
+		/*
+		 * These options serve as temporary markers during YSQL upgrade,
+		 * but they might also be used for other purposes (e.g. table_oid
+		 * was used to backup/restore colocated tables).
+		 */
+		if (IsYsqlUpgrade &&
+			(strcmp(s, "table_oid") == 0 ||
+			 strcmp(s, "row_type_oid") == 0 ||
+			 strcmp(s, "use_initdb_acl") == 0))
+			continue;
+
+		/*
+		 * We do not want colocation ID to be persisted in reloptions,
+		 * we can get it via YbGetTableProperties.
+		 */
+		if (strcmp(s, "colocation_id") == 0)
+			continue;
+
+		astate = accumArrayResult(astate, optiondatums[i],
+								  false, TEXTOID,
+								  CurrentMemoryContext);
+	}
+
+	if (astate)
+		result = makeArrayResult(astate, CurrentMemoryContext);
+	else
+		result = (Datum) 0;
+
+	return result;
+}
 
 /*
  * Convert the text-array format of reloptions into a List of DefElem.
@@ -1362,6 +1550,7 @@ untransformRelOptions(Datum options)
 			val = (Node *) makeString(pstrdup(p));
 		}
 		result = lappend(result, makeDefElem(pstrdup(s), val, -1));
+		pfree(s);				/* YB-added */
 	}
 
 	return result;
@@ -1500,7 +1689,7 @@ parseRelOptionsInternal(Datum options, bool validate,
  * returned array.  Values of type string are allocated separately and must
  * be freed by the caller.
  */
-static relopt_value *
+relopt_value *
 parseRelOptions(Datum options, bool validate, relopt_kind kind,
 				int *numrelopts)
 {
@@ -1620,6 +1809,26 @@ parse_one_reloption(relopt_value *option, char *text_str, int text_len,
 									value, option->gen->name),
 							 errdetail("Valid values are between \"%d\" and \"%d\".",
 									   optint->min, optint->max)));
+			}
+			break;
+		case RELOPT_TYPE_OID:
+			{
+				yb_relopt_oid *optoid = (yb_relopt_oid *) option->gen;
+
+				parsed = parse_oid(value, &option->values.oid_val, NULL);
+				if (validate && !parsed)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for OID option \"%s\": %s",
+									option->gen->name, value)));
+				if (validate && (option->values.oid_val < optoid->min ||
+								 option->values.oid_val > optoid->max))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("value %s out of bounds for option \"%s\"",
+									value, option->gen->name),
+							 errdetail("Valid values are between \"%u\" and \"%u\".",
+									   optoid->min, optoid->max)));
 			}
 			break;
 		case RELOPT_TYPE_REAL:
@@ -1777,6 +1986,11 @@ fillRelOptions(void *rdopts, Size basesize,
 							options[i].values.int_val :
 							((relopt_int *) options[i].gen)->default_val;
 						break;
+					case RELOPT_TYPE_OID:
+						*(Oid *) itempos = options[i].isset ?
+							options[i].values.oid_val :
+							((yb_relopt_oid *) options[i].gen)->default_val;
+						break;
 					case RELOPT_TYPE_REAL:
 						*(double *) itempos = options[i].isset ?
 							options[i].values.real_val :
@@ -1885,7 +2099,14 @@ default_reloptions(Datum reloptions, bool validate, relopt_kind kind)
 		{"vacuum_index_cleanup", RELOPT_TYPE_ENUM,
 		offsetof(StdRdOptions, vacuum_index_cleanup)},
 		{"vacuum_truncate", RELOPT_TYPE_BOOL,
-		offsetof(StdRdOptions, vacuum_truncate)}
+		offsetof(StdRdOptions, vacuum_truncate)},
+		{"colocated", RELOPT_TYPE_BOOL,
+		offsetof(StdRdOptions, colocated)},
+		/* Reuse colocated field in StdRdOptions. */
+		{"colocation", RELOPT_TYPE_BOOL, offsetof(StdRdOptions, colocated)},
+		{"colocation_id", RELOPT_TYPE_OID, offsetof(StdRdOptions, colocation_id)},
+		{"table_oid", RELOPT_TYPE_OID, offsetof(StdRdOptions, table_oid)},
+		{"row_type_oid", RELOPT_TYPE_OID, offsetof(StdRdOptions, row_type_oid)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, kind,
@@ -1988,6 +2209,21 @@ build_local_reloptions(local_relopts *relopts, Datum options, bool validate)
 bytea *
 partitioned_table_reloptions(Datum reloptions, bool validate)
 {
+	if (IsYugaByteEnabled())
+	{
+		/* YB supports colocation_id option for partioned tables. */
+		static const relopt_parse_elt tab[] = {
+			{"colocation_id", RELOPT_TYPE_OID,
+			offsetof(YbParitionedTableOptions, colocation_id)},
+			{"colocation", RELOPT_TYPE_BOOL,
+			offsetof(YbParitionedTableOptions, colocation)},
+		};
+
+		return (bytea *) build_reloptions(reloptions, validate,
+										  RELOPT_KIND_PARTITIONED,
+										  sizeof(YbParitionedTableOptions),
+										  tab, lengthof(tab));
+	}
 	/*
 	 * There are no options for partitioned tables yet, but this is able to do
 	 * some validation.
@@ -2009,7 +2245,9 @@ view_reloptions(Datum reloptions, bool validate)
 		{"security_invoker", RELOPT_TYPE_BOOL,
 		offsetof(ViewOptions, security_invoker)},
 		{"check_option", RELOPT_TYPE_ENUM,
-		offsetof(ViewOptions, check_option)}
+		offsetof(ViewOptions, check_option)},
+		{"use_initdb_acl", RELOPT_TYPE_BOOL,
+		offsetof(ViewOptions, yb_use_initdb_acl)}
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
@@ -2102,6 +2340,53 @@ tablespace_reloptions(Datum reloptions, bool validate)
 									  RELOPT_KIND_TABLESPACE,
 									  sizeof(TableSpaceOpts),
 									  tab, lengthof(tab));
+}
+
+/*
+ * Option parser for yugabyte tablespace reloptions
+ */
+bytea *
+yb_tablespace_reloptions(Datum reloptions, bool validate)
+{
+	relopt_value *options;
+	YBTableSpaceOpts *tsopts;
+	int			numoptions;
+	static const relopt_parse_elt yb_tab[] = {
+		{"replica_placement", RELOPT_TYPE_STRING,
+		 offsetof(YBTableSpaceOpts, placement_offset)},
+		{"read_replica_placement", RELOPT_TYPE_STRING,
+		 offsetof(YBTableSpaceOpts, read_replica_placement_offset)}
+	};
+
+	options = parseRelOptions(reloptions, validate, RELOPT_KIND_YB_TABLESPACE, &numoptions);
+
+	/* if none set, we're done */
+	if (numoptions == 0)
+	{
+		return NULL;
+	}
+
+	tsopts = allocateReloptStruct(sizeof(YBTableSpaceOpts), options, numoptions);
+
+	fillRelOptions((void *) tsopts, sizeof(YBTableSpaceOpts), options, numoptions,
+				   validate, yb_tab, lengthof(yb_tab));
+
+	if (validate)
+	{
+		const char *live_replicas_str = NULL;
+		const char *read_replicas_str = NULL;
+
+		if (tsopts->placement_offset > 0)
+			live_replicas_str = (char *) tsopts + tsopts->placement_offset;
+		if (tsopts->read_replica_placement_offset > 0)
+			read_replicas_str = (char *) tsopts + tsopts->read_replica_placement_offset;
+
+		validatePlacementConfigurations(live_replicas_str, read_replicas_str);
+	}
+
+	pfree(options);
+
+	return (bytea *) tsopts;
 }
 
 /*

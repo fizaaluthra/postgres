@@ -2901,7 +2901,8 @@ make_row_comparison_op(ParseState *pstate, List *opname,
 	rcexpr->opfamilies = opfamilies;
 	rcexpr->inputcollids = NIL; /* assign_expr_collations will fix this */
 	rcexpr->largs = largs;
-	rcexpr->rargs = rargs;
+	/* YB: change rargs for batched row compare support */
+	rcexpr->rargs = (Node *) rargs;
 
 	return (Node *) rcexpr;
 }

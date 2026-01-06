@@ -41,6 +41,7 @@ extern Path *create_samplescan_path(PlannerInfo *root, RelOptInfo *rel,
 extern IndexPath *create_index_path(PlannerInfo *root,
 									IndexOptInfo *index,
 									List *indexclauses,
+									List *yb_bitmap_idx_pushdowns,
 									List *indexorderbys,
 									List *indexorderbycols,
 									List *pathkeys,
@@ -48,13 +49,20 @@ extern IndexPath *create_index_path(PlannerInfo *root,
 									bool indexonly,
 									Relids required_outer,
 									double loop_count,
-									bool partial_path);
+									bool partial_path,
+									List *yb_saop_merge_saop_cols);
 extern BitmapHeapPath *create_bitmap_heap_path(PlannerInfo *root,
 											   RelOptInfo *rel,
 											   Path *bitmapqual,
 											   Relids required_outer,
 											   double loop_count,
 											   int parallel_degree);
+extern YbBitmapTablePath *create_yb_bitmap_table_path(PlannerInfo *root,
+													  RelOptInfo *rel,
+													  Path *bitmapqual,
+													  Relids required_outer,
+													  double loop_count,
+													  int parallel_degree);
 extern BitmapAndPath *create_bitmap_and_path(PlannerInfo *root,
 											 RelOptInfo *rel,
 											 List *bitmapquals);
@@ -334,5 +342,18 @@ extern RelOptInfo *build_child_join_rel(PlannerInfo *root,
 										RelOptInfo *outer_rel, RelOptInfo *inner_rel,
 										RelOptInfo *parent_joinrel, List *restrictlist,
 										SpecialJoinInfo *sjinfo, JoinType jointype);
+
+/* YB */
+extern bool yb_has_same_batching_reqs(List *paths);
+extern ParamPathInfo *yb_find_batched_param_path_info(RelOptInfo *rel,
+													  Relids required_outer,
+													  Relids yb_required_batched_outer);
+extern Path *yb_create_distinct_index_path(PlannerInfo *root,
+										   IndexOptInfo *index,
+										   IndexPath *basepath,
+										   int yb_distinct_prefixlen,
+										   int yb_distinct_nkeys);
+extern bool ybfindHintAlias(List *ybfindHintAlias, char *hintAlias);
+extern void yb_assign_unique_path_node_id(PlannerInfo *root, Path *path);
 
 #endif							/* PATHNODE_H */

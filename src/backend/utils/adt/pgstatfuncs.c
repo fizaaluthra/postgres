@@ -33,9 +33,21 @@
 #include "utils/inet.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "commands/progress.h"
+#include "commands/yb_cmds.h"
+#include "inttypes.h"
+#include "pg_yb_utils.h"
+#include "utils/uuid.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
 
 #define HAS_PGSTAT_PERMISSIONS(role)	 (has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS) || has_privs_of_role(GetUserId(), role))
+
+extern bool yb_retrieved_concurrent_index_progress;
+
+uint64_t   *yb_pg_stat_retrieve_concurrent_index_progress();
 
 Datum
 pg_stat_get_numscans(PG_FUNCTION_ARGS)
@@ -464,6 +476,9 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 	ProgressCommandType cmdtype;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
+	uint64_t   *index_progress = NULL;
+	uint64_t   *index_progress_iterator = NULL;
+
 	/* Translate command name into command type code. */
 	if (pg_strcasecmp(cmd, "VACUUM") == 0)
 		cmdtype = PROGRESS_COMMAND_VACUUM;
@@ -483,6 +498,27 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 				 errmsg("invalid command name: \"%s\"", cmd)));
 
 	InitMaterializedSRF(fcinfo, 0);
+
+	/*
+	 * YB: Fetch stats for in-progress concurrent create indexes that aren't
+	 * captured in the local backend entry from master. We avoid reading these
+	 * stats while constructing the local backend entry in
+	 * pg_read_current_stats() in order to avoid extraneous RPCs to master
+	 * (in case we read from pg_stat_* views within a transaction but don't
+	 * read from pg_stat_progress_create_index). Since these stats are computed
+	 * on the fly and not at the time of pg_read_current_stats(), they may not
+	 * be consistent with other backend stats.
+	 * Also, the fetched values are constant within a transaction - we only
+	 * fetch from master if we haven't already done so within the current
+	 * transaction.
+	 */
+	if (IsYugaByteEnabled() && cmdtype == PROGRESS_COMMAND_CREATE_INDEX &&
+		!yb_retrieved_concurrent_index_progress)
+	{
+		index_progress = yb_pg_stat_retrieve_concurrent_index_progress();
+		index_progress_iterator = index_progress;
+		yb_retrieved_concurrent_index_progress = true;
+	}
 
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
@@ -506,9 +542,38 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 		/*
 		 * Report values for only those backends which are running the given
 		 * command.
+		 *
+		 * YB: for COPY, report even if the command finished.
 		 */
-		if (!beentry || beentry->st_progress_command != cmdtype)
+		if (!beentry || (beentry->st_progress_command != cmdtype &&
+						 beentry->st_progress_command != PROGRESS_COMMAND_COPY))
 			continue;
+
+		/*
+		 * Fill in tuples_done for concurrent create indexes on YB relations
+		 * that are in the backfilling phase. Note: This block will not be
+		 * executed for indexes on non-YB relations (temporary relations)
+		 * because they are always built non-concurrently.
+		 */
+		if (IsYugaByteEnabled() && cmdtype == PROGRESS_COMMAND_CREATE_INDEX &&
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_COMMAND]
+			 == PROGRESS_CREATEIDX_COMMAND_CREATE_CONCURRENTLY) &&
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_PHASE]
+			 == YB_PROGRESS_CREATEIDX_BACKFILLING) &&
+			index_progress_iterator)
+		{
+			/*
+			 * Note: we expect the ordering of the indexes in index_progress to
+			 * to match the ordering within the backend status array -
+			 * therefore we don't need to loop through index_progress to find
+			 * the relevant entry
+			 */
+			beentry->st_progress_param[PROGRESS_CREATEIDX_TUPLES_DONE]
+				= (*index_progress_iterator > PG_INT64_MAX ?
+				   PG_INT64_MAX :
+				   (int64) *index_progress_iterator);
+			index_progress_iterator++;
+		}
 
 		/* Value available to all callers */
 		values[0] = Int32GetDatum(beentry->st_procpid);
@@ -528,8 +593,42 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 				nulls[i + 3] = true;
 		}
 
+		/*
+		 * YB: Set the columns of pg_stat_progress_create_index that are unused
+		 * in YB to null.
+		 */
+		if (IsYugaByteEnabled() && cmdtype == PROGRESS_COMMAND_CREATE_INDEX)
+		{
+			for (i = 0; i < PGSTAT_NUM_PROGRESS_PARAM; i++)
+			{
+				/*
+				 * In YB, we only use the command, index_relid, phase,
+				 * tuples_total, tuples_done, partitions_total, partitions_done
+				 * columns for YB indexes. For temp indexes, tuples_total and
+				 * tuples_done are never computed (the beentry progress params
+				 * are set to an invalid value (YB_PROGRESS_CREATEIDX_INVALID)
+				 * so we set those to null too.
+				 */
+				if (i == PROGRESS_CREATEIDX_COMMAND ||
+					i == PROGRESS_CREATEIDX_INDEX_OID ||
+					i == PROGRESS_CREATEIDX_PHASE ||
+					i == PROGRESS_CREATEIDX_PARTITIONS_TOTAL ||
+					i == PROGRESS_CREATEIDX_PARTITIONS_DONE ||
+					(beentry->st_progress_param[i] !=
+					 YB_PROGRESS_CREATEIDX_INVALID &&
+					 (i == PROGRESS_CREATEIDX_TUPLES_TOTAL ||
+					  i == PROGRESS_CREATEIDX_TUPLES_DONE)))
+					continue;
+				nulls[i + 3] = true;
+			}
+		}
+
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+
+	/* YB */
+	if (index_progress)
+		pfree(index_progress);
 
 	return (Datum) 0;
 }
@@ -541,19 +640,50 @@ Datum
 pg_stat_get_activity(PG_FUNCTION_ARGS)
 {
 #define PG_STAT_GET_ACTIVITY_COLS	30
+/* YB specific fields in pg_stat_activity */
+#define YB_PG_STAT_GET_ACTIVITY_COLS 1
+#define YB_BACKEND_XID_COL			PG_STAT_GET_ACTIVITY_COLS
 	int			num_backends = pgstat_fetch_stat_numbackends();
 	int			curr_backend;
 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TimestampTz yb_txn_rpc_timestamp;
 
 	InitMaterializedSRF(fcinfo, 0);
+
+	YbcPgSessionTxnInfo *txn_infos = NULL;
+
+	YbcReplicationSlotDescriptor *yb_replication_slots = NULL;
+	size_t		yb_numreplicationslots = 0;
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_pg_locks)
+	{
+		txn_infos = (YbcPgSessionTxnInfo *)
+			palloc0(sizeof(YbcPgSessionTxnInfo) * num_backends);
+		/* 1-based index */
+		for (curr_backend = 1; curr_backend <= num_backends; ++curr_backend)
+		{
+			const PgBackendStatus *beentry = pgstat_fetch_stat_beentry(curr_backend);
+
+			if (!beentry)
+				break;
+			txn_infos[curr_backend - 1].session_id = beentry->yb_session_id;
+		}
+		yb_txn_rpc_timestamp = GetCurrentTimestamp();
+		HandleYBStatus(YBCPgActiveTransactions(txn_infos, num_backends));
+	}
+
+	if (IsYugaByteEnabled())
+		YBCListReplicationSlots(&yb_replication_slots, &yb_numreplicationslots);
 
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
 	{
 		/* for each row */
-		Datum		values[PG_STAT_GET_ACTIVITY_COLS];
-		bool		nulls[PG_STAT_GET_ACTIVITY_COLS];
+		Datum		values[PG_STAT_GET_ACTIVITY_COLS +
+						   YB_PG_STAT_GET_ACTIVITY_COLS];
+		bool		nulls[PG_STAT_GET_ACTIVITY_COLS +
+						  YB_PG_STAT_GET_ACTIVITY_COLS];
 		LocalPgBackendStatus *local_beentry;
 		PgBackendStatus *beentry;
 		PGPROC	   *proc;
@@ -617,6 +747,23 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 		else
 			nulls[16] = true;
 
+		if (IsYugaByteEnabled())
+		{
+			int			slotno;
+
+			for (slotno = 0; slotno < yb_numreplicationslots; slotno++)
+			{
+				YbcReplicationSlotDescriptor *slot = &yb_replication_slots[slotno];
+
+				if (slot->active_pid == beentry->st_procpid)
+				{
+					values[16] = slot->xmin;
+					nulls[16] = false;
+					break;
+				}
+			}
+		}
+
 		/* Values only available to role member or pg_read_all_stats */
 		if (HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
 		{
@@ -657,7 +804,9 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 			proc = BackendPidGetProc(beentry->st_procpid);
 
-			if (proc == NULL && (beentry->st_backendType != B_BACKEND))
+			if (proc == NULL && (beentry->st_backendType != B_BACKEND &&
+								 beentry->st_backendType != YB_AUTO_ANALYZE_BACKEND &&
+								 beentry->st_backendType != YB_YSQL_CONN_MGR))
 			{
 				/*
 				 * For an auxiliary process, retrieve process info from
@@ -711,7 +860,8 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			 * date.
 			 */
 			if (beentry->st_xact_start_timestamp != 0 &&
-				beentry->st_backendType != B_WAL_SENDER)
+				beentry->st_backendType != B_WAL_SENDER &&
+				beentry->st_backendType != YB_YSQL_CONN_MGR_WAL_SENDER)
 				values[8] = TimestampTzGetDatum(beentry->st_xact_start_timestamp);
 			else
 				nulls[8] = true;
@@ -891,6 +1041,28 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			nulls[27] = true;
 			nulls[28] = true;
 			nulls[29] = true;
+		}
+
+		nulls[YB_BACKEND_XID_COL] = true;
+
+		/*
+		 * YB: The activity_start_timestamp is updated at the start of every
+		 * query. When the query start timestamp is later (greater) than the
+		 * timestamp of the RPC above, this indicates that the data in the RPC
+		 * is out-of-date. In such cases, we skip printing the transaction ID.
+		 */
+
+		if (yb_enable_pg_locks && beentry->yb_session_id &&
+			beentry->st_activity_start_timestamp <= yb_txn_rpc_timestamp)
+		{
+			Assert(txn_infos);
+			const YbcPgSessionTxnInfo *info = txn_infos + curr_backend - 1;
+
+			if (info->is_not_null)
+			{
+				values[YB_BACKEND_XID_COL] = UUIDPGetDatum(&info->txn_id);
+				nulls[YB_BACKEND_XID_COL] = false;
+			}
 		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
@@ -1182,6 +1354,75 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 										CStringGetDatum(remote_port)));
 }
 
+Datum
+yb_pg_stat_get_backend_catalog_version(PG_FUNCTION_ARGS)
+{
+	int32		beid = PG_GETARG_INT32(0);
+	PgBackendStatus *beentry;
+
+	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	if (beentry->yb_st_catalog_version.has_version)
+		PG_RETURN_DATUM(UInt64GetDatum(beentry->yb_st_catalog_version.version));
+	else
+		PG_RETURN_NULL();
+}
+
+/*
+ * Returns a record of (datid, local_catalog_version) about the backend
+ * with the specified process ID if the backend has both a valid datid
+ * (OidIsValid) and a local_catalog_version (> 0), or one record for each
+ * such valid backend in the system if NULL is specified.
+ */
+Datum
+yb_pg_stat_get_backend_local_catalog_version(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_ARGISNULL(0) ? InvalidPid : PG_GETARG_INT32(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			num_backends = pgstat_fetch_stat_numbackends();
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* 1-based index */
+	for (i = 1; i <= num_backends; i++)
+	{
+		PgBackendStatus *beentry;
+		LocalPgBackendStatus *local_beentry = pgstat_fetch_stat_local_beentry(i);
+
+		if (!local_beentry)
+			continue;
+
+		beentry = &local_beentry->backendStatus;
+		if (pid != InvalidPid && beentry->st_procpid != pid)
+			continue;
+
+		/*
+		 * ash has version but also has STATE_UNDEFINED, we do not want to
+		 * have a PG background worker to hold off garbage collection of
+		 * tserver invalidation messages.
+		 */
+		if (beentry->st_state == STATE_UNDEFINED)
+			continue;
+
+		/* datid and local_catalog_version are available to all callers */
+		if (beentry->st_databaseid == InvalidOid ||
+			beentry->yb_st_catalog_version.version == 0)
+			continue;
+
+		/* for each row */
+		Datum		values[2];
+		bool		nulls[2];
+
+		values[0] = ObjectIdGetDatum(beentry->st_databaseid);
+		values[1] = UInt64GetDatum(beentry->yb_st_catalog_version.version);
+		nulls[0] = false;
+		nulls[1] = false;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
 
 Datum
 pg_stat_get_db_numbackends(PG_FUNCTION_ARGS)
@@ -2419,4 +2660,117 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 	PgStat_Kind kind = pgstat_get_kind_from_str(stats_type);
 
 	PG_RETURN_BOOL(pgstat_have_entry(kind, dboid, objoid));
+}
+
+/* Returns backend_allocated_mem_bytes from the process's beid */
+Datum
+yb_pg_stat_get_backend_allocated_mem_bytes(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_memory_tracking)
+		PG_RETURN_NULL();
+
+	int32		beid = PG_GETARG_INT32(0);
+	int64		result;
+	PgBackendStatus *beentry;
+
+	if ((beentry = pgstat_fetch_stat_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	result = beentry->yb_st_allocated_mem_bytes;
+
+	PG_RETURN_INT64(result);
+}
+
+/* Returns rss_mem_bytes from the process's beid */
+Datum
+yb_pg_stat_get_backend_rss_mem_bytes(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_memory_tracking)
+		PG_RETURN_NULL();
+
+	int32		beid = PG_GETARG_INT32(0);
+	int64		result;
+	LocalPgBackendStatus *local_beentry;
+
+	if ((local_beentry = pgstat_fetch_stat_local_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	result = local_beentry->yb_backend_rss_mem_bytes;
+
+	PG_RETURN_INT64(result);
+}
+
+/* Returns rss_mem_bytes from the process's beid */
+Datum
+yb_pg_stat_get_backend_pss_mem_bytes(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_memory_tracking)
+		PG_RETURN_NULL();
+
+	int32		beid = PG_GETARG_INT32(0);
+	int64		result;
+	LocalPgBackendStatus *local_beentry;
+
+	if ((local_beentry = pgstat_fetch_stat_local_beentry(beid)) == NULL)
+		PG_RETURN_NULL();
+
+	result = local_beentry->yb_backend_pss_mem_bytes;
+
+	PG_RETURN_INT64(result);
+}
+
+/*
+ * In YB, this function is used to retrieve stats for in-progress concurrent
+ * CREATE INDEX from master.
+ */
+uint64_t *
+yb_pg_stat_retrieve_concurrent_index_progress()
+{
+	int			num_backends = pgstat_fetch_stat_numbackends();
+	int			curr_backend;
+	int			num_indexes = 0;
+	Oid			database_oids[num_backends];
+	Oid			index_oids[num_backends];
+	uint64_t   *num_rows_read_from_table = NULL;
+
+	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
+	{
+		PgBackendStatus *beentry;
+		LocalPgBackendStatus *local_beentry;
+
+		local_beentry = pgstat_fetch_stat_local_beentry(curr_backend);
+
+		if (!local_beentry)
+			continue;
+
+		beentry = &local_beentry->backendStatus;
+
+		/*
+		 * Filter out commands besides concurrent create indexes on YB
+		 * relations that are in the backfilling phase.  Note: This block will
+		 * not be executed for indexes on non-YB relations (temporary
+		 * relations) because they are always built non-concurrently.
+		 */
+		if (beentry->st_progress_command != PROGRESS_COMMAND_CREATE_INDEX ||
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_COMMAND]
+			 != PROGRESS_CREATEIDX_COMMAND_CREATE_CONCURRENTLY) ||
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_PHASE]
+			 < YB_PROGRESS_CREATEIDX_BACKFILLING))
+			continue;
+
+		database_oids[num_indexes] = beentry->st_databaseid;
+		index_oids[num_indexes++] =
+			beentry->st_progress_param[PROGRESS_CREATEIDX_INDEX_OID];
+	}
+
+	if (num_indexes > 0)
+	{
+		num_rows_read_from_table = palloc(sizeof(uint64_t) * num_indexes);
+		HandleYBStatus(YBCGetIndexBackfillProgress(index_oids, database_oids,
+												   num_rows_read_from_table,
+												   NULL,
+												   num_indexes));
+	}
+
+	return num_rows_read_from_table;
 }

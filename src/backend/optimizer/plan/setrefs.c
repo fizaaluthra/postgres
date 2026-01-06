@@ -28,6 +28,10 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "nodes/execnodes.h"
+#include "pg_yb_utils.h"
+
 
 typedef struct
 {
@@ -561,6 +565,20 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 								  rtoffset, NUM_EXEC_QUAL(plan));
 			}
 			break;
+		case T_YbSeqScan:
+			{
+				YbSeqScan  *splan = (YbSeqScan *) plan;
+
+				splan->scan.scanrelid += rtoffset;
+				splan->yb_pushdown.quals =
+					fix_scan_list(root, splan->yb_pushdown.quals, rtoffset, NUM_EXEC_QUAL(plan));
+				splan->scan.plan.targetlist =
+					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset,
+								  NUM_EXEC_TLIST(plan));
+				splan->scan.plan.qual =
+					fix_scan_list(root, splan->scan.plan.qual, rtoffset, NUM_EXEC_QUAL(plan));
+			}
+			break;
 		case T_SampleScan:
 			{
 				SampleScan *splan = (SampleScan *) plan;
@@ -588,6 +606,41 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
 								  rtoffset, NUM_EXEC_QUAL(plan));
+				splan->yb_rel_pushdown.quals =
+					fix_scan_list(root, splan->yb_rel_pushdown.quals,
+								  rtoffset, NUM_EXEC_QUAL(plan));
+				/*
+				 * YB: Index quals has to be fixed to refer to index columns,
+				 * not main table columns, so we need to index the indextlist.
+				 */
+				if (splan->yb_idx_pushdown.quals)
+				{
+					indexed_tlist *index_itlist;
+
+					index_itlist = build_tlist_index(splan->indextlist);
+					splan->yb_idx_pushdown.quals = (List *)
+						fix_upper_expr(root,
+									   (Node *) splan->yb_idx_pushdown.quals,
+									   index_itlist,
+									   INDEX_VAR,
+									   rtoffset,
+									   NUM_EXEC_QUAL(plan));
+					splan->yb_idx_pushdown.colrefs = (List *)
+						fix_upper_expr(root,
+									   (Node *) splan->yb_idx_pushdown.colrefs,
+									   index_itlist,
+									   INDEX_VAR,
+									   rtoffset,
+									   NUM_EXEC_TLIST(plan));
+					pfree(index_itlist);
+				}
+				/*
+				 * YB: Also, indextlist has to be converted as ANALYZE may use
+				 * it.
+				 */
+				splan->indextlist =
+					fix_scan_list(root, splan->indextlist, rtoffset,
+								  NUM_EXEC_TLIST(plan));
 				splan->indexqual =
 					fix_scan_list(root, splan->indexqual,
 								  rtoffset, 1);
@@ -624,6 +677,51 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 								  rtoffset, NUM_EXEC_QUAL(plan));
 			}
 			break;
+		case T_YbBitmapIndexScan:
+			{
+				YbBitmapIndexScan *splan = (YbBitmapIndexScan *) plan;
+
+				splan->scan.scanrelid += rtoffset;
+				/* no need to fix targetlist and qual */
+				Assert(splan->scan.plan.targetlist == NIL);
+				Assert(splan->scan.plan.qual == NIL);
+				splan->indexqual =
+					fix_scan_list(root, splan->indexqual, rtoffset, 1);
+				splan->indexqualorig =
+					fix_scan_list(root, splan->indexqualorig, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+				/*
+				 * Index quals has to be fixed to refer to index columns, not
+				 * main table columns, so we need to index the indextlist.
+				 * Also, indextlist has to be converted, as ANALYZE may use it.
+				 * Skip that if we don't have index pushdown quals.
+				 */
+				if (splan->yb_idx_pushdown.quals)
+				{
+					indexed_tlist *index_itlist;
+
+					index_itlist = build_tlist_index(splan->indextlist);
+					splan->yb_idx_pushdown.quals = (List *)
+						fix_upper_expr(root,
+									   (Node *) splan->yb_idx_pushdown.quals,
+									   index_itlist,
+									   INDEX_VAR,
+									   rtoffset,
+									   NUM_EXEC_QUAL(plan));
+					splan->yb_idx_pushdown.colrefs = (List *)
+						fix_upper_expr(root,
+									   (Node *) splan->yb_idx_pushdown.colrefs,
+									   index_itlist,
+									   INDEX_VAR,
+									   rtoffset,
+									   NUM_EXEC_TLIST(plan));
+					splan->indextlist =
+						fix_scan_list(root, splan->indextlist, rtoffset,
+									  NUM_EXEC_TLIST(plan));
+					pfree(index_itlist);
+				}
+			}
+			break;
 		case T_BitmapHeapScan:
 			{
 				BitmapHeapScan *splan = (BitmapHeapScan *) plan;
@@ -640,6 +738,37 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 								  rtoffset, NUM_EXEC_QUAL(plan));
 			}
 			break;
+		case T_YbBitmapTableScan:
+			{
+				YbBitmapTableScan *splan = (YbBitmapTableScan *) plan;
+
+				splan->scan.scanrelid += rtoffset;
+				splan->scan.plan.targetlist =
+					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset,
+								  NUM_EXEC_TLIST(plan));
+				splan->scan.plan.qual =
+					fix_scan_list(root, splan->scan.plan.qual, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+
+				splan->rel_pushdown.quals =
+					fix_scan_list(root, splan->rel_pushdown.quals, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+
+				splan->recheck_pushdown.quals =
+					fix_scan_list(root, splan->recheck_pushdown.quals, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+				splan->recheck_local_quals =
+					fix_scan_list(root, splan->recheck_local_quals, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+
+				splan->fallback_pushdown.quals =
+					fix_scan_list(root, splan->fallback_pushdown.quals, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+				splan->fallback_local_quals =
+					fix_scan_list(root, splan->fallback_local_quals, rtoffset,
+								  NUM_EXEC_QUAL(plan));
+			}
+			break;
 		case T_TidScan:
 			{
 				TidScan    *splan = (TidScan *) plan;
@@ -650,6 +779,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 								  rtoffset, NUM_EXEC_TLIST(plan));
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
+								  rtoffset, NUM_EXEC_QUAL(plan));
+				splan->yb_rel_pushdown.quals =
+					fix_scan_list(root, splan->yb_rel_pushdown.quals,
 								  rtoffset, NUM_EXEC_QUAL(plan));
 				splan->tidquals =
 					fix_scan_list(root, splan->tidquals,
@@ -771,6 +903,7 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			break;
 
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
 			set_join_references(root, (Join *) plan, rtoffset);
@@ -1276,6 +1409,20 @@ set_indexonlyscan_references(PlannerInfo *root,
 					   INDEX_VAR,
 					   rtoffset,
 					   NUM_EXEC_QUAL((Plan *) plan));
+	plan->yb_pushdown.quals = (List *)
+		fix_upper_expr(root,
+					   (Node *) plan->yb_pushdown.quals,
+					   index_itlist,
+					   INDEX_VAR,
+					   rtoffset,
+					   NUM_EXEC_QUAL((Plan *) plan));
+	plan->yb_pushdown.colrefs = (List *)
+		fix_upper_expr(root,
+					   (Node *) plan->yb_pushdown.colrefs,
+					   index_itlist,
+					   INDEX_VAR,
+					   rtoffset,
+					   NUM_EXEC_TLIST((Plan *) plan));
 	/* indexqual is already transformed to reference index columns */
 	plan->indexqual = fix_scan_list(root, plan->indexqual,
 									rtoffset, 1);
@@ -1318,6 +1465,22 @@ set_subqueryscan_references(PlannerInfo *root,
 		 * We can omit the SubqueryScan node and just pull up the subplan.
 		 */
 		result = clean_up_removed_plan_level((Plan *) plan, plan->subplan);
+
+		if (IsYugaByteEnabled() && rel->ybHintAlias != NULL)
+		{
+			/*
+			 * We are eliminating this subquery scan so put its hint alias on
+			 * its input Plan.
+			 */
+			if (yb_enable_planner_trace)
+			{
+				ereport(DEBUG1,
+						(errmsg("\nPlan id %d inherited hint alias : [block %d : table %s (uid = %d, relid = %d)]",
+								plan->subplan->plan_node_id, root->ybBlockId, rel->ybHintAlias, rel->ybUniqueBaseId, rel->relid)));
+			}
+
+			result->ybInheritedHintAlias = rel->ybHintAlias;
+		}
 	}
 	else
 	{
@@ -2149,6 +2312,23 @@ fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
 								  (void *) context);
 }
 
+static int
+YbBNL_hinfo_cmp_inner_att(const void *arg_1,
+						  const void *arg_2)
+{
+	const YbBNLHashClauseInfo *hinfo_1 = (const YbBNLHashClauseInfo *) arg_1;
+	const YbBNLHashClauseInfo *hinfo_2 = (const YbBNLHashClauseInfo *) arg_2;
+
+	if (!OidIsValid(hinfo_1->hashOp))
+		return -1;
+
+	if (!OidIsValid(hinfo_2->hashOp))
+		return 1;
+
+	return ((hinfo_1->innerHashAttNo > hinfo_2->innerHashAttNo) -
+			(hinfo_1->innerHashAttNo < hinfo_2->innerHashAttNo));
+}
+
 /*
  * set_join_references
  *	  Modify the target list and quals of a join node to reference its
@@ -2184,9 +2364,11 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 								   NUM_EXEC_QUAL((Plan *) join));
 
 	/* Now do join-type-specific stuff */
-	if (IsA(join, NestLoop))
+	if (IsA(join, NestLoop) || IsA(join, YbBatchedNestLoop))
 	{
-		NestLoop   *nl = (NestLoop *) join;
+		NestLoop   *nl = (IsA(join, NestLoop) ?
+						  (NestLoop *) join :
+						  &((YbBatchedNestLoop *) join)->nl);
 		ListCell   *lc;
 
 		foreach(lc, nl->nestParams)
@@ -2204,6 +2386,79 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 				  nlp->paramval->varno == OUTER_VAR))
 				elog(ERROR, "NestLoopParam was not reduced to a simple Var");
 		}
+
+		ListCell   *l;
+
+		if (IsA(join, YbBatchedNestLoop))
+		{
+			YbBatchedNestLoop *batchednl = (YbBatchedNestLoop *) join;
+
+			YbBNLHashClauseInfo *current_hinfo = batchednl->hashClauseInfos;
+
+			foreach(l, join->joinqual)
+			{
+				Expr	   *clause = (Expr *) lfirst(l);
+				Oid			hashOp = current_hinfo->hashOp;
+
+				if (OidIsValid(hashOp))
+				{
+					Assert(IsA(clause, OpExpr));
+					OpExpr	   *opexpr = (OpExpr *) clause;
+
+					Assert(list_length(opexpr->args) == 2);
+					Expr	   *leftArg = linitial(opexpr->args);
+					Expr	   *rightArg = lsecond(opexpr->args);
+
+					if (IsA(leftArg, RelabelType))
+						leftArg = ((RelabelType *) leftArg)->arg;
+
+					if (IsA(rightArg, RelabelType))
+						rightArg = ((RelabelType *) rightArg)->arg;
+
+					Var		   *innerArg;
+					Expr	   *outerArg;
+
+					if (IsA((Expr *) leftArg, Var) &&
+						((Var *) leftArg)->varno == INNER_VAR)
+					{
+						innerArg = (Var *) leftArg;
+						outerArg = rightArg;
+					}
+					else
+					{
+						outerArg = leftArg;
+						innerArg = (Var *) rightArg;
+					}
+
+					Assert(innerArg->varno = INNER_VAR);
+
+					current_hinfo->innerHashAttNo =
+						((Var *) innerArg)->varattno;
+					current_hinfo->outerParamExpr = outerArg;
+					current_hinfo->orig_expr = clause;
+				}
+				current_hinfo++;
+			}
+
+			qsort(batchednl->hashClauseInfos, join->joinqual->length,
+				  sizeof(YbBNLHashClauseInfo), YbBNL_hinfo_cmp_inner_att);
+
+			YbBNLHashClauseInfo *valid_bnl_hinfos = batchednl->hashClauseInfos;
+			int			num_invalid = 0;
+
+			while (num_invalid < batchednl->num_hashClauseInfos &&
+				   !OidIsValid(valid_bnl_hinfos->hashOp))
+			{
+				valid_bnl_hinfos++;
+				num_invalid++;
+			}
+			if (num_invalid == batchednl->num_hashClauseInfos)
+				valid_bnl_hinfos = NULL;
+
+			batchednl->hashClauseInfos = valid_bnl_hinfos;
+			batchednl->num_hashClauseInfos -= num_invalid;
+		}
+
 	}
 	else if (IsA(join, MergeJoin))
 	{
@@ -3031,6 +3286,30 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 	/* Special cases (apply only AFTER failing to match to lower tlist) */
 	if (IsA(node, Param))
 		return fix_param_node(context->root, (Param *) node);
+	if (IsA(node, YbExprColrefDesc))
+	{
+		YbExprColrefDesc *colref = castNode(YbExprColrefDesc, node);
+		AttrNumber	varattno = colref->attno;
+		tlist_vinfo *vinfo;
+		int			i;
+
+		vinfo = context->subplan_itlist->vars;
+		i = context->subplan_itlist->num_vars;
+		while (i-- > 0)
+		{
+			if (vinfo->varattno == varattno)
+			{
+				/* Found a match */
+				YbExprColrefDesc *newcolref = makeNode(YbExprColrefDesc);
+
+				*newcolref = *colref;
+				newcolref->attno = vinfo->resno;
+				return (Node *) newcolref;
+			}
+			vinfo++;
+		}
+		elog(ERROR, "column reference not found in subplan target list");
+	}
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;

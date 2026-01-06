@@ -46,6 +46,8 @@ LIBS += $(PTHREAD_LIBS)
 # If you add objects here, see also src/tools/msvc/Mkvcbuild.pm
 
 OBJS_COMMON = \
+	pg_yb_common.o \
+	\
 	archive.o \
 	base64.o \
 	checksum_helper.o \

@@ -23,6 +23,9 @@
 #include "catalog/pg_constraint_d.h"
 #include "nodes/pg_list.h"
 
+/* YB includes */
+#include "utils/catcache.h"
+
 /* ----------------
  *		pg_constraint definition.  cpp turns this into
  *		typedef struct FormData_pg_constraint

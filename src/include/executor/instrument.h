@@ -15,6 +15,9 @@
 
 #include "portability/instr_time.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 /*
  * BufferUsage and WalUsage counters keep being incremented infinitely,
@@ -63,6 +66,37 @@ typedef enum InstrumentOption
 	INSTRUMENT_ALL = PG_INT32_MAX
 } InstrumentOption;
 
+/*
+ * YugabyteDB RPC statistics
+ */
+typedef struct YbPgRpcStats
+{
+	double		count;			/* # of RPCs */
+	double		rows_scanned;	/* # of rows scanned by RPCs */
+	double		wait_time;		/* RPC wait time (ns) */
+  double		rows_received; /* # of rows received from RPCs */
+} YbPgRpcStats;
+
+typedef struct YbInstrumentation
+{
+	YbPgRpcStats tbl_reads;
+	YbPgRpcStats index_reads;
+	YbPgRpcStats catalog_reads;
+	YbPgRpcStats write_flushes;
+	double		tbl_read_ops;
+	double		index_read_ops;
+	double		catalog_read_ops;
+	double		tbl_writes;
+	double		index_writes;
+	double		catalog_writes;
+
+	YbcPgExecStorageMetrics *read_metrics;
+	YbcPgExecStorageMetrics *write_metrics;
+
+	uint64_t	rows_removed_by_recheck;
+	uint64_t	commit_wait;
+} YbInstrumentation;
+
 typedef struct Instrumentation
 {
 	/* Parameters set at node creation: */
@@ -88,6 +122,8 @@ typedef struct Instrumentation
 	double		nfiltered2;		/* # of tuples removed by "other" quals */
 	BufferUsage bufusage;		/* total buffer usage */
 	WalUsage	walusage;		/* total WAL usage */
+
+	YbInstrumentation yb_instr; /* YB specific instrumentation stats */
 } Instrumentation;
 
 typedef struct WorkerInstrumentation

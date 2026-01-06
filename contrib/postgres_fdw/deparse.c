@@ -102,6 +102,7 @@ typedef struct deparse_expr_cxt
 								 * a base relation. */
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
+	AttrNumber	yb_min_attr;	/* FirstLowInvalidHeapNumber for Vars */
 } deparse_expr_cxt;
 
 #define REL_ALIAS_PREFIX	"r"
@@ -131,6 +132,7 @@ static void deparseTargetList(StringInfo buf,
 							  bool is_returning,
 							  Bitmapset *attrs_used,
 							  bool qualify_col,
+							  AttrNumber yb_min_attr,
 							  List **retrieved_attrs);
 static void deparseExplicitTargetList(List *tlist,
 									  bool is_returning,
@@ -142,12 +144,16 @@ static void deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 								 bool trig_after_row,
 								 List *withCheckOptionList,
 								 List *returningList,
+								 AttrNumber yb_min_attr,
 								 List **retrieved_attrs);
 static void deparseColumnRef(StringInfo buf, int varno, int varattno,
-							 RangeTblEntry *rte, bool qualify_col);
+							 RangeTblEntry *rte, bool qualify_col,
+							 AttrNumber yb_min_attr);
 static void deparseRelation(StringInfo buf, Relation rel);
 static void deparseExpr(Expr *expr, deparse_expr_cxt *context);
 static void deparseVar(Var *node, deparse_expr_cxt *context);
+static void deparseYbBatchedExpr(YbBatchedExpr *node,
+								 deparse_expr_cxt *context);
 static void deparseConst(Const *node, deparse_expr_cxt *context, int showtype);
 static void deparseParam(Param *node, deparse_expr_cxt *context);
 static void deparseSubscriptingRef(SubscriptingRef *node, deparse_expr_cxt *context);
@@ -349,7 +355,7 @@ foreign_expr_walker(Node *node,
 					 * particular, almost certainly doesn't match).
 					 */
 					if (var->varattno < 0 &&
-						var->varattno != SelfItemPointerAttributeNumber)
+						var->varattno != fpinfo->yb_min_attr)
 						return false;
 
 					/* Else check the collation */
@@ -1177,6 +1183,7 @@ deparseSelectStmtForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 	context.foreignrel = rel;
 	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.params_list = params_list;
+	context.yb_min_attr = fpinfo->yb_min_attr;
 
 	/* Construct SELECT clause */
 	deparseSelectSql(tlist, is_subquery, retrieved_attrs, &context);
@@ -1283,7 +1290,8 @@ deparseSelectSql(List *tlist, bool is_subquery, List **retrieved_attrs,
 		Relation	rel = table_open(rte->relid, NoLock);
 
 		deparseTargetList(buf, rte, foreignrel->relid, rel, false,
-						  fpinfo->attrs_used, false, retrieved_attrs);
+						  fpinfo->attrs_used, false, fpinfo->yb_min_attr,
+						  retrieved_attrs);
 		table_close(rel, NoLock);
 	}
 }
@@ -1337,6 +1345,7 @@ deparseTargetList(StringInfo buf,
 				  bool is_returning,
 				  Bitmapset *attrs_used,
 				  bool qualify_col,
+				  AttrNumber yb_min_attr,
 				  List **retrieved_attrs)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
@@ -1347,7 +1356,7 @@ deparseTargetList(StringInfo buf,
 	*retrieved_attrs = NIL;
 
 	/* If there's a whole-row reference, we'll need all the columns. */
-	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
+	have_wholerow = bms_is_member(0 - yb_min_attr,
 								  attrs_used);
 
 	first = true;
@@ -1360,7 +1369,7 @@ deparseTargetList(StringInfo buf,
 			continue;
 
 		if (have_wholerow ||
-			bms_is_member(i - FirstLowInvalidHeapAttributeNumber,
+			bms_is_member(i - yb_min_attr,
 						  attrs_used))
 		{
 			if (!first)
@@ -1369,7 +1378,7 @@ deparseTargetList(StringInfo buf,
 				appendStringInfoString(buf, " RETURNING ");
 			first = false;
 
-			deparseColumnRef(buf, rtindex, i, rte, qualify_col);
+			deparseColumnRef(buf, rtindex, i, rte, qualify_col, yb_min_attr);
 
 			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
 		}
@@ -1378,8 +1387,10 @@ deparseTargetList(StringInfo buf,
 	/*
 	 * Add ctid if needed.  We currently don't support retrieving any other
 	 * system columns.
+	 * YB note: The target list will contain CTID only when the server is of
+	 * type postgres.
 	 */
-	if (bms_is_member(SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber,
+	if (bms_is_member(SelfItemPointerAttributeNumber - yb_min_attr,
 					  attrs_used))
 	{
 		if (!first)
@@ -1395,6 +1406,23 @@ deparseTargetList(StringInfo buf,
 		*retrieved_attrs = lappend_int(*retrieved_attrs,
 									   SelfItemPointerAttributeNumber);
 	}
+	else if (bms_is_member(YBTupleIdAttributeNumber - yb_min_attr,
+						   attrs_used))
+	{
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		else if (is_returning)
+			appendStringInfoString(buf, " RETURNING ");
+		first = false;
+
+		if (qualify_col)
+			ADD_REL_QUALIFIER(buf, rtindex);
+		appendStringInfoString(buf, "ybctid");
+
+		*retrieved_attrs = lappend_int(*retrieved_attrs,
+									   YBTupleIdAttributeNumber);
+	}
+
 
 	/* Don't generate bad syntax if no undropped columns */
 	if (first && !is_returning)
@@ -1756,6 +1784,7 @@ deparseFromExprForRel(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 			context.scanrel = foreignrel;
 			context.root = root;
 			context.params_list = params_list;
+			context.yb_min_attr = fpinfo->yb_min_attr;
 
 			appendStringInfoChar(buf, '(');
 			appendConditions(fpinfo->joinclauses, &context);
@@ -1879,6 +1908,7 @@ deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 	AttrNumber	pindex;
 	bool		first;
 	ListCell   *lc;
+	AttrNumber	yb_min_attr = yb_get_min_attr_from_ftrelid(RelationGetRelid(rel));
 
 	appendStringInfoString(buf, "INSERT INTO ");
 	deparseRelation(buf, rel);
@@ -1896,7 +1926,7 @@ deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 				appendStringInfoString(buf, ", ");
 			first = false;
 
-			deparseColumnRef(buf, rtindex, attnum, rte, false);
+			deparseColumnRef(buf, rtindex, attnum, rte, false, yb_min_attr);
 		}
 
 		appendStringInfoString(buf, ") VALUES (");
@@ -1932,7 +1962,8 @@ deparseInsertSql(StringInfo buf, RangeTblEntry *rte,
 
 	deparseReturningList(buf, rte, rtindex, rel,
 						 rel->trigdesc && rel->trigdesc->trig_insert_after_row,
-						 withCheckOptionList, returningList, retrieved_attrs);
+						 withCheckOptionList, returningList, yb_min_attr,
+						 retrieved_attrs);
 }
 
 /*
@@ -2012,6 +2043,7 @@ deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 	AttrNumber	pindex;
 	bool		first;
 	ListCell   *lc;
+	AttrNumber	yb_min_attr = yb_get_min_attr_from_ftrelid(RelationGetRelid(rel));
 
 	appendStringInfoString(buf, "UPDATE ");
 	deparseRelation(buf, rel);
@@ -2028,7 +2060,7 @@ deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 			appendStringInfoString(buf, ", ");
 		first = false;
 
-		deparseColumnRef(buf, rtindex, attnum, rte, false);
+		deparseColumnRef(buf, rtindex, attnum, rte, false, yb_min_attr);
 		if (attr->attgenerated)
 			appendStringInfoString(buf, " = DEFAULT");
 		else
@@ -2037,11 +2069,13 @@ deparseUpdateSql(StringInfo buf, RangeTblEntry *rte,
 			pindex++;
 		}
 	}
-	appendStringInfoString(buf, " WHERE ctid = $1");
+	appendStringInfo(buf, " WHERE %s = $1",
+					 (yb_min_attr == YBFirstLowInvalidAttributeNumber) ? "ybctid" : "ctid");
 
 	deparseReturningList(buf, rte, rtindex, rel,
 						 rel->trigdesc && rel->trigdesc->trig_update_after_row,
-						 withCheckOptionList, returningList, retrieved_attrs);
+						 withCheckOptionList, returningList, yb_min_attr,
+						 retrieved_attrs);
 }
 
 /*
@@ -2078,6 +2112,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 	RangeTblEntry *rte = planner_rt_fetch(rtindex, root);
 	ListCell   *lc,
 			   *lc2;
+	AttrNumber	yb_min_attr = yb_get_min_attr_from_ftrelid(RelationGetRelid(rel));
 
 	/* Set up context struct for recursion */
 	context.root = root;
@@ -2085,6 +2120,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 	context.scanrel = foreignrel;
 	context.buf = buf;
 	context.params_list = params_list;
+	context.yb_min_attr = yb_min_attr;
 
 	appendStringInfoString(buf, "UPDATE ");
 	deparseRelation(buf, rel);
@@ -2108,7 +2144,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 			appendStringInfoString(buf, ", ");
 		first = false;
 
-		deparseColumnRef(buf, rtindex, attnum, rte, false);
+		deparseColumnRef(buf, rtindex, attnum, rte, false, yb_min_attr);
 		appendStringInfoString(buf, " = ");
 		deparseExpr((Expr *) tle->expr, &context);
 	}
@@ -2136,7 +2172,7 @@ deparseDirectUpdateSql(StringInfo buf, PlannerInfo *root,
 								  &context);
 	else
 		deparseReturningList(buf, rte, rtindex, rel, false,
-							 NIL, returningList, retrieved_attrs);
+							 NIL, returningList, yb_min_attr, retrieved_attrs);
 }
 
 /*
@@ -2152,13 +2188,16 @@ deparseDeleteSql(StringInfo buf, RangeTblEntry *rte,
 				 List *returningList,
 				 List **retrieved_attrs)
 {
+	AttrNumber	yb_min_attr = yb_get_min_attr_from_ftrelid(RelationGetRelid(rel));
+
 	appendStringInfoString(buf, "DELETE FROM ");
 	deparseRelation(buf, rel);
-	appendStringInfoString(buf, " WHERE ctid = $1");
+	appendStringInfo(buf, " WHERE %s = $1",
+					 (yb_min_attr == YBFirstLowInvalidAttributeNumber) ? "ybctid" : "ctid");
 
 	deparseReturningList(buf, rte, rtindex, rel,
 						 rel->trigdesc && rel->trigdesc->trig_delete_after_row,
-						 NIL, returningList, retrieved_attrs);
+						 NIL, returningList, yb_min_attr, retrieved_attrs);
 }
 
 /*
@@ -2185,6 +2224,7 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 					   List **retrieved_attrs)
 {
 	deparse_expr_cxt context;
+	AttrNumber	yb_min_attr = yb_get_min_attr_from_ftrelid(RelationGetRelid(rel));
 
 	/* Set up context struct for recursion */
 	context.root = root;
@@ -2192,6 +2232,7 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 	context.scanrel = foreignrel;
 	context.buf = buf;
 	context.params_list = params_list;
+	context.yb_min_attr = yb_min_attr;
 
 	appendStringInfoString(buf, "DELETE FROM ");
 	deparseRelation(buf, rel);
@@ -2220,7 +2261,7 @@ deparseDirectDeleteSql(StringInfo buf, PlannerInfo *root,
 	else
 		deparseReturningList(buf, planner_rt_fetch(rtindex, root),
 							 rtindex, rel, false,
-							 NIL, returningList, retrieved_attrs);
+							 NIL, returningList, yb_min_attr, retrieved_attrs);
 }
 
 /*
@@ -2232,6 +2273,7 @@ deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 					 bool trig_after_row,
 					 List *withCheckOptionList,
 					 List *returningList,
+					 AttrNumber yb_min_attr,
 					 List **retrieved_attrs)
 {
 	Bitmapset  *attrs_used = NULL;
@@ -2240,7 +2282,7 @@ deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 	{
 		/* whole-row reference acquires all non-system columns */
 		attrs_used =
-			bms_make_singleton(0 - FirstLowInvalidHeapAttributeNumber);
+			bms_make_singleton(0 - yb_min_attr);
 	}
 
 	if (withCheckOptionList != NIL)
@@ -2254,8 +2296,8 @@ deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 		 * might differ from the data supplied by the core code, for example
 		 * as a result of remote triggers.
 		 */
-		pull_varattnos((Node *) withCheckOptionList, rtindex,
-					   &attrs_used);
+		pull_varattnos_min_attr((Node *) withCheckOptionList, rtindex,
+								&attrs_used, yb_min_attr + 1);
 	}
 
 	if (returningList != NIL)
@@ -2264,13 +2306,27 @@ deparseReturningList(StringInfo buf, RangeTblEntry *rte,
 		 * We need the attrs, non-system and system, mentioned in the local
 		 * query's RETURNING list.
 		 */
-		pull_varattnos((Node *) returningList, rtindex,
-					   &attrs_used);
+		pull_varattnos_min_attr((Node *) returningList, rtindex,
+								&attrs_used, yb_min_attr + 1);
 	}
 
 	if (attrs_used != NULL)
+	{
+		/*
+		 * RETURNING projections assume that the ybctid of the tuple is
+		 * populated. For postgres_fdw, the ybctid is lost when the tuple is
+		 * returned by libpq from the remote server, unless explicitly requested.
+		 * Add ybctid to the returning list to work around this. Remove once
+		 * GH-27762 is fixed.
+		 */
+		if (yb_min_attr == YBFirstLowInvalidAttributeNumber)
+			attrs_used = bms_add_member(attrs_used,
+										YBTupleIdAttributeNumber - yb_min_attr);
+
 		deparseTargetList(buf, rte, rtindex, rel, true, attrs_used, false,
-						  retrieved_attrs);
+						  yb_min_attr, retrieved_attrs);
+	}
+
 	else
 		*retrieved_attrs = NIL;
 }
@@ -2398,7 +2454,7 @@ deparseTruncateSql(StringInfo buf,
  */
 static void
 deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
-				 bool qualify_col)
+				 bool qualify_col, AttrNumber yb_min_attr)
 {
 	/* We support fetching the remote side's CTID and OID. */
 	if (varattno == SelfItemPointerAttributeNumber)
@@ -2406,6 +2462,12 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		if (qualify_col)
 			ADD_REL_QUALIFIER(buf, varno);
 		appendStringInfoString(buf, "ctid");
+	}
+	else if (varattno == YBTupleIdAttributeNumber)
+	{
+		if (qualify_col)
+			ADD_REL_QUALIFIER(buf, varno);
+		appendStringInfoString(buf, "ybctid");
 	}
 	else if (varattno < 0)
 	{
@@ -2453,7 +2515,7 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 		 * "whole row" attribute.
 		 */
 		attrs_used = bms_add_member(NULL,
-									0 - FirstLowInvalidHeapAttributeNumber);
+									0 - yb_min_attr);
 
 		/*
 		 * In case the whole-row reference is under an outer join then it has
@@ -2470,7 +2532,7 @@ deparseColumnRef(StringInfo buf, int varno, int varattno, RangeTblEntry *rte,
 
 		appendStringInfoString(buf, "ROW(");
 		deparseTargetList(buf, rte, varno, rel, false, attrs_used, qualify_col,
-						  &retrieved_attrs);
+						  yb_min_attr, &retrieved_attrs);
 		appendStringInfoChar(buf, ')');
 
 		/* Complete the CASE WHEN statement started above. */
@@ -2616,6 +2678,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 		case T_Param:
 			deparseParam((Param *) node, context);
 			break;
+		case T_YbBatchedExpr:
+			deparseYbBatchedExpr((YbBatchedExpr *) node, context);
+			break;
 		case T_SubscriptingRef:
 			deparseSubscriptingRef((SubscriptingRef *) node, context);
 			break;
@@ -2690,7 +2755,7 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 	if (bms_is_member(node->varno, relids) && node->varlevelsup == 0)
 		deparseColumnRef(context->buf, node->varno, node->varattno,
 						 planner_rt_fetch(node->varno, context->root),
-						 qualify_col);
+						 qualify_col, context->yb_min_attr);
 	else
 	{
 		/* Treat like a Param */
@@ -2720,6 +2785,18 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 			printRemotePlaceholder(node->vartype, node->vartypmod, context);
 		}
 	}
+}
+
+/*
+ * Deparse given YbBatchedExpr node into context->buf.
+ *
+ * We simply deparse the original expression contained in this batched
+ * expression.
+ */
+static void
+deparseYbBatchedExpr(YbBatchedExpr *node, deparse_expr_cxt *context)
+{
+	deparseExpr(node->orig_expr, context);
 }
 
 /*

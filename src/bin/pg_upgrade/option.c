@@ -23,6 +23,9 @@ static void check_required_directory(char **dirpath,
 									 const char *envVarName, bool useCwd,
 									 const char *cmdLineOption, const char *description,
 									 bool missingOk);
+
+static void yb_check_sockdir(ClusterInfo *cluster);
+
 #define FIX_DEFAULT_READ_ONLY "-c default_transaction_read_only=false"
 
 
@@ -53,11 +56,15 @@ parseCommandLine(int argc, char *argv[])
 		{"link", no_argument, NULL, 'k'},
 		{"retain", no_argument, NULL, 'r'},
 		{"jobs", required_argument, NULL, 'j'},
-		{"socketdir", required_argument, NULL, 's'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"clone", no_argument, NULL, 1},
 		{"no-statistics", no_argument, NULL, 5},
 
+		/* Yugabyte flags */
+		{"old-host", required_argument, NULL, 'h'},
+		{"new-host", required_argument, NULL, 'H'},
+		{"old-socketdir", required_argument, NULL, 's'},
+		{"new-socketdir", required_argument, NULL, 'S'},
 		{NULL, 0, NULL, 0}
 	};
 	int			option;			/* Command line option */
@@ -74,13 +81,24 @@ parseCommandLine(int argc, char *argv[])
 	old_cluster.port = getenv("PGPORTOLD") ? atoi(getenv("PGPORTOLD")) : DEF_PGUPORT;
 	new_cluster.port = getenv("PGPORTNEW") ? atoi(getenv("PGPORTNEW")) : DEF_PGUPORT;
 
-	os_user_effective_id = get_user_info(&os_info.user);
-	/* we override just the database user name;  we got the OS id above */
-	if (getenv("PGUSER"))
+	if (is_yugabyte_enabled())
 	{
-		pg_free(os_info.user);
-		/* must save value, getenv()'s pointer is not stable */
-		os_info.user = pg_strdup(getenv("PGUSER"));
+		/*
+		 * In YB we allow root users to run pg_upgrade. User name is a
+		 * required parameter so we can skip the env checks.
+		 */
+		os_user_effective_id = -1;
+	}
+	else
+	{
+		os_user_effective_id = get_user_info(&os_info.user);
+		/* we override just the database user name;  we got the OS id above */
+		if (getenv("PGUSER"))
+		{
+			pg_free(os_info.user);
+			/* must save value, getenv()'s pointer is not stable */
+			os_info.user = pg_strdup(getenv("PGUSER"));
+		}
 	}
 
 	if (argc > 1)
@@ -101,7 +119,7 @@ parseCommandLine(int argc, char *argv[])
 	if (os_user_effective_id == 0)
 		pg_fatal("%s: cannot be run as root\n", os_info.progname);
 
-	while ((option = getopt_long(argc, argv, "d:D:b:B:cj:kNo:O:p:P:rs:U:v",
+	while ((option = getopt_long(argc, argv, "d:D:b:B:ch:H:j:kNo:O:p:P:rs:S:U:v",
 								 long_options, &optindex)) != -1)
 	{
 		switch (option)
@@ -124,6 +142,14 @@ parseCommandLine(int argc, char *argv[])
 
 			case 'D':
 				new_cluster.pgdata = pg_strdup(optarg);
+				break;
+
+			case 'h':			/* YB */
+				old_cluster.yb_hostaddr = pg_strdup(optarg);
+				break;
+
+			case 'H':			/* YB */
+				new_cluster.yb_hostaddr = pg_strdup(optarg);
 				break;
 
 			case 'j':
@@ -179,7 +205,11 @@ parseCommandLine(int argc, char *argv[])
 				break;
 
 			case 's':
-				user_opts.socketdir = pg_strdup(optarg);
+				old_cluster.sockdir = pg_strdup(optarg);
+				break;
+
+			case 'S':			/* YB */
+				new_cluster.sockdir = pg_strdup(optarg);
 				break;
 
 			case 'U':
@@ -210,6 +240,16 @@ parseCommandLine(int argc, char *argv[])
 	if (optind < argc)
 		pg_fatal("too many command-line arguments (first is \"%s\")\n", argv[optind]);
 
+	if (is_yugabyte_enabled())
+	{
+		if (os_info.user == NULL)
+			pg_fatal("missing user name\n");
+
+		old_cluster.yb_user = os_info.user;
+		/* In YB, the new cluster is always connected via the yugabyte user */
+		new_cluster.yb_user = "yugabyte";
+	}
+
 	if (log_opts.verbose)
 		pg_log(PG_REPORT, "Running in verbose mode\n");
 
@@ -228,16 +268,27 @@ parseCommandLine(int argc, char *argv[])
 		setenv("PGOPTIONS", FIX_DEFAULT_READ_ONLY, 1);
 
 	/* Get values from env if not already set */
-	check_required_directory(&old_cluster.bindir, "PGBINOLD", false,
-							 "-b", _("old cluster binaries reside"), false);
+	if (!is_yugabyte_enabled())
+		check_required_directory(&old_cluster.bindir, "PGBINOLD", false,
+								 "-b", _("old cluster binaries reside"), false);
 	check_required_directory(&new_cluster.bindir, "PGBINNEW", false,
 							 "-B", _("new cluster binaries reside"), true);
-	check_required_directory(&old_cluster.pgdata, "PGDATAOLD", false,
-							 "-d", _("old cluster data resides"), false);
-	check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
-							 "-D", _("new cluster data resides"), false);
+	if (!is_yugabyte_enabled() || user_opts.check)
+		/* In YB upgrade, we don't need the old directory. */
+		check_required_directory(&old_cluster.pgdata, "PGDATAOLD", false,
+								 "-d", _("old cluster data resides"), false);
+	if (!(is_yugabyte_enabled() && user_opts.check))
+		/*
+		 * Checks in YB are done only on the old cluster and don't need a new
+		 * cluster data dir.
+		 */
+		check_required_directory(&new_cluster.pgdata, "PGDATANEW", false,
+								 "-D", _("new cluster data resides"), false);
 	check_required_directory(&user_opts.socketdir, "PGSOCKETDIR", true,
 							 "-s", _("sockets will be created"), false);
+
+	if (is_yugabyte_enabled() && !user_opts.check)
+		yb_check_sockdir(&new_cluster);
 
 #ifdef WIN32
 
@@ -284,12 +335,15 @@ usage(void)
 	printf(_("  -p, --old-port=PORT           old cluster port number (default %d)\n"), old_cluster.port);
 	printf(_("  -P, --new-port=PORT           new cluster port number (default %d)\n"), new_cluster.port);
 	printf(_("  -r, --retain                  retain SQL and log files after success\n"));
-	printf(_("  -s, --socketdir=DIR           socket directory to use (default current dir.)\n"));
 	printf(_("  -U, --username=NAME           cluster superuser (default \"%s\")\n"), os_info.user);
 	printf(_("  -v, --verbose                 enable verbose internal logging\n"));
 	printf(_("  -V, --version                 display version information, then exit\n"));
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
 	printf(_("  --no-statistics               do not import statistics from old cluster\n"));
+	printf(_("  -h, --old-host=HOST           old cluster host address\n"));	/* YB */
+	printf(_("  -H, --new-host=HOST           new cluster host address\n"));	/* YB */
+	printf(_("  -s, --old-socketdir=DIR       old cluster socket directory\n"));	/* YB */
+	printf(_("  -S, --new-socketdir=DIR       new cluster socket directory\n"));	/* YB */
 	printf(_("  -?, --help                    show this help, then exit\n"));
 	printf(_("\n"
 			 "Before running pg_upgrade you must:\n"
@@ -451,6 +505,9 @@ adjust_data_dir(ClusterInfo *cluster)
 void
 get_sock_dir(ClusterInfo *cluster, bool live_check)
 {
+	/* In Yugabyte socket directory are specified via the input arguments. */
+	Assert(!is_yugabyte_enabled());
+
 #if defined(HAVE_UNIX_SOCKETS) && !defined(WIN32)
 	if (!live_check)
 		cluster->sockdir = user_opts.socketdir;
@@ -500,4 +557,13 @@ get_sock_dir(ClusterInfo *cluster, bool live_check)
 #else							/* !HAVE_UNIX_SOCKETS || WIN32 */
 	cluster->sockdir = NULL;
 #endif
+}
+
+static void
+yb_check_sockdir(ClusterInfo *cluster)
+{
+	Assert(is_yugabyte_enabled());
+
+	if (!cluster->sockdir)
+		pg_fatal("socket directory must be specified\n");
 }

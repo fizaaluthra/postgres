@@ -331,10 +331,12 @@ search_plan_tree(PlanState *node, Oid table_oid,
 			 * children's current outputs.)
 			 */
 		case T_SeqScanState:
+		case T_YbSeqScanState:
 		case T_SampleScanState:
 		case T_IndexScanState:
 		case T_IndexOnlyScanState:
 		case T_BitmapHeapScanState:
+		case T_YbBitmapTableScan:
 		case T_TidScanState:
 		case T_TidRangeScanState:
 		case T_ForeignScanState:

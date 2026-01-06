@@ -33,6 +33,9 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 PG_MODULE_MAGIC;
 
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
@@ -79,6 +82,8 @@ static void pgoutput_stream_commit(struct LogicalDecodingContext *ctx,
 static void pgoutput_stream_prepare_txn(LogicalDecodingContext *ctx,
 										ReorderBufferTXN *txn, XLogRecPtr prepare_lsn);
 
+static void yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid);
+
 static bool publications_valid;
 static bool in_streaming;
 
@@ -100,6 +105,15 @@ static void send_repl_origin(LogicalDecodingContext *ctx,
 							 bool send_origin);
 static void update_replication_progress(LogicalDecodingContext *ctx,
 										bool skipped_xact);
+
+/*
+ * This indicates whether the plugin being used is yboutput or pgoutput. In
+ * yboutput mode, we also support yb-specific replica identity
+ * (CHANGE for now).
+ */
+static bool yb_is_yboutput_mode;
+
+static void yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity);
 
 /*
  * Only 3 publication actions are used for row filtering ("insert", "update",
@@ -282,6 +296,12 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->stream_truncate_cb = pgoutput_truncate;
 	/* transaction streaming - two-phase commit */
 	cb->stream_prepare_cb = pgoutput_stream_prepare_txn;
+
+	if (IsYugaByteEnabled())
+	{
+		cb->yb_schema_change_cb = yb_pgoutput_schema_change;
+		cb->yb_support_yb_specifc_replica_identity_cb = yb_support_yb_specific_replica_identity;
+	}
 }
 
 static void
@@ -504,6 +524,9 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 					 errmsg("two-phase commit requested, but not supported by output plugin")));
 		else
 			ctx->twophase_opt_given = true;
+
+		if (IsYugaByteEnabled())
+			opt->yb_publication_names = data->publication_names;
 
 		/* Init publication state. */
 		data->publications = NIL;
@@ -741,6 +764,10 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 		set_schema_sent_in_streamed_txn(relentry, topxid);
 	else
 		relentry->schema_sent = true;
+
+	if (IsYugaByteEnabled())
+		elog(DEBUG1, "Sent the RELATION message for table_id: %d",
+			 RelationGetRelid(relation));
 }
 
 /*
@@ -1529,6 +1556,19 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 			maybe_send_schema(ctx, change, relation, relentry);
 
+			bool	   *yb_old_is_omitted = NULL;
+			bool	   *yb_new_is_omitted = NULL;
+
+			if (IsYugaByteEnabled() && yb_is_yboutput_mode)
+			{
+				yb_old_is_omitted =
+					change->data.tp.oldtuple ?
+					change->data.tp.oldtuple->yb_is_omitted :
+					NULL;
+
+				yb_new_is_omitted = change->data.tp.newtuple->yb_is_omitted;
+			}
+
 			OutputPluginPrepareWrite(ctx, true);
 
 			/*
@@ -1545,7 +1585,9 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				case REORDER_BUFFER_CHANGE_UPDATE:
 					logicalrep_write_update(ctx->out, xid, targetrel,
 											old_slot, new_slot, data->binary,
-											relentry->columns);
+											relentry->columns,
+											yb_old_is_omitted,
+											yb_new_is_omitted);
 					break;
 				case REORDER_BUFFER_CHANGE_DELETE:
 					logicalrep_write_delete(ctx->out, xid, targetrel,
@@ -1769,6 +1811,14 @@ pgoutput_shutdown(LogicalDecodingContext *ctx)
 
 	/* Better safe than sorry */
 	pubctx = NULL;
+}
+
+static void
+yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid)
+{
+	elog(DEBUG1, "yb_pgoutput_schema_change for relid: %d", relid);
+
+	rel_sync_cache_relation_cb(0 /* unused */ , relid);
 }
 
 /*
@@ -2480,4 +2530,10 @@ update_replication_progress(LogicalDecodingContext *ctx, bool skipped_xact)
 		OutputPluginUpdateProgress(ctx, skipped_xact);
 		changes_count = 0;
 	}
+}
+
+static void
+yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity)
+{
+	yb_is_yboutput_mode = support_yb_specific_replica_identity;
 }

@@ -26,6 +26,9 @@
 #include "access/htup_details.h"
 #include "utils/builtins.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 static bool check_attrmap_match(TupleDesc indesc,
 								TupleDesc outdesc,
@@ -172,7 +175,8 @@ build_attrmap_by_position(TupleDesc indesc,
  */
 AttrMap *
 build_attrmap_by_name(TupleDesc indesc,
-					  TupleDesc outdesc)
+					  TupleDesc outdesc,
+					  bool yb_ignore_type_mismatch)
 {
 	AttrMap    *attrMap;
 	int			outnatts;
@@ -223,7 +227,8 @@ build_attrmap_by_name(TupleDesc indesc,
 			if (strcmp(attname, NameStr(inatt->attname)) == 0)
 			{
 				/* Found it, check type */
-				if (atttypid != inatt->atttypid || atttypmod != inatt->atttypmod)
+				if ((atttypid != inatt->atttypid || atttypmod != inatt->atttypmod) &&
+					!(IsYugaByteEnabled() && yb_ignore_type_mismatch))
 					ereport(ERROR,
 							(errcode(ERRCODE_DATATYPE_MISMATCH),
 							 errmsg("could not convert row type"),
@@ -262,7 +267,8 @@ build_attrmap_by_name_if_req(TupleDesc indesc,
 	AttrMap    *attrMap;
 
 	/* Verify compatibility and prepare attribute-number map */
-	attrMap = build_attrmap_by_name(indesc, outdesc);
+	attrMap = build_attrmap_by_name(indesc, outdesc,
+									false /* yb_ignore_type_mismatch */ );
 
 	/* Check if the map has a one-to-one match */
 	if (check_attrmap_match(indesc, outdesc, attrMap))

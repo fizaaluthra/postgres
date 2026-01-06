@@ -934,6 +934,7 @@ parseqatom(struct vars *v,
 			NOTE(REG_UPBOTCH);
 			/* fall through into case PLAIN */
 			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case PLAIN:
 			onechr(v, v->nextvalue, lp, rp);
 			okcolors(v->nfa, v->cm);

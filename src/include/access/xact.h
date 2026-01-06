@@ -22,6 +22,9 @@
 #include "storage/relfilenode.h"
 #include "storage/sinval.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 /*
  * Maximum size of Global Transaction ID (including '\0').
  *
@@ -38,6 +41,8 @@
 #define XACT_REPEATABLE_READ	2
 #define XACT_SERIALIZABLE		3
 
+#define YB_READ_COMMITTED_INTERNAL_SUB_TXN_NAME "yb_internal_txn_for_read_committed"
+
 extern PGDLLIMPORT int DefaultXactIsoLevel;
 extern PGDLLIMPORT int XactIsoLevel;
 
@@ -47,8 +52,11 @@ extern PGDLLIMPORT int XactIsoLevel;
  * the others use one snapshot per statement.
  * Serializable uses predicate locks in addition to snapshots.
  * These macros should be used to check which isolation level is selected.
+ *
+ * YB: When using Read Committed or Read Uncommitted isolation, we fall back to Snapshot isolation
+ * if yb_enable_read_committed_isolation is not enabled.
  */
-#define IsolationUsesXactSnapshot() (XactIsoLevel >= XACT_REPEATABLE_READ)
+#define IsolationUsesXactSnapshot() (XactIsoLevel >= XACT_REPEATABLE_READ || !IsYBReadCommitted())
 #define IsolationIsSerializable() (XactIsoLevel == XACT_SERIALIZABLE)
 
 /* Xact read-only state */
@@ -527,4 +535,52 @@ extern void EnterParallelMode(void);
 extern void ExitParallelMode(void);
 extern bool IsInParallelMode(void);
 
+/* YB */
+extern const char *GetCurrentTransactionName(void);
+extern int	YBGetEffectivePggateIsolationLevel();
+extern void YBInitializeTransaction(void);
+extern void YBCommitTransactionIntermediate(void);
+extern void YBResetTransactionReadPoint(void);
+extern void YBRestartReadPoint(void);
+extern void YBCRestartWriteTransaction(void);
+extern void YbSetTxnUsesTempRel(void);
+extern void YBMarkTxnUsesTempRelAndSetTxnId();
+extern bool YbCurrentTxnUsesTempRel(void);
+extern void YbBeginInternalSubTransactionForReadCommittedStatement();
+
+/*
+ * Determine if the transaction block contains a savepoint other than the
+ * internal ones created for READ COMMITTED isolation level.
+ */
+extern bool YBTransactionContainsNonReadCommittedSavepoint(void);
+extern void YBStartTransactionCommandInternal(bool yb_skip_read_committed_internal_savepoint);
+extern void YbCommitTransactionCommandIntermediate(void);
+extern void YBMarkDataSent(void);
+extern void YBMarkDataNotSent(void);
+extern void YBMarkDataNotSentForCurrQuery(void);
+extern bool YBIsDataSent(void);
+extern bool YBIsDataSentForCurrQuery(void);
+
+/*
+ * YB: Utilities for postponed pggate DDL statement handles, that can be
+ * executed after the YSQL DDL transaction has commited. To qualify for this
+ * the DDL must have the following properties:
+ *   1. It cannot be rolled back by abort (so we wait for commit to succeed).
+ *   2. It does not cause inconsistencies if it fails (i.e. after txn commit).
+ * Currently the main example is dropping DocDB objects (e.g. table/indexes)
+ * which we cannot roll back, and also does not cause inconsistency if it fails
+ * after YSQL-layer deleted the metadata entry for that object (because we do
+ * not reuse oids/uuids -- so objects remain simply orphaned/unused).
+ * Note: Orphaned DocDB objects will be best-effort cleaned by a DocDB (catalog
+ *       manager) background-cleanup job. This would eventually also roll back
+ *       failed (online) alter operations (#3979).
+ */
+extern void YBSaveDdlHandle(YbcPgStatement handle);
+extern List *YBGetDdlHandles(void);
+extern void YBClearDdlHandles(void);
+
+/*
+ * YB: Utility for clearing transaction ID.
+*/
+extern void YbClearParallelContexts(void);
 #endif							/* XACT_H */

@@ -183,4 +183,7 @@ extern void InitializeLatchWaitSet(void);
 extern int	GetNumRegisteredWaitEvents(WaitEventSet *set);
 extern bool WaitEventSetCanReportClosed(void);
 
+/* YB */
+extern void DisownLatchOnBehalfOfPid(Latch *latch, int owner_pid);
+
 #endif							/* LATCH_H */

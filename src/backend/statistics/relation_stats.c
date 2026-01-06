@@ -127,6 +127,16 @@ relation_statistics_update(FunctionCallInfo fcinfo)
 	 */
 	crel = table_open(RelationRelationId, RowExclusiveLock);
 
+	bool		yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBAddDdlTxnState(YB_DDL_MODE_BREAKING_CHANGE);
+		else
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_BREAKING_CHANGE);
+	}
+
 	ctup = SearchSysCache1(RELOID, ObjectIdGetDatum(reloid));
 	if (!HeapTupleIsValid(ctup))
 		elog(ERROR, "pg_class entry for relid %u not found", reloid);
@@ -166,6 +176,14 @@ relation_statistics_update(FunctionCallInfo fcinfo)
 	}
 
 	ReleaseSysCache(ctup);
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBMergeDdlTxnState();
+		else
+			YBDecrementDdlNestingLevel();
+	}
 
 	/* release the lock, consistent with vac_update_relstats() */
 	table_close(crel, RowExclusiveLock);

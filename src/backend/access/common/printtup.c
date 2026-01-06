@@ -23,6 +23,9 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+
 
 static void printtup_startup(DestReceiver *self, int operation,
 							 TupleDesc typeinfo);
@@ -360,12 +363,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 		else
 		{
 			/* Binary output */
-			bytea	   *outputbytes;
-
-			outputbytes = SendFunctionCall(&thisState->finfo, attr);
-			pq_sendint32(buf, VARSIZE(outputbytes) - VARHDRSZ);
-			pq_sendbytes(buf, VARDATA(outputbytes),
-						 VARSIZE(outputbytes) - VARHDRSZ);
+			StringInfoSendFunctionCall(buf, &thisState->finfo, attr);
 		}
 	}
 

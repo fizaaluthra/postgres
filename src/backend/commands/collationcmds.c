@@ -37,6 +37,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 typedef struct
 {
@@ -282,6 +285,11 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 			check_encoding_locale_matches(collencoding, collcollate, collctype);
 		}
 	}
+
+	if (IsYugaByteEnabled() && !collisdeterministic)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("nondeterministic collation is not supported")));
 
 	if (!collversion)
 		collversion = get_collation_actual_version(collprovider, collprovider == COLLPROVIDER_ICU ? colliculocale : collcollate);
@@ -645,6 +653,12 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 				elog(DEBUG1, "skipping locale with non-ASCII name: \"%s\"", localebuf);
 				continue;
 			}
+
+			/*
+			 * For libc, Yugabyte only supports the basic locales.
+			 */
+			if (IsYugaByteEnabled() && !YBIsSupportedLibcLocale(localebuf))
+				continue;
 
 			enc = pg_get_encoding_from_locale(localebuf, false);
 			if (enc < 0)

@@ -55,12 +55,13 @@ extern void AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 
 extern void CheckTableNotInUse(Relation rel, const char *stmt);
 
-extern void ExecuteTruncate(TruncateStmt *stmt);
+extern void ExecuteTruncate(TruncateStmt *stmt, bool yb_is_top_level, List **yb_relids);
 extern void ExecuteTruncateGuts(List *explicit_rels,
 								List *relids,
 								List *relids_logged,
 								DropBehavior behavior,
-								bool restart_seqs);
+								bool restart_seqs,
+								bool yb_is_top_level);
 
 extern void SetRelationHasSubclass(Oid relationId, bool relhassubclass);
 
@@ -72,7 +73,8 @@ extern ObjectAddress renameatt(RenameStmt *stmt);
 
 extern ObjectAddress RenameConstraint(RenameStmt *stmt);
 
-extern ObjectAddress RenameRelation(RenameStmt *stmt);
+extern ObjectAddress RenameRelation(RenameStmt *stmt,
+									bool yb_is_internal_clone_rename);
 
 extern void RenameRelationInternal(Oid myrelid,
 								   const char *newrelname, bool is_internal,

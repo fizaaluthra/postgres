@@ -26,6 +26,9 @@
 #include "nodes/readfuncs.h"
 #include "nodes/value.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pggate.h"
+
 
 /* Static state for pg_strtok */
 static const char *pg_strtok_ptr = NULL;
@@ -35,6 +38,44 @@ static const char *pg_strtok_ptr = NULL;
 bool		restore_location_fields = false;
 #endif
 
+static const char *
+GetPgStrTokPtr()
+{
+	if (IsMultiThreadedMode())
+	{
+		return (char *) YBCPgGetThreadLocalStrTokPtr();
+	}
+	else
+	{
+		return pg_strtok_ptr;
+	}
+}
+
+static void
+SetPgStrTokPtr(const char *new_pg_strtok_ptr)
+{
+	if (IsMultiThreadedMode())
+	{
+		YBCPgSetThreadLocalStrTokPtr((char *) new_pg_strtok_ptr);
+	}
+	else
+	{
+		pg_strtok_ptr = new_pg_strtok_ptr;
+	}
+}
+
+int
+GetYbExpressionVersion(void)
+{
+	return IsMultiThreadedMode() ? YBCPgGetThreadLocalYbExpressionVersion() : PG_MAJORVERSION_NUM;
+}
+
+static void
+SetYbExpressionVersion(int yb_expr_version)
+{
+	Assert(IsMultiThreadedMode());
+	YBCPgSetThreadLocalYbExpressionVersion(yb_expr_version);
+}
 
 /*
  * stringToNode -
@@ -59,9 +100,9 @@ stringToNodeInternal(const char *str, bool restore_loc_fields)
 	 * a lot of notational overhead by having to pass the next-character
 	 * pointer around through all the readfuncs.c code.
 	 */
-	save_strtok = pg_strtok_ptr;
+	save_strtok = GetPgStrTokPtr();
 
-	pg_strtok_ptr = str;		/* point pg_strtok at the string to read */
+	SetPgStrTokPtr(str);		/* point pg_strtok at the string to read */
 
 	/*
 	 * If enabled, likewise save/restore the location field handling flag.
@@ -73,7 +114,7 @@ stringToNodeInternal(const char *str, bool restore_loc_fields)
 
 	retval = nodeRead(NULL, 0); /* do the reading */
 
-	pg_strtok_ptr = save_strtok;
+	SetPgStrTokPtr(save_strtok);
 
 #ifdef WRITE_READ_PARSE_PLAN_TREES
 	restore_location_fields = save_restore_location_fields;
@@ -88,6 +129,14 @@ stringToNodeInternal(const char *str, bool restore_loc_fields)
 void *
 stringToNode(const char *str)
 {
+	return stringToNodeInternal(str, false);
+}
+
+void *
+ybDeserializeNode(const char *str, int yb_expr_version)
+{
+	Assert(IsMultiThreadedMode());
+	SetYbExpressionVersion(yb_expr_version);
 	return stringToNodeInternal(str, false);
 }
 
@@ -154,7 +203,7 @@ pg_strtok(int *length)
 	const char *local_str;		/* working pointer to string */
 	const char *ret_str;		/* start of token to return */
 
-	local_str = pg_strtok_ptr;
+	local_str = GetPgStrTokPtr();
 
 	while (*local_str == ' ' || *local_str == '\n' || *local_str == '\t')
 		local_str++;
@@ -162,7 +211,7 @@ pg_strtok(int *length)
 	if (*local_str == '\0')
 	{
 		*length = 0;
-		pg_strtok_ptr = local_str;
+		SetPgStrTokPtr(local_str);
 		return NULL;			/* no more tokens */
 	}
 
@@ -199,7 +248,7 @@ pg_strtok(int *length)
 	if (*length == 2 && ret_str[0] == '<' && ret_str[1] == '>')
 		*length = 0;
 
-	pg_strtok_ptr = local_str;
+	SetPgStrTokPtr(local_str);
 
 	return ret_str;
 }

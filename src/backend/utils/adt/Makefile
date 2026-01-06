@@ -12,6 +12,8 @@ override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 # keep this list arranged alphabetically or it gets to be a mess
 OBJS = \
+	yb_lockfuncs.o \
+	\
 	acl.o \
 	amutils.o \
 	array_expanded.o \

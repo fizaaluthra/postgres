@@ -744,6 +744,7 @@ lexescape(struct vars *v)
 			v->now = save;
 			/* and fall through into octal number */
 			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case CHR('0'):
 			NOTE(REG_UUNPORT);
 			v->now--;			/* put first digit back */

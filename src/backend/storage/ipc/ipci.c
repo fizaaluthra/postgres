@@ -49,6 +49,12 @@
 #include "storage/spin.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+#include "yb_ash.h"
+#include "yb_query_diagnostics.h"
+#include "yb_terminated_queries.h"
+
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
 
@@ -144,6 +150,15 @@ CalculateShmemSize(int *num_semaphores)
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_ash)
+		size = add_size(size, YbAshShmemSize());
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
+		size = add_size(size, YbQueryDiagnosticsShmemSize());
+
+	/* include additional shmem for yb_terminated_queries */
+	size = add_size(size, YbTerminatedQueriesShmemSize());
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
@@ -293,6 +308,15 @@ CreateSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_ash)
+		YbAshShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
+		YbQueryDiagnosticsShmemInit();
+
+	/* Setting up yb_terminated_queries shared memory space. */
+	YbTerminatedQueriesShmemInit();
 
 #ifdef EXEC_BACKEND
 

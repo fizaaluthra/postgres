@@ -41,6 +41,9 @@
 #include "access/xlogrecord.h"
 #include "storage/buf.h"
 
+/* YB includes */
+#include "replication/yb_virtual_wal_client_typedefs.h"
+
 /* WALOpenSegment represents a WAL segment being read. */
 typedef struct WALOpenSegment
 {
@@ -234,6 +237,8 @@ struct XLogReaderState
 
 	/* Last record returned by XLogReadRecord(). */
 	DecodedXLogRecord *record;
+
+	YbVirtualWalRecord *yb_virtual_wal_record;
 
 	/* ----------------------------------------
 	 * private/internal state
@@ -439,5 +444,7 @@ extern bool XLogRecGetBlockTagExtended(XLogReaderState *record, uint8 block_id,
 									   RelFileNode *rnode, ForkNumber *forknum,
 									   BlockNumber *blknum,
 									   Buffer *prefetch_buffer);
+
+extern void YBResetDecoder(XLogReaderState *state);
 
 #endif							/* XLOGREADER_H */

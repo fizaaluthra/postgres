@@ -29,7 +29,7 @@
 #include "pg_backup.h"
 
 /* version string we expect back from pg_dump */
-#define PGDUMP_VERSIONSTR "pg_dump (PostgreSQL) " PG_VERSION "\n"
+#define PGDUMP_VERSIONSTR "ysql_dump (YSQL) " PG_VERSION "\n"
 
 
 static void help(void);
@@ -42,13 +42,13 @@ static void dropTablespaces(PGconn *conn);
 static void dumpTablespaces(PGconn *conn);
 static void dropDBs(PGconn *conn);
 static void dumpUserConfig(PGconn *conn, const char *username);
-static void dumpDatabases(PGconn *conn);
+static void dumpDatabases(PGconn *conn, const char *pgdb);
 static void dumpTimestamp(const char *msg);
 static int	runPgDump(const char *dbname, const char *create_opts);
 static void buildShSecLabels(PGconn *conn,
 							 const char *catalog_name, Oid objectId,
 							 const char *objtype, const char *objname,
-							 PQExpBuffer buffer);
+							 PQExpBuffer buffer, const char *yb_indent);
 static PGconn *connectDatabase(const char *dbname, const char *connstr, const char *pghost, const char *pgport,
 							   const char *pguser, trivalue prompt_password, bool fail_on_error);
 static char *constructConnStr(const char **keywords, const char **values);
@@ -56,6 +56,12 @@ static PGresult *executeQuery(PGconn *conn, const char *query);
 static void executeCommand(PGconn *conn, const char *query);
 static void expand_dbname_patterns(PGconn *conn, SimpleStringList *patterns,
 								   SimpleStringList *names);
+
+static void ybProcessTablespaceSpcOptions(PGconn *conn, PQExpBuffer *buf, char *spcoptions);
+static void dropYbRoleProfiles(PGconn *conn);
+static void dropYbProfiles(PGconn *conn);
+static void dumpYbProfiles(PGconn *conn);
+static void dumpYbRoleProfiles(PGconn *conn);
 
 static char pg_dump_bin[MAXPGPATH];
 static const char *progname;
@@ -96,6 +102,7 @@ static int	statistics_only = 0;
 static char role_catalog[10];
 #define PG_AUTHID "pg_authid"
 #define PG_ROLES  "pg_roles "
+#define YB_SUPERUSER  "yb_superuser"
 
 static FILE *OPF;
 static char *filename = NULL;
@@ -104,6 +111,19 @@ static SimpleStringList database_exclude_patterns = {NULL, NULL};
 static SimpleStringList database_exclude_names = {NULL, NULL};
 
 #define exit_nicely(code) exit(code)
+
+static int	include_yb_metadata = 0;	/* In this mode DDL statements include
+										 * YB specific metadata such as tablet
+										 * partitions. */
+static int	yb_dump_role_checks = 0;	/* Add to the dump additional checks
+										 * if the used ROLE exists. The ROLE
+										 * usage statements are skipped if the
+										 * ROLE does not exist. */
+static int	dump_single_database = 0;	/* Dump only one DB specified by
+										 * '--database' argument. */
+
+static bool IsYugabyteEnabled = true;
+static int	yb_no_profiles = 0;
 
 int
 main(int argc, char *argv[])
@@ -145,6 +165,7 @@ main(int argc, char *argv[])
 		{"lock-wait-timeout", required_argument, NULL, 2},
 		{"no-table-access-method", no_argument, &no_table_access_method, 1},
 		{"no-tablespaces", no_argument, &no_tablespaces, 1},
+		{"no-yb-profiles", no_argument, &yb_no_profiles, 1},
 		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
 		{"load-via-partition-root", no_argument, &load_via_partition_root, 1},
 		{"role", required_argument, NULL, 3},
@@ -166,6 +187,9 @@ main(int argc, char *argv[])
 		{"on-conflict-do-nothing", no_argument, &on_conflict_do_nothing, 1},
 		{"rows-per-insert", required_argument, NULL, 7},
 		{"statistics-only", no_argument, &statistics_only, 1},
+		{"include-yb-metadata", no_argument, &include_yb_metadata, 1},
+		{"dump-role-checks", no_argument, &yb_dump_role_checks, 1},
+		{"dump-single-database", no_argument, &dump_single_database, 1},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -190,7 +214,7 @@ main(int argc, char *argv[])
 
 	pg_logging_init(argv[0]);
 	pg_logging_set_level(PG_LOG_WARNING);
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
+	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("ysql_dump"));
 	progname = get_progname(argv[0]);
 
 	if (argc > 1)
@@ -202,12 +226,12 @@ main(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_dumpall (PostgreSQL) " PG_VERSION);
+			puts("ysql_dumpall (YSQL) " PG_VERSION);
 			exit_nicely(0);
 		}
 	}
 
-	if ((ret = find_other_exec(argv[0], "pg_dump", PGDUMP_VERSIONSTR,
+	if ((ret = find_other_exec(argv[0], "ysql_dump", PGDUMP_VERSIONSTR,
 							   pg_dump_bin)) < 0)
 	{
 		char		full_path[MAXPGPATH];
@@ -217,10 +241,10 @@ main(int argc, char *argv[])
 
 		if (ret == -1)
 			pg_fatal("program \"%s\" is needed by %s but was not found in the same directory as \"%s\"",
-					 "pg_dump", progname, full_path);
+					 "ysql_dump", progname, full_path);
 		else
 			pg_fatal("program \"%s\" was found by \"%s\" but was not the same version as %s",
-					 "pg_dump", full_path, progname);
+					 "ysql_dump", full_path, progname);
 	}
 
 	pgdumpopts = createPQExpBuffer();
@@ -398,6 +422,20 @@ main(int argc, char *argv[])
 		exit_nicely(1);
 	}
 
+	if (binary_upgrade && include_yb_metadata)
+	{
+		pg_log_error("options --binary-upgrade and --include-yb-metadata cannot be used together");
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
+		exit_nicely(1);
+	}
+
+	if (yb_dump_role_checks && !include_yb_metadata)
+	{
+		pg_log_error("option --dump-role-checks must be used only together with --include-yb-metadata");
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
+		exit_nicely(1);
+	}
+
 	/*
 	 * If password values are not required in the dump, switch to using
 	 * pg_roles which is equally useful, just more likely to have unrestricted
@@ -457,6 +495,10 @@ main(int argc, char *argv[])
 		appendPQExpBufferStr(pgdumpopts, " --on-conflict-do-nothing");
 	if (statistics_only)
 		appendPQExpBufferStr(pgdumpopts, " --statistics-only");
+	if (include_yb_metadata)
+		appendPQExpBufferStr(pgdumpopts, " --include-yb-metadata");
+	if (yb_dump_role_checks)
+		appendPQExpBufferStr(pgdumpopts, " --dump-role-checks");
 
 	/*
 	 * If there was a database specified on the command line, use that,
@@ -541,7 +583,7 @@ main(int argc, char *argv[])
 	if (quote_all_identifiers)
 		executeCommand(conn, "SET quote_all_identifiers = true");
 
-	fprintf(OPF, "--\n-- PostgreSQL database cluster dump\n--\n\n");
+	fprintf(OPF, "--\n-- YSQL database cluster dump\n--\n\n");
 	if (verbose)
 		dumpTimestamp("Started on");
 
@@ -565,6 +607,9 @@ main(int argc, char *argv[])
 
 	if (!data_only)
 	{
+		bool		yb_dump_profile = IsYugabyteEnabled && !roles_only &&
+			!tablespaces_only && !yb_no_profiles;
+
 		/*
 		 * If asked to --clean, do that first.  We can avoid detailed
 		 * dependency analysis because databases never depend on each other,
@@ -578,6 +623,12 @@ main(int argc, char *argv[])
 
 			if (!roles_only && !no_tablespaces)
 				dropTablespaces(conn);
+
+			if (yb_dump_profile)
+			{
+				dropYbRoleProfiles(conn);
+				dropYbProfiles(conn);
+			}
 
 			if (!tablespaces_only)
 				dropRoles(conn);
@@ -598,6 +649,12 @@ main(int argc, char *argv[])
 			/* Dump role GUC privileges */
 			if (server_version >= 150000 && !skip_acls)
 				dumpRoleGUCPrivs(conn);
+
+			if (yb_dump_profile)
+			{
+				dumpYbProfiles(conn);
+				dumpYbRoleProfiles(conn);
+			}
 		}
 
 		/* Dump tablespaces */
@@ -606,13 +663,14 @@ main(int argc, char *argv[])
 	}
 
 	if (!globals_only && !roles_only && !tablespaces_only)
-		dumpDatabases(conn);
+		/* YB: Dump one DB only with '--dump-single-database'. */
+		dumpDatabases(conn, dump_single_database ? pgdb : NULL);
 
 	PQfinish(conn);
 
 	if (verbose)
 		dumpTimestamp("Completed on");
-	fprintf(OPF, "--\n-- PostgreSQL database cluster dump complete\n--\n\n");
+	fprintf(OPF, "--\n-- YSQL database cluster dump complete\n--\n\n");
 
 	if (filename)
 	{
@@ -630,7 +688,7 @@ main(int argc, char *argv[])
 static void
 help(void)
 {
-	printf(_("%s extracts a PostgreSQL database cluster into an SQL script file.\n\n"), progname);
+	printf(_("%s extracts a YSQL database cluster into an SQL script file.\n\n"), progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
 
@@ -651,6 +709,7 @@ help(void)
 	printf(_("  -S, --superuser=NAME         superuser user name to use in the dump\n"));
 	printf(_("  -t, --tablespaces-only       dump only tablespaces, no databases or roles\n"));
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
+	printf(_("  --dump-single-database       dump only one DB specified by '--database' argument\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
@@ -658,6 +717,14 @@ help(void)
 	printf(_("  --exclude-database=PATTERN   exclude databases whose name matches PATTERN\n"));
 	printf(_("  --extra-float-digits=NUM     override default setting for extra_float_digits\n"));
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
+	printf(_("  --include-yb-metadata        include Yugabyte-specific metadata, uses extended\n"
+			 "                               YSQL syntax not compatible with PostgreSQL.\n"
+			 "                               (As of now, doesn't automatically include some things\n"
+			 "                               like SPLIT details).\n"));
+	printf(_("  --dump-role-checks           add to the dump additional checks if the used ROLE\n"
+			 "                               exists. The ROLE usage statements are skipped if\n"
+			 "                               the ROLE does not exist.\n"
+			 "                               Requires --include-yb-metadata.\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
 	printf(_("  --no-comments                do not dump comments\n"));
@@ -673,6 +740,7 @@ help(void)
 	printf(_("  --no-tablespaces             do not dump tablespace assignments\n"));
 	printf(_("  --no-toast-compression       do not dump TOAST compression methods\n"));
 	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
+	printf(_("  --no-yb-profiles             do not dump yb profile and role profile data\n"));
 	printf(_("  --on-conflict-do-nothing     add ON CONFLICT DO NOTHING to INSERT commands\n"));
 	printf(_("  --quote-all-identifiers      quote all identifiers, even if not key words\n"));
 	printf(_("  --rows-per-insert=NROWS      number of rows per INSERT; implies --inserts\n"));
@@ -696,7 +764,7 @@ help(void)
 
 	printf(_("\nIf -f/--file is not used, then the SQL script will be written to the standard\n"
 			 "output.\n\n"));
-	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
+	printf(_("Report bugs on https://github.com/YugaByte/yugabyte-db/issues/new\n"));
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
 }
 
@@ -827,12 +895,27 @@ dumpRoles(PGconn *conn)
 	i_is_current_user = PQfnumber(res, "is_current_user");
 
 	if (PQntuples(res) > 0)
+	{
 		fprintf(OPF, "--\n-- Roles\n--\n\n");
+
+		if (include_yb_metadata)
+			fprintf(OPF,
+					"-- Set variable ignore_existing_roles (if not already set)\n"
+					"\\if :{?ignore_existing_roles}\n"
+					"\\else\n"
+					"\\set ignore_existing_roles false\n"
+					"\\endif\n\n");
+	}
 
 	for (i = 0; i < PQntuples(res); i++)
 	{
 		const char *rolename;
 		Oid			auth_oid;
+
+		char	   *yb_frolename = NULL;
+		const char *yb_indent = "";
+		bool		yb_skip_create_role = false;
+		bool		yb_need_endif = false;
 
 		auth_oid = atooid(PQgetvalue(res, i, i_oid));
 		rolename = PQgetvalue(res, i, i_rolname);
@@ -840,6 +923,23 @@ dumpRoles(PGconn *conn)
 		if (strncmp(rolename, "pg_", 3) == 0)
 		{
 			pg_log_warning("role name starting with \"pg_\" skipped (%s)",
+						   rolename);
+			continue;
+		}
+
+		/*
+		 * In Yugabyte major upgrade, there are additional roles already created
+		 * by initdb.
+		 * yb_superuser is created outside of initdb, so it needs to be included.
+		 * Note: If additional special roles with "yb_" prefix are added in the
+		 * future, they must also be excluded in the preflight check function
+		 * yb_check_yb_role_prefix() in check.c
+		 */
+		if (IsYugabyteEnabled && binary_upgrade &&
+			strncmp(rolename, "yb_", 3) == 0 &&
+			strncmp(rolename, YB_SUPERUSER, strlen(YB_SUPERUSER)) != 0)
+		{
+			pg_log_warning("role name starting with \"yb_\" skipped (%s)",
 						   rolename);
 			continue;
 		}
@@ -854,6 +954,7 @@ dumpRoles(PGconn *conn)
 							  auth_oid);
 		}
 
+		yb_frolename = pg_strdup(fmtId(rolename));
 		/*
 		 * We dump CREATE ROLE followed by ALTER ROLE to ensure that the role
 		 * will acquire the right properties even if it already exists (ie, it
@@ -861,11 +962,52 @@ dumpRoles(PGconn *conn)
 		 * for the role we are connected as, since even with --clean we will
 		 * have failed to drop it.  binary_upgrade cannot generate any errors,
 		 * so we assume the current role is already created.
+		 *
+		 * General algorithm for YB:
+		 * [1] Dump for Binary Upgrade (binary_upgrade == true)
+		 *     yugabyte / postgres roles (created by default): ALTER ROLE...
+		 *     Any other roles                               : CREATE ROLE... ALTER ROLE...
+		 * [2] Dump for Backup (include_yb_metadata == true, binary_upgrade == false)
+		 *     Current user (i_is_current_user == "t")       : ALTER ROLE...
+		 *     Any other roles                               :
+		 *                        \\if (!role_exists) { CREATE ROLE... ALTER ROLE... }
+		 * [3] Common dump (include_yb_metadata == false, binary_upgrade == false)
+		 *     Any roles                                     : CREATE ROLE... ALTER ROLE...
+		 *
+		 * In Yugabyte major upgrade, initdb always creates the yugabyte
+		 * and postgres users.
 		 */
-		if (!binary_upgrade ||
-			strcmp(PQgetvalue(res, i, i_is_current_user), "f") == 0)
-			appendPQExpBuffer(buf, "CREATE ROLE %s;\n", fmtId(rolename));
-		appendPQExpBuffer(buf, "ALTER ROLE %s WITH", fmtId(rolename));
+		if (IsYugabyteEnabled && binary_upgrade)
+			yb_skip_create_role =
+				(strcmp(rolename, "yugabyte") == 0 || strcmp(rolename, "postgres") == 0);
+		else
+			yb_skip_create_role = ((binary_upgrade || include_yb_metadata) &&
+								   (strcmp(PQgetvalue(res, i, i_is_current_user), "t") == 0));
+
+		if (!yb_skip_create_role)
+		{
+			if (include_yb_metadata)
+			{
+				yb_need_endif = true;
+				yb_indent = "    ";
+				appendPQExpBuffer(buf,
+								  "\\set role_exists false\n"
+								  "\\if :ignore_existing_roles\n"
+								  "%sSELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = ",
+								  yb_indent);
+				appendStringLiteralConn(buf, rolename, conn);
+				appendPQExpBuffer(buf,
+								  ") AS role_exists \\gset\n"
+								  "\\endif\n"
+								  "\\if :role_exists\n"
+								  "%s\\echo 'Role already exists:' %s\n"
+								  "\\else\n", yb_indent, yb_frolename);
+			}
+
+			appendPQExpBuffer(buf, "%sCREATE ROLE %s;\n", yb_indent, yb_frolename);
+		}
+
+		appendPQExpBuffer(buf, "%sALTER ROLE %s WITH", yb_indent, yb_frolename);
 
 		if (strcmp(PQgetvalue(res, i, i_rolsuper), "t") == 0)
 			appendPQExpBufferStr(buf, " SUPERUSER");
@@ -921,7 +1063,7 @@ dumpRoles(PGconn *conn)
 
 		if (!no_comments && !PQgetisnull(res, i, i_rolcomment))
 		{
-			appendPQExpBuffer(buf, "COMMENT ON ROLE %s IS ", fmtId(rolename));
+			appendPQExpBuffer(buf, "%sCOMMENT ON ROLE %s IS ", yb_indent, yb_frolename);
 			appendStringLiteralConn(buf, PQgetvalue(res, i, i_rolcomment), conn);
 			appendPQExpBufferStr(buf, ";\n");
 		}
@@ -929,9 +1071,16 @@ dumpRoles(PGconn *conn)
 		if (!no_security_labels)
 			buildShSecLabels(conn, "pg_authid", auth_oid,
 							 "ROLE", rolename,
-							 buf);
+							 buf, yb_indent);
+
+		if (yb_need_endif)
+			appendPQExpBufferStr(buf, "\\endif\n");
+
+		if (include_yb_metadata)
+			appendPQExpBufferStr(buf, "\n");
 
 		fprintf(OPF, "%s", buf->data);
+		free(yb_frolename);
 	}
 
 	/*
@@ -987,10 +1136,14 @@ dumpRoleMembership(PGconn *conn)
 		char	   *member = PQgetvalue(res, i, 1);
 		char	   *option = PQgetvalue(res, i, 2);
 
-		fprintf(OPF, "GRANT %s", fmtId(roleid));
-		fprintf(OPF, " TO %s", fmtId(member));
+		char	   *yb_grantor = NULL;
+
+		PQExpBuffer yb_sql = createPQExpBuffer();
+
+		appendPQExpBuffer(yb_sql, "GRANT %s", fmtId(roleid));
+		appendPQExpBuffer(yb_sql, " TO %s", fmtId(member));
 		if (*option == 't')
-			fprintf(OPF, " WITH ADMIN OPTION");
+			appendPQExpBufferStr(yb_sql, " WITH ADMIN OPTION");
 
 		/*
 		 * We don't track the grantor very carefully in the backend, so cope
@@ -998,17 +1151,35 @@ dumpRoleMembership(PGconn *conn)
 		 */
 		if (!PQgetisnull(res, i, 3))
 		{
-			char	   *grantor = PQgetvalue(res, i, 3);
-
-			fprintf(OPF, " GRANTED BY %s", fmtId(grantor));
+			yb_grantor = PQgetvalue(res, i, 3);
+			appendPQExpBuffer(yb_sql, " GRANTED BY %s", fmtId(yb_grantor));
 		}
-		fprintf(OPF, ";\n");
+		appendPQExpBufferStr(yb_sql, ";\n");
+
+		if (yb_dump_role_checks)
+		{
+			PQExpBuffer yb_source_sql = yb_sql;
+
+			yb_sql = createPQExpBuffer();
+			YBWwrapInRoleChecks(conn, yb_source_sql, "grant privilege",
+								member, /* role1 */
+								yb_grantor, /* role2; note: yb_grantor can be
+											 * NULL */
+								NULL,	/* role3 */
+								yb_sql);
+			destroyPQExpBuffer(yb_source_sql);
+		}
+
+		fprintf(OPF, "%s", yb_sql->data);
+		destroyPQExpBuffer(yb_sql);
 	}
 
 	PQclear(res);
 	destroyPQExpBuffer(buf);
 
-	fprintf(OPF, "\n\n");
+	fprintf(OPF, "\n");
+	if (!yb_dump_role_checks)
+		fprintf(OPF, "\n");		/* Second EOL. */
 }
 
 
@@ -1050,9 +1221,9 @@ dumpRoleGUCPrivs(PGconn *conn)
 		/* needed for buildACLCommands() */
 		fparname = pg_strdup(fmtId(parname));
 
-		if (!buildACLCommands(fparname, NULL, NULL, "PARAMETER",
+		if (!buildACLCommands(conn, fparname, NULL, NULL, "PARAMETER",
 							  paracl, acldefault,
-							  parowner, "", server_version, buf))
+							  parowner, "", server_version, yb_dump_role_checks, buf))
 		{
 			pg_log_error("could not parse ACL list (%s) for parameter \"%s\"",
 						 paracl, parname);
@@ -1123,14 +1294,25 @@ dumpTablespaces(PGconn *conn)
 					   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
 					   "pg_catalog.pg_tablespace_location(oid), "
 					   "spcacl, acldefault('t', spcowner) AS acldefault, "
-					   "array_to_string(spcoptions, ', '),"
+					   "spcoptions,"	/* YB: processing is done later in
+										 * ybProcessTablespaceSpcOptions */
 					   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
 					   "FROM pg_catalog.pg_tablespace "
 					   "WHERE spcname !~ '^pg_' "
 					   "ORDER BY 1");
 
 	if (PQntuples(res) > 0)
+	{
 		fprintf(OPF, "--\n-- Tablespaces\n--\n\n");
+
+		if (include_yb_metadata)
+			fprintf(OPF,
+					"-- Set variable ignore_existing_tablespaces (if not already set)\n"
+					"\\if :{?ignore_existing_tablespaces}\n"
+					"\\else\n"
+					"\\set ignore_existing_tablespaces false\n"
+					"\\endif\n\n");
+	}
 
 	for (i = 0; i < PQntuples(res); i++)
 	{
@@ -1154,23 +1336,40 @@ dumpTablespaces(PGconn *conn)
 			appendPQExpBuffer(buf, "SELECT pg_catalog.binary_upgrade_set_next_pg_tablespace_oid('%u'::pg_catalog.oid);\n", spcoid);
 		}
 
+		if (include_yb_metadata)
+			appendPQExpBuffer(buf,
+							  "\\set tablespace_exists false\n"
+							  "\\if :ignore_existing_tablespaces\n"
+							  "    SELECT EXISTS(SELECT 1 FROM pg_tablespace WHERE spcname = '%s')"
+							  " AS tablespace_exists \\gset\n"
+							  "\\endif\n"
+							  "\\if :tablespace_exists\n"
+							  "    \\echo 'Tablespace %s already exists.'\n"
+							  "\\else\n    ", fspcname, fspcname);
+
 		appendPQExpBuffer(buf, "CREATE TABLESPACE %s", fspcname);
 		appendPQExpBuffer(buf, " OWNER %s", fmtId(spcowner));
 
 		appendPQExpBufferStr(buf, " LOCATION ");
 		appendStringLiteralConn(buf, spclocation, conn);
-		appendPQExpBufferStr(buf, ";\n");
 
 		if (spcoptions && spcoptions[0] != '\0')
-			appendPQExpBuffer(buf, "ALTER TABLESPACE %s SET (%s);\n",
-							  fspcname, spcoptions);
+		{
+			appendPQExpBufferStr(buf, " WITH (");
+			ybProcessTablespaceSpcOptions(conn, &buf, spcoptions);
+			appendPQExpBufferStr(buf, ")");
+		}
+		appendPQExpBufferStr(buf, ";\n");
+
+		if (include_yb_metadata)
+			appendPQExpBufferStr(buf, "\\endif\n");
 
 		/* tablespaces can't have initprivs */
 
 		if (!skip_acls &&
-			!buildACLCommands(fspcname, NULL, NULL, "TABLESPACE",
+			!buildACLCommands(conn, fspcname, NULL, NULL, "TABLESPACE",
 							  spcacl, acldefault,
-							  spcowner, "", server_version, buf))
+							  spcowner, "", server_version, yb_dump_role_checks, buf))
 		{
 			pg_log_error("could not parse ACL list (%s) for tablespace \"%s\"",
 						 spcacl, spcname);
@@ -1188,7 +1387,10 @@ dumpTablespaces(PGconn *conn)
 		if (!no_security_labels)
 			buildShSecLabels(conn, "pg_tablespace", spcoid,
 							 "TABLESPACE", spcname,
-							 buf);
+							 buf, "");
+
+		if (include_yb_metadata)
+			appendPQExpBufferStr(buf, "\n");
 
 		fprintf(OPF, "%s", buf->data);
 
@@ -1200,6 +1402,24 @@ dumpTablespaces(PGconn *conn)
 	fprintf(OPF, "\n\n");
 }
 
+/*
+ * Vanilla PG does not have strings in spcoptions column in pg_tablespace.
+ * Since YB tablespaces have JSON strings in its options, process using
+ * appendRelOptionsArray and append to 'buf'.
+ */
+static void
+ybProcessTablespaceSpcOptions(PGconn *conn, PQExpBuffer *buf, char *spcoptions)
+{
+	int			encoding = PQclientEncoding(conn);
+	bool		std_strings = PQparameterStatus(conn, "standard_conforming_strings");
+	bool		res = appendReloptionsArray(*buf, spcoptions, "", encoding, std_strings);
+
+	if (!res)
+	{
+		fprintf(stderr, "WARNING: could not parse reloptions array\n");
+		exit_nicely(1);
+	}
+}
 
 /*
  * Dump commands to drop each database.
@@ -1274,7 +1494,7 @@ dumpUserConfig(PGconn *conn, const char *username)
 		resetPQExpBuffer(buf);
 		makeAlterConfigCommand(conn, PQgetvalue(res, i, 0),
 							   "ROLE", username, NULL, NULL,
-							   buf);
+							   yb_dump_role_checks, buf);
 		fprintf(OPF, "%s", buf->data);
 	}
 
@@ -1341,7 +1561,7 @@ expand_dbname_patterns(PGconn *conn,
  * Dump contents of databases.
  */
 static void
-dumpDatabases(PGconn *conn)
+dumpDatabases(PGconn *conn, const char *pgdb)
 {
 	PGresult   *res;
 	int			i;
@@ -1371,6 +1591,9 @@ dumpDatabases(PGconn *conn)
 		char	   *dbname = PQgetvalue(res, i, 0);
 		const char *create_opts;
 		int			ret;
+
+		if (pgdb && strcmp(dbname, pgdb) != 0)
+			continue;
 
 		/* Skip template0, even if it's not marked !datallowconn. */
 		if (strcmp(dbname, "template0") == 0)
@@ -1414,7 +1637,7 @@ dumpDatabases(PGconn *conn)
 
 		ret = runPgDump(dbname, create_opts);
 		if (ret != 0)
-			pg_fatal("pg_dump failed on database \"%s\", exiting", dbname);
+			pg_fatal("ysql_dump failed on database \"%s\", exiting", dbname);
 
 		if (filename)
 		{
@@ -1488,14 +1711,14 @@ runPgDump(const char *dbname, const char *create_opts)
 static void
 buildShSecLabels(PGconn *conn, const char *catalog_name, Oid objectId,
 				 const char *objtype, const char *objname,
-				 PQExpBuffer buffer)
+				 PQExpBuffer buffer, const char *yb_indent)
 {
 	PQExpBuffer sql = createPQExpBuffer();
 	PGresult   *res;
 
 	buildShSecLabelQuery(catalog_name, objectId, sql);
 	res = executeQuery(conn, sql->data);
-	emitShSecLabels(conn, res, buffer, objtype, objname);
+	emitShSecLabels(conn, res, buffer, objtype, objname, yb_indent);
 
 	PQclear(res);
 	destroyPQExpBuffer(sql);
@@ -1789,4 +2012,204 @@ dumpTimestamp(const char *msg)
 
 	if (strftime(buf, sizeof(buf), PGDUMP_STRFTIME_FMT, localtime(&now)) != 0)
 		fprintf(OPF, "-- %s %s\n\n", msg, buf);
+}
+
+/*
+ * Drop YB role profiles
+ */
+static void
+dropYbRoleProfiles(PGconn *conn)
+{
+	PQExpBuffer buf = createPQExpBuffer();
+	PGresult   *res;
+	int			i;
+	int			i_rolname;
+
+	printfPQExpBuffer(buf,
+					  "SELECT r.rolname "
+					  "FROM pg_yb_role_profile rp "
+					  "JOIN %s r ON r.oid = rp.rolprfrole",
+					  role_catalog);
+
+	res = executeQuery(conn, buf->data);
+	i_rolname = PQfnumber(res, "rolname");
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "--\n-- Drop YB role-profile mappings\n--\n\n");
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		const char *rolename = PQgetvalue(res, i, i_rolname);
+
+		fprintf(OPF, "ALTER ROLE %s NOPROFILE;\n", fmtId(rolename));
+	}
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "\n\n");
+
+	PQclear(res);
+	destroyPQExpBuffer(buf);
+}
+
+/*
+ * Drop YB profiles
+ */
+static void
+dropYbProfiles(PGconn *conn)
+{
+	PQExpBuffer buf = createPQExpBuffer();
+	PGresult   *res;
+	int			i_prfname;
+	int			i;
+
+	/* Select all profiles from pg_yb_profile table */
+	appendPQExpBuffer(buf, "SELECT prfname FROM pg_yb_profile");
+
+	res = executeQuery(conn, buf->data);
+
+	i_prfname = PQfnumber(res, "prfname");
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "--\n-- Drop YB profiles\n--\n\n");
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		const char *prfname;
+
+		prfname = PQgetvalue(res, i, i_prfname);
+
+		fprintf(OPF, "DROP PROFILE %s%s;\n",
+				if_exists ? "IF EXISTS " : "",
+				fmtId(prfname));
+	}
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "\n\n");
+
+	PQclear(res);
+	destroyPQExpBuffer(buf);
+}
+
+static void
+dumpYbProfiles(PGconn *conn)
+{
+	PQExpBuffer buf = createPQExpBuffer();
+	PGresult   *res;
+	int			i;
+
+	/* Get all rows from pg_yb_profile */
+	res = executeQuery(conn, "SELECT prfname, prfmaxfailedloginattempts "
+					   "FROM pg_yb_profile ORDER BY prfname");
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "--\n-- YB Profiles\n--\n\n");
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		char	   *prfname = PQgetvalue(res, i, 0);
+		char	   *max_failed_logins = PQgetvalue(res, i, 1);
+		char	   *fprfname = pg_strdup(fmtId(prfname));
+
+		PQExpBuffer stmt = createPQExpBuffer();
+
+		appendPQExpBuffer(stmt, "CREATE PROFILE %s", fprfname);
+		if (max_failed_logins && strlen(max_failed_logins) > 0)
+			appendPQExpBuffer(stmt, " LIMIT FAILED_LOGIN_ATTEMPTS %s", max_failed_logins);
+		appendPQExpBufferStr(stmt, ";\n");
+
+		fprintf(OPF, "%s", stmt->data);
+
+		free(fprfname);
+		destroyPQExpBuffer(stmt);
+	}
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "\n\n");
+
+	PQclear(res);
+	destroyPQExpBuffer(buf);
+}
+
+static void
+dumpYbRoleProfiles(PGconn *conn)
+{
+	PQExpBuffer buf = createPQExpBuffer();
+	PGresult   *res;
+	int			i;
+
+	printfPQExpBuffer(buf,
+					  "SELECT r.rolname AS role_name, "
+					  "p.prfname AS profile_name, "
+					  "rp.rolprfstatus, "
+					  "rp.rolprffailedloginattempts, "
+					  "rp.rolprflockeduntil "
+					  "FROM pg_yb_role_profile rp "
+					  "JOIN %s r ON r.oid = rp.rolprfrole "
+					  "JOIN pg_yb_profile p ON p.oid = rp.rolprfprofile "
+					  "ORDER BY role_name, profile_name",
+					  role_catalog);
+
+	res = executeQuery(conn, buf->data);
+	destroyPQExpBuffer(buf);
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "--\n-- YB Role-Profile Mappings\n--\n\n");
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		char	   *role_name = PQgetvalue(res, i, 0);
+		char	   *profile_name = PQgetvalue(res, i, 1);
+		char		status = *PQgetvalue(res, i, 2);
+		int			failed_login_attempts = atoi(PQgetvalue(res, i, 3));
+		const char *locked_until = PQgetvalue(res, i, 4);
+		bool		has_locked_until = !PQgetisnull(res, i, 4);
+
+		PQExpBuffer stmt = createPQExpBuffer();
+
+		appendPQExpBuffer(stmt, "ALTER ROLE %s PROFILE %s;\n",
+						  role_name, profile_name);
+
+		appendPQExpBuffer(stmt,
+						  "UPDATE pg_catalog.pg_yb_role_profile\n"
+						  "SET rolprfstatus = '%c',\n"
+						  "    rolprffailedloginattempts = %d",
+						  status, failed_login_attempts);
+
+		if (has_locked_until)
+		{
+			appendPQExpBuffer(stmt,
+							  ",\n    rolprflockeduntil = '%s'",
+							  locked_until);
+		}
+
+		appendPQExpBuffer(stmt,
+						  "\nWHERE rolprfrole = (SELECT oid FROM %s WHERE rolname = ", role_catalog);
+		appendStringLiteralConn(stmt, role_name, conn);
+		appendPQExpBuffer(stmt,
+						  ")\n  AND rolprfprofile = (SELECT oid FROM pg_yb_profile WHERE prfname = ");
+		appendStringLiteralConn(stmt, profile_name, conn);
+		appendPQExpBuffer(stmt,
+						  ");\n");
+
+		if (yb_dump_role_checks)
+		{
+			PQExpBuffer yb_source_sql = stmt;
+
+			stmt = createPQExpBuffer();
+			YBWwrapInRoleChecks(conn, yb_source_sql, "alter role",
+								role_name,	/* role1 */
+								NULL,	/* role2 */
+								NULL,	/* role3 */
+								stmt);
+			destroyPQExpBuffer(yb_source_sql);
+		}
+
+		fprintf(OPF, "%s%s", stmt->data, yb_dump_role_checks ? "" : "\n");
+		destroyPQExpBuffer(stmt);
+	}
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "\n");
+
+	PQclear(res);
 }

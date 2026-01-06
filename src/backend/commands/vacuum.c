@@ -60,6 +60,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "pg_yb_utils.h"
+
 
 /*
  * GUC parameters
@@ -305,6 +309,23 @@ vacuum(List *relations, VacuumParams *params,
 	volatile bool in_outer_xact,
 				use_own_xacts;
 
+	/*
+	 * VACUUM currently not supported for Yugabyte.
+	 */
+	if (params->options & VACOPT_VACUUM)
+	{
+		ereport(NOTICE,
+				(errmsg("VACUUM is a no-op statement since YugabyteDB performs garbage collection of dead tuples automatically")));
+		if (params->options & VACOPT_ANALYZE)
+		{
+			params->options &= ~VACOPT_VACUUM;
+		}
+		else
+		{
+			return;
+		}
+	}
+
 	Assert(params != NULL);
 
 	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
@@ -436,8 +457,11 @@ vacuum(List *relations, VacuumParams *params,
 	 * commit the transaction started in PostgresMain() here, and start
 	 * another one before exiting to match the commit waiting for us back in
 	 * PostgresMain().
+	 *
+	 * YB: Handle the commit later while starting the new transaction. See the
+	 * call to YbCommitTransactionCommandIntermediate.
 	 */
-	if (use_own_xacts)
+	if (!IsYugaByteEnabled() && use_own_xacts)
 	{
 		Assert(!in_outer_xact);
 
@@ -485,7 +509,15 @@ vacuum(List *relations, VacuumParams *params,
 				 */
 				if (use_own_xacts)
 				{
-					StartTransactionCommand();
+					/*
+					 * YB: Commit the earlier transaction remembering the ddl
+					 * state, start a new one and set the stored ddl state.
+					 */
+					if (IsYugaByteEnabled())
+						YbCommitTransactionCommandIntermediate();
+					else
+						StartTransactionCommand();
+
 					/* functions in indexes may want a snapshot set */
 					PushActiveSnapshot(GetTransactionSnapshot());
 				}
@@ -493,12 +525,12 @@ vacuum(List *relations, VacuumParams *params,
 				analyze_rel(vrel->oid, vrel->relation, params,
 							vrel->va_cols, in_outer_xact, vac_strategy);
 
-				if (use_own_xacts)
+				if (!IsYugaByteEnabled() && use_own_xacts)
 				{
 					PopActiveSnapshot();
 					CommitTransactionCommand();
 				}
-				else
+				else if (!use_own_xacts)
 				{
 					/*
 					 * If we're not using separate xacts, better separate the
@@ -522,13 +554,18 @@ vacuum(List *relations, VacuumParams *params,
 	 */
 	if (use_own_xacts)
 	{
-		/* here, we are not in a transaction */
+		if (IsYugaByteEnabled())
+			YbCommitTransactionCommandIntermediate();
+		else
+		{
+			/* here, we are not in a transaction */
 
-		/*
-		 * This matches the CommitTransaction waiting for us in
-		 * PostgresMain().
-		 */
-		StartTransactionCommand();
+			/*
+			 * This matches the CommitTransaction waiting for us in
+			 * PostgresMain().
+			 */
+			StartTransactionCommand();
+		}
 	}
 
 	if ((params->options & VACOPT_VACUUM) && !IsAutoVacuumWorkerProcess())
@@ -1452,7 +1489,8 @@ vac_update_relstats(Relation relation,
 
 	/* If anything changed, write out the tuple. */
 	if (dirty)
-		systable_inplace_update_finish(inplace_state, ctup);
+		systable_inplace_update_finish(inplace_state, ctup,
+									   false /* yb_shared_update */ );
 	else
 		systable_inplace_update_cancel(inplace_state);
 
@@ -1675,7 +1713,8 @@ vac_update_datfrozenxid(void)
 		newMinMulti = dbform->datminmxid;
 
 	if (dirty)
-		systable_inplace_update_finish(inplace_state, tuple);
+		systable_inplace_update_finish(inplace_state, tuple,
+									   false /* yb_shared_update */ );
 	else
 		systable_inplace_update_cancel(inplace_state);
 

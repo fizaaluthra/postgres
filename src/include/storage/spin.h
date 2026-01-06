@@ -14,6 +14,7 @@
  *		Acquire a spinlock, waiting if necessary.
  *		Time out and abort() if unable to acquire the lock in a
  *		"reasonable" amount of time --- typically ~ 1 minute.
+ *		YB note: instead of 1 minute, it's roughly 15 seconds.
  *
  *	void SpinLockRelease(volatile slock_t *lock)
  *		Unlock a previously acquired lock.
@@ -56,12 +57,30 @@
 #include "storage/pg_sema.h"
 #endif
 
+/* YB includes */
+#include "miscadmin.h"
+#include "storage/proc.h"
+
 
 #define SpinLockInit(lock)	S_INIT_LOCK(lock)
 
-#define SpinLockAcquire(lock) S_LOCK(lock)
+/* YB modified */
+#define SpinLockAcquire(lock) \
+	do \
+	{ \
+		if (IsUnderPostmaster && MyProc) \
+			MyProc->ybSpinLocksAcquired++; \
+		S_LOCK(lock); \
+	} while (0)
 
-#define SpinLockRelease(lock) S_UNLOCK(lock)
+/* YB modified */
+#define SpinLockRelease(lock) \
+	do \
+	{ \
+		S_UNLOCK(lock); \
+		if (IsUnderPostmaster && MyProc && MyProc->ybSpinLocksAcquired >= 1) \
+			MyProc->ybSpinLocksAcquired--; \
+	} while (0)
 
 #define SpinLockFree(lock)	S_LOCK_FREE(lock)
 

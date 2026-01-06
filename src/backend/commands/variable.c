@@ -33,6 +33,9 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * DATESTYLE
  */
@@ -513,6 +516,16 @@ check_transaction_read_only(bool *newval, void **extra, GucSource source)
 	return true;
 }
 
+void
+assign_transaction_read_only(bool newval, void *extra)
+{
+	XactReadOnly = newval;
+	if (YBTransactionsEnabled())
+	{
+		HandleYBStatus(YBCPgSetTransactionReadOnly(XactReadOnly));
+	}
+}
+
 /*
  * SET TRANSACTION ISOLATION LEVEL
  *
@@ -525,6 +538,16 @@ bool
 check_XactIsoLevel(int *newval, void **extra, GucSource source)
 {
 	int			newXactIsoLevel = *newval;
+
+	if (source >= PGC_S_INTERACTIVE &&
+		newXactIsoLevel == XACT_READ_COMMITTED &&
+		!YBIsReadCommittedSupported())
+	{
+		ereport(WARNING,
+				(errmsg("read committed isolation is disabled"),
+				 errdetail("Set yb_enable_read_committed_isolation to enable. When disabled, read "
+						   "committed falls back to using repeatable read isolation.")));
+	}
 
 	if (newXactIsoLevel != XactIsoLevel && IsTransactionState())
 	{
@@ -554,6 +577,160 @@ check_XactIsoLevel(int *newval, void **extra, GucSource source)
 	return true;
 }
 
+void
+yb_assign_XactIsoLevel(int newval, void *extra)
+{
+	XactIsoLevel = newval;
+	if (YBTransactionsEnabled())
+		HandleYBStatus(YBCPgSetTransactionIsolationLevel(YBGetEffectivePggateIsolationLevel()));
+}
+
+bool
+check_yb_default_xact_isolation(int *newval, void **extra, GucSource source)
+{
+	if (source >= PGC_S_INTERACTIVE && (*newval == XACT_READ_COMMITTED) &&
+		!YBIsReadCommittedSupported())
+	{
+		ereport(WARNING,
+				(errmsg("read committed isolation is disabled"),
+				 errdetail("Set yb_enable_read_committed_isolation to enable. When disabled, read "
+						   "committed falls back to using repeatable read isolation.")));
+	}
+	return true;
+}
+
+const char *
+yb_fetch_effective_transaction_isolation_level(void)
+{
+	switch (XactIsoLevel)
+	{
+		case XACT_READ_UNCOMMITTED:
+			yb_switch_fallthrough();
+		case XACT_READ_COMMITTED:
+			if (IsYBReadCommitted())
+				return "read committed";
+			yb_switch_fallthrough();
+		case XACT_REPEATABLE_READ:
+			return "repeatable read";
+		case XACT_SERIALIZABLE:
+			return "serializable";
+		default:
+			return "bogus";
+	}
+}
+
+bool
+is_staleness_acceptable(int32_t staleness_ms)
+{
+	int32_t		max_clock_skew_usec = YBGetMaxClockSkewUsec();
+	const int	kMargin = 2;
+
+	if (staleness_ms * 1000 < kMargin * max_clock_skew_usec)
+	{
+		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		GUC_check_errmsg("cannot enable yb_read_from_followers with a staleness of less than "
+						 "%d * (max_clock_skew = %d usec)", kMargin, max_clock_skew_usec);
+		return false;
+	}
+	return true;
+}
+
+bool
+check_follower_reads(bool *newval, void **extra, GucSource source)
+{
+	if (YBFollowerReadsBehaviorBefore20482())
+	{
+		if (*newval == false)
+		{
+			return true;
+		}
+		return is_staleness_acceptable(yb_follower_read_staleness_ms);
+	}
+
+	if (XactReadOnly && IsTransactionState())
+	{
+		if (FirstSnapshotSet)
+		{
+			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
+			GUC_check_errmsg("SET yb_read_from_followers must be called before any query");
+			return false;
+		}
+		if (IsSubTransaction())
+		{
+			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
+			GUC_check_errmsg("SET yb_read_from_followers must not be called in a subtransaction");
+			return false;
+		}
+		/* Can't enable follower reads while recovery is still active */
+		if (RecoveryInProgress())
+		{
+			GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+			GUC_check_errmsg("cannot set yb_read_from_followers during recovery");
+			return false;
+		}
+	}
+	return true;
+}
+
+void
+assign_follower_reads(bool newval, void *extra)
+{
+	if (YBFollowerReadsBehaviorBefore20482())
+	{
+		return;
+	}
+
+	yb_read_from_followers = newval;
+	if (YBTransactionsEnabled())
+		HandleYBStatus(YBCPgUpdateFollowerReadsConfig(YBReadFromFollowersEnabled(),
+													  YBFollowerReadStalenessMs()));
+}
+
+bool
+check_follower_read_staleness_ms(int32_t *newval, void **extra, GucSource source)
+{
+	if (YBFollowerReadsBehaviorBefore20482())
+	{
+		if (!YBReadFromFollowersEnabled())
+		{
+			return true;
+		}
+		return is_staleness_acceptable(*newval);
+	}
+	if (XactReadOnly && YBTransactionsEnabled())
+	{
+		if (FirstSnapshotSet)
+		{
+			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
+			GUC_check_errmsg("SET yb_follower_read_staleness_ms must be called before any query");
+			return false;
+		}
+		if (IsSubTransaction())
+		{
+			GUC_check_errcode(ERRCODE_ACTIVE_SQL_TRANSACTION);
+			GUC_check_errmsg("SET yb_follower_read_staleness_ms must not be called in a subtransaction");
+			return false;
+		}
+		/* Can't change follower read staleness while recovery is still active */
+		if (RecoveryInProgress())
+		{
+			GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+			GUC_check_errmsg("cannot set yb_follower_read_staleness_ms during recovery");
+			return false;
+		}
+	}
+	return is_staleness_acceptable(*newval);
+}
+
+void
+assign_follower_read_staleness_ms(int32_t newval, void *extra)
+{
+	yb_follower_read_staleness_ms = newval;
+	if (YBTransactionsEnabled() && !YBFollowerReadsBehaviorBefore20482())
+		HandleYBStatus(YBCPgUpdateFollowerReadsConfig(YBReadFromFollowersEnabled(),
+													  YBFollowerReadStalenessMs()));
+}
+
 /*
  * SET TRANSACTION [NOT] DEFERRABLE
  */
@@ -575,6 +752,16 @@ check_transaction_deferrable(bool *newval, void **extra, GucSource source)
 	}
 
 	return true;
+}
+
+void
+assign_transaction_deferrable(bool newval, void *extra)
+{
+	XactDeferrable = newval;
+	if (YBTransactionsEnabled())
+	{
+		HandleYBStatus(YBCPgSetTransactionDeferrable(XactDeferrable));
+	}
 }
 
 /*
@@ -807,9 +994,14 @@ check_session_authorization(char **newval, void **extra, GucSource source)
 		 * Only superusers may SET SESSION AUTHORIZATION a role other than
 		 * itself. Note that in case of multiple SETs in a single session, the
 		 * original authenticated user's superuserness is what matters.
+		 *
+		 * YB: further allow yb_db_admin users as long as they are not trying
+		 * to SET SESSION AUTHORIZATION to superuser.
 		 */
 		if (roleid != GetAuthenticatedUserId() &&
-			!GetAuthenticatedUserIsSuperuser())
+			!GetAuthenticatedUserIsSuperuser() &&
+			!(IsYbDbAdminUserNosuper(GetAuthenticatedUserId()) &&
+			  !superuser_arg(roleid)))
 		{
 			if (source == PGC_S_TEST)
 			{

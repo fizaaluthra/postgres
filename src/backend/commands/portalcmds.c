@@ -34,6 +34,9 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * PerformCursorOpen
@@ -146,6 +149,13 @@ PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo pa
 	PortalStart(portal, params, 0, GetActiveSnapshot());
 
 	Assert(portal->strategy == PORTAL_ONE_SELECT);
+
+	/* Increment yb_sticky_connection if a WITH HOLD cursor is declared. */
+	if (YbIsClientYsqlConnMgr() && (cstmt->options & CURSOR_OPT_HOLD))
+	{
+		elog(LOG, "Incrementing sticky object count for cursor %s", cstmt->portalname);
+		increment_sticky_object_count();
+	}
 
 	/*
 	 * We're done; the query won't actually be run until PerformPortalFetch is
@@ -292,12 +302,22 @@ PortalCleanup(Portal portal)
 
 			/* We must make the portal's resource owner current */
 			saveResourceOwner = CurrentResourceOwner;
-			if (portal->resowner)
-				CurrentResourceOwner = portal->resowner;
+			/* YB: wrap in try-catch for transparent query retry */
+			PG_TRY();
+			{
+				if (portal->resowner)
+					CurrentResourceOwner = portal->resowner;
 
-			ExecutorFinish(queryDesc);
-			ExecutorEnd(queryDesc);
-			FreeQueryDesc(queryDesc);
+				ExecutorFinish(queryDesc);
+				ExecutorEnd(queryDesc);
+				FreeQueryDesc(queryDesc);
+			}
+			PG_CATCH();
+			{
+				CurrentResourceOwner = saveResourceOwner;
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 
 			CurrentResourceOwner = saveResourceOwner;
 		}

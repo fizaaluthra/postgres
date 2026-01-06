@@ -35,4 +35,10 @@ extern void ExecAsyncForeignScanRequest(AsyncRequest *areq);
 extern void ExecAsyncForeignScanConfigureWait(AsyncRequest *areq);
 extern void ExecAsyncForeignScanNotify(AsyncRequest *areq);
 
+/*
+ * Update YugabyteDB specific run-time statistics
+ */
+extern void YbExecUpdateInstrumentForeignScan(ForeignScanState *node,
+											  Instrumentation *instr);
+
 #endif							/* NODEFOREIGNSCAN_H */

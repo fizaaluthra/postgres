@@ -40,6 +40,12 @@
 #include "utils/typcache.h"
 #include "utils/xml.h"
 
+/* YB includes */
+#include "executor/ybModifyTable.h"
+#include "optimizer/planner.h"
+#include "pg_yb_utils.h"
+#include "utils/guc.h"
+
 
 /* Hook for plugins to get control in ExplainOneQuery() */
 ExplainOneQuery_hook_type ExplainOneQuery_hook = NULL;
@@ -53,6 +59,8 @@ explain_get_index_name_hook_type explain_get_index_name_hook = NULL;
 #define X_CLOSING 1
 #define X_CLOSE_IMMEDIATE 2
 #define X_NOWHITESPACE 4
+
+#define CEILING_K(s) ((s + 1023) / 1024)
 
 static void ExplainOneQuery(Query *query, int cursorOptions,
 							IntoClause *into, ExplainState *es,
@@ -123,6 +131,8 @@ static void show_buffer_usage(ExplainState *es, const BufferUsage *usage,
 							  bool planning);
 static void show_wal_usage(ExplainState *es, const WalUsage *usage);
 static void ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir,
+									YbPlanInfo *yb_plan_info,
+									bool yb_is_agg_pushdown,
 									ExplainState *es);
 static void ExplainScanTarget(Scan *plan, ExplainState *es);
 static void ExplainModifyTarget(ModifyTable *plan, ExplainState *es);
@@ -154,7 +164,801 @@ static void ExplainJSONLineEnding(ExplainState *es);
 static void ExplainYAMLLineStarting(ExplainState *es);
 static void escape_yaml(StringInfo buf, const char *str);
 
+/* YB declarations */
+static void show_yb_planning_stats_common(double num_seeks,
+										  double num_nexts_prevs,
+										  double num_table_pages,
+										  double num_index_pages,
+										  int docdb_result_width,
+										  ExplainState *es);
+static void show_yb_planning_stats(YbPlanInfo *planinfo, ExplainState *es);
+static void show_yb_bitmap_scan_planning_stats(YbPlanInfo *planinfo,
+											   ExplainState *es);
+static void show_yb_rpc_stats(PlanState *planstate, ExplainState *es);
+static void YbAppendPgMemInfo(ExplainState *es, const Size peakMem);
+static void YbAggregateExplainableRPCRequestStat(ExplainState *es,
+												 const YbInstrumentation *instr);
+static void YbExplainSaopMerge(PlanState *planstate, List *indextlist,
+							   YbSaopMergeInfo *saop_merge_info,
+							   ExplainState *es, List *ancestors);
+static void YbExplainDistinctPrefixLen(PlanState *planstate, List *indextlist,
+									   int yb_distinct_prefixlen,
+									   ExplainState *es, List *ancestors);
+static void show_ybtidbitmap_info(YbBitmapTableScanState *planstate,
+								  ExplainState *es);
 
+typedef enum YbStatLabel
+{
+	YB_STAT_LABEL_FIRST = 0,
+
+	YB_STAT_LABEL_CATALOG_READ = YB_STAT_LABEL_FIRST,
+	YB_STAT_LABEL_CATALOG_READ_OP,
+	YB_STAT_LABEL_CATALOG_WRITE,
+
+	YB_STAT_LABEL_STORAGE_READ,
+	YB_STAT_LABEL_STORAGE_READ_OP,
+	YB_STAT_LABEL_STORAGE_WRITE,
+
+	YB_STAT_LABEL_STORAGE_TABLE_READ,
+	YB_STAT_LABEL_STORAGE_TABLE_READ_OP,
+	YB_STAT_LABEL_STORAGE_TABLE_WRITE,
+	YB_STAT_LABEL_STORAGE_TABLE_ROWS_SCANNED,
+
+	YB_STAT_LABEL_STORAGE_INDEX_READ,
+	YB_STAT_LABEL_STORAGE_INDEX_READ_OP,
+	YB_STAT_LABEL_STORAGE_INDEX_WRITE,
+	YB_STAT_LABEL_STORAGE_INDEX_ROWS_SCANNED,
+
+	YB_STAT_LABEL_STORAGE_FLUSH,
+
+	YB_STAT_LABEL_STORAGE_ROWS_SCANNED,
+
+	YB_STAT_LABEL_LAST
+} YbStatLabel;
+
+typedef struct YbStatLabelData
+{
+	const char *requests;
+	const char *execution_time;
+
+	/* Indicates if field can vary between runs of the same query */
+	const bool	is_non_deterministic;
+} YbStatLabelData;
+
+typedef struct YbExplainState
+{
+	ExplainState *es;
+	bool		display_zero;
+} YbExplainState;
+
+#define BUILD_STAT_LABEL_DATA(NAME, IS_NON_DETERMINISTIC) \
+	{ \
+		NAME, NULL, IS_NON_DETERMINISTIC \
+	}
+
+#define BUILD_REQUEST_STAT_LABEL_DATA(NAME, IS_NON_DETERMINISTIC) \
+	{ \
+		NAME " Requests", NAME " Execution Time", IS_NON_DETERMINISTIC \
+	}
+
+#define BUILD_NON_DETERMINISTIC_STAT_LABEL_DATA(NAME) \
+	BUILD_STAT_LABEL_DATA(NAME, true)
+
+#define BUILD_DETERMINISTIC_STAT_LABEL_DATA(NAME) \
+	BUILD_STAT_LABEL_DATA(NAME, false)
+
+#define BUILD_NON_DETERMINISTIC_REQUEST_STAT_LABEL_DATA(NAME) \
+	BUILD_REQUEST_STAT_LABEL_DATA(NAME, true)
+
+#define BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA(NAME) \
+	BUILD_REQUEST_STAT_LABEL_DATA(NAME, false)
+
+const YbStatLabelData yb_stat_label_data[] = {
+	[YB_STAT_LABEL_CATALOG_READ] =
+	BUILD_NON_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Catalog Read"),
+	[YB_STAT_LABEL_CATALOG_READ_OP] =
+	BUILD_NON_DETERMINISTIC_STAT_LABEL_DATA("Catalog Read Ops"),
+	[YB_STAT_LABEL_CATALOG_WRITE] =
+	BUILD_NON_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Catalog Write"),
+
+	[YB_STAT_LABEL_STORAGE_READ] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Read"),
+	[YB_STAT_LABEL_STORAGE_READ_OP] =
+	BUILD_DETERMINISTIC_STAT_LABEL_DATA("Storage Read Ops"),
+	[YB_STAT_LABEL_STORAGE_WRITE] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Write"),
+	[YB_STAT_LABEL_STORAGE_ROWS_SCANNED] =
+	BUILD_DETERMINISTIC_STAT_LABEL_DATA("Storage Rows Scanned"),
+
+	[YB_STAT_LABEL_STORAGE_TABLE_READ] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Table Read"),
+	[YB_STAT_LABEL_STORAGE_TABLE_READ_OP] =
+	BUILD_DETERMINISTIC_STAT_LABEL_DATA("Storage Table Read Ops"),
+	[YB_STAT_LABEL_STORAGE_TABLE_WRITE] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Table Write"),
+	[YB_STAT_LABEL_STORAGE_TABLE_ROWS_SCANNED] =
+	BUILD_DETERMINISTIC_STAT_LABEL_DATA("Storage Table Rows Scanned"),
+
+	[YB_STAT_LABEL_STORAGE_INDEX_READ] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Index Read"),
+	[YB_STAT_LABEL_STORAGE_INDEX_READ_OP] =
+	BUILD_DETERMINISTIC_STAT_LABEL_DATA("Storage Index Read Ops"),
+	[YB_STAT_LABEL_STORAGE_INDEX_WRITE] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Index Write"),
+	[YB_STAT_LABEL_STORAGE_INDEX_ROWS_SCANNED] =
+	BUILD_DETERMINISTIC_STAT_LABEL_DATA("Storage Index Rows Scanned"),
+
+	[YB_STAT_LABEL_STORAGE_FLUSH] =
+	BUILD_DETERMINISTIC_REQUEST_STAT_LABEL_DATA("Storage Flush"),
+};
+
+#undef BUILD_STAT_LABEL_DATA
+
+#define BUILD_METRIC_LABEL(NAME) ("Metric " NAME)
+
+/*  These labels are identical to exported metric names. */
+const char *yb_metric_gauge_label[] = {
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_ADD] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_add"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_ADD_FAILURES] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_add_failures"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_INDEX_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_index_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_INDEX_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_index_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_FILTER_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_filter_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_FILTER_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_filter_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_DATA_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_data_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_DATA_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_data_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_BYTES_WRITE] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_bytes_write"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_USEFUL] =
+	BUILD_METRIC_LABEL("rocksdb_bloom_filter_useful"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_CHECKED] =
+	BUILD_METRIC_LABEL("rocksdb_bloom_filter_checked"),
+	[YB_STORAGE_GAUGE_REGULARDB_MEMTABLE_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_memtable_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_MEMTABLE_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_memtable_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_GET_HIT_L0] =
+	BUILD_METRIC_LABEL("rocksdb_get_hit_l0"),
+	[YB_STORAGE_GAUGE_REGULARDB_GET_HIT_L1] =
+	BUILD_METRIC_LABEL("rocksdb_get_hit_l1"),
+	[YB_STORAGE_GAUGE_REGULARDB_GET_HIT_L2_AND_UP] =
+	BUILD_METRIC_LABEL("rocksdb_get_hit_l2_and_up"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_KEYS_WRITTEN] =
+	BUILD_METRIC_LABEL("rocksdb_number_keys_written"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_KEYS_READ] =
+	BUILD_METRIC_LABEL("rocksdb_number_keys_read"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_KEYS_UPDATED] =
+	BUILD_METRIC_LABEL("rocksdb_number_keys_updated"),
+	[YB_STORAGE_GAUGE_REGULARDB_BYTES_WRITTEN] =
+	BUILD_METRIC_LABEL("rocksdb_bytes_written"),
+	[YB_STORAGE_GAUGE_REGULARDB_BYTES_READ] =
+	BUILD_METRIC_LABEL("rocksdb_bytes_read"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_SEEK] =
+	BUILD_METRIC_LABEL("rocksdb_number_db_seek"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_NEXT] =
+	BUILD_METRIC_LABEL("rocksdb_number_db_next"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_PREV] =
+	BUILD_METRIC_LABEL("rocksdb_number_db_prev"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_SEEK_FOUND] =
+	BUILD_METRIC_LABEL("rocksdb_number_db_seek_found"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_NEXT_FOUND] =
+	BUILD_METRIC_LABEL("rocksdb_number_db_next_found"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DB_PREV_FOUND] =
+	BUILD_METRIC_LABEL("rocksdb_number_db_prev_found"),
+	[YB_STORAGE_GAUGE_REGULARDB_ITER_BYTES_READ] =
+	BUILD_METRIC_LABEL("rocksdb_iter_bytes_read"),
+	[YB_STORAGE_GAUGE_REGULARDB_NO_FILE_CLOSES] =
+	BUILD_METRIC_LABEL("rocksdb_no_file_closes"),
+	[YB_STORAGE_GAUGE_REGULARDB_NO_FILE_OPENS] =
+	BUILD_METRIC_LABEL("rocksdb_no_file_opens"),
+	[YB_STORAGE_GAUGE_REGULARDB_NO_FILE_ERRORS] =
+	BUILD_METRIC_LABEL("rocksdb_no_file_errors"),
+	[YB_STORAGE_GAUGE_REGULARDB_STALL_L0_SLOWDOWN_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_stall_l0_slowdown_micros"),
+	[YB_STORAGE_GAUGE_REGULARDB_STALL_MEMTABLE_COMPACTION_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_stall_memtable_compaction_micros"),
+	[YB_STORAGE_GAUGE_REGULARDB_STALL_L0_NUM_FILES_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_stall_l0_num_files_micros"),
+	[YB_STORAGE_GAUGE_REGULARDB_STALL_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_stall_micros"),
+	[YB_STORAGE_GAUGE_REGULARDB_DB_MUTEX_WAIT_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_db_mutex_wait_micros"),
+	[YB_STORAGE_GAUGE_REGULARDB_RATE_LIMIT_DELAY_MILLIS] =
+	BUILD_METRIC_LABEL("rocksdb_rate_limit_delay_millis"),
+	[YB_STORAGE_GAUGE_REGULARDB_NO_ITERATORS] =
+	BUILD_METRIC_LABEL("rocksdb_no_iterators"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_MULTIGET_CALLS] =
+	BUILD_METRIC_LABEL("rocksdb_number_multiget_calls"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_MULTIGET_KEYS_READ] =
+	BUILD_METRIC_LABEL("rocksdb_number_multiget_keys_read"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_MULTIGET_BYTES_READ] =
+	BUILD_METRIC_LABEL("rocksdb_number_multiget_bytes_read"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_FILTERED_DELETES] =
+	BUILD_METRIC_LABEL("rocksdb_number_filtered_deletes"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_MERGE_FAILURES] =
+	BUILD_METRIC_LABEL("rocksdb_number_merge_failures"),
+	[YB_STORAGE_GAUGE_REGULARDB_SEQUENCE_NUMBER] =
+	BUILD_METRIC_LABEL("rocksdb_sequence_number"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_PREFIX_CHECKED] =
+	BUILD_METRIC_LABEL("rocksdb_bloom_filter_prefix_checked"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOOM_FILTER_PREFIX_USEFUL] =
+	BUILD_METRIC_LABEL("rocksdb_bloom_filter_prefix_useful"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_OF_RESEEKS_IN_ITERATION] =
+	BUILD_METRIC_LABEL("rocksdb_number_of_reseeks_in_iteration"),
+	[YB_STORAGE_GAUGE_REGULARDB_GET_UPDATES_SINCE_CALLS] =
+	BUILD_METRIC_LABEL("rocksdb_get_updates_since_calls"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_COMPRESSED_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_compressed_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_COMPRESSED_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_compressed_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_COMPRESSED_ADD] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_compressed_add"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_COMPRESSED_ADD_FAILURES] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_compressed_add_failures"),
+	[YB_STORAGE_GAUGE_REGULARDB_WAL_FILE_SYNCED] =
+	BUILD_METRIC_LABEL("rocksdb_wal_file_synced"),
+	[YB_STORAGE_GAUGE_REGULARDB_WAL_FILE_BYTES] =
+	BUILD_METRIC_LABEL("rocksdb_wal_file_bytes"),
+	[YB_STORAGE_GAUGE_REGULARDB_WRITE_DONE_BY_SELF] =
+	BUILD_METRIC_LABEL("rocksdb_write_done_by_self"),
+	[YB_STORAGE_GAUGE_REGULARDB_WRITE_DONE_BY_OTHER] =
+	BUILD_METRIC_LABEL("rocksdb_write_done_by_other"),
+	[YB_STORAGE_GAUGE_REGULARDB_WRITE_WITH_WAL] =
+	BUILD_METRIC_LABEL("rocksdb_write_with_wal"),
+	[YB_STORAGE_GAUGE_REGULARDB_COMPACT_READ_BYTES] =
+	BUILD_METRIC_LABEL("rocksdb_compact_read_bytes"),
+	[YB_STORAGE_GAUGE_REGULARDB_COMPACT_WRITE_BYTES] =
+	BUILD_METRIC_LABEL("rocksdb_compact_write_bytes"),
+	[YB_STORAGE_GAUGE_REGULARDB_FLUSH_WRITE_BYTES] =
+	BUILD_METRIC_LABEL("rocksdb_flush_write_bytes"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_DIRECT_LOAD_TABLE_PROPERTIES] =
+	BUILD_METRIC_LABEL("rocksdb_number_direct_load_table_properties"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_SUPERVERSION_ACQUIRES] =
+	BUILD_METRIC_LABEL("rocksdb_number_superversion_acquires"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_SUPERVERSION_RELEASES] =
+	BUILD_METRIC_LABEL("rocksdb_number_superversion_releases"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_SUPERVERSION_CLEANUPS] =
+	BUILD_METRIC_LABEL("rocksdb_number_superversion_cleanups"),
+	[YB_STORAGE_GAUGE_REGULARDB_NUMBER_BLOCK_NOT_COMPRESSED] =
+	BUILD_METRIC_LABEL("rocksdb_number_block_not_compressed"),
+	[YB_STORAGE_GAUGE_REGULARDB_MERGE_OPERATION_TOTAL_TIME] =
+	BUILD_METRIC_LABEL("rocksdb_merge_operation_total_time"),
+	[YB_STORAGE_GAUGE_REGULARDB_FILTER_OPERATION_TOTAL_TIME] =
+	BUILD_METRIC_LABEL("rocksdb_filter_operation_total_time"),
+	[YB_STORAGE_GAUGE_REGULARDB_ROW_CACHE_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_row_cache_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_ROW_CACHE_MISS] =
+	BUILD_METRIC_LABEL("rocksdb_row_cache_miss"),
+	[YB_STORAGE_GAUGE_REGULARDB_NO_TABLE_CACHE_ITERATORS] =
+	BUILD_METRIC_LABEL("rocksdb_no_table_cache_iterators"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_SINGLE_TOUCH_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_single_touch_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_SINGLE_TOUCH_ADD] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_single_touch_add"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_SINGLE_TOUCH_BYTES_WRITE] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_single_touch_bytes_write"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_MULTI_TOUCH_HIT] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_multi_touch_hit"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_MULTI_TOUCH_ADD] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_multi_touch_add"),
+	[YB_STORAGE_GAUGE_REGULARDB_BLOCK_CACHE_MULTI_TOUCH_BYTES_WRITE] =
+	BUILD_METRIC_LABEL("rocksdb_block_cache_multi_touch_bytes_write"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_ADD] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_add"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_ADD_FAILURES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_add_failures"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_INDEX_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_index_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_INDEX_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_index_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_FILTER_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_filter_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_FILTER_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_filter_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_DATA_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_data_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_DATA_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_data_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_BYTES_WRITE] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_bytes_write"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOOM_FILTER_USEFUL] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bloom_filter_useful"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOOM_FILTER_CHECKED] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bloom_filter_checked"),
+	[YB_STORAGE_GAUGE_INTENTSDB_MEMTABLE_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_memtable_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_MEMTABLE_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_memtable_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_GET_HIT_L0] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_get_hit_l0"),
+	[YB_STORAGE_GAUGE_INTENTSDB_GET_HIT_L1] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_get_hit_l1"),
+	[YB_STORAGE_GAUGE_INTENTSDB_GET_HIT_L2_AND_UP] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_get_hit_l2_and_up"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_KEYS_WRITTEN] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_keys_written"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_KEYS_READ] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_keys_read"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_KEYS_UPDATED] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_keys_updated"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BYTES_WRITTEN] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bytes_written"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BYTES_READ] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bytes_read"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DB_SEEK] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_db_seek"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DB_NEXT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_db_next"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DB_PREV] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_db_prev"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DB_SEEK_FOUND] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_db_seek_found"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DB_NEXT_FOUND] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_db_next_found"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DB_PREV_FOUND] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_db_prev_found"),
+	[YB_STORAGE_GAUGE_INTENTSDB_ITER_BYTES_READ] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_iter_bytes_read"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NO_FILE_CLOSES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_no_file_closes"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NO_FILE_OPENS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_no_file_opens"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NO_FILE_ERRORS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_no_file_errors"),
+	[YB_STORAGE_GAUGE_INTENTSDB_STALL_L0_SLOWDOWN_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_stall_l0_slowdown_micros"),
+	[YB_STORAGE_GAUGE_INTENTSDB_STALL_MEMTABLE_COMPACTION_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_stall_memtable_compaction_micros"),
+	[YB_STORAGE_GAUGE_INTENTSDB_STALL_L0_NUM_FILES_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_stall_l0_num_files_micros"),
+	[YB_STORAGE_GAUGE_INTENTSDB_STALL_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_stall_micros"),
+	[YB_STORAGE_GAUGE_INTENTSDB_DB_MUTEX_WAIT_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_db_mutex_wait_micros"),
+	[YB_STORAGE_GAUGE_INTENTSDB_RATE_LIMIT_DELAY_MILLIS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_rate_limit_delay_millis"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NO_ITERATORS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_no_iterators"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_MULTIGET_CALLS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_multiget_calls"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_MULTIGET_KEYS_READ] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_multiget_keys_read"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_MULTIGET_BYTES_READ] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_multiget_bytes_read"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_FILTERED_DELETES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_filtered_deletes"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_MERGE_FAILURES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_merge_failures"),
+	[YB_STORAGE_GAUGE_INTENTSDB_SEQUENCE_NUMBER] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_sequence_number"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOOM_FILTER_PREFIX_CHECKED] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bloom_filter_prefix_checked"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOOM_FILTER_PREFIX_USEFUL] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bloom_filter_prefix_useful"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_OF_RESEEKS_IN_ITERATION] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_of_reseeks_in_iteration"),
+	[YB_STORAGE_GAUGE_INTENTSDB_GET_UPDATES_SINCE_CALLS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_get_updates_since_calls"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_COMPRESSED_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_compressed_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_COMPRESSED_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_compressed_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_COMPRESSED_ADD] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_compressed_add"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_COMPRESSED_ADD_FAILURES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_compressed_add_failures"),
+	[YB_STORAGE_GAUGE_INTENTSDB_WAL_FILE_SYNCED] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_wal_file_synced"),
+	[YB_STORAGE_GAUGE_INTENTSDB_WAL_FILE_BYTES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_wal_file_bytes"),
+	[YB_STORAGE_GAUGE_INTENTSDB_WRITE_DONE_BY_SELF] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_write_done_by_self"),
+	[YB_STORAGE_GAUGE_INTENTSDB_WRITE_DONE_BY_OTHER] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_write_done_by_other"),
+	[YB_STORAGE_GAUGE_INTENTSDB_WRITE_WITH_WAL] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_write_with_wal"),
+	[YB_STORAGE_GAUGE_INTENTSDB_COMPACT_READ_BYTES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_compact_read_bytes"),
+	[YB_STORAGE_GAUGE_INTENTSDB_COMPACT_WRITE_BYTES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_compact_write_bytes"),
+	[YB_STORAGE_GAUGE_INTENTSDB_FLUSH_WRITE_BYTES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_flush_write_bytes"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_DIRECT_LOAD_TABLE_PROPERTIES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_direct_load_table_properties"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_SUPERVERSION_ACQUIRES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_superversion_acquires"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_SUPERVERSION_RELEASES] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_superversion_releases"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_SUPERVERSION_CLEANUPS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_superversion_cleanups"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NUMBER_BLOCK_NOT_COMPRESSED] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_number_block_not_compressed"),
+	[YB_STORAGE_GAUGE_INTENTSDB_MERGE_OPERATION_TOTAL_TIME] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_merge_operation_total_time"),
+	[YB_STORAGE_GAUGE_INTENTSDB_FILTER_OPERATION_TOTAL_TIME] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_filter_operation_total_time"),
+	[YB_STORAGE_GAUGE_INTENTSDB_ROW_CACHE_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_row_cache_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_ROW_CACHE_MISS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_row_cache_miss"),
+	[YB_STORAGE_GAUGE_INTENTSDB_NO_TABLE_CACHE_ITERATORS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_no_table_cache_iterators"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_SINGLE_TOUCH_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_single_touch_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_SINGLE_TOUCH_ADD] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_single_touch_add"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_SINGLE_TOUCH_BYTES_WRITE] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_single_touch_bytes_write"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_MULTI_TOUCH_HIT] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_multi_touch_hit"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_MULTI_TOUCH_ADD] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_multi_touch_add"),
+	[YB_STORAGE_GAUGE_INTENTSDB_BLOCK_CACHE_MULTI_TOUCH_BYTES_WRITE] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_block_cache_multi_touch_bytes_write"),
+	[YB_STORAGE_GAUGE_ACTIVE_WRITE_QUERY_OBJECTS] =
+	BUILD_METRIC_LABEL("active_write_query_objects"),
+};
+
+const char *yb_metric_counter_label[] = {
+	[YB_STORAGE_COUNTER_NOT_LEADER_REJECTIONS] =
+	BUILD_METRIC_LABEL("not_leader_rejections"),
+	[YB_STORAGE_COUNTER_LEADER_MEMORY_PRESSURE_REJECTIONS] =
+	BUILD_METRIC_LABEL("leader_memory_pressure_rejections"),
+	[YB_STORAGE_COUNTER_MAJORITY_SST_FILES_REJECTIONS] =
+	BUILD_METRIC_LABEL("majority_sst_file_rejections"),
+	[YB_STORAGE_COUNTER_TRANSACTION_CONFLICTS] =
+	BUILD_METRIC_LABEL("transaction_conflicts"),
+	[YB_STORAGE_COUNTER_EXPIRED_TRANSACTIONS] =
+	BUILD_METRIC_LABEL("expired_transactions"),
+	[YB_STORAGE_COUNTER_RESTART_READ_REQUESTS] =
+	BUILD_METRIC_LABEL("restart_read_requests"),
+	[YB_STORAGE_COUNTER_CONSISTENT_PREFIX_READ_REQUESTS] =
+	BUILD_METRIC_LABEL("consistent_prefix_read_requests"),
+	[YB_STORAGE_COUNTER_PICKED_READ_TIME_ON_DOCDB] =
+	BUILD_METRIC_LABEL("picked_read_time_on_docdb"),
+	[YB_STORAGE_COUNTER_PGSQL_CONSISTENT_PREFIX_READ_ROWS] =
+	BUILD_METRIC_LABEL("pgsql_consistent_prefix_read_rows"),
+	[YB_STORAGE_COUNTER_TABLET_DATA_CORRUPTIONS] =
+	BUILD_METRIC_LABEL("tablet_data_corruptions"),
+	[YB_STORAGE_COUNTER_ROWS_INSERTED] =
+	BUILD_METRIC_LABEL("rows_inserted"),
+	[YB_STORAGE_COUNTER_FAILED_BATCH_LOCK] =
+	BUILD_METRIC_LABEL("failed_batch_lock"),
+	[YB_STORAGE_COUNTER_DOCDB_KEYS_FOUND] =
+	BUILD_METRIC_LABEL("docdb_keys_found"),
+	[YB_STORAGE_COUNTER_DOCDB_OBSOLETE_KEYS_FOUND] =
+	BUILD_METRIC_LABEL("docdb_obsolete_keys_found"),
+	[YB_STORAGE_COUNTER_DOCDB_OBSOLETE_KEYS_FOUND_PAST_CUTOFF] =
+	BUILD_METRIC_LABEL("docdb_obsolete_keys_found_past_cutoff"),
+};
+
+const char *yb_metric_event_label[] = {
+	[YB_STORAGE_EVENT_REGULARDB_DB_GET] =
+	BUILD_METRIC_LABEL("rocksdb_db_get_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_DB_WRITE] =
+	BUILD_METRIC_LABEL("rocksdb_db_write_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_COMPACTION_TIME] =
+	BUILD_METRIC_LABEL("rocksdb_compaction_times_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_WAL_FILE_SYNC_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_wal_file_sync_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_DB_MULTIGET] =
+	BUILD_METRIC_LABEL("rocksdb_db_multiget_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_READ_BLOCK_COMPACTION_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_read_block_compaction_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_READ_BLOCK_GET_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_read_block_get_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_WRITE_RAW_BLOCK_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_write_raw_block_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_NUM_FILES_IN_SINGLE_COMPACTION] =
+	BUILD_METRIC_LABEL("rocksdb_num_files_in_singlecompaction"),
+	[YB_STORAGE_EVENT_REGULARDB_DB_SEEK] =
+	BUILD_METRIC_LABEL("rocksdb_db_seek_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_SST_READ_MICROS] =
+	BUILD_METRIC_LABEL("rocksdb_sst_read_micros"),
+	[YB_STORAGE_EVENT_REGULARDB_BYTES_PER_READ] =
+	BUILD_METRIC_LABEL("rocksdb_bytes_per_read"),
+	[YB_STORAGE_EVENT_REGULARDB_BYTES_PER_WRITE] =
+	BUILD_METRIC_LABEL("rocksdb_bytes_per_write"),
+	[YB_STORAGE_EVENT_REGULARDB_BYTES_PER_MULTIGET] =
+	BUILD_METRIC_LABEL("rocksdb_bytes_per_multiget"),
+	[YB_STORAGE_EVENT_REGULARDB_BLOOM_FILTER_TIME_NANOS] =
+	BUILD_METRIC_LABEL("rocksdb_bloom_filter_time_nanos"),
+	[YB_STORAGE_EVENT_REGULARDB_GET_FIXED_SIZE_FILTER_BLOCK_HANDLE_NANOS] =
+	BUILD_METRIC_LABEL("rocksdb_get_fixed_size_filter_block_handle_nanos"),
+	[YB_STORAGE_EVENT_REGULARDB_GET_FILTER_BLOCK_FROM_CACHE_NANOS] =
+	BUILD_METRIC_LABEL("rocksdb_get_filter_block_from_cache_nanos"),
+	[YB_STORAGE_EVENT_INTENTSDB_DB_GET] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_db_get_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_DB_WRITE] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_db_write_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_COMPACTION_TIME] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_compaction_times_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_WAL_FILE_SYNC_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_wal_file_sync_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_DB_MULTIGET] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_db_multiget_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_READ_BLOCK_COMPACTION_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_read_block_compaction_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_READ_BLOCK_GET_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_read_block_get_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_WRITE_RAW_BLOCK_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_write_raw_block_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_NUM_FILES_IN_SINGLE_COMPACTION] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_num_files_in_singlecompaction"),
+	[YB_STORAGE_EVENT_INTENTSDB_DB_SEEK] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_db_seek_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_SST_READ_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_sst_read_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_BYTES_PER_READ] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bytes_per_read"),
+	[YB_STORAGE_EVENT_INTENTSDB_BYTES_PER_WRITE] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bytes_per_write"),
+	[YB_STORAGE_EVENT_INTENTSDB_BYTES_PER_MULTIGET] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bytes_per_multiget"),
+	[YB_STORAGE_EVENT_INTENTSDB_BLOOM_FILTER_TIME_NANOS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_bloom_filter_time_nanos"),
+	[YB_STORAGE_EVENT_INTENTSDB_GET_FIXED_SIZE_FILTER_BLOCK_HANDLE_NANOS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_get_fixed_size_filter_block_handle_nanos"),
+	[YB_STORAGE_EVENT_INTENTSDB_GET_FILTER_BLOCK_FROM_CACHE_NANOS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_get_filter_block_from_cache_nanos"),
+	[YB_STORAGE_EVENT_INTENTSDB_WRITE_JOIN_GROUP_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_write_thread_join_group_micros"),
+	[YB_STORAGE_EVENT_INTENTSDB_REMOVE_JOIN_GROUP_MICROS] =
+	BUILD_METRIC_LABEL("intentsdb_rocksdb_remove_thread_join_group_micros"),
+	[YB_STORAGE_EVENT_SNAPSHOT_READ_INFLIGHT_WAIT_DURATION] =
+	BUILD_METRIC_LABEL("snapshot_read_inflight_wait_duration"),
+	[YB_STORAGE_EVENT_QL_READ_LATENCY] =
+	BUILD_METRIC_LABEL("ql_read_latency"),
+	[YB_STORAGE_EVENT_WRITE_LOCK_LATENCY] =
+	BUILD_METRIC_LABEL("write_lock_latency"),
+	[YB_STORAGE_EVENT_QL_WRITE_LATENCY] =
+	BUILD_METRIC_LABEL("ql_write_latency"),
+	[YB_STORAGE_EVENT_READ_TIME_WAIT] =
+	BUILD_METRIC_LABEL("read_time_wait"),
+	[YB_STORAGE_EVENT_TOTAL_WAIT_QUEUE_TIME] =
+	BUILD_METRIC_LABEL("total_wait_queue_time"),
+};
+
+#undef BUILD_METRIC_LABEL
+
+typedef struct
+{
+	bool		is_required;
+	bool		is_dist;
+	ExplainFormat format;
+} YbExplainCommitStatState;
+
+/*
+ * YB: Commit stats are collected after the end of the query, and need to outlive
+ * both the query and the transaction. Therefore, store information in a static
+ * scoped global variable.
+ */
+static YbExplainCommitStatState yb_explain_commit_stat_state = {0};
+
+/* Explains a single stat with no associated timing */
+static void
+YbExplainStatWithoutTiming(YbExplainState *yb_es, YbStatLabel label,
+						   double count)
+{
+	if (!(count > 0 || yb_es->display_zero) ||
+		(yb_explain_hide_non_deterministic_fields &&
+		 yb_stat_label_data[label].is_non_deterministic))
+		return;
+
+	const YbStatLabelData *label_data = &yb_stat_label_data[label];
+	ExplainState *es = yb_es->es;
+
+	ExplainPropertyFloat(label_data->requests, NULL, count, 0, es);
+}
+
+/* Explains a single RPC related stat and its associated timing */
+static void
+YbExplainRpcRequestStat(YbExplainState *yb_es, YbStatLabel label, double count,
+						double timing)
+{
+	if (!(count > 0 || yb_es->display_zero) ||
+		(yb_explain_hide_non_deterministic_fields &&
+		 yb_stat_label_data[label].is_non_deterministic))
+		return;
+
+	const YbStatLabelData *label_data = &yb_stat_label_data[label];
+	ExplainState *es = yb_es->es;
+
+	ExplainPropertyFloat(label_data->requests, NULL, count, 0, es);
+
+	/*
+	 * Display timing info only when there is at least 1 RPC request. This
+	 * enables the output to be concise.
+	 */
+	if (yb_es->es->timing && count > 0)
+		ExplainPropertyFloat(label_data->execution_time, "ms",
+							 timing / 1000000.0, 3, yb_es->es);
+}
+
+static void
+YbExplainRpcRequestNumericMetric(YbExplainState *yb_es, const char *label, double value,
+								 bool is_mean)
+{
+	Assert(label != NULL);
+	if (value == 0)
+		return;
+
+	ExplainState *es = yb_es->es;
+
+	ExplainPropertyFloat(label, NULL, value, is_mean ? 3 : 0, es);
+}
+
+/* Explains a single RPC gauge metric */
+static void
+YbExplainRpcRequestGauge(YbExplainState *yb_es, YbPgGaugeMetrics metric, double value,
+						 bool is_mean)
+{
+	YbExplainRpcRequestNumericMetric(yb_es, yb_metric_gauge_label[metric], value, is_mean);
+}
+
+/* Explains a single RPC counter metric */
+static void
+YbExplainRpcRequestCounter(YbExplainState *yb_es, YbPgCounterMetrics metric, double value,
+						   bool is_mean)
+{
+	YbExplainRpcRequestNumericMetric(yb_es, yb_metric_counter_label[metric], value, is_mean);
+}
+
+/* Explains a single RPC event metric */
+static void
+YbExplainRpcRequestEvent(YbExplainState *yb_es, YbPgEventMetrics metric,
+						 const YbcPgExecEventMetric *value, double nloops, bool is_mean)
+{
+	if (value->count == 0)
+		return;
+
+	const char *label = yb_metric_event_label[metric];
+	ExplainState *es = yb_es->es;
+
+	Assert(label != NULL);
+
+	int			ndigits = is_mean ? 3 : 0;
+
+	char	   *buf;
+
+	buf = psprintf("sum: %.*f, count: %.*f",
+				   ndigits, value->sum / nloops, ndigits, value->count / nloops);
+	ExplainProperty(label, NULL, buf, false, es);
+	pfree(buf);
+}
+
+/* Maps a row mark type to a string. */
+static const char *
+YbRowMarkTypeToPgsqlString(RowMarkType row_mark_type)
+{
+	switch (row_mark_type)
+	{
+		case ROW_MARK_EXCLUSIVE:
+			return "FOR UPDATE";
+		case ROW_MARK_NOKEYEXCLUSIVE:
+			return "FOR NO KEY UPDATE";
+		case ROW_MARK_SHARE:
+			return "FOR SHARE";
+		case ROW_MARK_KEYSHARE:
+			return "FOR KEY SHARE";
+		default:
+			return "";
+	}
+}
+
+/* Explains a scan lock using row marks. */
+static void
+YbExplainScanLocks(YbLockMechanism yb_lock_mechanism, ExplainState *es)
+{
+	ListCell   *l;
+	const char *lock_mode;
+
+	if (!es->pstmt->rowMarks)
+		return;
+
+	if (!IsolationIsSerializable() && yb_lock_mechanism == YB_NO_SCAN_LOCK)
+		return;
+
+	foreach(l, es->pstmt->rowMarks)
+	{
+		PlanRowMark *erm = (PlanRowMark *) lfirst(l);
+
+		if (erm->markType != ROW_MARK_REFERENCE &&
+			erm->markType != ROW_MARK_COPY)
+		{
+			lock_mode = YbRowMarkTypeToPgsqlString(erm->markType);
+			break;
+		}
+	}
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+		appendStringInfo(es->str, " (Locked %s)", lock_mode);
+	else
+		ExplainPropertyText("Lock Type", lock_mode, es);
+}
+
+/* Explains a LockRows node */
+static void
+YbExplainLockRows(ExplainState *es)
+{
+	/* We only have something interesting to do in SERIALIZABLE isolation. */
+	if (!IsolationIsSerializable())
+		return;
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+		appendStringInfoString(es->str, " (no-op)");
+	else
+		ExplainPropertyBool("Executes", false, es);
+}
+
+static bool
+YbIsTimingNeeded(ExplainState *es, bool timing_set)
+{
+	/* Disable timing if only deterministic fields are requested */
+	if (yb_explain_hide_non_deterministic_fields)
+	{
+		if (timing_set && es->timing)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("GUC yb_explain_hide_non_deterministic_fields "
+							"disables EXPLAIN option TIMING")));
+		}
+		return false;
+	}
+
+	/* Else if timing option is explicitly set in the query, honor it */
+	if (timing_set)
+		return es->timing;
+
+	/* Else, use timing if the query needs it */
+	return es->analyze;
+}
+
+static void
+YbExplainRpcRequestMetrics(YbExplainState *yb_es, YbcPgExecStorageMetrics *metrics,
+						   double nloops, bool is_mean, const char *labelname)
+{
+	if (!metrics)
+		return;
+
+	ExplainOpenGroup(labelname, labelname, true, yb_es->es);
+
+	if (yb_es->es->format == EXPLAIN_FORMAT_TEXT)
+		++yb_es->es->indent;
+
+	for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i)
+		YbExplainRpcRequestGauge(yb_es, i, metrics->gauges[i] / nloops,
+								 is_mean);
+
+	for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; ++i)
+		YbExplainRpcRequestCounter(yb_es, i, metrics->counters[i] / nloops,
+								   is_mean);
+
+	for (int i = 0; i < YB_STORAGE_EVENT_COUNT; ++i)
+		YbExplainRpcRequestEvent(yb_es, i, &metrics->events[i],
+								 nloops, is_mean);
+
+	if (yb_es->es->format == EXPLAIN_FORMAT_TEXT)
+		--yb_es->es->indent;
+
+	ExplainCloseGroup(labelname, labelname, true, yb_es->es);
+}
 
 /*
  * ExplainQuery -
@@ -190,6 +994,14 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 			es->wal = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "settings") == 0)
 			es->settings = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "dist") == 0)
+			es->rpc = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "debug") == 0)
+			es->yb_debug = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "commit") == 0)
+			es->yb_commit = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "timing") == 0)
 		{
 			timing_set = true;
@@ -219,6 +1031,12 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 								opt->defname, p),
 						 parser_errposition(pstate, opt->location)));
 		}
+		/* YB */
+		else if (strcmp(opt->defname, "hints") == 0)
+			es->ybShowHints = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "uids") == 0)
+			es->ybShowUniqueIds = defGetBoolean(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -227,13 +1045,25 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 					 parser_errposition(pstate, opt->location)));
 	}
 
+	if (es->analyze)
+		yb_run_with_explain_analyze = true;
+
 	if (es->wal && !es->analyze)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("EXPLAIN option WAL requires ANALYZE")));
 
-	/* if the timing was not set explicitly, set default value */
-	es->timing = (timing_set) ? es->timing : es->analyze;
+	if (yb_explain_hide_non_deterministic_fields && es->yb_debug)
+	{
+		ereport(WARNING,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("GUC yb_explain_hide_non_deterministic_fields "
+						"disables EXPLAIN option DEBUG")));
+		es->yb_debug = false;
+	}
+
+	/* YB: check if timing is required */
+	es->timing = YbIsTimingNeeded(es, timing_set);
 
 	/* check that timing is used with EXPLAIN ANALYZE */
 	if (es->timing && !es->analyze)
@@ -243,6 +1073,23 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 
 	/* if the summary was not set explicitly, set default value */
 	es->summary = (summary_set) ? es->summary : es->analyze;
+
+	if (es->rpc && !es->analyze)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("EXPLAIN option DIST requires ANALYZE")));
+
+	if (es->yb_commit && !es->analyze)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("EXPLAIN option COMMIT requires ANALYZE")));
+
+	/* Turn on timing of RPC requests in accordance to the flags passed */
+	YbToggleSessionStatsTimer(es->timing);
+	if (es->yb_debug)
+	{
+		YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_ALL);
+	}
 
 	query = castNode(Query, stmt->query);
 	if (IsQueryIdEnabled())
@@ -301,6 +1148,133 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 		do_text_output_oneline(tstate, es->str->data);
 	end_tup_output(tstate);
 
+	/*
+	 * YB: If commit stats are to be collected and explained, copy over the
+	 * necessary options to the global variable as the ExplainState will be lost
+	 * after this function returns.
+	 */
+	if (YbIsCommitStatsCollectionEnabled() && es->yb_commit)
+	{
+		yb_explain_commit_stat_state.is_required = (es->analyze && es->summary);
+		yb_explain_commit_stat_state.is_dist = es->rpc;
+		yb_explain_commit_stat_state.format = es->format;
+	}
+	else
+	{
+		/*
+		 * YB: Turn off timing RPC requests and metrics capture so that future
+		 * queries are not timed and metrics are not sent by default.
+		 * Also turn off commit stats collection if 'COMMIT' is not specified
+		 * as an EXPLAIN option.
+		 */
+		YbToggleSessionStatsTimer(false);
+		YbToggleCommitStatsCollection(false);
+	}
+
+	YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_NONE);
+	pfree(es->str->data);
+}
+
+void
+YbExplainCommitStats(DestReceiver *dest)
+{
+	/* Nothing to explain if statement is not run with ANALYZE */
+	if (!yb_explain_commit_stat_state.is_required)
+		return;
+
+	/* No stats to be printed */
+	if (!yb_explain_commit_stat_state.is_dist &&
+		(!YbIsSessionStatsTimerEnabled() || yb_explain_hide_non_deterministic_fields))
+		return;
+
+	ExplainState *es = NewExplainState();
+	TupOutputState *tstate = NULL;
+	TupleDesc	tupdesc;
+	YbInstrumentation yb_instr = {0};
+
+	es->rpc = yb_explain_commit_stat_state.is_dist;
+	es->format = yb_explain_commit_stat_state.format;
+	es->timing = YbIsSessionStatsTimerEnabled();
+
+	/* DocDB stats are currently not collected for COMMIT */
+	es->yb_debug = false;
+
+	/* Collect the stats */
+	YbUpdateSessionStats(&yb_instr);
+	YbAggregateExplainableRPCRequestStat(es, &yb_instr);
+
+	/*
+	 * Postgres does not provide an API to detect if autocommit is turned on/off
+	 * in the given connection. Therefore the commit wait is used to estimate
+	 * this. A wait of 0 ns implies that either:
+	 * - the transaction commit has not yet run (OR)
+	 * - the commit has run but with timing disabled.
+	 * In both cases, ensure that there is something to print before proceeding
+	 * further.
+	 */
+	if (!(yb_instr.commit_wait ||
+		  es->yb_stats.read.count || es->yb_stats.flush.count ||
+		  (es->yb_stats.catalog_read.count && !yb_explain_hide_non_deterministic_fields)))
+	{
+		YbToggleSessionStatsTimer(false);
+		pfree(es);
+		return;
+	}
+
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "COMMIT STATS",
+					   TEXTOID, -1, 0);
+
+	ExplainBeginOutput(es);
+	ExplainOpenGroup("Commit", NULL, true, es);
+
+	if (es->rpc)
+	{
+		YbExplainState yb_es = {es, false /* display_zero */ };
+
+		YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_CATALOG_READ,
+								es->yb_stats.catalog_read.count,
+								es->yb_stats.catalog_read.wait_time);
+
+		YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_CATALOG_READ_OP,
+								   es->yb_stats.catalog_read_op_count);
+
+		YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_READ,
+								es->yb_stats.read.count,
+								es->yb_stats.read.wait_time);
+
+		YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_READ_OP,
+								   es->yb_stats.read_op_count);
+
+		YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_WRITE,
+								   es->yb_stats.write_count);
+
+		YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_FLUSH,
+								es->yb_stats.flush.count,
+								es->yb_stats.flush.wait_time);
+	}
+
+	if (es->timing && !yb_explain_hide_non_deterministic_fields)
+		ExplainPropertyFloat("Commit Execution Time", "ms",
+							 (double) yb_instr.commit_wait / 1000.0, 3, es);
+
+	ExplainCloseGroup("Commit", NULL, true, es);
+	ExplainEndOutput(es);
+
+	/* output tuples */
+	tstate = begin_tup_output_tupdesc(dest, tupdesc, &TTSOpsVirtual);
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+		do_text_output_multiline(tstate, es->str->data);
+	else
+		do_text_output_oneline(tstate, es->str->data);
+	end_tup_output(tstate);
+
+	/*
+	 * YB: Turn off timing RPC requests and metrics capture so that future
+	 * queries are not timed and metrics are not sent by default
+	 */
+	YbToggleSessionStatsTimer(yb_enable_pg_stat_statements_rpc_stats);
+	YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_NONE);
 	pfree(es->str->data);
 }
 
@@ -526,6 +1500,7 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	double		totaltime = 0;
 	int			eflags;
 	int			instrument_option = 0;
+	bool		show_variable_fields = !yb_explain_hide_non_deterministic_fields;
 
 	Assert(plannedstmt->commandType != CMD_UTILITY);
 
@@ -578,6 +1553,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	/* call ExecutorStart to prepare the plan for execution */
 	ExecutorStart(queryDesc, eflags);
 
+	int64		peakMem = 0;
+
 	/* Execute the plan for statistics if asked for */
 	if (es->analyze)
 	{
@@ -589,11 +1566,36 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		else
 			dir = ForwardScanDirection;
 
+		/* YB: Figure out if the query can be run as a single row txn */
+		queryDesc->estate->yb_es_is_single_row_modify_txn =
+			YbIsSingleRowModifyTxnPlanned(plannedstmt, queryDesc->estate);
+
+		/* YB: Refresh the session stats before the start of the query */
+		if (es->analyze)
+		{
+			YbRefreshSessionStatsBeforeExecution();
+		}
+
 		/* run the plan */
 		ExecutorRun(queryDesc, dir, 0L, true);
 
+		/* YB: take a snapshot on the max PG memory consumption */
+		peakMem = PgMemTracker.stmt_max_mem_bytes;
+
 		/* run cleanup too */
 		ExecutorFinish(queryDesc);
+
+		/*
+		 * YB: Fetch stats collected at the query level (ie. not corresponding
+		 * to any execution node)
+		 */
+		if (es->rpc)
+		{
+			YbInstrumentation *yb_instr = &queryDesc->yb_query_stats->yb_instr;
+
+			YbUpdateSessionStats(yb_instr);
+			YbAggregateExplainableRPCRequestStat(es, yb_instr);
+		}
 
 		/* We can't run ExecutorEnd 'till we're done printing the stats... */
 		totaltime += elapsed_time(&starttime);
@@ -621,14 +1623,24 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	}
 
 	/* Show buffer usage in planning */
-	if (bufusage)
+	if (bufusage && show_variable_fields)
 	{
 		ExplainOpenGroup("Planning", "Planning", true, es);
 		show_buffer_usage(es, bufusage, true);
 		ExplainCloseGroup("Planning", "Planning", true, es);
 	}
 
-	if (es->summary && planduration)
+	if (es->ybShowHints)
+	{
+		char	   *generatedHints = ybGenerateHintString(plannedstmt);
+
+		if (generatedHints != NULL)
+			ExplainPropertyText("Generated hints", generatedHints, es);
+		else
+			ExplainPropertyText("Generated hints", "none", es);
+	}
+
+	if (es->summary && planduration && show_variable_fields)
 	{
 		double		plantime = INSTR_TIME_GET_DOUBLE(*planduration);
 
@@ -673,8 +1685,70 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	 * the output).  By default, ANALYZE sets SUMMARY to true.
 	 */
 	if (es->summary && es->analyze)
-		ExplainPropertyFloat("Execution Time", "ms", 1000.0 * totaltime, 3,
-							 es);
+	{
+		if (show_variable_fields)
+			ExplainPropertyFloat("Execution Time", "ms", 1000.0 * totaltime, 3,
+								 es);
+
+		if (es->rpc)
+		{
+			/*
+			 * Total RPC wait time is the sum of Read waits, Flush waits and Catalog waits.
+			 */
+			double		total_rpc_wait = 0.0;
+
+			if (es->yb_stats.read.count > 0.0)
+				total_rpc_wait += es->yb_stats.read.wait_time;
+
+			if (es->yb_stats.flush.count > 0.0)
+				total_rpc_wait += es->yb_stats.flush.wait_time;
+
+			if (es->yb_stats.catalog_read.count > 0.0)
+				total_rpc_wait += es->yb_stats.catalog_read.wait_time;
+
+			YbExplainState yb_es = {es, true};
+
+			YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_READ,
+									es->yb_stats.read.count,
+									es->yb_stats.read.wait_time);
+			YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_READ_OP,
+									   es->yb_stats.read_op_count);
+			YbExplainStatWithoutTiming(&yb_es,
+									   YB_STAT_LABEL_STORAGE_ROWS_SCANNED,
+									   es->yb_stats.read.rows_scanned);
+
+			if (es->yb_debug)
+				YbExplainRpcRequestMetrics(&yb_es, es->yb_stats.read_metrics, 1.0 /* nloops */ ,
+										   false /* is_mean */ , "Read Metrics" /* labelname */ );
+
+			YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_CATALOG_READ,
+									es->yb_stats.catalog_read.count,
+									es->yb_stats.catalog_read.wait_time);
+			YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_CATALOG_READ_OP,
+									   es->yb_stats.catalog_read_op_count);
+			YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_CATALOG_WRITE,
+									   es->yb_stats.catalog_write_count);
+			YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_WRITE,
+									   es->yb_stats.write_count);
+			YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_FLUSH,
+									es->yb_stats.flush.count,
+									es->yb_stats.flush.wait_time);
+
+			if (es->yb_debug)
+				YbExplainRpcRequestMetrics(&yb_es, es->yb_stats.write_metrics, 1.0 /* nloops */ ,
+										   false /* is_mean */ , "Write Metrics" /* labelname */ );
+
+			if (es->timing)
+				ExplainPropertyFloat("Storage Execution Time", "ms",
+									 total_rpc_wait / 1000000.0, 3, es);
+
+			if (YBCCurrentTransactionUsesFastPath())
+				ExplainPropertyText("Transaction", "Fast Path", es);
+		}
+
+		if (IsYugaByteEnabled() && yb_enable_memory_tracking && show_variable_fields)
+			YbAppendPgMemInfo(es, peakMem);
+	}
 
 	ExplainCloseGroup("Query", NULL, true, es);
 }
@@ -1074,10 +2148,12 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
+		case T_YbSeqScan:
 		case T_SampleScan:
 		case T_IndexScan:
 		case T_IndexOnlyScan:
 		case T_BitmapHeapScan:
+		case T_YbBitmapTableScan:
 		case T_TidScan:
 		case T_TidRangeScan:
 		case T_SubqueryScan:
@@ -1157,6 +2233,15 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	int			save_indent = es->indent;
 	bool		haschildren;
 
+	bool		yb_is_agg_pushdown = false;
+
+	/* YB */
+	if (planstate->instrument)
+	{
+		YbAggregateExplainableRPCRequestStat(es,
+											 &planstate->instrument->yb_instr);
+	}
+
 	/*
 	 * Prepare per-worker output buffers, if needed.  We'll append the data in
 	 * these to the main output string further down.
@@ -1171,6 +2256,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	{
 		case T_Result:
 			pname = sname = "Result";
+
+			if (plan->ybHintAlias != NULL)
+			{
+				StringInfoData buf;
+
+				initStringInfo(&buf);
+				appendStringInfo(&buf, "%s %s", pname, plan->ybHintAlias);
+				pname = sname = buf.data;
+			}
+
 			break;
 		case T_ProjectSet:
 			pname = sname = "ProjectSet";
@@ -1214,6 +2309,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_NestLoop:
 			pname = sname = "Nested Loop";
 			break;
+		case T_YbBatchedNestLoop:
+			pname = sname = "YB Batched Nested Loop";
+			break;
 		case T_MergeJoin:
 			pname = "Merge";	/* "Join" gets added by jointype switch */
 			sname = "Merge Join";
@@ -1223,6 +2321,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			sname = "Hash Join";
 			break;
 		case T_SeqScan:
+			pname = sname = "Seq Scan";
+			break;
+		case T_YbSeqScan:
 			pname = sname = "Seq Scan";
 			break;
 		case T_SampleScan:
@@ -1236,15 +2337,25 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 		case T_IndexScan:
 			pname = sname = "Index Scan";
+			if (((IndexScan *) plan)->yb_distinct_prefixlen > 0)
+				pname = sname = "Distinct Index Scan";
 			break;
 		case T_IndexOnlyScan:
 			pname = sname = "Index Only Scan";
+			if (((IndexOnlyScan *) plan)->yb_distinct_prefixlen > 0)
+				pname = sname = "Distinct Index Only Scan";
 			break;
 		case T_BitmapIndexScan:
 			pname = sname = "Bitmap Index Scan";
 			break;
+		case T_YbBitmapIndexScan:
+			pname = sname = "Bitmap Index Scan";
+			break;
 		case T_BitmapHeapScan:
 			pname = sname = "Bitmap Heap Scan";
+			break;
+		case T_YbBitmapTableScan:
+			pname = sname = "YB Bitmap Table Scan";
 			break;
 		case T_TidScan:
 			pname = sname = "Tid Scan";
@@ -1278,7 +2389,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			switch (((ForeignScan *) plan)->operation)
 			{
 				case CMD_SELECT:
-					pname = "Foreign Scan";
+					if (IsYBRelation(((ScanState *) planstate)->ss_currentRelation))
+						sname = pname = "YB Foreign Scan";
+					else
+						pname = "Foreign Scan";
 					operation = "Select";
 					break;
 				case CMD_INSERT:
@@ -1352,10 +2466,19 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 				if (DO_AGGSPLIT_SKIPFINAL(agg->aggsplit))
 				{
-					partialmode = "Partial";
+					if (((AggState *) planstate)->yb_pushdown_supported)
+						/*
+						 * If partial aggregate is pushed down, it does not
+						 * really do anything, since entire operation is
+						 * delegated to DocDB.
+						 */
+						partialmode = "Noop";
+					else
+						partialmode = "Partial";
 					pname = psprintf("%s %s", partialmode, pname);
 				}
-				else if (DO_AGGSPLIT_COMBINE(agg->aggsplit))
+				else if (DO_AGGSPLIT_COMBINE(agg->aggsplit) ||
+						 ((AggState *) planstate)->yb_pushdown_supported)
 				{
 					partialmode = "Finalize";
 					pname = psprintf("%s %s", partialmode, pname);
@@ -1446,11 +2569,20 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		ExplainPropertyBool("Async Capable", plan->async_capable, es);
 	}
 
+	if (IsYugaByteEnabled())
+	{
+		List	  **aggrefs = YbPlanStateTryGetAggrefs(planstate);
+
+		yb_is_agg_pushdown = aggrefs && *aggrefs != NIL;
+	}
+
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
+		case T_YbSeqScan:
 		case T_SampleScan:
 		case T_BitmapHeapScan:
+		case T_YbBitmapTableScan:
 		case T_TidScan:
 		case T_TidRangeScan:
 		case T_SubqueryScan:
@@ -1459,10 +2591,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_ValuesScan:
 		case T_CteScan:
 		case T_WorkTableScan:
+			YbExplainScanLocks(YB_NO_SCAN_LOCK, es);
 			ExplainScanTarget((Scan *) plan, es);
 			break;
 		case T_ForeignScan:
 		case T_CustomScan:
+			YbExplainScanLocks(YB_NO_SCAN_LOCK, es);
 			if (((Scan *) plan)->scanrelid > 0)
 				ExplainScanTarget((Scan *) plan, es);
 			break;
@@ -1470,8 +2604,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			{
 				IndexScan  *indexscan = (IndexScan *) plan;
 
+				YbExplainScanLocks(indexscan->yb_lock_mechanism, es);
 				ExplainIndexScanDetails(indexscan->indexid,
 										indexscan->indexorderdir,
+										&indexscan->yb_plan_info,
+										yb_is_agg_pushdown,
 										es);
 				ExplainScanTarget((Scan *) indexscan, es);
 			}
@@ -1482,11 +2619,14 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 				ExplainIndexScanDetails(indexonlyscan->indexid,
 										indexonlyscan->indexorderdir,
+										&indexonlyscan->yb_plan_info,
+										yb_is_agg_pushdown,
 										es);
 				ExplainScanTarget((Scan *) indexonlyscan, es);
 			}
 			break;
 		case T_BitmapIndexScan:
+		case T_YbBitmapIndexScan:
 			{
 				BitmapIndexScan *bitmapindexscan = (BitmapIndexScan *) plan;
 				const char *indexname =
@@ -1503,6 +2643,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			ExplainModifyTarget((ModifyTable *) plan, es);
 			break;
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
 			{
@@ -1575,6 +2716,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					ExplainPropertyText("Command", setopcmd, es);
 			}
 			break;
+		case T_LockRows:
+			YbExplainLockRows(es);
+			break;
 		default:
 			break;
 	}
@@ -1597,6 +2741,39 @@ ExplainNode(PlanState *planstate, List *ancestors,
 								 0, es);
 			ExplainPropertyInteger("Plan Width", NULL, plan->plan_width,
 								   es);
+		}
+	}
+
+	/*
+	 * YB: If this node was an input to a trivial subquery scan that was
+	 * removed then show the hint alias that was 'inherited' from the subquery
+	 * scan.
+	 */
+	if (plan->ybInheritedHintAlias != NULL && es->ybShowHints)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			appendStringInfo(es->str, " (Hint Alias : %s)", plan->ybInheritedHintAlias);
+		}
+		else
+		{
+			ExplainPropertyText("Hint Alias", plan->ybInheritedHintAlias, es);
+		}
+	}
+
+	/*
+	 * YB: Display unique ids for Plan nodes (passed from corresponding Path
+	 * nodes).
+	 */
+	if (es->ybShowUniqueIds)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			appendStringInfo(es->str, " (UID %u)", plan->ybUniqueId);
+		}
+		else
+		{
+			ExplainPropertyUInteger("UID", NULL, plan->ybUniqueId, es);
 		}
 	}
 
@@ -1723,6 +2900,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	switch (nodeTag(plan))
 	{
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
 			/* try not to be too chatty about this in text mode */
@@ -1736,6 +2914,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 	}
 
+	const bool	is_yb_rpc_stats_required = (es->rpc && es->analyze &&
+											planstate->instrument->nloops > 0);
+	const bool	is_yb_planning_stats_required = (es->yb_debug &&
+												 yb_enable_base_scans_cost_model);
+
 	/* quals, sort keys, etc */
 	switch (nodeTag(plan))
 	{
@@ -1745,12 +2928,37 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (((IndexScan *) plan)->indexqualorig)
 				show_instrumentation_count("Rows Removed by Index Recheck", 2,
 										   planstate, es);
+			YbExplainSaopMerge(planstate,
+							   ((IndexScan *) plan)->indextlist,
+							   ((IndexScan *) plan)->yb_saop_merge_info,
+							   es, ancestors);
+			/*
+			 * YB note: Quals are shown in the order they are applied: index
+			 * pushdown, relation pushdown, local clauses.
+			 */
 			show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
 						   "Order By", planstate, ancestors, es);
+			/*
+			 * YB: Distinct prefix during Distinct Index Scan.
+			 * Shown after ORDER BY clause and before storage filters since
+			 * that's currently the order of operations in DocDB.
+			 */
+			YbExplainDistinctPrefixLen(planstate,
+									   ((IndexScan *) plan)->indextlist,
+									   ((IndexScan *) plan)->yb_distinct_prefixlen,
+									   es, ancestors);
+			show_scan_qual(((IndexScan *) plan)->yb_idx_pushdown.quals,
+						   "Storage Index Filter", planstate, ancestors, es);
+			show_scan_qual(((IndexScan *) plan)->yb_rel_pushdown.quals,
+						   "Storage Filter", planstate, ancestors, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
+			if (is_yb_planning_stats_required)
+				show_yb_planning_stats(&((IndexScan *) plan)->yb_plan_info, es);
 			break;
 		case T_IndexOnlyScan:
 			show_scan_qual(((IndexOnlyScan *) plan)->indexqual,
@@ -1758,8 +2966,26 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (((IndexOnlyScan *) plan)->recheckqual)
 				show_instrumentation_count("Rows Removed by Index Recheck", 2,
 										   planstate, es);
+			YbExplainSaopMerge(planstate,
+							   ((IndexOnlyScan *) plan)->indextlist,
+							   ((IndexOnlyScan *) plan)->yb_saop_merge_info,
+							   es, ancestors);
 			show_scan_qual(((IndexOnlyScan *) plan)->indexorderby,
 						   "Order By", planstate, ancestors, es);
+			/*
+			 * YB: Distinct prefix during HybridScan.
+			 * Shown after ORDER BY clause and before storage filters since
+			 * that's currently the order of operations in DocDB.
+			 */
+			YbExplainDistinctPrefixLen(planstate,
+									   ((IndexOnlyScan *) plan)->indextlist,
+									   ((IndexOnlyScan *) plan)->yb_distinct_prefixlen,
+									   es, ancestors);
+			/*
+			 * YB: Storage filter is applied first, so it is output first.
+			 */
+			show_scan_qual(((IndexOnlyScan *) plan)->yb_pushdown.quals,
+						   "Storage Filter", planstate, ancestors, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
@@ -1767,10 +2993,25 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (es->analyze)
 				ExplainPropertyFloat("Heap Fetches", NULL,
 									 planstate->instrument->ntuples2, 0, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
+			if (is_yb_planning_stats_required)
+				show_yb_planning_stats(&((IndexOnlyScan *) plan)->yb_plan_info, es);
 			break;
 		case T_BitmapIndexScan:
 			show_scan_qual(((BitmapIndexScan *) plan)->indexqualorig,
 						   "Index Cond", planstate, ancestors, es);
+			break;
+		case T_YbBitmapIndexScan:
+			show_scan_qual(((YbBitmapIndexScan *) plan)->indexqualorig,
+						   "Index Cond", planstate, ancestors, es);
+			show_scan_qual(((YbBitmapIndexScan *) plan)->yb_idx_pushdown.quals,
+						   "Storage Index Filter", planstate, ancestors, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
+			if (is_yb_planning_stats_required)
+				show_yb_bitmap_scan_planning_stats(&((YbBitmapIndexScan *) plan)->yb_plan_info,
+												   es);
 			break;
 		case T_BitmapHeapScan:
 			show_scan_qual(((BitmapHeapScan *) plan)->bitmapqualorig,
@@ -1785,11 +3026,56 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (es->analyze)
 				show_tidbitmap_info((BitmapHeapScanState *) planstate, es);
 			break;
+		case T_YbBitmapTableScan:
+			{
+				YbBitmapTableScanState *bitmapscanstate =
+					(YbBitmapTableScanState *) planstate;
+				YbBitmapTableScan *bitmapplan = (YbBitmapTableScan *) plan;
+				List	   *storage_filter = (bitmapscanstate->work_mem_exceeded ?
+											  bitmapplan->fallback_pushdown.quals :
+											  bitmapplan->rel_pushdown.quals);
+				List	   *local_filter = (bitmapscanstate->work_mem_exceeded ?
+											bitmapplan->fallback_local_quals :
+											plan->qual);
+
+				/*
+				 * Storage filters are applied first, so they are output
+				 * first.
+				 */
+				if (bitmapscanstate->btss_might_recheck)
+					show_scan_qual(bitmapplan->recheck_pushdown.quals,
+								   "Storage Recheck Cond", planstate, ancestors,
+								   es);
+				show_scan_qual(storage_filter, "Storage Filter", planstate,
+							   ancestors, es);
+
+				if (bitmapscanstate->btss_might_recheck)
+				{
+					show_scan_qual(bitmapplan->recheck_local_quals, "Recheck Cond",
+								   planstate, ancestors, es);
+					if (bitmapplan->recheck_local_quals)
+						show_instrumentation_count("Rows Removed by Index Recheck",
+												   2, planstate, es);
+				}
+
+				show_scan_qual(local_filter, "Filter", planstate, ancestors, es);
+				if (local_filter)
+					show_instrumentation_count("Rows Removed by Filter", 1,
+											   planstate, es);
+				if (es->rpc && es->analyze)
+					show_yb_rpc_stats(planstate, es);
+				if (es->analyze)
+					show_ybtidbitmap_info(bitmapscanstate, es);
+				if (is_yb_planning_stats_required)
+					show_yb_planning_stats(&bitmapplan->yb_plan_info, es);
+				break;
+			}
 		case T_SampleScan:
 			show_tablesample(((SampleScan *) plan)->tablesample,
 							 planstate, ancestors, es);
 			/* fall through to print additional fields the same as SeqScan */
 			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case T_SeqScan:
 		case T_ValuesScan:
 		case T_CteScan:
@@ -1800,6 +3086,23 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
+			break;
+		case T_YbSeqScan:
+			/*
+			 * Storage filter is applied first, so it is output first.
+			 */
+			show_scan_qual(((YbSeqScan *) plan)->yb_pushdown.quals,
+						   "Storage Filter", planstate, ancestors, es);
+			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual)
+				show_instrumentation_count("Rows Removed by Filter", 1,
+										   planstate, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
+			if (is_yb_planning_stats_required)
+				show_yb_planning_stats(&((YbSeqScan *) plan)->yb_plan_info, es);
 			break;
 		case T_Gather:
 			{
@@ -1897,14 +3200,18 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				 * as an OR condition.
 				 */
 				List	   *tidquals = ((TidScan *) plan)->tidquals;
+				List	   *yb_pushdown = ((TidScan *) plan)->yb_rel_pushdown.quals;
 
 				if (list_length(tidquals) > 1)
 					tidquals = list_make1(make_orclause(tidquals));
 				show_scan_qual(tidquals, "TID Cond", planstate, ancestors, es);
+				show_scan_qual(yb_pushdown, "Storage Filter", planstate, ancestors, es);
 				show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 				if (plan->qual)
 					show_instrumentation_count("Rows Removed by Filter", 1,
 											   planstate, es);
+				if (is_yb_rpc_stats_required)
+					show_yb_rpc_stats(planstate, es);
 			}
 			break;
 		case T_TidRangeScan:
@@ -1929,7 +3236,11 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			show_scan_qual(((ForeignScan *) plan)->fdw_recheck_quals,
+						   "Remote Filter", planstate, ancestors, es);
 			show_foreignscan_info((ForeignScanState *) planstate, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
 			break;
 		case T_CustomScan:
 			{
@@ -1944,11 +3255,23 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			}
 			break;
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 			show_upper_qual(((NestLoop *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
 			if (((NestLoop *) plan)->join.joinqual)
 				show_instrumentation_count("Rows Removed by Join Filter", 1,
 										   planstate, es);
+			if (IsA(plan, YbBatchedNestLoop))
+			{
+				YbBatchedNestLoop *bnl = (YbBatchedNestLoop *) plan;
+
+				if (bnl->numSortCols > 0)
+					show_sort_group_keys(planstate, "Sort Keys",
+										 bnl->numSortCols, 0, bnl->sortColIdx,
+										 bnl->sortOperators, bnl->collations,
+										 bnl->nullsFirst, ancestors, es);
+			}
+
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 2,
@@ -1983,7 +3306,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_Agg:
 			show_agg_keys(castNode(AggState, planstate), ancestors, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
-			show_hashagg_info((AggState *) planstate, es);
+			if (!yb_explain_hide_non_deterministic_fields)
+				show_hashagg_info((AggState *) planstate, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
@@ -2024,10 +3348,14 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
 			break;
 		case T_ModifyTable:
 			show_modifytable_info(castNode(ModifyTableState, planstate), ancestors,
 								  es);
+			if (is_yb_rpc_stats_required)
+				show_yb_rpc_stats(planstate, es);
 			break;
 		case T_Hash:
 			show_hash_info(castNode(HashState, planstate), es);
@@ -2039,6 +3367,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		default:
 			break;
 	}
+
+	/* YB aggregate pushdown */
+	if (yb_is_agg_pushdown)
+		ExplainPropertyBool("Partial Aggregate", true, es);
 
 	/*
 	 * Prepare per-worker JIT instrumentation.  As with the overall JIT
@@ -2280,7 +3612,12 @@ show_expression(Node *node, const char *qlabel,
 									   ancestors);
 
 	/* Deparse the expression */
-	exprstr = deparse_expression(node, context, useprefix, false);
+	if (YBCPgIsYugaByteEnabled())
+		exprstr =
+			yb_deparse_expression(node, context, useprefix, false,
+								  es->verbose);
+	else
+		exprstr = deparse_expression(node, context, useprefix, false);
 
 	/* And add to es->str */
 	ExplainPropertyText(qlabel, exprstr, es);
@@ -2737,23 +4074,35 @@ show_sort_info(SortState *sortstate, ExplainState *es)
 		const char *sortMethod;
 		const char *spaceType;
 		int64		spaceUsed;
+		bool		show_variable_fields = !yb_explain_hide_non_deterministic_fields;
 
 		tuplesort_get_stats(state, &stats);
 		sortMethod = tuplesort_method_name(stats.sortMethod);
-		spaceType = tuplesort_space_type_name(stats.spaceType);
-		spaceUsed = stats.spaceUsed;
+		if (show_variable_fields)
+		{
+			spaceType = tuplesort_space_type_name(stats.spaceType);
+			spaceUsed = stats.spaceUsed;
+		}
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			ExplainIndentText(es);
-			appendStringInfo(es->str, "Sort Method: %s  %s: " INT64_FORMAT "kB\n",
-							 sortMethod, spaceType, spaceUsed);
+			appendStringInfo(es->str, "Sort Method: %s", sortMethod);
+
+			if (show_variable_fields)
+				appendStringInfo(es->str, "  %s: " INT64_FORMAT "kB\n",
+								 spaceType, spaceUsed);
+			else
+				appendStringInfo(es->str, "\n");
 		}
 		else
 		{
 			ExplainPropertyText("Sort Method", sortMethod, es);
-			ExplainPropertyInteger("Sort Space Used", "kB", spaceUsed, es);
-			ExplainPropertyText("Sort Space Type", spaceType, es);
+			if (show_variable_fields)
+			{
+				ExplainPropertyInteger("Sort Space Used", "kB", spaceUsed, es);
+				ExplainPropertyText("Sort Space Type", spaceType, es);
+			}
 		}
 	}
 
@@ -2853,7 +4202,8 @@ show_incremental_sort_group_info(IncrementalSortGroupInfo *groupInfo,
 				appendStringInfoString(es->str, ", ");
 		}
 
-		if (groupInfo->maxMemorySpaceUsed > 0)
+		if (groupInfo->maxMemorySpaceUsed > 0 &&
+			!yb_explain_hide_non_deterministic_fields)
 		{
 			int64		avgSpace = groupInfo->totalMemorySpaceUsed / groupInfo->groupCount;
 			const char *spaceTypeName;
@@ -2864,7 +4214,8 @@ show_incremental_sort_group_info(IncrementalSortGroupInfo *groupInfo,
 							 spaceTypeName, groupInfo->maxMemorySpaceUsed);
 		}
 
-		if (groupInfo->maxDiskSpaceUsed > 0)
+		if (groupInfo->maxDiskSpaceUsed > 0 &&
+			!yb_explain_hide_non_deterministic_fields)
 		{
 			int64		avgSpace = groupInfo->totalDiskSpaceUsed / groupInfo->groupCount;
 
@@ -2887,7 +4238,8 @@ show_incremental_sort_group_info(IncrementalSortGroupInfo *groupInfo,
 
 		ExplainPropertyList("Sort Methods Used", methodNames, es);
 
-		if (groupInfo->maxMemorySpaceUsed > 0)
+		if (groupInfo->maxMemorySpaceUsed > 0 &&
+			!yb_explain_hide_non_deterministic_fields)
 		{
 			int64		avgSpace = groupInfo->totalMemorySpaceUsed / groupInfo->groupCount;
 			const char *spaceTypeName;
@@ -2904,7 +4256,8 @@ show_incremental_sort_group_info(IncrementalSortGroupInfo *groupInfo,
 
 			ExplainCloseGroup("Sort Space", memoryName.data, true, es);
 		}
-		if (groupInfo->maxDiskSpaceUsed > 0)
+		if (groupInfo->maxDiskSpaceUsed > 0 &&
+			!yb_explain_hide_non_deterministic_fields)
 		{
 			int64		avgSpace = groupInfo->totalDiskSpaceUsed / groupInfo->groupCount;
 			const char *spaceTypeName;
@@ -3067,18 +4420,42 @@ show_hash_info(HashState *hashstate, ExplainState *es)
 	{
 		long		spacePeakKb = (hinstrument.space_peak + 1023) / 1024;
 
+		/*
+		 * YB: Hash joins have some non-deterministic fields and some
+		 * deterministic fields.
+		 * - Original Hash Buckets and Original Hash Batches are computed at the
+		 *   beginning by ExecChooseHashTableSize.
+		 * - Hash Buckets may be updated based on the number of tuples. This
+		 *   is consistent across multiple runs.
+		 * - Hash Batches and Memory Usage depend on the size of each tuple,
+		 *   which may vary slightly.
+		 */
+		bool		show_variable_fields = (!IsYugaByteEnabled() ||
+											!yb_explain_hide_non_deterministic_fields);
+
 		if (es->format != EXPLAIN_FORMAT_TEXT)
 		{
 			ExplainPropertyInteger("Hash Buckets", NULL,
 								   hinstrument.nbuckets, es);
 			ExplainPropertyInteger("Original Hash Buckets", NULL,
 								   hinstrument.nbuckets_original, es);
-			ExplainPropertyInteger("Hash Batches", NULL,
-								   hinstrument.nbatch, es);
+			if (show_variable_fields)
+				ExplainPropertyInteger("Hash Batches", NULL,
+									   hinstrument.nbatch, es);
 			ExplainPropertyInteger("Original Hash Batches", NULL,
 								   hinstrument.nbatch_original, es);
-			ExplainPropertyInteger("Peak Memory Usage", "kB",
-								   spacePeakKb, es);
+			if (show_variable_fields)
+				ExplainPropertyInteger("Peak Memory Usage", "kB",
+									   spacePeakKb, es);
+		}
+		else if (!show_variable_fields)
+		{
+			appendStringInfoSpaces(es->str, es->indent * 2);
+			appendStringInfo(es->str,
+							 "Buckets: %d (originally %d)  Original Batches: %d\n",
+							 hinstrument.nbuckets,
+							 hinstrument.nbuckets_original,
+							 hinstrument.nbatch_original);
 		}
 		else if (hinstrument.nbatch_original != hinstrument.nbatch ||
 				 hinstrument.nbuckets_original != hinstrument.nbuckets)
@@ -3156,7 +4533,7 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 
 	pfree(keystr.data);
 
-	if (!es->analyze)
+	if (!es->analyze || yb_explain_hide_non_deterministic_fields)
 		return;
 
 	if (mstate->stats.cache_misses > 0)
@@ -3272,7 +4649,8 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		 * detect this by checking how much memory it used.  If we find it
 		 * didn't do any work then we don't show its properties.
 		 */
-		if (es->analyze && aggstate->hash_mem_peak > 0)
+		if (es->analyze && aggstate->hash_mem_peak > 0 &&
+			!yb_explain_hide_non_deterministic_fields)
 		{
 			ExplainPropertyInteger("HashAgg Batches", NULL,
 								   aggstate->hash_batches_used, es);
@@ -3298,7 +4676,8 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		 * detect this by checking how much memory it used.  If we find it
 		 * didn't do any work then we don't show its properties.
 		 */
-		if (es->analyze && aggstate->hash_mem_peak > 0)
+		if (es->analyze && aggstate->hash_mem_peak > 0 &&
+			!yb_explain_hide_non_deterministic_fields)
 		{
 			if (!gotone)
 				ExplainIndentText(es);
@@ -3322,7 +4701,8 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 	}
 
 	/* Display stats for each parallel worker */
-	if (es->analyze && aggstate->shared_info != NULL)
+	if (es->analyze && aggstate->shared_info != NULL &&
+		!yb_explain_hide_non_deterministic_fields)
 	{
 		for (int n = 0; n < aggstate->shared_info->num_workers; n++)
 		{
@@ -3398,6 +4778,21 @@ show_tidbitmap_info(BitmapHeapScanState *planstate, ExplainState *es)
 }
 
 /*
+ * If it's EXPLAIN ANALYZE, show some details about the YBBitmapTableScan node
+ */
+static void
+show_ybtidbitmap_info(YbBitmapTableScanState *planstate, ExplainState *es)
+{
+
+	if (planstate->work_mem_exceeded)
+		ExplainPropertyBool("Exceeded work_mem", true, es);
+
+	if (es->yb_debug && !yb_explain_hide_non_deterministic_fields)
+		ExplainPropertyInteger("Average ybctid Size", "B",
+							   planstate->average_ybctid_bytes, es);
+}
+
+/*
  * If it's EXPLAIN ANALYZE, show instrumentation information for a plan node
  *
  * "which" identifies which instrumentation counter to print
@@ -3417,6 +4812,14 @@ show_instrumentation_count(const char *qlabel, int which,
 	else
 		nfiltered = planstate->instrument->nfiltered1;
 	nloops = planstate->instrument->nloops;
+
+
+	if (IsYugaByteEnabled() && which == 2)
+	{
+		YbInstrumentation *yb_instr = &planstate->instrument->yb_instr;
+
+		nfiltered += yb_instr->rows_removed_by_recheck;
+	}
 
 	/* In text mode, suppress zero counts; they're not interesting enough */
 	if (nfiltered > 0 || es->format != EXPLAIN_FORMAT_TEXT)
@@ -3663,6 +5066,53 @@ show_buffer_usage(ExplainState *es, const BufferUsage *usage, bool planning)
 	}
 }
 
+static void
+show_yb_planning_stats_common(double num_seeks, double num_nexts_prevs,
+							  double num_table_pages, double num_index_pages,
+							  int docdb_result_width, ExplainState *es)
+{
+	ExplainPropertyFloat("Estimated Seeks", NULL, num_seeks, 0, es);
+	ExplainPropertyFloat("Estimated Nexts And Prevs", NULL, num_nexts_prevs, 0,
+						 es);
+
+	/*
+	 * YB_TODO(#27210): Do not print values of estimated_num_table_result_pages
+	 * or estimated_num_index_result_pages if == 0.
+	 */
+	if (num_table_pages >= 0)
+		ExplainPropertyFloat("Estimated Table Roundtrips", NULL,
+							 num_table_pages, 0, es);
+
+	if (num_index_pages >= 0)
+		ExplainPropertyFloat("Estimated Index Roundtrips", NULL,
+							 num_index_pages, 0, es);
+
+	ExplainPropertyInteger("Estimated Docdb Result Width", NULL,
+						   docdb_result_width, es);
+}
+
+static void
+show_yb_planning_stats(YbPlanInfo *planinfo, ExplainState *es)
+{
+	show_yb_planning_stats_common(planinfo->estimated_num_seeks,
+								  planinfo->estimated_num_nexts_prevs,
+								  planinfo->estimated_num_table_result_pages,
+								  planinfo->estimated_num_index_result_pages,
+								  planinfo->estimated_docdb_result_width,
+								  es);
+}
+
+static void
+show_yb_bitmap_scan_planning_stats(YbPlanInfo *planinfo, ExplainState *es)
+{
+	show_yb_planning_stats_common(planinfo->estimated_num_bmscan_seeks,
+								  planinfo->estimated_num_bmscan_nexts_prevs,
+								  -1,
+								  planinfo->estimated_num_bmscan_result_pages,
+								  planinfo->estimated_docdb_result_width,
+								  es);
+}
+
 /*
  * Show WAL usage details.
  */
@@ -3702,17 +5152,75 @@ show_wal_usage(ExplainState *es, const WalUsage *usage)
 }
 
 /*
+ * Show YB RPC stats.
+ */
+static void
+show_yb_rpc_stats(PlanState *planstate, ExplainState *es)
+{
+	YbInstrumentation *yb_instr = &planstate->instrument->yb_instr;
+	double		nloops = planstate->instrument->nloops;
+
+	/* Read stats */
+	double		table_reads = yb_instr->tbl_reads.count / nloops;
+	double		table_read_wait = yb_instr->tbl_reads.wait_time / nloops;
+	double		table_read_ops = yb_instr->tbl_read_ops / nloops;
+	double		index_reads = yb_instr->index_reads.count / nloops;
+	double		index_read_wait = yb_instr->index_reads.wait_time / nloops;
+	double		index_read_ops = yb_instr->index_read_ops / nloops;
+	double		table_rows_scanned = yb_instr->tbl_reads.rows_scanned / nloops;
+	double		index_rows_scanned = yb_instr->index_reads.rows_scanned / nloops;
+
+	/* Write stats */
+	double		table_writes = yb_instr->tbl_writes / nloops;
+	double		index_writes = yb_instr->index_writes / nloops;
+	double		flushes = yb_instr->write_flushes.count / nloops;
+	double		flushes_wait = yb_instr->write_flushes.wait_time / nloops;
+
+	YbExplainState yb_es = {es, false};
+
+	YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_TABLE_READ,
+							table_reads, table_read_wait);
+	YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_TABLE_READ_OP,
+							   table_read_ops);
+	YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_TABLE_ROWS_SCANNED,
+							   table_rows_scanned);
+	YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_INDEX_READ,
+							index_reads, index_read_wait);
+	YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_INDEX_READ_OP,
+							   index_read_ops);
+	YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_INDEX_ROWS_SCANNED,
+							   index_rows_scanned);
+
+	if (es->yb_debug)
+		YbExplainRpcRequestMetrics(&yb_es, yb_instr->read_metrics, nloops, true /* is_mean */ ,
+								   "Read Metrics" /* labelname */ );
+
+	YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_TABLE_WRITE,
+							   table_writes);
+	YbExplainStatWithoutTiming(&yb_es, YB_STAT_LABEL_STORAGE_INDEX_WRITE,
+							   index_writes);
+	YbExplainRpcRequestStat(&yb_es, YB_STAT_LABEL_STORAGE_FLUSH, flushes,
+							flushes_wait);
+
+	if (es->yb_debug)
+		YbExplainRpcRequestMetrics(&yb_es, yb_instr->write_metrics, nloops, true /* is_mean */ ,
+								   "Write Metrics" /* labelname */ );
+}
+
+/*
  * Add some additional details about an IndexScan or IndexOnlyScan
  */
 static void
 ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir,
+						YbPlanInfo *yb_plan_info, bool yb_is_agg_pushdown,
 						ExplainState *es)
 {
 	const char *indexname = explain_get_index_name(indexid);
 
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
-		if (ScanDirectionIsBackward(indexorderdir))
+		/* YB: index aggregate pushdown does not actually set any ordering. */
+		if (ScanDirectionIsBackward(indexorderdir) && !yb_is_agg_pushdown)
 			appendStringInfoString(es->str, " Backward");
 		appendStringInfo(es->str, " using %s", quote_identifier(indexname));
 	}
@@ -3737,6 +5245,8 @@ ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir,
 		}
 		ExplainPropertyText("Scan Direction", scandir, es);
 		ExplainPropertyText("Index Name", indexname, es);
+		if (es->yb_debug && yb_enable_base_scans_cost_model)
+			show_yb_planning_stats(yb_plan_info, es);
 	}
 }
 
@@ -3782,10 +5292,12 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 	switch (nodeTag(plan))
 	{
 		case T_SeqScan:
+		case T_YbSeqScan:
 		case T_SampleScan:
 		case T_IndexScan:
 		case T_IndexOnlyScan:
 		case T_BitmapHeapScan:
+		case T_YbBitmapTableScan:
 		case T_TidScan:
 		case T_TidRangeScan:
 		case T_ForeignScan:
@@ -5019,4 +6531,226 @@ static void
 escape_yaml(StringInfo buf, const char *str)
 {
 	escape_json(buf, str);
+}
+
+/*
+ * Append YbPgMemTracker related info to EXPLAIN output,
+ * currently only the max memory info.
+ */
+static void
+YbAppendPgMemInfo(ExplainState *es, const Size peakMem)
+{
+	Size		peakMemKb = CEILING_K(peakMem);
+
+	ExplainPropertyInteger("Peak Memory Usage", "kB", peakMemKb, es);
+}
+
+static void
+YbAggregateExplainableRpcMetrics(YbcPgExecStorageMetrics **metrics,
+								 const YbcPgExecStorageMetrics *instr_metrics)
+{
+	if (!instr_metrics)
+		return;
+
+	if (*metrics == NULL)
+		*metrics = (YbcPgExecStorageMetrics *) palloc0(sizeof(YbcPgExecStorageMetrics));
+
+	for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; ++i)
+		(*metrics)->gauges[i] += instr_metrics->gauges[i];
+
+	for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; ++i)
+		(*metrics)->counters[i] += instr_metrics->counters[i];
+
+	for (int i = 0; i < YB_STORAGE_EVENT_COUNT; ++i)
+	{
+		const YbcPgExecEventMetric *val = &instr_metrics->events[i];
+		YbcPgExecEventMetric *agg = &(*metrics)->events[i];
+
+		agg->sum += val->sum;
+		agg->count += val->count;
+	}
+}
+
+static void
+YbAggregateExplainableRPCRequestStat(ExplainState *es,
+									 const YbInstrumentation *yb_instr)
+{
+	/* Storage Reads */
+	es->yb_stats.read.count +=
+		yb_instr->tbl_reads.count + yb_instr->index_reads.count;
+	es->yb_stats.read.wait_time +=
+		yb_instr->tbl_reads.wait_time + yb_instr->index_reads.wait_time;
+	es->yb_stats.read_op_count +=
+		yb_instr->tbl_read_ops + yb_instr->index_read_ops;
+
+	/* Storage Writes */
+	es->yb_stats.write_count += yb_instr->tbl_writes + yb_instr->index_writes;
+
+	/* Catalog Reads */
+	es->yb_stats.catalog_read.count += yb_instr->catalog_reads.count;
+	es->yb_stats.catalog_read_op_count += yb_instr->catalog_read_ops;
+	es->yb_stats.catalog_read.wait_time += yb_instr->catalog_reads.wait_time;
+
+	/* Catalog Writes */
+	es->yb_stats.catalog_write_count += yb_instr->catalog_writes;
+
+	/* Storage Flushes */
+	es->yb_stats.flush.count += yb_instr->write_flushes.count;
+	es->yb_stats.flush.wait_time += yb_instr->write_flushes.wait_time;
+
+	/* Rows Scanned */
+	es->yb_stats.read.rows_scanned +=
+		yb_instr->tbl_reads.rows_scanned + yb_instr->index_reads.rows_scanned;
+
+	/* RPC Storage Metrics */
+	if (es->yb_debug)
+	{
+		YbAggregateExplainableRpcMetrics(&es->yb_stats.read_metrics,
+										 yb_instr->read_metrics);
+		YbAggregateExplainableRpcMetrics(&es->yb_stats.write_metrics,
+										 yb_instr->write_metrics);
+	}
+}
+
+/*
+ * YB:
+ * Explain Output
+ * --------------
+ * Distinct Index Scan
+ *       ...
+ * 	 Distinct Keys: <Index Prefix Keys>
+ *       ...
+ *
+ * Adds Distinct Prefix to explain info
+ */
+static void
+YbExplainDistinctPrefixLen(PlanState *planstate, List *indextlist,
+						   int yb_distinct_prefixlen, ExplainState *es,
+						   List *ancestors)
+{
+	if (yb_distinct_prefixlen > 0)
+	{
+		/* Print distinct prefix keys. */
+		List	   *context;
+		List	   *result = NIL;
+		StringInfoData distinct_prefix_key_buf;
+		bool		useprefix;
+		int			keyno;
+		ListCell   *tlelc;
+
+		initStringInfo(&distinct_prefix_key_buf);
+
+		/* Set up deparsing context */
+		context = set_deparse_context_plan(es->deparse_cxt,
+										   planstate->plan,
+										   ancestors);
+		useprefix = (list_length(es->rtable) > 1 || es->verbose);
+
+		keyno = 0;
+		foreach(tlelc, indextlist)
+		{
+			TargetEntry *indextle;
+			char	   *exprstr;
+
+			if (keyno >= yb_distinct_prefixlen)
+				break;
+
+			indextle = (TargetEntry *) lfirst(tlelc);
+
+			/* Deparse the expression, showing any top-level cast */
+			exprstr = deparse_expression((Node *) indextle->expr, context,
+										 useprefix, true);
+			resetStringInfo(&distinct_prefix_key_buf);
+			appendStringInfoString(&distinct_prefix_key_buf, exprstr);
+			/* Emit one property-list item per key */
+			result = lappend(result, pstrdup(distinct_prefix_key_buf.data));
+
+			keyno++;
+		}
+
+		ExplainPropertyList("Distinct Keys", result, es);
+	}
+}
+
+static void
+YbExplainSaopMerge(PlanState *planstate, List *indextlist,
+				   YbSaopMergeInfo *saop_merge_info,
+				   ExplainState *es, List *ancestors)
+{
+	List	   *saop_keys = NIL;
+	List	   *saops = NIL;
+	int			num_streams = 1;
+	List	   *sort_keys = NIL;
+	ListCell   *lc;
+	List	   *context;
+	StringInfoData sortkeybuf;
+	bool		useprefix;
+	int			keyno;
+
+	/* If no SAOP merge, nothing to do. */
+	if (!saop_merge_info)
+		return;
+
+	initStringInfo(&sortkeybuf);
+
+	/* Set up deparsing context */
+	context = set_deparse_context_plan(es->deparse_cxt,
+									   planstate->plan,
+									   ancestors);
+	useprefix = (list_length(es->rtable) > 1 || es->verbose);
+
+	foreach(lc, saop_merge_info->saop_cols)
+	{
+		YbSaopMergeSaopColInfo *item = lfirst(lc);
+		TargetEntry *target = get_tle_by_resno(indextlist,
+											   item->indexcol + 1);
+		char	   *exprstr;
+
+		if (!target)
+			elog(ERROR, "no tlist entry for key %d", item->indexcol);
+		/* Deparse the expression, showing any top-level cast */
+		exprstr = deparse_expression((Node *) target->expr, context,
+									 useprefix, true);
+
+		saop_keys = lappend(saop_keys, exprstr);
+		saops = lappend(saops, item->saop);
+		num_streams *= item->num_elems;
+	}
+
+	YbSortInfo *sort_cols = saop_merge_info->sort_cols;
+
+	/* Parts copied from show_sort_group_keys. */
+	for (keyno = 0; keyno < sort_cols->numCols; keyno++)
+	{
+		/* find key expression in tlist */
+		AttrNumber	keyresno = sort_cols->sortColIdx[keyno];
+		TargetEntry *target = get_tle_by_resno(indextlist,
+											   keyresno);
+		char	   *exprstr;
+
+		if (!target)
+			elog(ERROR, "no tlist entry for key %d", keyresno);
+		/* Deparse the expression, showing any top-level cast */
+		exprstr = deparse_expression((Node *) target->expr, context,
+									 useprefix, true);
+		resetStringInfo(&sortkeybuf);
+		appendStringInfoString(&sortkeybuf, exprstr);
+		/* Append sort order information */
+		Assert(sort_cols->sortOperators != NULL);
+		show_sortorder_options(&sortkeybuf,
+							   (Node *) target->expr,
+							   sort_cols->sortOperators[keyno],
+							   sort_cols->collations[keyno],
+							   sort_cols->nullsFirst[keyno]);
+		/* Emit one property-list item per sort key */
+		sort_keys = lappend(sort_keys, pstrdup(sortkeybuf.data));
+	}
+
+	if (sort_keys)
+		ExplainPropertyList("Merge Sort Key", sort_keys, es);
+	Assert(saop_keys);
+	ExplainPropertyList("Merge Stream Key", saop_keys, es);
+	ExplainPropertyInteger("Merge Streams", NULL, num_streams, es);
+	if (es->verbose)
+		show_scan_qual(saops, "Merge Cond", planstate, ancestors, es);
 }

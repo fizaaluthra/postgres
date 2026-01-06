@@ -24,7 +24,7 @@
 #include "utils/builtins.h"
 
 /* GUC */
-int			default_toast_compression = TOAST_PGLZ_COMPRESSION;
+int			default_toast_compression = TOAST_LZ4_COMPRESSION;
 
 #define NO_LZ4_SUPPORT() \
 	ereport(ERROR, \
@@ -44,7 +44,7 @@ pglz_compress_datum(const struct varlena *value)
 				len;
 	struct varlena *tmp = NULL;
 
-	valsize = VARSIZE_ANY_EXHDR(value);
+	valsize = VARSIZE_ANY_EXHDR(DatumGetPointer(value));
 
 	/*
 	 * No point in wasting a palloc cycle if value size is outside the allowed

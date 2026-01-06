@@ -21,6 +21,10 @@
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
 
+/* YB includes */
+#include "nodes/plannodes.h"
+#include "nodes/ybtidbitmap.h"
+
 /* We don't want this file to depend on execnodes.h. */
 struct IndexInfo;
 
@@ -144,10 +148,23 @@ extern void index_close(Relation relation, LOCKMODE lockmode);
 extern bool index_insert(Relation indexRelation,
 						 Datum *values, bool *isnull,
 						 ItemPointer heap_t_ctid,
+						 Datum ybctid,
 						 Relation heapRelation,
 						 IndexUniqueCheck checkUnique,
 						 bool indexUnchanged,
-						 struct IndexInfo *indexInfo);
+						 struct IndexInfo *indexInfo,
+						 bool yb_shared_insert);
+
+extern void yb_index_delete(Relation indexRelation,
+							Datum *values, bool *isnull,
+							Datum ybctid,
+							Relation heapRelation,
+							struct IndexInfo *indexInfo);
+extern void yb_index_update(Relation indexRelation,
+							Datum *values, bool *isnull,
+							Datum oldYbctid, Datum newYbctid,
+							Relation heapRelation,
+							struct IndexInfo *indexInfo);
 
 extern IndexScanDesc index_beginscan(Relation heapRelation,
 									 Relation indexRelation,
@@ -176,6 +193,7 @@ extern bool index_fetch_heap(IndexScanDesc scan, struct TupleTableSlot *slot);
 extern bool index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
 							   struct TupleTableSlot *slot);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
+extern int64 yb_index_getbitmap(IndexScanDesc scan, YbTIDBitmap *bitmap);
 
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 												IndexBulkDeleteResult *istat,
@@ -195,6 +213,10 @@ extern void index_store_float8_orderby_distances(IndexScanDesc scan,
 extern bytea *index_opclass_options(Relation relation, AttrNumber attnum,
 									Datum attoptions, bool validate);
 
+
+extern bool yb_index_might_recheck(Scan *scan, Relation heapRelation,
+								   Relation indexRelation, bool xs_want_itup,
+								   ScanKey keys, int nkeys);
 
 /*
  * index access method support routines (in genam.c)
@@ -235,7 +257,11 @@ extern void systable_inplace_update_begin(Relation relation,
 										  int nkeys, const ScanKeyData *key,
 										  HeapTuple *oldtupcopy,
 										  void **state);
-extern void systable_inplace_update_finish(void *state, HeapTuple tuple);
+extern void systable_inplace_update_finish(void *state, HeapTuple tuple,
+										   bool yb_shared_update);
 extern void systable_inplace_update_cancel(void *state);
+
+extern Relation yb_dummy_baserel_index_open(Oid relationId, LOCKMODE lockmode);
+extern void yb_free_dummy_baserel_index(Relation relation);
 
 #endif							/* GENAM_H */

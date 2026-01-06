@@ -68,6 +68,16 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "catalog/objectaddress.h"
+#include "catalog/pg_yb_profile_d.h"
+#include "catalog/pg_yb_role_profile_d.h"
+#include "catalog/pg_yb_tablegroup_d.h"
+#include "commands/yb_profile.h"
+#include "commands/yb_tablegroup.h"
+#include "pg_yb_utils.h"
+#include "postgres_ext.h"
+
 typedef enum
 {
 	LOCAL_OBJECT,
@@ -99,6 +109,7 @@ static void shdepDropDependency(Relation sdepRel,
 								SharedDependencyType deptype);
 static void storeObjectDescription(StringInfo descs,
 								   SharedDependencyObjectType type,
+								   Oid refobjid,
 								   ObjectAddress *object,
 								   SharedDependencyType deptype,
 								   int count);
@@ -258,7 +269,7 @@ shdepChangeDep(Relation sdepRel,
 	{
 		/* No new entry needed, so just delete existing entry if any */
 		if (oldtup)
-			CatalogTupleDelete(sdepRel, &oldtup->t_self);
+			CatalogTupleDelete(sdepRel, oldtup);
 	}
 	else if (oldtup)
 	{
@@ -298,6 +309,43 @@ shdepChangeDep(Relation sdepRel,
 
 	if (oldtup)
 		heap_freetuple(oldtup);
+}
+
+void
+shdepFindImplicitTablegroup(Oid tablespaceId, Oid *tablegroupId)
+{
+	Oid			databaseId;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	Relation	sdepRel;
+	HeapTuple	tup;
+
+	*tablegroupId = InvalidOid;
+	databaseId = MyDatabaseId;
+	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
+
+
+	ScanKeyInit(&key[0], Anum_pg_shdepend_dbid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(databaseId));
+
+	ScanKeyInit(&key[1], Anum_pg_shdepend_classid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(YbTablegroupRelationId));
+
+	scan = systable_beginscan(sdepRel, SharedDependDependerIndexId, true, NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_shdepend shdepForm = (Form_pg_shdepend) GETSTRUCT(tup);
+
+		if (shdepForm->refobjid == tablespaceId)
+		{
+			*tablegroupId = shdepForm->objid;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(sdepRel, RowExclusiveLock);
 }
 
 /*
@@ -361,6 +409,29 @@ recordDependencyOnTablespace(Oid classId, Oid objectId, Oid tablespace)
 {
 	ObjectAddress myself,
 				referenced;
+
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * When recording dependencies on tablespaces for relations, InvalidOid
+		 * indicates the database's default tablespace and should never be
+		 * passed as an argument tablespace to record a tablespace dependency.
+		 * Instead, a dependency on the database's default tablespace is added on
+		 * the creation of the database and exists for the lifetime of the database
+		 * or until the database default tablespace is altered.
+		 */
+		if (tablespace == InvalidOid)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("tablespace dependencies cannot be recorded on InvalidOid")));
+
+		/*
+		 * Since the pg_default and pg_global tablespaces cannot be dropped,
+		 * it is safe to never record dependencies on these tablespaces.
+		 */
+		if (tablespace == DEFAULTTABLESPACE_OID || tablespace == GLOBALTABLESPACE_OID)
+			return;
+	}
 
 	ObjectAddressSet(myself, classId, objectId);
 	ObjectAddressSet(referenced, TableSpaceRelationId, tablespace);
@@ -771,6 +842,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 			numReportedDeps++;
 			storeObjectDescription(&descs,
 								   objects[i].objtype,
+								   objectId,
 								   &objects[i].object,
 								   objects[i].deptype,
 								   0);
@@ -779,6 +851,7 @@ checkSharedDependencies(Oid classId, Oid objectId,
 			numNotReportedDeps++;
 		storeObjectDescription(&alldescs,
 							   objects[i].objtype,
+							   objectId,
 							   &objects[i].object,
 							   objects[i].deptype,
 							   0);
@@ -798,12 +871,12 @@ checkSharedDependencies(Oid classId, Oid objectId,
 		if (numReportedDeps < MAX_REPORTED_DEPS)
 		{
 			numReportedDeps++;
-			storeObjectDescription(&descs, REMOTE_OBJECT, &object,
+			storeObjectDescription(&descs, REMOTE_OBJECT, objectId, &object,
 								   SHARED_DEPENDENCY_INVALID, dep->count);
 		}
 		else
 			numNotReportedDbs++;
-		storeObjectDescription(&alldescs, REMOTE_OBJECT, &object,
+		storeObjectDescription(&alldescs, REMOTE_OBJECT, objectId, &object,
 							   SHARED_DEPENDENCY_INVALID, dep->count);
 	}
 
@@ -923,14 +996,16 @@ copyTemplateDependencies(Oid templateDbId, Oid newDbId)
 		/* If slots are full, insert a batch of tuples */
 		if (slot_stored_count == max_slots)
 		{
-			CatalogTuplesMultiInsertWithInfo(sdepRel, slot, slot_stored_count, indstate);
+			CatalogTuplesMultiInsertWithInfo(sdepRel, slot, slot_stored_count, indstate,
+											 false /* yb_shared_insert */ );
 			slot_stored_count = 0;
 		}
 	}
 
 	/* Insert any tuples left in the buffer */
 	if (slot_stored_count > 0)
-		CatalogTuplesMultiInsertWithInfo(sdepRel, slot, slot_stored_count, indstate);
+		CatalogTuplesMultiInsertWithInfo(sdepRel, slot, slot_stored_count, indstate,
+										 false /* yb_shared_insert */ );
 
 	systable_endscan(scan);
 
@@ -974,7 +1049,7 @@ dropDatabaseDependencies(Oid databaseId)
 
 	while (HeapTupleIsValid(tup = systable_getnext(scan)))
 	{
-		CatalogTupleDelete(sdepRel, &tup->t_self);
+		CatalogTupleDelete(sdepRel, tup);
 	}
 
 	systable_endscan(scan);
@@ -1127,7 +1202,7 @@ shdepDropDependency(Relation sdepRel,
 			continue;
 
 		/* OK, delete it */
-		CatalogTupleDelete(sdepRel, &tup->t_self);
+		CatalogTupleDelete(sdepRel, tup);
 	}
 
 	systable_endscan(scan);
@@ -1205,6 +1280,19 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 				break;
 			}
 
+		case YbProfileRelationId:
+			{
+				/* For lack of a syscache on yb_pg_profile, do this: */
+				char	   *profile = yb_get_profile_name(objectId);
+
+				if (profile == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_OBJECT),
+							 errmsg("profile %u was concurrently dropped",
+									objectId)));
+				pfree(profile);
+				break;
+			}
 
 		default:
 			elog(ERROR, "unrecognized shared classId: %u", classId);
@@ -1229,6 +1317,7 @@ shdepLockAndCheckObject(Oid classId, Oid objectId)
 static void
 storeObjectDescription(StringInfo descs,
 					   SharedDependencyObjectType type,
+					   Oid refobjid,
 					   ObjectAddress *object,
 					   SharedDependencyType deptype,
 					   int count)
@@ -1256,7 +1345,21 @@ storeObjectDescription(StringInfo descs,
 			else if (deptype == SHARED_DEPENDENCY_POLICY)
 				appendStringInfo(descs, _("target of %s"), objdesc);
 			else if (deptype == SHARED_DEPENDENCY_TABLESPACE)
-				appendStringInfo(descs, _("tablespace for %s"), objdesc);
+			{
+				char		implicit_tablegroup_name[33];
+
+				sprintf(implicit_tablegroup_name, "tablegroup colocation_%u", refobjid);
+
+				/*
+				 * Do not report dependency from implicit tablegroup to tablespace.
+				 * This would be fine since implicit tablegroup will be dropped if no tables
+				 * are present in it.
+				 */
+				if (strcmp(implicit_tablegroup_name, objdesc) != 0)
+					appendStringInfo(descs, _("tablespace for %s"), objdesc);
+			}
+			else if (deptype == SHARED_DEPENDENCY_PROFILE)
+				appendStringInfo(descs, _("profile of %s"), objdesc);
 			else
 				elog(ERROR, "unrecognized dependency type: %d",
 					 (int) deptype);
@@ -1414,6 +1517,12 @@ shdepDropOwned(List *roleids, DropBehavior behavior)
 						}
 						add_exact_object_address(&obj, deleteobjs);
 					}
+					break;
+				case SHARED_DEPENDENCY_PROFILE:
+					/*
+					 * If it is a profile object, do not delete. Profile
+					 * associations can be removed by ALTER USER <u> NOPROFILE.
+					 */
 					break;
 			}
 		}
@@ -1624,6 +1733,77 @@ shdepReassignOwned(List *roleids, Oid newrole)
 
 		systable_endscan(scan);
 	}
+
+	table_close(sdepRel, RowExclusiveLock);
+}
+
+/*
+ * ybRecordDependencyOnProfile
+ *
+ * A convenient wrapper of recordSharedDependencyOn -- register the specified
+ * profile to the given object.
+ *
+ * Note: it's the caller's responsibility to ensure that there isn't a profile
+ * entry for the object already.
+ */
+void
+ybRecordDependencyOnProfile(Oid classId, Oid objectId, Oid profile)
+{
+	ObjectAddress myself,
+				referenced;
+
+	ObjectAddressSet(myself, classId, objectId);
+	ObjectAddressSet(referenced, YbProfileRelationId, profile);
+
+	recordSharedDependencyOn(&myself, &referenced,
+							 SHARED_DEPENDENCY_PROFILE);
+}
+
+/*
+ * ybChangeDependencyOnProfile
+ *
+ * Update the shared dependencies to account for the new profile.
+ *
+ * Note: we don't need an objsubid argument because only whole objects
+ * have tablespaces.
+ */
+void
+ybChangeDependencyOnProfile(Oid roleId, Oid newProfileId)
+{
+	Relation	sdepRel;
+
+	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
+
+	if (newProfileId != InvalidOid)
+		shdepChangeDep(sdepRel,
+					   AuthIdRelationId, roleId, 0,
+					   YbProfileRelationId, newProfileId,
+					   SHARED_DEPENDENCY_PROFILE);
+	else
+		shdepDropDependency(sdepRel,
+							AuthIdRelationId, roleId, 0, true,
+							InvalidOid, InvalidOid,
+							SHARED_DEPENDENCY_INVALID);
+
+	table_close(sdepRel, RowExclusiveLock);
+}
+
+/*
+ * ybDropDependencyOnProfile
+ *
+ * Delete all pg_shdepend entries corresponding to a user -> profile mapping.
+ */
+void
+ybDropDependencyOnProfile(Oid roleId)
+{
+	Relation	sdepRel;
+
+	sdepRel = table_open(SharedDependRelationId, RowExclusiveLock);
+
+	shdepDropDependency(sdepRel, AuthIdRelationId, roleId, 0,
+						true,
+						YbProfileRelationId, InvalidOid,
+						SHARED_DEPENDENCY_PROFILE);
 
 	table_close(sdepRel, RowExclusiveLock);
 }

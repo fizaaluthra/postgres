@@ -51,6 +51,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 static int	extractRemainingColumns(ParseNamespaceColumn *src_nscolumns,
 									List *src_colnames,
@@ -3151,7 +3154,7 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 		if (!ielem->opclass)
 			pInfer->inferopclass = InvalidOid;
 		else
-			pInfer->inferopclass = get_opclass_oid(BTREE_AM_OID,
+			pInfer->inferopclass = get_opclass_oid(IsYugaByteEnabled() ? LSM_AM_OID : BTREE_AM_OID,
 												   ielem->opclass, false);
 
 		result = lappend(result, pInfer);
@@ -3188,11 +3191,26 @@ transformOnConflictArbiter(ParseState *pstate,
 				 parser_errposition(pstate,
 									exprLocation((Node *) onConflictClause))));
 
+	if (IsYsqlUpgrade &&
+		IsYBRelation(pstate->p_target_relation) &&
+		onConflictClause->action != ONCONFLICT_NOTHING)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("only ON CONFLICT DO NOTHING can be used in YSQL upgrade"),
+				 parser_errposition(pstate,
+									exprLocation((Node *) onConflictClause))));
+	}
+
 	/*
 	 * To simplify certain aspects of its design, speculative insertion into
 	 * system catalogs is disallowed
+	 *
+	 * For Yugabyte, however, there's no practical difference between system
+	 * catalogs and user tables.
 	 */
-	if (IsCatalogRelation(pstate->p_target_relation))
+	if (!IsYBRelation(pstate->p_target_relation) &&
+		IsCatalogRelation(pstate->p_target_relation))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("ON CONFLICT is not supported with system catalog tables"),

@@ -87,6 +87,14 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 
+/* YB includes */
+#include "commands/defrem.h"
+#include "commands/progress.h"
+#include "commands/yb_cmds.h"
+#include "parser/parse_utilcmd.h"
+#include "pg_yb_utils.h"
+#include "pgstat.h"
+
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_index_pg_class_oid = InvalidOid;
 Oid			binary_upgrade_next_index_pg_class_relfilenode = InvalidOid;
@@ -113,7 +121,7 @@ static TupleDesc ConstructTupleDescriptor(Relation heapRelation,
 										  Oid *classObjectId);
 static void InitializeAttributeOids(Relation indexRelation,
 									int numatts, Oid indexoid);
-static void AppendAttributeTuples(Relation indexRelation, Datum *attopts);
+static void AppendAttributeTuples(Relation indexRelation, Datum *attopts, bool yb_relisshared);
 static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								Oid parentIndexId,
 								IndexInfo *indexInfo,
@@ -124,7 +132,8 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								bool isexclusion,
 								bool immediate,
 								bool isvalid,
-								bool isready);
+								bool isready,
+								bool yb_relisshared);
 static void index_update_stats(Relation rel,
 							   bool hasindex,
 							   double reltuples);
@@ -180,6 +189,20 @@ relationHasPrimaryKey(Relation rel)
 	list_free(indexoidlist);
 
 	return result;
+}
+
+/*
+ * YBRelationHasPrimaryKey
+ *		See whether an existing relation has a primary key.
+ *
+ * Caller must have suitable lock on the relation.
+ *
+ * Note: It is just a wrapper over the relationHasPrimaryKey function above.
+ */
+bool
+YBRelationHasPrimaryKey(Relation rel)
+{
+	return relationHasPrimaryKey(rel);
 }
 
 /*
@@ -503,7 +526,7 @@ InitializeAttributeOids(Relation indexRelation,
  * ----------------------------------------------------------------
  */
 static void
-AppendAttributeTuples(Relation indexRelation, Datum *attopts)
+AppendAttributeTuples(Relation indexRelation, Datum *attopts, bool yb_relisshared)
 {
 	Relation	pg_attribute;
 	CatalogIndexState indstate;
@@ -521,7 +544,7 @@ AppendAttributeTuples(Relation indexRelation, Datum *attopts)
 	 */
 	indexTupDesc = RelationGetDescr(indexRelation);
 
-	InsertPgAttributeTuples(pg_attribute, indexTupDesc, InvalidOid, attopts, indstate);
+	InsertPgAttributeTuples(pg_attribute, indexTupDesc, InvalidOid, attopts, indstate, yb_relisshared);
 
 	CatalogCloseIndexes(indstate);
 
@@ -546,7 +569,8 @@ UpdateIndexRelation(Oid indexoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready)
+					bool isready,
+					bool yb_relisshared)
 {
 	int2vector *indkey;
 	oidvector  *indcollation;
@@ -642,7 +666,7 @@ UpdateIndexRelation(Oid indexoid,
 	/*
 	 * insert the tuple into the pg_index catalog
 	 */
-	CatalogTupleInsert(pg_index, tuple);
+	YBCatalogTupleInsert(pg_index, tuple, yb_relisshared && !IsBootstrapProcessingMode());
 
 	/*
 	 * close the relation and free the tuple
@@ -718,7 +742,13 @@ index_create(Relation heapRelation,
 			 bits16 constr_flags,
 			 bool allow_system_table_mods,
 			 bool is_internal,
-			 Oid *constraintId)
+			 Oid *constraintId,
+			 YbOptSplit *split_options,
+			 const bool skip_index_backfill,
+			 bool is_colocated,
+			 Oid tablegroupId,
+			 Oid colocationId,
+			 bool yb_skip_index_creation)
 {
 	Oid			heapRelationId = RelationGetRelid(heapRelation);
 	Relation	pg_class;
@@ -841,8 +871,11 @@ index_create(Relation heapRelation,
 	/*
 	 * We cannot allow indexing a shared relation after initdb (because
 	 * there's no way to make the entry in other databases' pg_class).
+	 *
+	 * YB NOTE:
+	 * Not totally true anymore, we're using a hacky way to do that.
 	 */
-	if (shared_relation && !IsBootstrapProcessingMode())
+	if (shared_relation && !IsBootstrapProcessingMode() && !IsYsqlUpgrade)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("shared indexes cannot be created after initdb")));
@@ -854,27 +887,35 @@ index_create(Relation heapRelation,
 		elog(ERROR, "shared relations must be placed in pg_global tablespace");
 
 	/*
-	 * Check for duplicate name (both as to the index, and as to the
-	 * associated constraint if any).  Such cases would fail on the relevant
-	 * catalogs' unique indexes anyway, but we prefer to give a friendlier
-	 * error message.
+	 * In YB mode, during bootstrap, a relation lookup by name will be a full-table scan
+	 * and slow because secondary indexes are not available yet. So we will skip this
+	 * duplicate name check as it will error later anyway when the indexes are created.
 	 */
-	if (get_relname_relid(indexRelationName, namespaceId))
+	if (!IsYugaByteEnabled() || !IsBootstrapProcessingMode())
 	{
-		if ((flags & INDEX_CREATE_IF_NOT_EXISTS) != 0)
+		/*
+		 * Check for duplicate name (both as to the index, and as to the
+		 * associated constraint if any).  Such cases would fail on the relevant
+		 * catalogs' unique indexes anyway, but we prefer to give a friendlier
+		 * error message.
+		 */
+		if (get_relname_relid(indexRelationName, namespaceId))
 		{
-			ereport(NOTICE,
-					(errcode(ERRCODE_DUPLICATE_TABLE),
-					 errmsg("relation \"%s\" already exists, skipping",
-							indexRelationName)));
-			table_close(pg_class, RowExclusiveLock);
-			return InvalidOid;
-		}
+			if ((flags & INDEX_CREATE_IF_NOT_EXISTS) != 0)
+			{
+				ereport(NOTICE,
+						(errcode(ERRCODE_DUPLICATE_TABLE),
+						 errmsg("relation \"%s\" already exists, skipping",
+								indexRelationName)));
+				table_close(pg_class, RowExclusiveLock);
+				return InvalidOid;
+			}
 
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_TABLE),
-				 errmsg("relation \"%s\" already exists",
-						indexRelationName)));
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_TABLE),
+					 errmsg("relation \"%s\" already exists",
+							indexRelationName)));
+		}
 	}
 
 	if ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0 &&
@@ -909,8 +950,17 @@ index_create(Relation heapRelation,
 	 */
 	if (!OidIsValid(indexRelationId))
 	{
+		bool		yb_index_pg_class_oids_supplied = IsBinaryUpgrade && !yb_binary_restore;
+
+		if (yb_binary_restore && !yb_ignore_pg_class_oids)
+			yb_index_pg_class_oids_supplied = true;
+
+		bool		yb_index_relfilenode_supplied = IsBinaryUpgrade && !yb_binary_restore;
+
+		if (yb_binary_restore && !yb_ignore_relfilenode_ids)
+			yb_index_relfilenode_supplied = true;
 		/* Use binary-upgrade override for pg_class.oid and relfilenode */
-		if (IsBinaryUpgrade)
+		if (yb_index_pg_class_oids_supplied)
 		{
 			if (!OidIsValid(binary_upgrade_next_index_pg_class_oid))
 				ereport(ERROR,
@@ -920,14 +970,17 @@ index_create(Relation heapRelation,
 			indexRelationId = binary_upgrade_next_index_pg_class_oid;
 			binary_upgrade_next_index_pg_class_oid = InvalidOid;
 
-			/* Override the index relfilenode */
-			if ((relkind == RELKIND_INDEX) &&
-				(!OidIsValid(binary_upgrade_next_index_pg_class_relfilenode)))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("index relfilenode value not set when in binary upgrade mode")));
-			relFileNode = binary_upgrade_next_index_pg_class_relfilenode;
-			binary_upgrade_next_index_pg_class_relfilenode = InvalidOid;
+			if (yb_index_relfilenode_supplied)
+			{
+				/* Override the index relfilenode */
+				if ((relkind == RELKIND_INDEX) &&
+					(!OidIsValid(binary_upgrade_next_index_pg_class_relfilenode)))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("index relfilenode value not set when in binary upgrade mode")));
+				relFileNode = binary_upgrade_next_index_pg_class_relfilenode;
+				binary_upgrade_next_index_pg_class_relfilenode = InvalidOid;
+			}
 
 			/*
 			 * Note that we want create_storage = true for binary upgrade. The
@@ -935,6 +988,12 @@ index_create(Relation heapRelation,
 			 * have something on disk in the meanwhile.
 			 */
 			Assert(create_storage);
+		}
+		else if (IsYBRelation(heapRelation) && IsCatalogRelation(heapRelation))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("system index must have an explicit OID")));
 		}
 		else
 		{
@@ -951,6 +1010,7 @@ index_create(Relation heapRelation,
 	indexRelation = heap_create(indexRelationName,
 								namespaceId,
 								tableSpaceId,
+								tablegroupId,
 								indexRelationId,
 								relFileNode,
 								accessMethodObjectId,
@@ -969,6 +1029,30 @@ index_create(Relation heapRelation,
 	Assert(indexRelationId == RelationGetRelid(indexRelation));
 
 	/*
+	 * Create index in YugaByte only if it is a secondary index. Primary key is
+	 * an implicit part of the base table in YugaByte and doesn't need to be created.
+	 */
+	if (IsYBRelation(indexRelation) && !isprimary && !yb_skip_index_creation)
+	{
+		YBCCreateIndex(indexRelationName,
+					   indexInfo,
+					   indexTupDesc,
+					   coloptions,
+					   reloptions,
+					   indexRelationId,
+					   heapRelation,
+					   split_options,
+					   skip_index_backfill,
+					   is_colocated,
+					   tablegroupId,
+					   colocationId,
+					   tableSpaceId,
+					   YbGetRelfileNodeId(indexRelation),
+					   InvalidOid /* oldRelfileNodeId */ ,
+					   classObjectId);
+	}
+
+	/*
 	 * Obtain exclusive lock on it.  Although no other transactions can see it
 	 * until we commit, this prevents deadlock-risk complaints from lock
 	 * manager in cases such as CLUSTER.
@@ -984,6 +1068,28 @@ index_create(Relation heapRelation,
 	indexRelation->rd_rel->relowner = heapRelation->rd_rel->relowner;
 	indexRelation->rd_rel->relam = accessMethodObjectId;
 	indexRelation->rd_rel->relispartition = OidIsValid(parentIndexRelid);
+
+	/*
+	 * YSQL upgrade notes:
+	 * -------------------
+	 * At this point, reloptions no longer affects the index
+	 * creation process, the only remaining use for them is to be
+	 * stored in pg_class. ybTransformRelOptions has already
+	 * removed all temporary reloptions.
+	 *
+	 * We want system tables and indexes to not have any reloptions
+	 * stored to imitate BKI processing, so we don't allow any reloption
+	 * not removed by ybTransformRelOptions.
+	 */
+	if (IsYsqlUpgrade && IsCatalogRelation(heapRelation) &&
+		reloptions != (Datum) 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("unsuppored reloptions were used for a system index "
+						"during YSQL upgrade"),
+				 errhint("Only a small subset is allowed due to BKI restrictions.")));
+	}
 
 	/*
 	 * store index's pg_class entry
@@ -1007,7 +1113,7 @@ index_create(Relation heapRelation,
 	/*
 	 * append ATTRIBUTE tuples for the index
 	 */
-	AppendAttributeTuples(indexRelation, indexInfo->ii_OpclassOptions);
+	AppendAttributeTuples(indexRelation, indexInfo->ii_OpclassOptions, shared_relation);
 
 	/* ----------------
 	 *	  update pg_index
@@ -1023,7 +1129,8 @@ index_create(Relation heapRelation,
 						isprimary, is_exclusion,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
-						!concurrent);
+						!concurrent,
+						shared_relation);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to
@@ -1052,12 +1159,19 @@ index_create(Relation heapRelation,
 	 *
 	 * During bootstrap we can't register any dependencies, and we don't try
 	 * to make a constraint either.
+	 *
+	 * YB NOTE:
+	 * During YSQL upgrade, we do create the constraints for system indexes.
+	 * This negates the need to do an ALTER TABLE ADD UNIQUE/PK USING INDEX
+	 * later (that initdb does).
 	 */
 	if (!IsBootstrapProcessingMode())
 	{
 		ObjectAddress myself,
 					referenced;
 		ObjectAddresses *addrs;
+		bool		yb_is_catalog_rel = IsYBRelation(heapRelation) &&
+			IsCatalogRelation(heapRelation);
 
 		ObjectAddressSet(myself, RelationRelationId, indexRelationId);
 
@@ -1090,7 +1204,7 @@ index_create(Relation heapRelation,
 			if (constraintId)
 				*constraintId = localaddr.objectId;
 		}
-		else
+		else if (!yb_is_catalog_rel)
 		{
 			bool		have_simple_col = false;
 
@@ -1126,66 +1240,69 @@ index_create(Relation heapRelation,
 			free_object_addresses(addrs);
 		}
 
-		/*
-		 * If this is an index partition, create partition dependencies on
-		 * both the parent index and the table.  (Note: these must be *in
-		 * addition to*, not instead of, all other dependencies.  Otherwise
-		 * we'll be short some dependencies after DETACH PARTITION.)
-		 */
-		if (OidIsValid(parentIndexRelid))
+		if (!yb_is_catalog_rel)
 		{
-			ObjectAddressSet(referenced, RelationRelationId, parentIndexRelid);
-			recordDependencyOn(&myself, &referenced, DEPENDENCY_PARTITION_PRI);
-
-			ObjectAddressSet(referenced, RelationRelationId, heapRelationId);
-			recordDependencyOn(&myself, &referenced, DEPENDENCY_PARTITION_SEC);
-		}
-
-		/* placeholder for normal dependencies */
-		addrs = new_object_addresses();
-
-		/* Store dependency on collations */
-
-		/* The default collation is pinned, so don't bother recording it */
-		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
-		{
-			if (OidIsValid(collationObjectId[i]) &&
-				collationObjectId[i] != DEFAULT_COLLATION_OID)
+			/*
+			 * If this is an index partition, create partition dependencies on
+			 * both the parent index and the table.  (Note: these must be *in
+			 * addition to*, not instead of, all other dependencies.  Otherwise
+			 * we'll be short some dependencies after DETACH PARTITION.)
+			 */
+			if (OidIsValid(parentIndexRelid))
 			{
-				ObjectAddressSet(referenced, CollationRelationId,
-								 collationObjectId[i]);
+				ObjectAddressSet(referenced, RelationRelationId, parentIndexRelid);
+				recordDependencyOn(&myself, &referenced, DEPENDENCY_PARTITION_PRI);
+
+				ObjectAddressSet(referenced, RelationRelationId, heapRelationId);
+				recordDependencyOn(&myself, &referenced, DEPENDENCY_PARTITION_SEC);
+			}
+
+			/* placeholder for normal dependencies */
+			addrs = new_object_addresses();
+
+			/* Store dependency on collations */
+
+			/* The default collation is pinned, so don't bother recording it */
+			for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
+			{
+				if (OidIsValid(collationObjectId[i]) &&
+					collationObjectId[i] != DEFAULT_COLLATION_OID)
+				{
+					ObjectAddressSet(referenced, CollationRelationId,
+									 collationObjectId[i]);
+					add_exact_object_address(&referenced, addrs);
+				}
+			}
+
+			/* Store dependency on operator classes */
+			for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
+			{
+				ObjectAddressSet(referenced, OperatorClassRelationId, classObjectId[i]);
 				add_exact_object_address(&referenced, addrs);
 			}
-		}
 
-		/* Store dependency on operator classes */
-		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
-		{
-			ObjectAddressSet(referenced, OperatorClassRelationId, classObjectId[i]);
-			add_exact_object_address(&referenced, addrs);
-		}
+			record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
+			free_object_addresses(addrs);
 
-		record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
-		free_object_addresses(addrs);
+			/* Store dependencies on anything mentioned in index expressions */
+			if (indexInfo->ii_Expressions)
+			{
+				recordDependencyOnSingleRelExpr(&myself,
+												(Node *) indexInfo->ii_Expressions,
+												heapRelationId,
+												DEPENDENCY_NORMAL,
+												DEPENDENCY_AUTO, false);
+			}
 
-		/* Store dependencies on anything mentioned in index expressions */
-		if (indexInfo->ii_Expressions)
-		{
-			recordDependencyOnSingleRelExpr(&myself,
-											(Node *) indexInfo->ii_Expressions,
-											heapRelationId,
-											DEPENDENCY_NORMAL,
-											DEPENDENCY_AUTO, false);
-		}
-
-		/* Store dependencies on anything mentioned in predicate */
-		if (indexInfo->ii_Predicate)
-		{
-			recordDependencyOnSingleRelExpr(&myself,
-											(Node *) indexInfo->ii_Predicate,
-											heapRelationId,
-											DEPENDENCY_NORMAL,
-											DEPENDENCY_AUTO, false);
+			/* Store dependencies on anything mentioned in predicate */
+			if (indexInfo->ii_Predicate)
+			{
+				recordDependencyOnSingleRelExpr(&myself,
+												(Node *) indexInfo->ii_Predicate,
+												heapRelationId,
+												DEPENDENCY_NORMAL,
+												DEPENDENCY_AUTO, false);
+			}
 		}
 	}
 	else
@@ -1210,7 +1327,7 @@ index_create(Relation heapRelation,
 	 * relcache entry has already been rebuilt thanks to sinval update during
 	 * CommandCounterIncrement.
 	 */
-	if (IsBootstrapProcessingMode())
+	if (IsBootstrapProcessingMode() || IsYugaByteEnabled())
 		RelationInitIndexAccessInfo(indexRelation);
 	else
 		Assert(indexRelation->rd_indexcxt != NULL);
@@ -1252,6 +1369,12 @@ index_create(Relation heapRelation,
 	}
 	else
 	{
+		if (IsYugaByteEnabled() && !concurrent && !invalid &&
+			yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"backfill",
+										"non-concurrent index backfill");
+
 		index_build(heapRelation, indexRelation, indexInfo, false, true);
 	}
 
@@ -1260,6 +1383,13 @@ index_create(Relation heapRelation,
 	 * of transaction.  Closing the heap is caller's responsibility.
 	 */
 	index_close(indexRelation, NoLock);
+
+	if (IsYugaByteEnabled() && !concurrent && !invalid &&
+		yb_test_block_index_phase[0] != '\0')
+		YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+									"postbackfill",
+									"operations after a non-concurrent "
+									"index backfill");
 
 	return indexRelationId;
 }
@@ -1400,6 +1530,16 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 	}
 
 	/*
+	 * YB: Get whether the indexed table is colocated
+	 * (either via database or a tablegroup).
+	 * If the indexed table is colocated, then this index is colocated as well.
+	 */
+	bool		is_colocated = (IsYBRelation(heapRelation) &&
+								!IsBootstrapProcessingMode() &&
+								!YbIsConnectedToTemplateDb() &&
+								YbGetTableProperties(heapRelation)->is_colocated);
+
+	/*
 	 * Now create the new index.
 	 *
 	 * For a partition index, we adjust the partition dependency later, to
@@ -1424,7 +1564,17 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 							  0,
 							  true, /* allow table to be a system catalog? */
 							  false,	/* is_internal? */
-							  NULL);
+							  NULL,
+							  NULL,
+							  true, /* skip_index_backfill */
+							  is_colocated,
+							  InvalidOid,	/* tablegroupId, TODO: fill this
+											 * appropriately when adding
+											 * support for reindex */
+							  InvalidOid,	/* colocationId, TODO: fill this
+											 * appropriately when adding
+											 * support for reindex */
+							  false /* yb_skip_index_creation */ );
 
 	/* Close the relations used and clean up */
 	index_close(indexRelation, NoLock);
@@ -2005,10 +2155,25 @@ index_constraint_create(Relation heapRelation,
 	 *
 	 * Note that the constraint has a dependency on the table, so we don't
 	 * need (or want) any direct dependency from the index to the table.
+	 *
+	 * YB note:
+	 * For constraint on catalog relations, initdb assigns an oid in
+	 * [FirstGenbkiObjectId, FirstUnpinnedObjectId), making them pinned objects
+	 * and hence dependencies on them are not explicity recorded. Migration
+	 * during YSQL upgrade, on the other hand, assigns them oid in
+	 * [FirstUnpinnedObjectId, FirstNormalObjectId) making them unpinned objects
+	 * (GH #27514). Calling recordDependencyOn() would add the dependency
+	 * in pg_depend. It requires additional work to do this correctly for shared
+	 * catalog relations. Adding this dependency is not even required because
+	 * ALTER TABLE ... DROP CONSTRAINT on catalog relations is not supported.
+	 * So, just skip it.
 	 */
-	ObjectAddressSet(myself, ConstraintRelationId, conOid);
-	ObjectAddressSet(idxaddr, RelationRelationId, indexRelationId);
-	recordDependencyOn(&idxaddr, &myself, DEPENDENCY_INTERNAL);
+	if (!(IsYsqlUpgrade && IsCatalogRelation(heapRelation)))
+	{
+		ObjectAddressSet(myself, ConstraintRelationId, conOid);
+		ObjectAddressSet(idxaddr, RelationRelationId, indexRelationId);
+		recordDependencyOn(&idxaddr, &myself, DEPENDENCY_INTERNAL);
+	}
 
 	/*
 	 * Also, if this is a constraint on a partition, give it partition-type
@@ -2182,6 +2347,10 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 */
 	CheckTableNotInUse(userIndexRelation, "DROP INDEX");
 
+	if (IsYugaByteEnabled() &&
+		userIndexRelation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		YBCRecordTempRelationDDL();
+
 	/*
 	 * Drop Index Concurrently is more or less the reverse process of Create
 	 * Index Concurrently.
@@ -2325,8 +2494,11 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 
 	/*
 	 * Schedule physical removal of the files (if any)
+	 * If the relation is a Yugabyte relation, there aren't any physical files to
+	 * remove.
 	 */
-	if (RELKIND_HAS_STORAGE(userIndexRelation->rd_rel->relkind))
+	if (RELKIND_HAS_STORAGE(userIndexRelation->rd_rel->relkind) &&
+		!IsYBRelation(userIndexRelation))
 		RelationDropStorage(userIndexRelation);
 
 	/* ensure that stats are dropped if transaction commits */
@@ -2353,7 +2525,7 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	hasexprs = !heap_attisnull(tuple, Anum_pg_index_indexprs,
 							   RelationGetDescr(indexRelation));
 
-	CatalogTupleDelete(indexRelation, &tuple->t_self);
+	CatalogTupleDelete(indexRelation, tuple);
 
 	ReleaseSysCache(tuple);
 	table_close(indexRelation, RowExclusiveLock);
@@ -2671,8 +2843,9 @@ BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii)
 	 */
 	Assert(ii->ii_Unique);
 
-	if (index->rd_rel->relam != BTREE_AM_OID)
-		elog(ERROR, "unexpected non-btree speculative unique index");
+	if (index->rd_rel->relam != BTREE_AM_OID &&
+		index->rd_rel->relam != LSM_AM_OID)
+		elog(ERROR, "unexpected non-btree/lsm speculative unique index");
 
 	ii->ii_UniqueOps = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
 	ii->ii_UniqueProcs = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
@@ -2858,7 +3031,7 @@ index_update_stats(Relation rel,
 	 */
 	if (update_stats)
 	{
-		relpages = RelationGetNumberOfBlocks(rel);
+		relpages = IsYBRelation(rel) ? 0 : RelationGetNumberOfBlocks(rel);
 
 		if (rel->rd_rel->relkind != RELKIND_INDEX)
 			visibilitymap_count(rel, &relallvisible, NULL);
@@ -2941,7 +3114,9 @@ index_update_stats(Relation rel,
 	 */
 	if (dirty)
 	{
-		systable_inplace_update_finish(state, tuple);
+		systable_inplace_update_finish(state, tuple,
+									   (rd_rel->relisshared &&
+										!IsBootstrapProcessingMode()));
 		/* the above sends a cache inval message */
 	}
 	else
@@ -2993,6 +3168,14 @@ index_build(Relation heapRelation,
 	Assert(PointerIsValid(indexRelation->rd_indam->ambuild));
 	Assert(PointerIsValid(indexRelation->rd_indam->ambuildempty));
 
+	if (yb_xcluster_automatic_mode_target_ddl)
+	{
+		/* Still need to update pg_catalog. */
+		index_update_stats(heapRelation, true, -1);
+		index_update_stats(indexRelation, false, -1);
+		return;
+	}
+
 	/*
 	 * Determine worker process details for parallel CREATE INDEX.  Currently,
 	 * only btree has support for parallel builds.
@@ -3028,6 +3211,10 @@ index_build(Relation heapRelation,
 	save_nestlevel = NewGUCNestLevel();
 
 	/* Set up initial progress report status */
+	if (IsYugaByteEnabled())
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 YB_PROGRESS_CREATEIDX_BACKFILLING);
+	else
 	{
 		const int	progress_index[] = {
 			PROGRESS_CREATEIDX_PHASE,
@@ -3125,11 +3312,33 @@ index_build(Relation heapRelation,
 	}
 
 	/*
-	 * Update heap and index pg_class rows
+	 * Sanity check to ensure concurrent index builds don't reach this
+	 * code-path. In YB, we don't compute stats during a concurrent index build
+	 * so we shouldn't update them here.
+	 */
+	if (IsYugaByteEnabled())
+		Assert(!indexInfo->ii_Concurrent);
+
+
+	/*
+	 * #25394 enabled update of base table and index table reltuples after
+	 * `CREATE INDEX [CONCURRENTLY]`. In case of non-concurrent index creation,
+	 * the index reltuples were already being set here, but the base table
+	 * reltuples were being left unchanged for YB tables.
+	 *
+	 * We must maintain this old behavior for non-concurrent index creation, but
+	 * when `yb_enable_update_reltuples_after_create_index` is enabled, we
+	 * should update the base table reltuples as well to achieve consistent
+	 * behavior across both forms of index creation.
+	 *
+	 * When reltuples is passed as -1.0 to index_update_stats, the stats are not
+	 * updated, only relhasindex is updated.
 	 */
 	index_update_stats(heapRelation,
 					   true,
-					   stats->heap_tuples);
+					   ((IsYBRelation(heapRelation) &&
+						 !yb_enable_update_reltuples_after_create_index) ?
+						-1.0 : stats->heap_tuples));
 
 	index_update_stats(indexRelation,
 					   false,
@@ -3152,6 +3361,114 @@ index_build(Relation heapRelation,
 
 	/* Restore userid and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+}
+
+/*
+ * yb_index_backfill - invoke access-method-specific index backfill procedure
+ *
+ * This is mainly a copy of index_build.  index_build is used for
+ * non-multi-stage index creation; yb_index_backfill is used for multi-stage index
+ * creation.
+ */
+double
+yb_index_backfill(Relation heapRelation,
+				  Relation indexRelation,
+				  IndexInfo *indexInfo,
+				  bool isprimary,
+				  YbBackfillInfo *bfinfo,
+				  YbPgExecOutParam *bfresult)
+{
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	IndexBuildResult *result;
+
+	/*
+	 * sanity checks
+	 */
+	Assert(RelationIsValid(indexRelation));
+	Assert(PointerIsValid(indexRelation->rd_indam));
+	Assert(PointerIsValid(indexRelation->rd_indam->yb_ambackfill));
+
+	ereport(DEBUG1,
+			(errmsg("backfilling index \"%s\" on table \"%s\"",
+					RelationGetRelationName(indexRelation),
+					RelationGetRelationName(heapRelation))));
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
+	/*
+	 * Call the access method's build procedure
+	 */
+	result = indexRelation->rd_indam->yb_ambackfill(heapRelation,
+													indexRelation,
+													indexInfo,
+													bfinfo,
+													bfresult);
+
+	/*
+	 * I don't think we should be backfilling unlogged indexes.
+	 */
+	Assert(indexRelation->rd_rel->relpersistence != RELPERSISTENCE_UNLOGGED);
+
+	/*
+	 * Update heap and index pg_class rows
+	 * TODO(jason): properly update reltuples.  They can't be set here because
+	 * this backfill func is called for each backfill chunk request from
+	 * master, and we need some way to sum up the tuple numbers.  We also don't
+	 * even collect stats properly for heapRelation anyway, at the moment.
+	 */
+	index_update_stats(heapRelation,
+					   true,
+					   -1);
+
+	index_update_stats(indexRelation,
+					   false,
+					   -1);
+
+	/* Make the updated catalog row versions visible */
+	CommandCounterIncrement();
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	return result->index_tuples;
+}
+
+double
+IndexBackfillHeapRangeScan(Relation table_rel,
+						   Relation index_rel,
+						   IndexInfo *index_info,
+						   YbIndexBuildCallback ybcallback,
+						   void *callback_state,
+						   YbBackfillInfo *bfinfo,
+						   YbPgExecOutParam *bfresult)
+{
+	return table_rel->rd_tableam->index_build_range_scan(table_rel,
+														 index_rel,
+														 index_info,
+														 true /* allow_sync */ ,
+														 false /* any_visible */ ,
+														 false /* progress */ ,
+														 0 /* start_blockno */ ,
+														 InvalidBlockNumber /* num_blocks */ ,
+														 NULL,
+														 callback_state,
+														 NULL,	/* scan */
+														 bfinfo,
+														 bfresult,
+														 ybcallback);
 }
 
 /*
@@ -3574,10 +3891,18 @@ IndexGetRelation(Oid indexId, bool missing_ok)
 
 /*
  * reindex_index - This routine is used to recreate a single index
+ *
+ * preserved_index_split_options:
+ * During ALTER TYPE on columns with dependent indexes, indexes are rebuilt by
+ * dropping and recreating them. We skip DocDB index table creation during the rebuild
+ * phase and defer it to the reindex phase. Since DocDB tables don't exist during the
+ * reindex phase, split options must be retrieved beforehand and passed via these
+ * parallel lists to restore correct split options.
  */
 void
 reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
-			  ReindexParams *params)
+			  ReindexParams *params, bool is_yb_table_rewrite,
+			  bool yb_copy_split_options, YbOptSplit *preserved_index_split_options)
 {
 	Relation	iRel,
 				heapRelation;
@@ -3668,8 +3993,12 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	/*
 	 * Partitioned indexes should never get processed here, as they have no
 	 * physical storage.
+	 * YB: We want to allow reindexes on partitioned indexes during
+	 * table rewrite to avoid schema inconsistencies during backup/restore
+	 * (see GH#24458).
 	 */
-	if (iRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
+	if (iRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX &&
+		!is_yb_table_rewrite)
 		elog(ERROR, "cannot reindex partitioned index \"%s.%s\"",
 			 get_namespace_name(RelationGetNamespace(iRel)),
 			 RelationGetRelationName(iRel));
@@ -3682,6 +4011,57 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot reindex temporary tables of other sessions")));
+
+	/*
+	 * YB pk indexes share the same storage as their tables, so it is not
+	 * possible to reindex them. However, this code-path may be internally
+	 * invoked by table rewrite, and we need to reset the index's reltuples.
+	 */
+	if (!is_yb_table_rewrite && iRel->rd_index->indisprimary &&
+		IsYBRelation(iRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot reindex nontemporary pk indexes"),
+				 errdetail("Primary key indexes share the same storage as their"
+						   " table for Yugabyte-backed relations.")));
+
+	/*
+	 * Supporting shared index could be complicated, so skip for now.
+	 */
+	if (iRel->rd_rel->relisshared)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot reindex shared system indexes")));
+
+	/*
+	 * Since YB REINDEX currently doesn't take locks, it is not a safe
+	 * operation.  Chance of failure or corruption is relatively high.
+	 * Mitigate negative affects by making it a two-step process:
+	 * 1. run the reindex on nonpublic index
+	 * 2. make the index public
+	 * In case (1) fails (e.g. duplicate key violation), things can be fixed or
+	 * changed then reindexed again.  After manually checking the reindex has
+	 * no corruption (since the index build is not online), (2) can be done.
+	 *
+	 * Checking indisvalid helps catch reindex on public index, but it is not
+	 * foolproof.  For example, the index could be made public while the
+	 * reindex is happening.
+	 *
+	 * indisvalid and indisready should be true for best chance of avoiding
+	 * corruption.
+	 *
+	 * NOTE: reindex is permitted internally on public indexes when the indexed
+	 * table is being rewritten.
+	 */
+	if (!is_yb_table_rewrite && iRel->rd_index->indisvalid
+		&& IsYBRelation(iRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot reindex public indexes"),
+				 errdetail("For safety, indexes should not be serving reads"
+						   " during REINDEX."),
+				 errhint("Run UPDATE pg_index SET indisvalid = false WHERE"
+						 " indexrelid = '<index_name>'::regclass.")));
 
 	/*
 	 * Don't allow reindex of an invalid index on TOAST table.  This is a
@@ -3761,13 +4141,27 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	/* Suppress use of the target index while rebuilding it */
 	SetReindexProcessing(heapId, indexId);
 
-	/* Create a new physical relation for the index */
-	RelationSetNewRelfilenode(iRel, persistence);
+	if (YbUseUnsafeTruncate(heapRelation))
+		YbUnsafeTruncate(iRel);
+	else
+	{
+		/* Create a new physical relation for the index */
+		RelationSetNewRelfilenode(iRel, persistence, yb_copy_split_options,
+								  preserved_index_split_options);
+	}
 
 	/* Initialize the index and rebuild */
 	/* Note: we do not need to re-establish pkey setting */
-	index_build(heapRelation, iRel, indexInfo, true, true);
-
+	/*
+	 * YB: Partitioned indexes can reach here as we allow reindexes on
+	 * them during table rewrite. However, we don't actually want to
+	 * do an index build for them (like PG), so skip this.
+	 */
+	if (!(IsYBRelation(iRel) &&
+		  iRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX))
+	{
+		index_build(heapRelation, iRel, indexInfo, true, true);
+	}
 	/* Re-allow use of target index */
 	ResetReindexProcessing();
 
@@ -3803,8 +4197,12 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	 * usability horizon must be advanced to the current transaction on every
 	 * build or rebuild.  pg_index is OK in this regard because catalog tables
 	 * are not subject to early cleanup.
+	 * YB: Partitioned indexes can reach here as we allow reindexes on
+	 * them during table rewrite. However, we don't actually perform an index
+	 * build on them (like PG), so we shouldn't update their pg_index entries.
 	 */
-	if (!skipped_constraint)
+	if (!skipped_constraint && !(IsYBRelation(iRel) &&
+								 iRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX))
 	{
 		Relation	pg_index;
 		HeapTuple	indexTuple;
@@ -3905,9 +4303,18 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
  * Returns true if any indexes were rebuilt (including toast table's index
  * when relevant).  Note that a CommandCounterIncrement will occur after each
  * index rebuild.
+ *
+ * changedIndexNames and changedIndexSplitOpts:
+ * During ALTER TYPE on columns with dependent indexes, the indexes are first rebuilt by
+ * dropping and recreating them. We skip DocDB index creation during the rebuild
+ * phase and defer it to the reindex phase. Since DocDB tables don't exist during the
+ * reindex phase, split options must be retrieved beforehand and passed via these
+ * parallel lists to restore correct split options.
  */
 bool
-reindex_relation(Oid relid, int flags, ReindexParams *params)
+reindex_relation(Oid relid, int flags, ReindexParams *params, bool is_yb_table_rewrite,
+				 bool yb_copy_split_options, List *changedIndexNames,
+				 List *changedIndexSplitOpts)
 {
 	Relation	rel;
 	Oid			toast_relid;
@@ -3934,8 +4341,11 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 	/*
 	 * Partitioned tables should never get processed here, as they have no
 	 * physical storage.
+	 * YB: We want to allow reindexes on partitioned indexes during
+	 * table rewrite to avoid schema inconsistencies during backup/restore
+	 * (see GH#24458).
 	 */
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE && !is_yb_table_rewrite)
 		elog(ERROR, "cannot reindex partitioned table \"%s.%s\"",
 			 get_namespace_name(RelationGetNamespace(rel)),
 			 RelationGetRelationName(rel));
@@ -3979,6 +4389,28 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 		Oid			indexOid = lfirst_oid(indexId);
 		Oid			indexNamespaceId = get_rel_namespace(indexOid);
 
+		/* TODO(fizaa): add YB prefix to iRel. */
+		Relation	iRel = index_open(indexOid, AccessExclusiveLock);
+
+		char *currentIndexName = RelationGetRelationName(iRel);
+
+		if (IsYBRelation(iRel))
+		{
+			if (!is_yb_table_rewrite && !iRel->rd_index->indisprimary)
+				/*
+				* Drop the old DocDB table associated with this index.
+				* This is only required for secondary indexes, because a
+				* primary index in YB doesn't have a DocDB table separate
+				* from the base relation's table.
+				* If this is a table rewrite, the indexes on the table
+				* will automatically be dropped when the table is dropped.
+				* Note: The drop isn't finalized until after the txn
+				* commits/aborts.
+				*/
+				YBCDropIndex(iRel);
+		}
+		index_close(iRel, AccessExclusiveLock);
+
 		/*
 		 * Skip any invalid indexes on a TOAST table.  These can only be
 		 * duplicate leftovers from a failed REINDEX CONCURRENTLY, and if
@@ -4003,8 +4435,27 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 			continue;
 		}
 
+		YbOptSplit *preserved_index_split_options = NULL;
+		if (changedIndexNames != NIL && changedIndexSplitOpts != NIL)
+		{
+			ListCell   *lc_name;
+			ListCell   *lc_split;
+
+			forboth(lc_name, changedIndexNames,
+					lc_split, changedIndexSplitOpts)
+			{
+				char *savedIndexName = (char *) lfirst(lc_name);
+				if (strcmp(savedIndexName, currentIndexName) == 0)
+				{
+					preserved_index_split_options = (YbOptSplit *) lfirst(lc_split);
+					break;
+				}
+			}
+		}
+
 		reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
-					  persistence, params);
+					  persistence, params, is_yb_table_rewrite,
+					  yb_copy_split_options, preserved_index_split_options);
 
 		CommandCounterIncrement();
 
@@ -4040,7 +4491,11 @@ reindex_relation(Oid relid, int flags, ReindexParams *params)
 
 		newparams.options &= ~(REINDEXOPT_MISSING_OK);
 		newparams.tablespaceOid = InvalidOid;
-		result |= reindex_relation(toast_relid, flags, &newparams);
+		result |= reindex_relation(toast_relid, flags, &newparams,
+								   false /* is_yb_table_rewrite */ ,
+								   yb_copy_split_options,
+								   NIL /* changedIndexNames */ ,
+								   NIL /* changedIndexSplitOpts */ );
 	}
 
 	return result;
@@ -4239,4 +4694,15 @@ RestoreReindexState(void *reindexstate)
 
 	/* Note the worker has its own transaction nesting level */
 	reindexingNestLevel = GetCurrentTransactionNestLevel();
+}
+
+/*
+ * YB Wrapper on index_update_stats to expose this static function.
+ */
+void
+yb_index_update_stats(Relation rel,
+					  bool hasindex,
+					  double reltuples)
+{
+	index_update_stats(rel, hasindex, reltuples);
 }

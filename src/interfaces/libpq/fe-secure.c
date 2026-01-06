@@ -421,6 +421,7 @@ retry_masked:
 				REMEMBER_EPIPE(spinfo, true);
 
 				/* FALL THRU */
+				yb_switch_fallthrough();
 
 			case ECONNRESET:
 				conn->write_failed = true;

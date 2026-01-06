@@ -253,6 +253,14 @@ typedef void (*IndexBuildCallback) (Relation index,
 									bool tupleIsAlive,
 									void *state);
 
+/* Typedef for callback function for yb_table_index_build_scan */
+typedef void (*YbIndexBuildCallback) (Relation index,
+									  Datum ybctid,
+									  Datum *values,
+									  bool *isnull,
+									  bool tupleIsAlive,
+									  void *state);
+
 /*
  * API struct for a table AM.  Note this must be allocated in a
  * server-lifetime manner, typically as a static const struct, which then gets
@@ -678,7 +686,10 @@ typedef struct TableAmRoutine
 										   BlockNumber numblocks,
 										   IndexBuildCallback callback,
 										   void *callback_state,
-										   TableScanDesc scan);
+										   TableScanDesc scan,
+										   YbBackfillInfo *bfinfo,
+										   YbPgExecOutParam *bfresult,
+										   YbIndexBuildCallback ybcallback);
 
 	/* see table_index_validate_scan for reference about parameters */
 	void		(*index_validate_scan) (Relation table_rel,
@@ -1764,7 +1775,40 @@ table_index_build_scan(Relation table_rel,
 														 InvalidBlockNumber,
 														 callback,
 														 callback_state,
-														 scan);
+														 scan,
+														 NULL,	/* bfinfo */
+														 NULL,	/* bfresult */
+														 NULL /* ybcallback */ );
+}
+
+/*
+ * YB variant of table_index_build_scan. Differences:
+ *  - use YbIndexBuildCallback, not IndexBuildCallback
+ *  - skip progress argument
+ */
+static inline double
+yb_table_index_build_scan(Relation table_rel,
+						  Relation index_rel,
+						  struct IndexInfo *index_info,
+						  bool allow_sync,
+						  YbIndexBuildCallback ybcallback,
+						  void *callback_state,
+						  TableScanDesc scan)
+{
+	return table_rel->rd_tableam->index_build_range_scan(table_rel,
+														 index_rel,
+														 index_info,
+														 allow_sync,
+														 false,
+														 false, /* progress */
+														 0,
+														 InvalidBlockNumber,
+														 NULL,	/* callback */
+														 callback_state,
+														 scan,
+														 NULL,	/* bfinfo */
+														 NULL,	/* bfresult */
+														 ybcallback);
 }
 
 /*
@@ -1788,7 +1832,9 @@ table_index_build_range_scan(Relation table_rel,
 							 BlockNumber numblocks,
 							 IndexBuildCallback callback,
 							 void *callback_state,
-							 TableScanDesc scan)
+							 TableScanDesc scan,
+							 YbBackfillInfo *bfinfo,
+							 YbPgExecOutParam *bfresult)
 {
 	return table_rel->rd_tableam->index_build_range_scan(table_rel,
 														 index_rel,
@@ -1800,7 +1846,10 @@ table_index_build_range_scan(Relation table_rel,
 														 numblocks,
 														 callback,
 														 callback_state,
-														 scan);
+														 scan,
+														 bfinfo,
+														 bfresult,
+														 NULL /* ybcallback */ );
 }
 
 /*

@@ -16,6 +16,14 @@
 #include "utils/backend_progress.h"
 
 
+/*
+ * YB: The number of attempts to read a BEEntry before proceeding with
+ * inconsistent results. This must be a multiple of YB_BEENTRY_LOGGING_INTERVAL
+ */
+#define YB_MAX_BEENTRIES_ATTEMPTS 1000
+/* YB: How often to log BEEntry read failures */
+#define YB_BEENTRY_LOGGING_INTERVAL 100
+
 /* ----------
  * Backend states
  * ----------
@@ -79,6 +87,24 @@ typedef struct PgBackendGSSStatus
 
 } PgBackendGSSStatus;
 
+
+/*
+ * YbPgBackendCatalogVersionStatus
+ *
+ * Each live backend maintains a YbPgBackendCatalogVersionStatus struct in
+ * shared memory indicating what catalog version it is at.  A backend in the
+ * middle of a query or transaction uses a consistent snapshot of the system
+ * catalog (technically, only the cache does, not direct reads/writes to/from
+ * system catalog).  The catalog version indicates that snapshot.  has_version
+ * is false for backends that are idle (and not in txn) or non-client backends.
+ */
+typedef struct YbPgBackendCatalogVersionStatus
+{
+	bool		has_version;	/* whether the backend is using the following
+								 * version */
+	uint64_t	version;		/* if has_version, catalog version that the
+								 * backend is on */
+} YbPgBackendCatalogVersionStatus;
 
 /* ----------
  * PgBackendStatus
@@ -168,6 +194,23 @@ typedef struct PgBackendStatus
 
 	/* query identifier, optionally computed using post_parse_analyze_hook */
 	uint64		st_query_id;
+
+	/* Yugabyte attributes */
+	char	   *st_databasename;	/* Used in YB Mode */
+
+	/*
+	 * YB: Memory usage of backend from TCMalloc, including PostgreSQL memory
+	 * usage + pggate memory usage + cached memory - memory that was freed but
+	 * not recycled
+	 */
+	int64_t		yb_st_allocated_mem_bytes;
+
+	/* YB catalog version */
+	YbPgBackendCatalogVersionStatus yb_st_catalog_version;
+
+	/* YB (pg_client <--> tserver) Session ID */
+	uint64_t	yb_session_id;
+
 } PgBackendStatus;
 
 
@@ -185,7 +228,8 @@ typedef struct PgBackendStatus
  *
  * Reader logic should follow this sketch:
  *
- *		for (;;)
+ *		int attempt = 1;
+ *		while (yb_pgstat_log_read_activity(beentry, ++attempt))
  *		{
  *			int before_ct, after_ct;
  *
@@ -258,6 +302,10 @@ typedef struct LocalPgBackendStatus
 	 * not.
 	 */
 	TransactionId backend_xmin;
+
+	/* YB: Backend's memory usage */
+	int64_t		yb_backend_rss_mem_bytes;
+	int64_t		yb_backend_pss_mem_bytes;
 } LocalPgBackendStatus;
 
 
@@ -316,6 +364,16 @@ extern int	pgstat_fetch_stat_numbackends(void);
 extern PgBackendStatus *pgstat_fetch_stat_beentry(int beid);
 extern LocalPgBackendStatus *pgstat_fetch_stat_local_beentry(int beid);
 extern char *pgstat_clip_activity(const char *raw_activity);
+
+/* ----------
+ * YB functions called from backends
+ * ----------
+ */
+extern void yb_pgstat_add_session_info(uint64_t session_id);
+
+extern bool yb_pgstat_log_read_activity(volatile PgBackendStatus *beentry, int attempt);
+
+extern PgBackendStatus *getBackendStatusArray(void);
 
 
 #endif							/* BACKEND_STATUS_H */

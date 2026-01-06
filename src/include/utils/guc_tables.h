@@ -23,6 +23,7 @@ enum config_type
 {
 	PGC_BOOL,
 	PGC_INT,
+	PGC_OID,
 	PGC_REAL,
 	PGC_STRING,
 	PGC_ENUM
@@ -32,6 +33,7 @@ union config_var_val
 {
 	bool		boolval;
 	int			intval;
+	Oid			oidval;
 	double		realval;
 	char	   *stringval;
 	int			enumval;
@@ -177,7 +179,7 @@ struct config_generic
  */
 #define GUC_PENDING_RESTART 0x0002	/* changed value cannot be applied yet */
 #define GUC_NEEDS_REPORT	0x0004	/* new value must be reported to client */
-
+#define GUC_VALUE_RESET		0x0008	/* YB: GUC value was reset */
 
 /* GUC records for specific variable types */
 
@@ -208,6 +210,22 @@ struct config_int
 	GucShowHook show_hook;
 	/* variable fields, initialized at runtime: */
 	int			reset_val;
+	void	   *reset_extra;
+};
+
+struct yb_config_oid
+{
+	struct config_generic gen;
+	/* constant fields, must be set correctly in initial value: */
+	Oid		   *variable;
+	Oid			boot_val;
+	Oid			min;
+	Oid			max;
+	YbGucOidCheckHook check_hook;
+	YbGucOidAssignHook assign_hook;
+	GucShowHook show_hook;
+	/* variable fields, initialized at runtime: */
+	Oid			reset_val;
 	void	   *reset_extra;
 };
 

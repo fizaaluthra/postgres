@@ -41,6 +41,17 @@
 #include "utils/rel.h"
 #include "utils/rls.h"
 
+/* YB includes */
+#include "commands/progress.h"
+#include "commands/trigger.h"
+#include "executor/execPartition.h"
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+#include "pgstat.h"
+#include "port/pg_bswap.h"
+
+int			yb_default_copy_from_rows_per_transaction = DEFAULT_BATCH_ROWS_PER_TRANSACTION;
+
 /*
  *	 DoCopy executes the SQL COPY statement
  *
@@ -75,7 +86,10 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 	/*
 	 * Disallow COPY to/from file or program except to users with the
 	 * appropriate role.
+	 *
+	 * YB might also disable access completely.
 	 */
+	YBCheckServerAccessIsAllowed();
 	if (!pipe)
 	{
 		if (stmt->is_program)
@@ -119,6 +133,10 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		/* Open and lock the relation, using the appropriate lock type. */
 		rel = table_openrv(stmt->relation, lockmode);
 
+		if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+			IsYugaByteEnabled())
+			YbSetTxnUsesTempRel();
+
 		relid = RelationGetRelid(rel);
 
 		nsitem = addRangeTableEntryForRelation(pstate, rel, lockmode,
@@ -151,7 +169,7 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		foreach(cur, attnums)
 		{
 			int			attno = lfirst_int(cur) -
-				FirstLowInvalidHeapAttributeNumber;
+				YBGetFirstLowInvalidAttributeNumber(rel);
 
 			if (is_from)
 				rte->insertedCols = bms_add_member(rte->insertedCols, attno);
@@ -420,6 +438,12 @@ ProcessCopyOptions(ParseState *pstate,
 
 	opts_out->file_encoding = -1;
 
+	/* Yugabyte options */
+	opts_out->batch_size = -1;
+	opts_out->num_initial_skipped_rows = 0;
+	opts_out->disable_fk_check = false;
+	opts_out->on_conflict_action = ONCONFLICT_NONE;
+
 	/* Extract options from the statement node tree */
 	foreach(option, options)
 	{
@@ -554,6 +578,34 @@ ProcessCopyOptions(ParseState *pstate,
 								defel->defname),
 						 parser_errposition(pstate, defel->location)));
 		}
+		else if (strcmp(defel->defname, "rows_per_transaction") == 0)
+		{
+			int			rows = defGetInt32(defel);
+
+			if (rows >= 0)
+				opts_out->batch_size = rows;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a positive integer", defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "skip") == 0)
+		{
+			int64_t		num_initial_skipped_rows = defGetInt64(defel);
+
+			if (num_initial_skipped_rows >= 0)
+				opts_out->num_initial_skipped_rows = num_initial_skipped_rows;
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("argument to option \"%s\" must be a nonnegative integer", defel->defname),
+						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "disable_fk_check") == 0)
+			opts_out->disable_fk_check = true;
+		else if (strcmp(defel->defname, "replace") == 0)
+			opts_out->on_conflict_action = ONCONFLICT_YB_REPLACE;
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),

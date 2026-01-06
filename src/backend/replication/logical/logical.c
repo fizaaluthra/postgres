@@ -43,6 +43,12 @@
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "replication/slot.h"
+#include "replication/walsender.h"
+#include "replication/yb_virtual_wal_client.h"
+
 /* data for errcontext callback */
 typedef struct LogicalErrorCallbackState
 {
@@ -95,6 +101,8 @@ static void stream_truncate_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *t
 
 static void LoadOutputPlugin(OutputPluginCallbacks *callbacks, const char *plugin);
 
+static void yb_schema_change_cb_wrapper(ReorderBuffer *cache, Oid relid);
+
 /*
  * Make sure the current settings & environment are capable of doing logical
  * decoding.
@@ -109,10 +117,14 @@ CheckLogicalDecodingRequirements(void)
 	 * needs the same check.
 	 */
 
-	if (wal_level < WAL_LEVEL_LOGICAL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("logical decoding requires wal_level >= logical")));
+	/* wal_level is not applicable to YSQL. */
+	if (!IsYugaByteEnabled())
+	{
+		if (wal_level < WAL_LEVEL_LOGICAL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("logical decoding requires wal_level >= logical")));
+	}
 
 	if (MyDatabaseId == InvalidOid)
 		ereport(ERROR,
@@ -211,6 +223,9 @@ StartupDecodingContext(List *output_plugin_options,
 		AllocateSnapshotBuilder(ctx->reorder, xmin_horizon, start_lsn,
 								need_full_snapshot, slot->data.two_phase_at);
 
+	if (IsYugaByteEnabled())
+		ctx->yb_start_decoding_at = start_lsn;
+
 	ctx->reorder->private_data = ctx;
 
 	/* wrap output plugin callbacks, so we can add error context information */
@@ -279,6 +294,9 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->reorder->commit_prepared = commit_prepared_cb_wrapper;
 	ctx->reorder->rollback_prepared = rollback_prepared_cb_wrapper;
 
+	if (IsYugaByteEnabled())
+		ctx->reorder->yb_schema_change = yb_schema_change_cb_wrapper;
+
 	ctx->out = makeStringInfo();
 	ctx->prepare_write = prepare_write;
 	ctx->write = do_write;
@@ -289,6 +307,37 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->fast_forward = fast_forward;
 
 	ctx->in_create = in_create;
+
+	/*
+	 * YB: Mark that we need to invalidate the relcache as part of the startup.
+	 *
+	 * Also, initialize the hash table needed for tracking per table relcache
+	 * invalidations based on DDL events.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		HASHCTL		ctl;
+
+		/*
+		 * Allocate the hash table to handle relcache invaldations. Uses the
+		 * memory context of the LogicalDecodingContext.
+		 */
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);	/* table_oid */
+
+		/*
+		 * Ideally, we want to keep a bool as the value or not have a value at
+		 * all (set) but the HTAB implementation asserts that entrysize >=
+		 * keysize. So, we end up keeping the value also as the OID which
+		 * remains unused.
+		 */
+		ctl.entrysize = sizeof(Oid);
+		ctl.hcxt = context;
+		ctx->yb_needs_relcache_invalidation =
+			hash_create("yb_needs_relcache_invalidation table",
+						32,		/* start small and extend */
+						&ctl, HASH_ELEM | HASH_BLOBS);
+	}
 
 	MemoryContextSwitchTo(old_context);
 
@@ -696,8 +745,16 @@ LoadOutputPlugin(OutputPluginCallbacks *callbacks, const char *plugin)
 {
 	LogicalOutputPluginInit plugin_init;
 
-	plugin_init = (LogicalOutputPluginInit)
-		load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
+	/*
+	 * 'yboutput' is a special plugin which reuses most of the code of
+	 * 'pgoutput'.
+	 */
+	if (IsYugaByteEnabled() && strcmp(plugin, YB_OUTPUT_PLUGIN) == 0)
+		plugin_init = (LogicalOutputPluginInit)
+			load_external_function(PG_OUTPUT_PLUGIN, "_PG_output_plugin_init", false, NULL);
+	else
+		plugin_init = (LogicalOutputPluginInit)
+			load_external_function(plugin, "_PG_output_plugin_init", false, NULL);
 
 	if (plugin_init == NULL)
 		elog(ERROR, "output plugins have to declare the _PG_output_plugin_init symbol");
@@ -705,12 +762,68 @@ LoadOutputPlugin(OutputPluginCallbacks *callbacks, const char *plugin)
 	/* ask the output plugin to fill the callback struct */
 	plugin_init(callbacks);
 
+	if (IsYugaByteEnabled())
+	{
+		if (strcmp(plugin, YB_OUTPUT_PLUGIN) == 0)
+			callbacks->yb_support_yb_specifc_replica_identity_cb(true);
+		else
+			callbacks->yb_support_yb_specifc_replica_identity_cb(false);
+	}
+
 	if (callbacks->begin_cb == NULL)
 		elog(ERROR, "output plugins have to register a begin callback");
 	if (callbacks->change_cb == NULL)
 		elog(ERROR, "output plugins have to register a change callback");
 	if (callbacks->commit_cb == NULL)
 		elog(ERROR, "output plugins have to register a commit callback");
+}
+
+void
+YBValidateOutputPlugin(char *plugin)
+{
+	OutputPluginCallbacks *callbacks;
+
+	callbacks = palloc(sizeof(OutputPluginCallbacks));
+	LoadOutputPlugin(callbacks, plugin);
+	pfree(callbacks);
+}
+
+void
+YBValidateLsnType(char *lsn_type)
+{
+	if (!(strcmp(lsn_type, LSN_TYPE_SEQUENCE) == 0
+		  || strcmp(lsn_type, LSN_TYPE_HYBRID_TIME) == 0))
+		elog(ERROR, "lsn type can only be SEQUENCE or HYBRID_TIME");
+}
+
+YbCRSLsnType
+YBParseLsnType(char *lsn_type)
+{
+	if (strcmp(lsn_type, LSN_TYPE_SEQUENCE) == 0)
+		return CRS_SEQUENCE;
+	else if (strcmp(lsn_type, LSN_TYPE_HYBRID_TIME) == 0)
+		return CRS_HYBRID_TIME;
+	else
+		elog(ERROR, "invalid lsn type provided");
+}
+
+void
+YBValidateOrderingMode(char *ordering_mode)
+{
+	if (!(strcmp(ordering_mode, ORDERING_MODE_ROW) == 0
+		  || strcmp(ordering_mode, ORDERING_MODE_TRANSACTION) == 0))
+		elog(ERROR, "ordering mode can only be ROW or TRANSACTION");
+}
+
+YbCRSOrderingMode
+YBParseOrderingMode(char *ordering_mode)
+{
+	if (strcmp(ordering_mode, ORDERING_MODE_ROW) == 0)
+		return YB_CRS_ROW;
+	else if (strcmp(ordering_mode, ORDERING_MODE_TRANSACTION) == 0)
+		return YB_CRS_TRANSACTION;
+	else
+		elog(ERROR, "invalid ordering mode provided");
 }
 
 static void
@@ -1587,6 +1700,34 @@ stream_truncate_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	error_context_stack = errcallback.previous;
 }
 
+static void
+yb_schema_change_cb_wrapper(ReorderBuffer *cache, Oid relid)
+{
+	LogicalDecodingContext *ctx = cache->private_data;
+	LogicalErrorCallbackState state;
+	ErrorContextCallback errcallback;
+
+	Assert(!ctx->fast_forward);
+
+	/* Push callback + info on the error context stack */
+	state.ctx = ctx;
+	state.callback_name = "yb_schema_change";
+	state.report_location = InvalidXLogRecPtr;
+	errcallback.callback = output_plugin_error_callback;
+	errcallback.arg = (void *) &state;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* set output state */
+	ctx->accept_writes = false;
+
+	/* do the actual work: call callback */
+	ctx->callbacks.yb_schema_change_cb(ctx, relid);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
+}
+
 /*
  * Set the required catalog xmin horizon for historic snapshots in the current
  * replication slot.
@@ -1744,9 +1885,15 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 {
 	Assert(lsn != InvalidXLogRecPtr);
 
+	/*
+	 * YB Note: The mechanism of updating restart lsn is different in YSQL. We
+	 * do not use candidate_xmin_lsn and candidate_restart_lsn. Hence, this
+	 * check is disabled.
+	 */
 	/* Do an unlocked check for candidate_lsn first. */
-	if (MyReplicationSlot->candidate_xmin_lsn != InvalidXLogRecPtr ||
-		MyReplicationSlot->candidate_restart_valid != InvalidXLogRecPtr)
+	if (!IsYugaByteEnabled() &&
+		(MyReplicationSlot->candidate_xmin_lsn != InvalidXLogRecPtr ||
+		 MyReplicationSlot->candidate_restart_valid != InvalidXLogRecPtr))
 	{
 		bool		updated_xmin = false;
 		bool		updated_restart = false;
@@ -1817,8 +1964,15 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 	}
 	else
 	{
+		XLogRecPtr	yb_restart_lsn = InvalidXLogRecPtr;
+
+		if (IsYugaByteEnabled())
+			yb_restart_lsn = YBCCalculatePersistAndGetRestartLSN(lsn);
+
 		SpinLockAcquire(&MyReplicationSlot->mutex);
 		MyReplicationSlot->data.confirmed_flush = lsn;
+		if (IsYugaByteEnabled() && yb_restart_lsn != InvalidXLogRecPtr)
+			MyReplicationSlot->data.restart_lsn = yb_restart_lsn;
 		SpinLockRelease(&MyReplicationSlot->mutex);
 	}
 }

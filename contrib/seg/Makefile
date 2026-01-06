@@ -13,7 +13,7 @@ PGFILEDESC = "seg - line segment data type"
 
 HEADERS = segdata.h
 
-REGRESS = security seg
+REGRESS = seg
 
 EXTRA_CLEAN = y.tab.c y.tab.h
 

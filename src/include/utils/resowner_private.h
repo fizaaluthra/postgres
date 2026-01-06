@@ -24,6 +24,10 @@
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
 
+/* YB includes */
+#include "utils/yb_inheritscache.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 /* support for buffer refcount management */
 extern void ResourceOwnerEnlargeBuffers(ResourceOwner owner);
@@ -108,5 +112,12 @@ extern void ResourceOwnerRememberHMAC(ResourceOwner owner,
 									  Datum handle);
 extern void ResourceOwnerForgetHMAC(ResourceOwner owner,
 									Datum handle);
+
+/* YB */
+extern void ResourceOwnerEnlargeYbPgInheritsRefs(ResourceOwner owner);
+extern void ResourceOwnerRememberYbPgInheritsRef(ResourceOwner owner,
+												 YbPgInheritsCacheEntry entry);
+extern void ResourceOwnerForgetYbPgInheritsRef(ResourceOwner owner,
+											   YbPgInheritsCacheEntry entry);
 
 #endif							/* RESOWNER_PRIVATE_H */

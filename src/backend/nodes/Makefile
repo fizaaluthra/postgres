@@ -13,6 +13,9 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	ybbitmatrix.o \
+	ybtidbitmap.o \
+	\
 	bitmapset.o \
 	copyfuncs.o \
 	equalfuncs.o \

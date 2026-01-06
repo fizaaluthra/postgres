@@ -16,6 +16,9 @@
 #include "access/xlogdefs.h"
 #include "utils/guc.h"
 
+/* YB includes */
+#include "storage/proc.h"
+
 #define SyncRepRequested() \
 	(max_wal_senders > 0 && synchronous_commit > SYNCHRONOUS_COMMIT_LOCAL_FLUSH)
 
@@ -85,7 +88,7 @@ extern PGDLLIMPORT char *SyncRepStandbyNames;
 extern void SyncRepWaitForLSN(XLogRecPtr lsn, bool commit);
 
 /* called at backend exit */
-extern void SyncRepCleanupAtProcExit(void);
+extern void SyncRepCleanupAtProcExit(PGPROC *proc);
 
 /* called by wal sender */
 extern void SyncRepInitConfig(void);

@@ -64,9 +64,17 @@ get_db_conn(ClusterInfo *cluster, const char *db_name)
 	appendPQExpBufferStr(&conn_opts, "dbname=");
 	appendConnStrVal(&conn_opts, db_name);
 	appendPQExpBufferStr(&conn_opts, " user=");
-	appendConnStrVal(&conn_opts, os_info.user);
+	if (is_yugabyte_enabled())
+		appendConnStrVal(&conn_opts, cluster->yb_user);
+	else
+		appendConnStrVal(&conn_opts, os_info.user);
 	appendPQExpBuffer(&conn_opts, " port=%d", cluster->port);
-	if (cluster->sockdir)
+	if (is_yugabyte_enabled() && cluster->yb_hostaddr)
+	{
+		appendPQExpBufferStr(&conn_opts, " host=");
+		appendConnStrVal(&conn_opts, cluster->yb_hostaddr);
+	}
+	else if (cluster->sockdir)
 	{
 		appendPQExpBufferStr(&conn_opts, " host=");
 		appendConnStrVal(&conn_opts, cluster->sockdir);
@@ -98,14 +106,23 @@ cluster_conn_opts(ClusterInfo *cluster)
 	else
 		resetPQExpBuffer(buf);
 
-	if (cluster->sockdir)
+	if (is_yugabyte_enabled() && cluster->yb_hostaddr)
+	{
+		appendPQExpBufferStr(buf, "--host ");
+		appendShellString(buf, cluster->yb_hostaddr);
+		appendPQExpBufferChar(buf, ' ');
+	}
+	else if (cluster->sockdir)
 	{
 		appendPQExpBufferStr(buf, "--host ");
 		appendShellString(buf, cluster->sockdir);
 		appendPQExpBufferChar(buf, ' ');
 	}
 	appendPQExpBuffer(buf, "--port %d --username ", cluster->port);
-	appendShellString(buf, os_info.user);
+	if (is_yugabyte_enabled())
+		appendShellString(buf, cluster->yb_user);
+	else
+		appendShellString(buf, os_info.user);
 
 	return buf->data;
 }

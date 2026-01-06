@@ -20,6 +20,10 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/restrictinfo.h"
 
+/* YB includes */
+#include "catalog/pg_operator.h"
+#include "catalog/pg_type.h"
+
 
 static RestrictInfo *make_restrictinfo_internal(PlannerInfo *root,
 												Expr *clause,
@@ -196,6 +200,8 @@ make_restrictinfo_internal(PlannerInfo *root,
 	 */
 	restrictinfo->parent_ec = NULL;
 
+	restrictinfo->yb_batched_rinfo = NULL;
+
 	restrictinfo->eval_cost.startup = -1;
 	restrictinfo->norm_selec = -1;
 	restrictinfo->outer_selec = -1;
@@ -221,6 +227,79 @@ make_restrictinfo_internal(PlannerInfo *root,
 	restrictinfo->right_hasheqoperator = InvalidOid;
 
 	return restrictinfo;
+}
+
+/*
+ * Returns whether the given rinfo can be used as a hashed clause during a
+ * hashed BNL join. This operates similar to the check hash joins do to
+ * determine if a clause can be hashed as in hash_inner_and_outer in
+ * joinpath.c.
+ */
+bool
+yb_can_hash_batched_rinfo(RestrictInfo *batched_rinfo,
+						  Relids outer_relids,
+						  Relids inner_relids)
+{
+	if (bms_is_subset(batched_rinfo->right_relids, outer_relids) &&
+		bms_is_subset(batched_rinfo->left_relids, inner_relids))
+		return true;
+	return false;
+}
+
+/*
+ *	Returns whether the given rinfo has a batched representation with
+ *	an inner variable from inner_relids and its outer batched variables from
+ *	outer_batched_relids.
+ */
+bool
+yb_can_batch_rinfo(RestrictInfo *rinfo,
+				   Relids outer_batched_relids,
+				   Relids inner_relids)
+{
+	RestrictInfo *batched_rinfo = yb_get_batched_restrictinfo(rinfo,
+															  outer_batched_relids,
+															  inner_relids);
+
+	return batched_rinfo != NULL;
+}
+
+/*
+ * Get a batched version of the given restrictinfo if any. The left/inner side
+ * of the returned restrictinfo will have relids within inner_relids and
+ * similarly for the right/outer side and outer_batched_relids.
+ */
+RestrictInfo *
+yb_get_batched_restrictinfo(RestrictInfo *rinfo,
+							Relids outer_batched_relids,
+							Relids inner_relids)
+{
+	if (list_length(rinfo->yb_batched_rinfo) == 0)
+		return NULL;
+
+	RestrictInfo *ret = linitial(rinfo->yb_batched_rinfo);
+
+	if (!bms_is_subset(ret->left_relids, inner_relids))
+	{
+		/* Try the other batched rinfo if it exists. */
+		if (list_length(rinfo->yb_batched_rinfo) > 1)
+		{
+			ret = lsecond(rinfo->yb_batched_rinfo);
+		}
+		else
+		{
+			return NULL;
+		}
+	}
+
+	/*
+	 * Make sure this clause involves both outer_batched_relids and
+	 * inner_relids.
+	 */
+	if (!bms_overlap(ret->right_relids, outer_batched_relids) ||
+		!bms_overlap(ret->left_relids, inner_relids))
+		return NULL;
+
+	return ret;
 }
 
 /*

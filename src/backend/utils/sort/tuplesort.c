@@ -118,6 +118,9 @@
 #include "utils/sortsupport.h"
 #include "utils/tuplesort.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /* sort-type codes for sort__start probes */
 #define HEAP_SORT		0
@@ -1113,7 +1116,8 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 	MemoryContext oldcontext;
 	int			i;
 
-	Assert(indexRel->rd_rel->relam == BTREE_AM_OID);
+	Assert(indexRel->rd_rel->relam == BTREE_AM_OID ||
+		   indexRel->rd_rel->relam == LSM_AM_OID);
 
 	oldcontext = MemoryContextSwitchTo(state->maincontext);
 

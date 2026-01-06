@@ -2077,6 +2077,7 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 						case DTK_DAY:
 							if (tzp == NULL)
 								return DTERR_BAD_FORMAT;
+							yb_switch_fallthrough();
 						default:
 							break;
 					}
@@ -3439,6 +3440,7 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 				 */
 
 				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 
 			case DTK_DATE:
 			case DTK_NUMBER:
@@ -3839,6 +3841,7 @@ DecodeISO8601Interval(char *str,
 					}
 					/* Else fall through to extended alternative format */
 					/* FALLTHROUGH */
+					yb_switch_fallthrough();
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -3922,6 +3925,7 @@ DecodeISO8601Interval(char *str,
 					}
 					/* Else fall through to extended alternative format */
 					/* FALLTHROUGH */
+					yb_switch_fallthrough();
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)

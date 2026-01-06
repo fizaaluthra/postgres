@@ -66,6 +66,9 @@
 #include "utils/snapmgr.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /* Globally visible state variables */
 bool		creating_extension = false;
@@ -863,7 +866,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 	 * here so that the control flags are correctly associated with the right
 	 * script(s) if they happen to be set in secondary control files.
 	 */
-	if (control->superuser && !superuser())
+	if (!IsYbExtensionUser(GetUserId()) && control->superuser && !superuser())
 	{
 		if (extension_is_trusted(control))
 			switch_to_superuser = true;
@@ -874,7 +877,8 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 							control->name),
 					 control->trusted
 					 ? errhint("Must have CREATE privilege on current database to create this extension.")
-					 : errhint("Must be superuser to create this extension.")));
+					 : errhint("Must be superuser or a member of the "
+							   "yb_extension role to create this extension.")));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -882,7 +886,8 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 							control->name),
 					 control->trusted
 					 ? errhint("Must have CREATE privilege on current database to update this extension.")
-					 : errhint("Must be superuser to update this extension.")));
+					 : errhint("Must be superuser or a member of the "
+							   "yb_extension role to create this extension.")));
 	}
 
 	filename = get_extension_script_filename(control, from_version, version);
@@ -1937,7 +1942,7 @@ RemoveExtensionById(Oid extId)
 
 	/* We assume that there can be at most one matching tuple */
 	if (HeapTupleIsValid(tuple))
-		CatalogTupleDelete(rel, &tuple->t_self);
+		CatalogTupleDelete(rel, tuple);
 
 	systable_endscan(scandesc);
 

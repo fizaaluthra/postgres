@@ -171,7 +171,7 @@ extern void heap_inplace_update_and_unlock(Relation relation,
 										   Buffer buffer);
 extern void heap_inplace_unlock(Relation relation,
 								HeapTuple oldtup, Buffer buffer);
-extern void heap_inplace_update(Relation relation, HeapTuple tuple);
+extern void heap_inplace_update(Relation relation, HeapTuple tuple, bool yb_shared_update);
 extern bool heap_freeze_tuple(HeapTupleHeader tuple,
 							  TransactionId relfrozenxid, TransactionId relminmxid,
 							  TransactionId cutoff_xid, TransactionId cutoff_multi);

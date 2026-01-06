@@ -47,6 +47,10 @@
 #include "utils/pg_locale.h"
 #include "utils/ps_status.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+#include "pg_yb_utils.h"
+
 
 const char *progname;
 
@@ -61,7 +65,7 @@ static void check_root(const char *progname);
  * Any Postgres server process begins execution here.
  */
 int
-main(int argc, char *argv[])
+PostgresServerProcessMain(int argc, char *argv[])
 {
 	bool		do_check_root = true;
 
@@ -174,6 +178,11 @@ main(int argc, char *argv[])
 			do_check_root = false;
 		else if (argc > 2 && strcmp(argv[1], "-C") == 0)
 			do_check_root = false;
+	}
+
+	if (YBShouldAllowRunningAsAnyUser())
+	{
+		do_check_root = false;
 	}
 
 	/*

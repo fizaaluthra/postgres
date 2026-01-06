@@ -45,6 +45,13 @@ typedef struct TableSpaceOpts
 	int			maintenance_io_concurrency;
 } TableSpaceOpts;
 
+typedef struct YBTableSpaceOpts
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	int			placement_offset;
+	int			read_replica_placement_offset;
+} YBTableSpaceOpts;
+
 extern Oid	CreateTableSpace(CreateTableSpaceStmt *stmt);
 extern void DropTableSpace(DropTableSpaceStmt *stmt);
 extern ObjectAddress RenameTableSpace(const char *oldname, const char *newname);
@@ -65,5 +72,11 @@ extern void remove_tablespace_symlink(const char *linkloc);
 extern void tblspc_redo(XLogReaderState *rptr);
 extern void tblspc_desc(StringInfo buf, XLogReaderState *rptr);
 extern const char *tblspc_identify(uint8 info);
+
+/* YB */
+extern void validatePlacementConfigurations(const char *live_placement,
+											const char *read_replica_placement);
+extern void yb_get_tablespace_options(Datum **options, int *num_options,
+									  Oid spc_oid);
 
 #endif							/* TABLESPACE_H */

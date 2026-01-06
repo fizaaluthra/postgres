@@ -31,18 +31,22 @@
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include <stdatomic.h>
+
 
 /*
  * This flag is set during proc_exit() to change ereport()'s behavior,
  * so that an ereport() from an on_proc_exit routine cannot get us out
  * of the exit procedure.  We do NOT want to go back to the idle loop...
  */
-bool		proc_exit_inprogress = false;
+atomic_bool proc_exit_inprogress = false;
 
 /*
  * Set when shmem_exit() is in progress.
  */
-bool		shmem_exit_inprogress = false;
+atomic_bool shmem_exit_inprogress = false;
 
 /*
  * This flag tracks whether we've called atexit() in the current process

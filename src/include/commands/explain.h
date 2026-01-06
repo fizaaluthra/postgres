@@ -17,6 +17,9 @@
 #include "lib/stringinfo.h"
 #include "parser/parse_node.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 typedef enum ExplainFormat
 {
 	EXPLAIN_FORMAT_TEXT,
@@ -33,6 +36,20 @@ typedef struct ExplainWorkersState
 	int		   *worker_state_save;	/* per-worker grouping state save areas */
 	StringInfo	prev_str;		/* saved output buffer while redirecting */
 } ExplainWorkersState;
+
+typedef struct YbExplainExecStats
+{
+	YbPgRpcStats read;
+	YbPgRpcStats catalog_read;
+	YbPgRpcStats flush;
+	double		read_op_count;
+	double		catalog_read_op_count;
+	double		write_count;
+	double		catalog_write_count;
+
+	YbcPgExecStorageMetrics *read_metrics;
+	YbcPgExecStorageMetrics *write_metrics;
+} YbExplainExecStats;
 
 typedef struct ExplainState
 {
@@ -59,6 +76,15 @@ typedef struct ExplainState
 	bool		hide_workers;	/* set if we find an invisible Gather */
 	/* state related to the current plan node */
 	ExplainWorkersState *workers_state; /* needed if parallel plan */
+
+	/* YB */
+	bool		rpc;			/* print RPC stats */
+	YbExplainExecStats yb_stats;	/* hold YB-specific exec stats */
+	bool		yb_debug;		/* print debug information */
+	bool		yb_commit;		/* print commit stats (when available) */
+	bool		ybShowHints;	/* generate and display hints that will
+								 * produce the same plan as one Explained */
+	bool		ybShowUniqueIds;	/* show unique Path/Plan ids */
 } ExplainState;
 
 /* Hook for plugins to get control in ExplainOneQuery() */
@@ -123,5 +149,7 @@ extern void ExplainOpenGroup(const char *objtype, const char *labelname,
 							 bool labeled, ExplainState *es);
 extern void ExplainCloseGroup(const char *objtype, const char *labelname,
 							  bool labeled, ExplainState *es);
+
+extern void YbExplainCommitStats(DestReceiver *dest);
 
 #endif							/* EXPLAIN_H */

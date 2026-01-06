@@ -296,6 +296,7 @@ main(int argc, char **argv)
 		 * done earlier.
 		 */
 		force_nl = false;
+		yb_switch_fallthrough();
 	    case form_feed:
 		break;
 	    case comment:
@@ -353,6 +354,7 @@ main(int argc, char **argv)
 		    goto sw_buffer;
 		}
 		/* FALLTHROUGH */
+		yb_switch_fallthrough();
 	    default:		/* it is the start of a normal statement */
 		{
 		    int remove_newlines;
@@ -923,6 +925,7 @@ check_type:
 	    if (ps.p_l_follow > 0)
 		goto copy_id;
 		/* FALLTHROUGH */
+		yb_switch_fallthrough();
 	case decl:		/* we have a declaration type (int, etc.) */
 	    parse(decl);	/* let parser worry about indentation */
 	    if (ps.last_token == rparen && ps.tos <= 1) {

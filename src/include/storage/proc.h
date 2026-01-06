@@ -22,6 +22,9 @@
 #include "storage/pg_sema.h"
 #include "storage/proclist_types.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
  * for non-aborted subtransactions of its current top transaction.  These
@@ -295,6 +298,62 @@ struct PGPROC
 	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
 	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
+
+	/*
+	 * YB: We use this structure to keep track of locked LWLocks for release
+	 * during error recovery.  Normally, only a few will be held at once, but
+	 * occasionally the number can be much higher; for example, the
+	 * pg_buffercache extension locks all buffer partitions simultaneously.
+	 */
+	bool		ybLWLockAcquired;
+	int			ybSpinLocksAcquired;
+	/*
+	 * YB: Keep track of if the proc has been fully initialized. If a process
+	 * that was not fully initialized is killed, we don't know how to clean up
+	 * after it. Restart the postmaster in those cases.
+	 */
+	bool		ybInitializationCompleted;
+	/*
+	 * YB: Keep track of if the proc has been terminated and is cleaning up
+	 * after itself. If a process is killed while cleaning itself up, we don't
+	 * know how to clean up after it. Restart the postmaster in those cases.
+	 */
+	bool		ybTerminationStarted;
+
+	/*
+	 * YB: True when we are in a critical section. Set by START_CRIT_SECTION
+	 * and reset by END_CRIT_SECTION when we leave our last critical section.
+	 *
+	 * There may be cases where MyProc is NULL and we enter a critical section.
+	 * These cases should be caught by ybInitializationCompleted and cause a
+	 * postmaster restart anyway.
+	 *
+	 * In critical sections, ERRORs are escalated to PANICs, causing a
+	 * postmaster restart. We also restart the postmaster if a process dies
+	 * while in a critical section.
+	 */
+	bool		ybEnteredCriticalSection;
+
+	/*
+	 * yb_ash_metadata is protected by yb_ash_metadata_lock instead of backendLock.
+	 * TODO: Investigate if yb_ash_metadata_lock is really needed, or can we
+	 * use backendLock itself if there is no significant drop in performance.
+	 */
+	LWLock		yb_ash_metadata_lock;
+	YbcAshMetadata yb_ash_metadata;
+	bool		yb_is_ash_metadata_set;
+
+	/*
+	 * YB:  The sync RPCs in pg_client.cc have a common wait event -
+	 * WaitingOnTServer and have the wait event aux set as the RPC name.
+	 * Instead of storing the RPC name as a string, we store an int because
+	 * it's faster to set an int than a string, and we only have 16 bytes for
+	 * wait event aux and some RPC names cannot fully fit into it. The enum
+	 * list is in wait_state.h (PggateRPC)
+	 */
+	uint16		yb_rpc_code;
+
+	YbcPgSharedDataPlaceholder yb_shared_data;
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
@@ -457,5 +516,15 @@ extern PGPROC *AuxiliaryPidGetProc(int pid);
 
 extern void BecomeLockGroupLeader(void);
 extern bool BecomeLockGroupMember(PGPROC *leader, int pid);
+
+/* YB */
+extern PGPROC *KilledProcToClean;
+extern int	RetryMaxBackoffMsecs;
+extern int	RetryMinBackoffMsecs;
+extern double RetryBackoffMultiplier;
+extern int	yb_max_query_layer_retries;
+extern int *yb_too_many_conn;
+extern void RemoveLockGroupLeader(PGPROC *proc);
+extern void ReleaseProcToFreeList(PGPROC *proc);
 
 #endif							/* _PROC_H_ */

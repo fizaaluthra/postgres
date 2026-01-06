@@ -47,6 +47,10 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "catalog/yb_type.h"
+#include "pg_yb_utils.h"
+
 /* Hook for plugins to get control in get_attavgwidth() */
 get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
 
@@ -226,7 +230,7 @@ get_ordering_op_properties(Oid opno,
 		Form_pg_amop aform = (Form_pg_amop) GETSTRUCT(tuple);
 
 		/* must be btree */
-		if (aform->amopmethod != BTREE_AM_OID)
+		if (aform->amopmethod != BTREE_AM_OID && aform->amopmethod != LSM_AM_OID)
 			continue;
 
 		if (aform->amopstrategy == BTLessStrategyNumber ||
@@ -318,7 +322,7 @@ get_ordering_op_for_equality_op(Oid opno, bool use_lhs_type)
 		Form_pg_amop aform = (Form_pg_amop) GETSTRUCT(tuple);
 
 		/* must be btree */
-		if (aform->amopmethod != BTREE_AM_OID)
+		if (aform->amopmethod != BTREE_AM_OID && aform->amopmethod != LSM_AM_OID)
 			continue;
 
 		if (aform->amopstrategy == BTEqualStrategyNumber)
@@ -379,7 +383,7 @@ get_mergejoin_opfamilies(Oid opno)
 		Form_pg_amop aform = (Form_pg_amop) GETSTRUCT(tuple);
 
 		/* must be btree equality */
-		if (aform->amopmethod == BTREE_AM_OID &&
+		if ((aform->amopmethod == BTREE_AM_OID || aform->amopmethod == LSM_AM_OID) &&
 			aform->amopstrategy == BTEqualStrategyNumber)
 			result = lappend_oid(result, aform->amopfamily);
 	}
@@ -615,7 +619,7 @@ get_op_btree_interpretation(Oid opno)
 		StrategyNumber op_strategy;
 
 		/* must be btree */
-		if (op_form->amopmethod != BTREE_AM_OID)
+		if (op_form->amopmethod != BTREE_AM_OID && op_form->amopmethod != LSM_AM_OID)
 			continue;
 
 		/* Get the operator's btree strategy number */
@@ -653,7 +657,7 @@ get_op_btree_interpretation(Oid opno)
 				StrategyNumber op_strategy;
 
 				/* must be btree */
-				if (op_form->amopmethod != BTREE_AM_OID)
+				if (op_form->amopmethod != BTREE_AM_OID && op_form->amopmethod != LSM_AM_OID)
 					continue;
 
 				/* Get the operator's btree strategy number */
@@ -714,8 +718,9 @@ equality_ops_are_compatible(Oid opno1, Oid opno2)
 		HeapTuple	op_tuple = &catlist->members[i]->tuple;
 		Form_pg_amop op_form = (Form_pg_amop) GETSTRUCT(op_tuple);
 
-		/* must be btree or hash */
+		/* must be btree, lsm or hash */
 		if (op_form->amopmethod == BTREE_AM_OID ||
+			op_form->amopmethod == LSM_AM_OID ||
 			op_form->amopmethod == HASH_AM_OID)
 		{
 			if (op_in_opfamily(opno2, op_form->amopfamily))
@@ -1976,6 +1981,30 @@ get_rel_type_id(Oid relid)
 }
 
 /*
+ * yb_get_rel_reltuples
+ *
+ *		Returns the reltuples associated with a given relation.
+ */
+float4
+yb_get_rel_reltuples(Oid relid)
+{
+	HeapTuple	tp;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_class reltup = (Form_pg_class) GETSTRUCT(tp);
+		float4		result;
+
+		result = reltup->reltuples;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		return 0;
+}
+
+/*
  * get_rel_relkind
  *
  *		Returns the relkind associated with a given relation.
@@ -2231,6 +2260,8 @@ get_typlenbyvalalign(Oid typid, int16 *typlen, bool *typbyval,
 	HeapTuple	tp;
 	Form_pg_type typtup;
 
+	if (YbTypeDetails(typid, typlen, typbyval, typalign))
+		return;
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for type %u", typid);
@@ -3099,6 +3130,40 @@ getSubscriptingRoutines(Oid typid, Oid *typelemp)
 /*				---------- STATISTICS CACHE ----------					 */
 
 /*
+ * yb_get_attdistinctcount
+ *
+ *	  Given the table and attribute number of a column, get the estimate
+ *    distinct count of entries in the column. Return 0 if no data available.
+ *
+ * Currently this is only consulted for individual tables, not for inheritance
+ * trees, so we don't need an "inh" parameter.
+ */
+float4
+yb_get_attdistinctcount(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	tp;
+	float4		stadistinct;
+
+	tp = SearchSysCache3(STATRELATTINH,
+						 ObjectIdGetDatum(relid),
+						 Int16GetDatum(attnum),
+						 BoolGetDatum(false));
+	if (HeapTupleIsValid(tp))
+	{
+		stadistinct = ((Form_pg_statistic) GETSTRUCT(tp))->stadistinct;
+		ReleaseSysCache(tp);
+		if (stadistinct < 0)
+		{
+			float4		reltuples = yb_get_rel_reltuples(relid);
+
+			stadistinct *= -1 * reltuples;
+		}
+		return stadistinct;
+	}
+	return 0;
+}
+
+/*
  * get_attavgwidth
  *
  *	  Given the table and attribute number of a column, get the average
@@ -3116,6 +3181,14 @@ get_attavgwidth(Oid relid, AttrNumber attnum)
 {
 	HeapTuple	tp;
 	int32		stawidth;
+
+	/*
+	 * YB: This functionality was left disabled even after ANALYZE was
+	 * implemented. This oversight was detected during cost model project. We
+	 * protect it under this feature toggle to prevent regressions.
+	 */
+	if (!yb_enable_base_scans_cost_model)
+		return 0;
 
 	if (get_attavgwidth_hook)
 	{

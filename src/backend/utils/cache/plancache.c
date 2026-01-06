@@ -74,6 +74,11 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/xact.h"
+#include "optimizer/ybplan.h"
+#include "pg_yb_utils.h"
+
 
 /*
  * We must skip "overhead" operations that involve database access when the
@@ -121,6 +126,18 @@ static void PlanCacheSysCallback(Datum arg, int cacheid, uint32 hashvalue);
 
 /* GUC parameter */
 int			plan_cache_mode;
+
+/*
+ * YB: For prepared statements, generate custom plans for at least the first 5
+ * runs (arbitrary)
+ */
+int			yb_test_planner_custom_plan_threshold = 5;
+
+/*
+ * YB: Prefer custom plan over generic plan for prepared statement if more
+ * partitions are pruned using a custom plan.
+ */
+bool		enable_choose_custom_plan_for_partition_pruning = true;
 
 /*
  * InitPlanCache: initialize module during InitPostgres.
@@ -432,6 +449,9 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 	plansource->cursor_options = cursor_options;
 	plansource->fixed_result = fixed_result;
 	plansource->resultDesc = PlanCacheComputeResultDesc(querytree_list);
+
+	/* YB: If the planner txn uses a pg relation, so will the execution txn */
+	plansource->yb_plan_references_pg_rel = YbCurrentTxnUsesTempRel();
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1047,11 +1067,42 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 	if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
 		return true;
 
-	/* Generate custom plans until we have done at least 5 (arbitrary) */
-	if (plansource->num_custom_plans < 5)
+	/*
+	 * YB: Generate custom plans until we have done at least
+	 * 'yb_test_planner_custom_plan_threshold' runs.
+	 */
+	if (plansource->num_custom_plans < yb_test_planner_custom_plan_threshold)
 		return true;
 
+	/*
+	 * YB: For single row modify operations, use a custom plan so as to push
+	 * down the update to the DocDB without performing the read. This involves
+	 * faking the read results in postgres. However the boundParams needs to
+	 * be passed for the creation of the plan and hence we would need to
+	 * enforce a custom plan.
+	 */
+	if (plansource->gplan && list_length(plansource->gplan->stmt_list))
+	{
+		PlannedStmt *pstmt = linitial_node(PlannedStmt,
+										   plansource->gplan->stmt_list);
+
+		if (YBCIsSingleRowModify(pstmt))
+		{
+			return true;
+		}
+	}
+
 	avg_custom_cost = plansource->total_custom_cost / plansource->num_custom_plans;
+
+	/*
+	 * YB: If generic plan is present, then choose custom plan if partition
+	 * pruning or constraint exclusion has pruned more relations for custom
+	 * plan over generic plan.
+	 */
+	if (enable_choose_custom_plan_for_partition_pruning && plansource->gplan &&
+		(plansource->yb_custom_max_num_referenced_rels <
+		 plansource->yb_generic_num_referenced_rels))
+		return true;
 
 	/*
 	 * Prefer generic plan if it's less expensive than the average custom
@@ -1067,6 +1118,25 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 		return false;
 
 	return true;
+}
+
+/*
+ * num_referenced_relations: Return number of relations referenced by a plan.
+ */
+static int
+num_referenced_relations(CachedPlan *plan)
+{
+	ListCell   *lc1;
+	int			nrelations = 0;
+
+	foreach(lc1, plan->stmt_list)
+	{
+		PlannedStmt *plannedstmt = lfirst_node(PlannedStmt, lc1);
+
+		nrelations += plannedstmt->yb_num_referenced_relations;
+	}
+
+	return nrelations;
 }
 
 /*
@@ -1159,6 +1229,13 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 	/* Make sure the querytree list is valid and we have parse-time locks */
 	qlist = RevalidateCachedQuery(plansource, queryEnv);
 
+	/*
+	 * YB: If the planner found a pg relation in this plan, set the appropriate
+	 * flag for the execution txn.
+	 */
+	if (plansource->yb_plan_references_pg_rel)
+		YbSetTxnUsesTempRel();
+
 	/* Decide whether to use a custom plan */
 	customplan = choose_custom_plan(plansource, boundParams);
 
@@ -1194,6 +1271,8 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 			}
 			/* Update generic_cost whenever we make a new generic plan */
 			plansource->generic_cost = cached_plan_cost(plan, false);
+			plansource->yb_generic_num_referenced_rels =
+				num_referenced_relations(plan);
 
 			/*
 			 * If, based on the now-known value of generic_cost, we'd not have
@@ -1223,6 +1302,23 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		plansource->total_custom_cost += cached_plan_cost(plan, true);
 
 		plansource->num_custom_plans++;
+		if (IsYugaByteEnabled())
+		{
+			/*
+			 * Store the maximum number of relations referenced across all
+			 * the runs using custom plan. In Yugabyte clusters, higher the
+			 * number of relations referenced by a plan, higher the number
+			 * of RPCs required to fetch the data across these relations. This
+			 * mostly comes into play when using partitioned tables, where
+			 * the number of pruned partitions can be a huge performance
+			 * factor.
+			 */
+			int			nrelations = num_referenced_relations(plan);
+
+			if (plansource->num_custom_plans == 1 ||
+				plansource->yb_custom_max_num_referenced_rels < nrelations)
+				plansource->yb_custom_max_num_referenced_rels = nrelations;
+		}
 	}
 	else
 	{
@@ -1284,6 +1380,21 @@ ReleaseCachedPlan(CachedPlan *plan, ResourceOwner owner)
 		if (!plan->is_oneshot)
 			MemoryContextDelete(plan->context);
 	}
+}
+
+/*
+ * YBAcquireExecutorLocksForRetry: Acquire necessary object locks for the
+ * statments about to be executed.
+ *
+ * This custom wrapper is only invoked on query layer retries either when
+ * the transaction or the statement is restarted and the portal is preserved
+ * along with the cached query plan. Since the object locks tied to the old
+ * transaction/statement would be released, we need to reacquire them.
+ */
+void
+YBAcquireExecutorLocksForRetry(List *stmt_list)
+{
+	AcquireExecutorLocks(stmt_list, true /* acquire */ );
 }
 
 /*

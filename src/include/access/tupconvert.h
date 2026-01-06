@@ -20,6 +20,9 @@
 #include "executor/tuptable.h"
 #include "nodes/bitmapset.h"
 
+/* YB includes */
+#include "utils/rel.h"
+
 
 typedef struct TupleConversionMap
 {
@@ -44,7 +47,7 @@ extern HeapTuple execute_attr_map_tuple(HeapTuple tuple, TupleConversionMap *map
 extern TupleTableSlot *execute_attr_map_slot(AttrMap *attrMap,
 											 TupleTableSlot *in_slot,
 											 TupleTableSlot *out_slot);
-extern Bitmapset *execute_attr_map_cols(AttrMap *attrMap, Bitmapset *inbitmap);
+extern Bitmapset *execute_attr_map_cols(AttrMap *attrMap, Bitmapset *inbitmap, Relation rel);
 
 extern void free_conversion_map(TupleConversionMap *map);
 

@@ -25,12 +25,21 @@
 #include "storage/itemptr.h"
 #include "utils/dsa.h"
 
+/* YB includes */
+#include "nodes/ybtidbitmap.h"
+
 
 /*
  * Actual bitmap representation is private to tidbitmap.c.  Callers can
  * do IsA(x, TIDBitmap) on it, but nothing else.
  */
 typedef struct TIDBitmap TIDBitmap;
+
+typedef union
+{
+	TIDBitmap  *tbm;
+	YbTIDBitmap *ybtbm;
+} YbTupleBitmap;
 
 /* Likewise, TBMIterator is private */
 typedef struct TBMIterator TBMIterator;

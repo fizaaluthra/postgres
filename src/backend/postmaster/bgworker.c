@@ -36,6 +36,10 @@
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 
+/* YB includes */
+#include "yb_ash.h"
+#include "yb_query_diagnostics.h"
+
 /*
  * The postmaster's list of registered background workers, in private memory.
  */
@@ -128,6 +132,15 @@ static const struct
 	},
 	{
 		"ApplyWorkerMain", ApplyWorkerMain
+	},
+	{
+		"YbAshMain", YbAshMain
+	},
+	{
+		"YbQueryDiagnosticsMain", YbQueryDiagnosticsMain
+	},
+	{
+		"YbQueryDiagnosticsDatabaseConnectionWorkerMain", YbQueryDiagnosticsDatabaseConnectionWorkerMain
 	}
 };
 
@@ -851,6 +864,8 @@ StartBackgroundWorker(void)
 	 * need to wait until the user code does it via
 	 * BackgroundWorkerInitializeConnection().
 	 */
+
+	MyProc->ybInitializationCompleted = true;
 
 	/*
 	 * Now invoke the user-defined worker code

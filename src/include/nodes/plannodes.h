@@ -22,6 +22,36 @@
 #include "nodes/parsenodes.h"
 #include "nodes/primnodes.h"
 
+/* YB includes */
+#include "access/relation.h"	/* TODO: is needed? */
+#include "nodes/pathnodes.h"	/* TODO: is needed? */
+#include "nodes/ybbitmatrix.h"
+
+
+/*
+ * YB: info used by YbSaopMergeInfo.
+ */
+typedef struct
+{
+	NodeTag		type;
+	int			numCols;		/* number of sort-key columns */
+	AttrNumber *sortColIdx;		/* their indexes in the target list */
+	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
+	Oid		   *collations;		/* OIDs of collations */
+	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
+} YbSortInfo;
+
+/*
+ * YB: info used by IndexScan and IndexOnlyScan nodes.
+ *
+ * Holds info used for scalar array operation merge index [only] scans.
+ */
+typedef struct
+{
+	NodeTag		type;
+	List	   *saop_cols;		/* List of YbSaopMergeSaopColInfo */
+	YbSortInfo *sort_cols;
+} YbSaopMergeInfo;
 
 /* ----------------------------------------------------------------
  *						node definitions
@@ -89,6 +119,13 @@ typedef struct PlannedStmt
 	/* statement location in source string (copied from Query) */
 	int			stmt_location;	/* start location, or -1 if unknown */
 	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+
+	/* YB specific fields */
+	/*
+	 * Number of relations that are still referenced by the plan after
+	 * constraint exclusion and partition pruning.
+	 */
+	int			yb_num_referenced_relations;
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -159,6 +196,28 @@ typedef struct Plan
 	 */
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
+
+	/* YB: alias to use for hinting - unique across all blocks/entire query */
+	char	   *ybHintAlias;
+
+	/*
+	 * YB: Unique id across all plan nodes. This is inherited from
+	 * corresponding Path node (in a few cases there is not one).
+	 */
+	uint32		ybUniqueId;
+
+	/*
+	 * YB: If a node is a child of a Subquery Scan node and the scan node gets
+	 * removed the child node will 'inherit' the unique hint alias
+	 * of the scan.
+	 */
+	char	   *ybInheritedHintAlias;
+
+	/* YB: Is this a join that was referenced in a leading join hint? */
+	bool		ybIsHinted;
+
+	/* YB: Is this node forced using a UID? */
+	bool		ybHasHintedUid;
 } Plan;
 
 /* ----------------
@@ -199,6 +258,119 @@ typedef struct ProjectSet
 {
 	Plan		plan;
 } ProjectSet;
+
+/*
+ * YB: An enum whose values describe the type of entity that may be excluded
+ * from bookkeeping operations performed by an UPDATE or an INSERT ON CONFLICT
+ * DO UPDATE query.
+ */
+typedef enum
+{
+	SKIP_PRIMARY_KEY,
+	SKIP_SECONDARY_INDEX,
+	SKIP_REFERENCING_FKEY,
+	SKIP_REFERENCED_FKEY,
+} YbSkippableEntityType;
+
+/*
+ * YbSkippableEntities is a collection of skip lists. Each skip list contains
+ * entities of a specific type (YbSkippableEntityType). The elements of the skip
+ * lists can be excluded from bookkeeping operations when being updated - for
+ * example entities in the index_list need not be updated, constraints in the
+ * ref*_fkey_list(s) need not be checked and so on).
+ */
+typedef struct
+{
+	NodeTag		type;
+
+	/* A list of indexes whose update can be skipped */
+	List	   *index_list;
+
+	/*
+	 * A list of skippable foreign key relationships where the relation under
+	 * consideration is the referencing relation.
+	 */
+	List	   *referencing_fkey_list;
+
+	/*
+	 * A list of skippable foreign key relationships where the relation under
+	 * consideration is the referenced relation.
+	 *
+	 * NOTE - The disambiugation between referencing and referenced foreign keys
+	 * relationships is important in the context of self-referential foreign key
+	 * constraints where one side of the relationship may be skippable, and the
+	 * other side may not be.
+	 */
+	List	   *referenced_fkey_list;
+} YbSkippableEntities;
+
+/*
+ * YbUpdateAffectedEntities holds planning time computation of entities (index,
+ * constraints, etc) that maybe affected by a ModifyTable query (currently used
+ * by only UPDATE or an INSERT ON CONFLICT DO UPDATE queries).
+ * Information held in this structure includes a list of columns that may be
+ * modified by the query, a list of entities that reference these columns, and
+ * the mapping between them.
+ */
+typedef struct YbUpdateAffectedEntities
+{
+	NodeTag		type;
+	/*
+	 * Identifying information about a list of entities that may be impacted by
+	 * the current query.
+	 */
+	struct YbUpdateEntity
+	{
+		Oid			oid;		/* OID of the entity that might need an update */
+		YbSkippableEntityType etype;	/* What type of entity is it? */
+	}		   *entity_list;
+
+	/*
+	 * YbUpdateColInfo holds information about columns that may be modified as
+	 * part of an UPDATE or an INSERT ON CONFLICT DO UPDATE query.
+	 * This includes -
+	 * 1. The attribute number of the column
+	 * 2. A list of entities that reference the column
+	 *
+	 * An entity is said to reference a column in a tuple if modification of the
+	 * column in the tuple could result in a housekeeping operation to be
+	 * performed on the entity. Examples include indexes and constraints.
+	 * Modification of one of the columns in the index will cause an index
+	 * update operation. Similarly, modification of a column that has a foreign
+	 * key constraint on it will trigger a referential integrity check.
+	 */
+	struct YbUpdateColInfo
+	{
+		/*
+		 * The attribute number of the column offset by
+		 *'YBFirstLowInvalidAttributeNumber' or 'FirstLowInvalidHeapAttributeNumber'
+		 * The offset makes the attribute number non-negative, allowing direct
+		 * interfacing with bitmapsets.
+		 */
+		AttrNumber	attnum;
+
+		/*
+		 * A list of entities that reference the column.
+		 * Entities are identified by their index in the entity_list.
+		 */
+		List	   *entity_refs;
+	}		   *col_info_list;
+
+	/*
+	 * A matrix that facilitates optimizing the number of columns to be compared
+	 * to decide if an entity is affected by the query. The columns of the
+	 * matrix represent the entities under consideration, the rows of the matrix
+	 * represent the columns/fields in the relation affected by the query.
+	 * A working copy of this matrix is made for each tuple that is updated at
+	 * execution time.
+	 */
+	YbBitMatrix matrix;
+} YbUpdateAffectedEntities;
+
+#define YB_UPDATE_AFFECTED_ENTITIES_NUM_FIELDS(state) \
+	YbBitMatrixNumRows(&state->matrix)
+#define YB_UPDATE_AFFECTED_ENTITIES_NUM_ENTITIES(state) \
+	YbBitMatrixNumCols(&state->matrix)
 
 /* ----------------
  *	 ModifyTable node -
@@ -241,6 +413,28 @@ typedef struct ModifyTable
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
+
+	/* YB */
+	List	   *ybPushdownTlist;	/* tlist for the pushdown SET expressions */
+	List	   *ybReturningColumns; /* columns to fetch from DocDB */
+	List	   *ybColumnRefs;	/* colrefs to evaluate pushdown expressions */
+	bool		no_row_trigger; /* planner has checked no triggers apply */
+	/*
+	 * YB: A collection of entities that are impacted by the ModifyTable query,
+	 * and their relationship to the columns that are modified by the query.
+	 * This is currently used only by UPDATE and INSERT ON CONFLICT DO UPDATE
+	 * queries. The contents of this struct are computed at planning time and
+	 * remain immutable for the lifetime of the plan.
+	 */
+	YbUpdateAffectedEntities *yb_update_affected_entities;
+	/*
+	 * YB: A collection of entity OIDs (grouped by type) for which it is known
+	 * at planning time that bookkeeping updates can be skipped. This is
+	 * currently used only by UPDATE and INSERT ON CONFLICT DO UPDATE queries.
+	 * The entities in this struct are mutually exclusive to the entities in
+	 * yb_update_affected_entities.
+	 */
+	YbSkippableEntities *yb_skip_entities;
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */
@@ -358,6 +552,24 @@ typedef struct SeqScan
 } SeqScan;
 
 /* ----------------
+ *		YB table sequential scan node
+ * ----------------
+ */
+
+typedef struct YbPushdownExprs
+{
+	List	   *quals;
+	List	   *colrefs;
+} YbPushdownExprs;
+
+typedef struct YbSeqScan
+{
+	Scan		scan;
+	YbPushdownExprs yb_pushdown;
+	YbPlanInfo	yb_plan_info;
+} YbSeqScan;
+
+/* ----------------
  *		table sample scan node
  * ----------------
  */
@@ -415,6 +627,15 @@ typedef struct IndexScan
 	List	   *indexorderbyorig;	/* the same in original form */
 	List	   *indexorderbyops;	/* OIDs of sort ops for ORDER BY exprs */
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
+
+	/* YB */
+	List	   *indextlist;		/* TargetEntry list describing index's cols */
+	YbPushdownExprs yb_idx_pushdown;
+	YbPushdownExprs yb_rel_pushdown;
+	YbPlanInfo	yb_plan_info;
+	int			yb_distinct_prefixlen;	/* distinct index scan prefix */
+	YbSaopMergeInfo *yb_saop_merge_info;
+	YbLockMechanism yb_lock_mechanism;	/* locks possible as part of the scan */
 } IndexScan;
 
 /* ----------------
@@ -457,6 +678,12 @@ typedef struct IndexOnlyScan
 	List	   *indexorderby;	/* list of index ORDER BY exprs */
 	List	   *indextlist;		/* TargetEntry list describing index's cols */
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
+
+	/* YB */
+	YbPushdownExprs yb_pushdown;
+	YbPlanInfo	yb_plan_info;
+	int			yb_distinct_prefixlen;	/* distinct index scan prefix */
+	YbSaopMergeInfo *yb_saop_merge_info;
 } IndexOnlyScan;
 
 /* ----------------
@@ -464,9 +691,9 @@ typedef struct IndexOnlyScan
  *
  * BitmapIndexScan delivers a bitmap of potential tuple locations;
  * it does not access the heap itself.  The bitmap is used by an
- * ancestor BitmapHeapScan node, possibly after passing through
- * intermediate BitmapAnd and/or BitmapOr nodes to combine it with
- * the results of other BitmapIndexScans.
+ * ancestor BitmapHeapScan or YbBitmapTableScan node, possibly after
+ * passing through intermediate BitmapAnd and/or BitmapOr nodes to
+ * combine it with the results of other BitmapIndexScans.
  *
  * The fields have the same meanings as for IndexScan, except we don't
  * store a direction flag because direction is uninteresting.
@@ -486,6 +713,35 @@ typedef struct BitmapIndexScan
 } BitmapIndexScan;
 
 /* ----------------
+ *		yb bitmap index scan node
+ *
+ * BitmapIndexScan delivers a bitmap of potential tuple locations;
+ * it does not access the heap itself.  The bitmap is used by an
+ * ancestor BitmapHeapScan or YbBitmapTableScan node, possibly after
+ * passing through intermediate BitmapAnd and/or BitmapOr nodes to
+ * combine it with the results of other BitmapIndexScans.
+ *
+ * The fields have the same meanings as for IndexScan, except we don't
+ * store a direction flag because direction is uninteresting.
+ *
+ * In a BitmapIndexScan plan node, the targetlist and qual fields are
+ * not used and are always NIL.  The indexqualorig field is unused at
+ * run time too, but is saved for the benefit of EXPLAIN.
+ * ----------------
+ */
+typedef struct YbBitmapIndexScan
+{
+	Scan		scan;
+	Oid			indexid;		/* OID of index to scan */
+	bool		isshared;		/* Create shared bitmap if set */
+	List	   *indexqual;		/* list of index quals (OpExprs) */
+	List	   *indexqualorig;	/* the same in original form */
+	List	   *indextlist;		/* TargetEntry list describing index's cols */
+	YbPushdownExprs yb_idx_pushdown;
+	YbPlanInfo	yb_plan_info;
+} YbBitmapIndexScan;
+
+/* ----------------
  *		bitmap sequential scan node
  *
  * This needs a copy of the qual conditions being used by the input index
@@ -501,6 +757,28 @@ typedef struct BitmapHeapScan
 } BitmapHeapScan;
 
 /* ----------------
+ *		yb bitmap sequential scan node
+ *
+ * This needs a copy of the qual conditions being used by the input index
+ * scans because there are various cases where we need to recheck the quals;
+ * for example, when the bitmap is lossy about the specific rows on a page
+ * that meet the index condition.
+ * ----------------
+ */
+typedef struct YbBitmapTableScan
+{
+	Scan		scan;
+	YbPushdownExprs rel_pushdown;	/* any pushable quals that aren't already
+									 * guaranteed by the Bitmap Index Scan
+									 * nodes. */
+	YbPushdownExprs recheck_pushdown;	/* pushable index quals */
+	List	   *recheck_local_quals;	/* non-pushable index quals */
+	YbPushdownExprs fallback_pushdown;	/* all pushable quals */
+	List	   *fallback_local_quals;	/* all non-pushable quals */
+	YbPlanInfo	yb_plan_info;
+} YbBitmapTableScan;
+
+/* ----------------
  *		tid scan node
  *
  * tidquals is an implicitly OR'ed list of qual expressions of the form
@@ -511,6 +789,7 @@ typedef struct BitmapHeapScan
 typedef struct TidScan
 {
 	Scan		scan;
+	YbPushdownExprs yb_rel_pushdown;
 	List	   *tidquals;		/* qual(s) involving CTID = something */
 } TidScan;
 
@@ -757,11 +1036,49 @@ typedef struct NestLoop
 	List	   *nestParams;		/* list of NestLoopParam nodes */
 } NestLoop;
 
+/*
+ * Information to use for each hashable clause in a batched nested loop join.
+ * This is used by the hash batching strategy of BNL.
+ */
+typedef struct YbBNLHashClauseInfo
+{
+	Oid			hashOp;			/*
+								 * Operator to hash the outer side of this clause
+								 * with. The inner side must be the left input of
+								 * this op.
+								 */
+	int			innerHashAttNo; /* Attno of inner side variable. */
+	Expr	   *outerParamExpr; /* Outer expression of this clause. */
+	Expr	   *orig_expr;
+} YbBNLHashClauseInfo;
+
+typedef struct YbBatchedNestLoop
+{
+	NestLoop	nl;
+
+	double		first_batch_factor;
+	/* Only relevant if we're using the hash batching strategy. */
+
+	/*
+	 * Array of information about each
+	 * hashable join clause.
+	 */
+	YbBNLHashClauseInfo *hashClauseInfos;
+	int			num_hashClauseInfos;
+	/* remaining fields are just like the sort-key info in struct Sort */
+	int			numSortCols;	/* number of sort-key columns */
+	AttrNumber *sortColIdx;		/* their indexes in the target list */
+	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
+	Oid		   *collations;		/* OIDs of collations */
+	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
+} YbBatchedNestLoop;
+
 typedef struct NestLoopParam
 {
 	NodeTag		type;
 	int			paramno;		/* number of the PARAM_EXEC Param to set */
 	Var		   *paramval;		/* outer-relation Var to assign to Param */
+	int			yb_batch_size;	/* Batch size of this param. */
 } NestLoopParam;
 
 /* ----------------
@@ -1313,6 +1630,11 @@ typedef struct PartitionPruneStepCombine
 	List	   *source_stepids;
 } PartitionPruneStepCombine;
 
+typedef struct YbPartitionPruneStepFuncOp
+{
+	PartitionPruneStep step;
+	List	   *exprs;
+} YbPartitionPruneStepFuncOp;
 
 /*
  * Plan invalidation info

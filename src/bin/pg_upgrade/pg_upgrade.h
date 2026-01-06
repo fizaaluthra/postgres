@@ -266,6 +266,9 @@ typedef struct
 	char		major_version_str[64];	/* string PG_VERSION of cluster */
 	uint32		bin_version;	/* version returned from pg_ctl */
 	const char *tablespace_suffix;	/* directory specification */
+
+	char	   *yb_hostaddr;	/* host address for Yugabyte node */
+	char	   *yb_user;		/* username for the cluster */
 } ClusterInfo;
 
 
@@ -331,6 +334,7 @@ extern ClusterInfo old_cluster,
 			new_cluster;
 extern OSInfo os_info;
 
+extern bool yb_has_check_fatal;
 
 /* check.c */
 
@@ -344,6 +348,7 @@ void		check_cluster_versions(void);
 void		check_cluster_compatibility(bool live_check);
 void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 
+void		yb_check_cluster_versions(void);
 
 /* controldata.c */
 
@@ -441,6 +446,9 @@ void		prep_status(const char *fmt,...) pg_attribute_printf(1, 2);
 void		prep_status_progress(const char *fmt,...) pg_attribute_printf(1, 2);
 unsigned int str2uint(const char *str);
 
+extern bool is_yugabyte_enabled();
+extern int	yb_fprintf_and_log(FILE *stream, const char *fmt,...);
+extern void yb_fatal(const char *fmt,...);
 
 /* version.c */
 

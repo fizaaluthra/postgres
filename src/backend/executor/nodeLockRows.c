@@ -29,6 +29,9 @@
 #include "miscadmin.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+
 
 /* ----------------------------------------------------------------
  *		ExecLockRows
@@ -57,6 +60,16 @@ ExecLockRows(PlanState *pstate)
 	 */
 lnext:
 	slot = ExecProcNode(outerPlan);
+
+	if (node->yb_are_row_marks_for_yb_rels &&
+		XactIsoLevel == XACT_SERIALIZABLE)
+	{
+		/*
+		 * For YB relations, we don't lock tuples using this node in SERIALIZABLE level. Instead we take
+		 * predicate locks by setting the row mark in read requests sent to txn participants.
+		 */
+		return slot;
+	}
 
 	if (TupIsNull(slot))
 	{
@@ -183,11 +196,21 @@ lnext:
 		if (!IsolationUsesXactSnapshot())
 			lockflags |= TUPLE_LOCK_FLAG_FIND_LAST_VERSION;
 
-		test = table_tuple_lock(erm->relation, &tid, estate->es_snapshot,
-								markSlot, estate->es_output_cid,
-								lockmode, erm->waitPolicy,
-								lockflags,
-								&tmfd);
+		Assert(IsYBBackedRelation(erm->relation) ==
+			   node->yb_are_row_marks_for_yb_rels);
+		if (node->yb_are_row_marks_for_yb_rels)
+		{
+			test = YBCLockTuple(erm->relation, datum, erm->markType,
+								erm->waitPolicy, estate);
+		}
+		else
+		{
+			test = table_tuple_lock(erm->relation, &tid, estate->es_snapshot,
+									markSlot, estate->es_output_cid,
+									lockmode, erm->waitPolicy,
+									lockflags,
+									&tmfd);
+		}
 
 		switch (test)
 		{
@@ -217,12 +240,29 @@ lnext:
 				/*
 				 * Got the lock successfully, the locked tuple saved in
 				 * markSlot for, if needed, EvalPlanQual testing below.
+				 *
+				 * YB: TODO(Piyush): If we use EvalPlanQual for READ
+				 * COMMITTED in future:
+				 * - remove !IsYBBackedRelation(erm->relation)
+				 * - In YBCLockTuple():
+				 *	- initialize tmfd.traversed to false
+				 *	- if the tuple being locked is updated, populate latest
+				 *    tuple version in markSlot and set tmfd.traversed to true
 				 */
-				if (tmfd.traversed)
+				if (!IsYBBackedRelation(erm->relation) && tmfd.traversed)
 					epq_needed = true;
 				break;
 
 			case TM_Updated:
+				/*
+				 * YB: TODO(Piyush): If handling using EvalPlanQual for READ
+				 * COMMITTED in future, replace
+				 * IsYBBackedRelation(erm->relation) with
+				 * IsolationUsesXactSnapshot().
+				 */
+				if (IsYBBackedRelation(erm->relation))
+					YBCHandleConflictError(erm->relation, erm->waitPolicy);
+
 				if (IsolationUsesXactSnapshot())
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -248,8 +288,14 @@ lnext:
 					 test);
 		}
 
-		/* Remember locked tuple's TID for EPQ testing and WHERE CURRENT OF */
-		erm->curCtid = tid;
+		if (!IsYBBackedRelation(erm->relation))
+		{
+			/*
+			 * Remember locked tuple's TID for EPQ testing and WHERE CURRENT
+			 * OF
+			 */
+			erm->curCtid = tid;
+		}
 	}
 
 	/*
@@ -342,6 +388,9 @@ ExecInitLockRows(LockRows *node, EState *estate, int eflags)
 	 */
 	lrstate->lr_arowMarks = NIL;
 	epq_arowmarks = NIL;
+	bool		row_lock_for_yb_rel_found = false;
+	bool		row_lock_for_non_yb_rel_found = false;
+
 	foreach(lc, node->rowMarks)
 	{
 		PlanRowMark *rc = lfirst_node(PlanRowMark, lc);
@@ -363,10 +412,28 @@ ExecInitLockRows(LockRows *node, EState *estate, int eflags)
 		 * do an EPQ recheck.
 		 */
 		if (RowMarkRequiresRowShareLock(erm->markType))
+		{
+			if (IsYBBackedRelation(erm->relation))
+				row_lock_for_yb_rel_found = true;
+			else
+				row_lock_for_non_yb_rel_found = true;
+
 			lrstate->lr_arowMarks = lappend(lrstate->lr_arowMarks, aerm);
+		}
 		else
 			epq_arowmarks = lappend(epq_arowmarks, aerm);
 	}
+
+	if (row_lock_for_yb_rel_found && row_lock_for_non_yb_rel_found)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("mixing Yugabyte relations and not Yugabyte "
+						"relations with row locks is not supported")));
+
+	if (row_lock_for_non_yb_rel_found)
+		YbSetTxnUsesTempRel();
+
+	lrstate->yb_are_row_marks_for_yb_rels = row_lock_for_yb_rel_found;
 
 	/* Now we have the info needed to set up EPQ state */
 	EvalPlanQualInit(&lrstate->lr_epqstate, estate,
@@ -400,4 +467,18 @@ ExecReScanLockRows(LockRowsState *node)
 	 */
 	if (node->ps.lefttree->chgParam == NULL)
 		ExecReScan(node->ps.lefttree);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecShutdownLockRows
+ *
+ *		YB: This flushes the explicit row lock buffer once there are no
+ *    more rows to be locked.
+ *
+ * ----------------------------------------------------------------
+ */
+void
+ExecShutdownLockRows(LockRowsState *node)
+{
+	YBCFlushTupleLocks();
 }

@@ -21,6 +21,10 @@
 #include "access/tupconvert.h"
 #include "executor/tuptable.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "pg_yb_utils.h"
+
 
 /*
  * The conversion setup routines have the following common API:
@@ -232,9 +236,12 @@ execute_attr_map_slot(AttrMap *attrMap,
  * The input and output bitmaps are offset by
  * FirstLowInvalidHeapAttributeNumber to accommodate system cols, like the
  * column-bitmaps in RangeTblEntry.
+ *
+ * YB uses YBGetFirstLowInvalidAttributeNumber instead of
+ * FirstLowInvalidHeapAttributeNumber.
  */
 Bitmapset *
-execute_attr_map_cols(AttrMap *attrMap, Bitmapset *in_cols)
+execute_attr_map_cols(AttrMap *attrMap, Bitmapset *in_cols, Relation rel)
 {
 	Bitmapset  *out_cols;
 	int			out_attnum;
@@ -248,7 +255,7 @@ execute_attr_map_cols(AttrMap *attrMap, Bitmapset *in_cols)
 	 */
 	out_cols = NULL;
 
-	for (out_attnum = FirstLowInvalidHeapAttributeNumber;
+	for (out_attnum = YBGetFirstLowInvalidAttributeNumber(rel) + 1;
 		 out_attnum <= attrMap->maplen;
 		 out_attnum++)
 	{
@@ -270,8 +277,9 @@ execute_attr_map_cols(AttrMap *attrMap, Bitmapset *in_cols)
 				continue;
 		}
 
-		if (bms_is_member(in_attnum - FirstLowInvalidHeapAttributeNumber, in_cols))
-			out_cols = bms_add_member(out_cols, out_attnum - FirstLowInvalidHeapAttributeNumber);
+		if (bms_is_member(in_attnum - YBGetFirstLowInvalidAttributeNumber(rel), in_cols))
+			out_cols = bms_add_member(out_cols,
+									  out_attnum - YBGetFirstLowInvalidAttributeNumber(rel));
 	}
 
 	return out_cols;

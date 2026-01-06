@@ -660,6 +660,9 @@ struct MinimalTupleData
 #define HeapTupleHasNulls(tuple) \
 		(((tuple)->t_data->t_infomask & HEAP_HASNULL) != 0)
 
+#define HeapTupleHeaderHasNulls(tuple) \
+		(((tuple)->t_infomask & HEAP_HASNULL) != 0)
+
 #define HeapTupleNoNulls(tuple) \
 		(!((tuple)->t_data->t_infomask & HEAP_HASNULL))
 
@@ -803,5 +806,7 @@ heap_getattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 		return heap_getsysattr(tup, attnum, tupleDesc, isnull);
 }
 #endif							/* FRONTEND */
+
+extern void yb_heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest);
 
 #endif							/* HTUP_DETAILS_H */

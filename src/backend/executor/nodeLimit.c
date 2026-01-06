@@ -26,6 +26,9 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 static void recompute_limits(LimitState *node);
 static int64 compute_tuples_needed(LimitState *node);
 
@@ -55,6 +58,15 @@ ExecLimit(PlanState *pstate)
 	outerPlan = outerPlanState(node);
 
 	/*
+	 * YB: Initialize LIMIT count and offset.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		pstate->state->yb_exec_params.limit_count = node->count;
+		pstate->state->yb_exec_params.limit_offset = node->offset;
+	}
+
+	/*
 	 * The main logic is a simple state machine.
 	 */
 	switch (node->lstate)
@@ -69,9 +81,25 @@ ExecLimit(PlanState *pstate)
 			 */
 			recompute_limits(node);
 
+			/*
+			 * YB: Update LIMIT count and offset after recomputing.
+			 */
+			if (IsYugaByteEnabled())
+			{
+				pstate->state->yb_exec_params.limit_count = node->count;
+				pstate->state->yb_exec_params.limit_offset = node->offset;
+			}
+
 			/* FALL THRU */
+			yb_switch_fallthrough();
 
 		case LIMIT_RESCAN:
+			/*
+			 * YB: If the limit is invalid (i.e. noCount = true), we need to
+			 * use the default limit in yb. Otherwise, we don't use the default
+			 * yb limit and use the one prescribed by this node.
+			 */
+			pstate->state->yb_exec_params.limit_use_default = node->noCount;
 
 			/*
 			 * If backwards scan, just return NULL without changing state.
@@ -217,6 +245,7 @@ ExecLimit(PlanState *pstate)
 
 			Assert(node->lstate == LIMIT_WINDOWEND_TIES);
 			/* FALL THRU */
+			yb_switch_fallthrough();
 
 		case LIMIT_WINDOWEND_TIES:
 			if (ScanDirectionIsForward(direction))

@@ -43,6 +43,9 @@
 #include "utils/pg_lsn.h"
 #include "utils/sortsupport.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* ----------
  * Uncomment the following to enable compilation of dump_numeric()
  * and dump_var() and to get a dump of any result produced by make_result().
@@ -529,6 +532,10 @@ static bool numericvar_to_uint64(const NumericVar *var, uint64 *result);
 #ifdef HAVE_INT128
 static bool numericvar_to_int128(const NumericVar *var, int128 *result);
 static void int128_to_numericvar(int128 val, NumericVar *var);
+#endif
+#ifdef YB_TODO
+/*  No longer in postgres new code. */
+double		numeric_to_double_no_overflow(Numeric num);
 #endif
 static double numericvar_to_double_no_overflow(const NumericVar *var);
 
@@ -2217,12 +2224,15 @@ numeric_abbrev_convert_var(const NumericVar *var, NumericSortSupport *nss)
 			default:
 				result |= ((int64) var->digits[3]);
 				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 			case 3:
 				result |= ((int64) var->digits[2]) << 14;
 				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 			case 2:
 				result |= ((int64) var->digits[1]) << 28;
 				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 			case 1:
 				result |= ((int64) var->digits[0]) << 42;
 				break;
@@ -6495,12 +6505,6 @@ int8_sum(PG_FUNCTION_ARGS)
  * we need to count the inputs.
  */
 
-typedef struct Int8TransTypeData
-{
-	int64		count;
-	int64		sum;
-} Int8TransTypeData;
-
 Datum
 int2_avg_accum(PG_FUNCTION_ARGS)
 {
@@ -7922,6 +7926,38 @@ int128_to_numericvar(int128 val, NumericVar *var)
 	var->digits = ptr;
 	var->ndigits = ndigits;
 	var->weight = ndigits - 1;
+}
+#endif
+
+#ifdef YB_TODO
+/*  No longer in Postgres code. */
+/*
+ * Convert numeric to float8; if out of range, return +/- HUGE_VAL
+ */
+double
+numeric_to_double_no_overflow(Numeric num)
+{
+	char	   *tmp;
+	double		val;
+	char	   *endptr;
+
+	tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
+											  NumericGetDatum(num)));
+
+	/* unlike float8in, we ignore ERANGE from strtod */
+	val = strtod(tmp, &endptr);
+	if (*endptr != '\0')
+	{
+		/* shouldn't happen ... */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"double precision", tmp)));
+	}
+
+	pfree(tmp);
+
+	return val;
 }
 #endif
 

@@ -33,6 +33,9 @@
 void
 get_control_data(ClusterInfo *cluster, bool live_check)
 {
+	/* YB: See comment above call to check_cluster_compatibility */
+	Assert(!is_yugabyte_enabled());
+
 	char		cmd[MAXPGPATH];
 	char		bufin[MAX_STRING];
 	FILE	   *output;
@@ -158,7 +161,7 @@ get_control_data(ClusterInfo *cluster, bool live_check)
 					else
 						pg_fatal("The target cluster was shut down while in recovery mode.  To upgrade, use \"rsync\" as documented or shut it down as a primary.\n");
 				}
-				else if (strcmp(p, "shut down\n") != 0)
+				else if (!is_yugabyte_enabled() && strcmp(p, "shut down\n") != 0)
 				{
 					if (cluster == &old_cluster)
 						pg_fatal("The source cluster was not shut down cleanly.\n");
@@ -647,6 +650,9 @@ void
 check_control_data(ControlData *oldctrl,
 				   ControlData *newctrl)
 {
+	/* YB: See comment above call to check_cluster_compatibility */
+	Assert(!is_yugabyte_enabled());
+
 	if (oldctrl->align == 0 || oldctrl->align != newctrl->align)
 		pg_fatal("old and new pg_controldata alignments are invalid or do not match\n"
 				 "Likely one cluster is a 32-bit install, the other 64-bit\n");

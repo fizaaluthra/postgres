@@ -165,10 +165,45 @@ CreateExecutorState(void)
 	estate->es_jit_flags = 0;
 	estate->es_jit = NULL;
 
+	NodeSetTag(&estate->yb_skip_entities, T_YbSkippableEntities);
+
 	/*
 	 * Return the executor state structure
 	 */
 	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * YugaByte-specific fields
+	 */
+	estate->yb_es_is_single_row_modify_txn = false;
+	estate->yb_es_is_fk_check_disabled = false;
+	estate->yb_es_in_txn_limit_ht_for_reads = 0;
+
+	estate->yb_exec_params.limit_count = 0;
+	estate->yb_exec_params.limit_offset = 0;
+	estate->yb_exec_params.limit_use_default = true;
+	estate->yb_exec_params.rowmark = -1;
+	estate->yb_exec_params.is_index_backfill = false;
+
+	/*
+	 * Pointer to the query's in_txn_limit_ht for read ops. This pointer is passed
+	 * down via PgDocOp instances to the DocDB read operations invoked for this
+	 * query. Only the first read operation initializes its value, and all the
+	 * other operations ensure that they don't read any value written past this
+	 * time.
+	 *
+	 * TODO(#16239): Each SQL statement can have multiple "EState"s. But we need
+	 * to ensure that only one in_txn_limit_ht is used for reads in one SQL
+	 * statement. Fix logic for such cases.
+	 */
+	estate->yb_exec_params.stmt_in_txn_limit_ht_for_reads =
+		&estate->yb_es_in_txn_limit_ht_for_reads;
+
+	estate->yb_exec_params.yb_fetch_row_limit = yb_fetch_row_limit;
+	estate->yb_exec_params.yb_fetch_size_limit = yb_fetch_size_limit;
+
+	estate->yb_exec_params.yb_index_check = false;
+	estate->yb_es_pk_proutes = NIL;
 
 	return estate;
 }
@@ -221,6 +256,16 @@ FreeExecutorState(EState *estate)
 		DestroyPartitionDirectory(estate->es_partition_directory);
 		estate->es_partition_directory = NULL;
 	}
+
+	ListCell   *lc;
+
+	foreach(lc, estate->yb_es_pk_proutes)
+	{
+		PartitionTupleRouting *proute = lfirst(lc);
+
+		ExecCleanupTupleRouting(NULL /* mtstate */ , proute);
+	}
+	list_free(estate->yb_es_pk_proutes);
 
 	/*
 	 * Free the per-query memory context, thereby releasing all working
@@ -1280,7 +1325,8 @@ ExecGetInsertedCols(ResultRelInfo *relinfo, EState *estate)
 
 		if (relinfo->ri_RootToPartitionMap != NULL)
 			return execute_attr_map_cols(relinfo->ri_RootToPartitionMap->attrMap,
-										 rte->insertedCols);
+										 rte->insertedCols,
+										 relinfo->ri_RelationDesc);
 		else
 			return rte->insertedCols;
 	}
@@ -1314,7 +1360,8 @@ ExecGetUpdatedCols(ResultRelInfo *relinfo, EState *estate)
 
 		if (relinfo->ri_RootToPartitionMap != NULL)
 			return execute_attr_map_cols(relinfo->ri_RootToPartitionMap->attrMap,
-										 rte->updatedCols);
+										 rte->updatedCols,
+										 relinfo->ri_RelationDesc);
 		else
 			return rte->updatedCols;
 	}

@@ -67,6 +67,22 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "catalog/binary_upgrade.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_yb_tablegroup_d.h"
+#include "catalog/yb_catalog_version.h"
+#include "commands/progress.h"
+#include "commands/yb_tablegroup.h"
+#include "pgstat.h"
+#include "utils/guc.h"
+#include "utils/yb_inheritscache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include <inttypes.h>
+
+/* Potentially set by pg_upgrade_support functions */
+Oid			yb_binary_upgrade_next_colocation_id = InvalidOid;
 
 /* non-export function prototypes */
 static bool CompareOpclassOptions(Datum *opts1, Datum *opts2, int natts);
@@ -107,6 +123,9 @@ static bool ReindexRelationConcurrently(Oid relationOid,
 										ReindexParams *params);
 static void update_relispartition(Oid relationId, bool newval);
 static inline void set_indexsafe_procflags(void);
+
+/* YB function declarations. */
+static void YbWaitForBackendsCatalogVersion();
 
 /*
  * callback argument type for RangeVarCallbackForReindexIndex()
@@ -574,6 +593,14 @@ DefineIndex(Oid relationId,
 	int			root_save_nestlevel;
 	int			i;
 
+	/* Yugabyte variables */
+	Oid			databaseId;
+	bool		relIsShared;
+	Oid			tablegroupId = InvalidOid;
+	Oid			colocation_id = InvalidOid;
+	bool		is_colocated = false;
+	bool		yb_skip_index_creation;
+
 	root_save_nestlevel = NewGUCNestLevel();
 
 	/*
@@ -592,6 +619,22 @@ DefineIndex(Oid relationId,
 	 * there's no harm in grabbing a stronger lock, and a non-concurrent DROP
 	 * is more efficient.  Do this before any use of the concurrent option is
 	 * done.
+	 *
+	 * YB note: this logic is mostly thrown away by redefining the "concurrent"
+	 * variable later on.  It is only needed right now for
+	 * pgstat_progress_update_param with an estimation on the "concurrent"
+	 * value.  Note that stmt->concurrent is an enum in YB and a bool in PG,
+	 * but the upstream PG condition "stmt->concurrent" still works well as
+	 * - for YB, it covers the non-zero cases YB_CONCURRENCY_IMPLICIT_ENABLED
+	 *   and YB_CONCURRENCY_EXPLICIT_ENABLED, which are a good estimate.
+	 * - for PG, ideally we want to only allow YB_CONCURRENCY_EXPLICIT_ENABLED,
+	 *   but we don't need to worry about YB_CONCURRENCY_IMPLICIT_ENABLED
+	 *   because
+	 *   - in case of temporary relations, the second condition "!=
+	 *     RELPERSISTENCE_TEMP" covers the inaccuracy.
+	 *   - in case of initdb, gram.y sets "stmt->concurrent" to
+	 *     YB_CONCURRENCY_DISABLED by default because
+	 *     YbIsConnectedToTemplateDb.
 	 */
 	if (stmt->concurrent && get_rel_persistence(relationId) != RELPERSISTENCE_TEMP)
 		concurrent = true;
@@ -659,8 +702,11 @@ DefineIndex(Oid relationId,
 	 * NB: If the lock strength here ever changes, code that is run by
 	 * parallel workers under the control of certain particular ambuild
 	 * functions will need to be updated, too.
+	 *
+	 * YB note: opening the relation under AccessShareLock first, just to get
+	 * access to its metadata.  Stronger lock will be taken later.
 	 */
-	lockmode = concurrent ? ShareUpdateExclusiveLock : ShareLock;
+	lockmode = IsYugaByteEnabled() ? AccessShareLock : concurrent ? ShareUpdateExclusiveLock : ShareLock;
 	rel = table_open(relationId, lockmode);
 
 	/*
@@ -672,6 +718,130 @@ DefineIndex(Oid relationId,
 	SetUserIdAndSecContext(rel->rd_rel->relowner,
 						   root_save_sec_context | SECURITY_RESTRICTED_OPERATION);
 
+	if (IsYugaByteEnabled())
+	{
+		const int	cols[] = {
+			PROGRESS_CREATEIDX_PHASE,
+			PROGRESS_CREATEIDX_TUPLES_TOTAL,
+			PROGRESS_CREATEIDX_TUPLES_DONE,
+		};
+		int64		values[3];
+
+		values[0] = YB_PROGRESS_CREATEIDX_INITIALIZING;
+		if (IsYBRelation(rel))
+		{
+			values[1] = rel->rd_rel->reltuples;
+			values[2] = 0;
+		}
+		else
+		{
+			/*
+			 * For temp tables, we set tuples_total and tuples_done to an
+			 * invalid value (YB_PROGRESS_CREATEIDX_INVALID) because we do
+			 * not compute them.
+			 */
+			values[1] = YB_PROGRESS_CREATEIDX_INVALID;
+			values[2] = YB_PROGRESS_CREATEIDX_INVALID;
+		}
+		pgstat_progress_update_multi_param(3, cols, values);
+
+		databaseId = YBCGetDatabaseOid(rel);
+
+		/*
+		 * An index build should not be concurrent when
+		 * - index backfill is disabled
+		 * - the index is primary
+		 * - the indexed table is temporary
+		 * - we are in bootstrap mode
+		 * - we are in binary upgrade mode (major PG version upgrade)
+		 * This logic works because
+		 * - primary key indexes are on the main table, and index backfill doesn't
+		 *   apply to them.
+		 * - temporary tables cannot have concurrency issues when building indexes.
+		 * - system table indexes created during initdb cannot have concurrency
+		 *   issues.
+		 * - index creation during a major PG version upgrade is for the index
+		 *   metadata (catalog tables) only.
+		 * Concurrent index build is currently also disabled for
+		 * - indexes in nested DDL
+		 * - system table indexes
+		 * The following behavior applies when CONCURRENTLY keyword is specified:
+		 * - For system tables, one throws an error when CONCURRENTLY is specified
+		 *   when creating index.
+		 * - For temporary tables, one can specify CONCURRENTLY when creating
+		 *   index, but it will be internally converted to nonconcurrent.
+		 *   This is consistent with Postgres' expected behavior.
+		 * - For other cases, it's grammatically impossible to specify
+		 *   CONCURRENTLY/NONCONCURRENTLY. In the implicit case, concurrency
+		 *   is safe to be disabled.
+		 */
+		if (concurrent && YbIsSysCatalogTabletRelation(rel))
+		{
+			if (stmt->concurrent == YB_CONCURRENCY_EXPLICIT_ENABLED)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CREATE INDEX CONCURRENTLY is currently not "
+								"supported for system catalog")));
+			else
+				concurrent = false;
+		}
+		/*
+		 * Temporary tables should already be ruled out by the PG-owned code
+		 * far above.  Also rule out foreign relations and views.
+		 */
+		if (!IsYBRelation(rel))
+			concurrent = false;
+		if (concurrent && (stmt->primary || IsBootstrapProcessingMode()))
+		{
+			Assert(stmt->concurrent != YB_CONCURRENCY_EXPLICIT_ENABLED);
+			concurrent = false;
+		}
+		/*
+		 * YB: For a major PG version upgrade, we're just creating the new
+		 * version's metadata for the index, so it's not concurrent.
+		 */
+		if (concurrent && IsYugaByteEnabled() && IsBinaryUpgrade)
+		{
+			if (stmt->concurrent == YB_CONCURRENCY_EXPLICIT_ENABLED)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CREATE INDEX CONCURRENTLY is not supported "
+								"during a binary upgrade")));
+			else
+				concurrent = false;
+		}
+		/*
+		* Use fast path create index when in nested DDL. This is desired
+		* when there would be no concurrency issues (e.g. `CREATE TABLE
+		* ... (... UNIQUE (...))`).
+		* TODO(jason): support concurrent build for nested DDL (issue #4786).
+		* In a nested DDL, it's grammatically impossible to specify
+		* CONCURRENTLY/NONCONCURRENTLY. In the implicit case, concurrency
+		* is safe to be disabled.
+		*/
+		if (concurrent && YBGetDdlNestingLevel() > 1)
+		{
+			Assert(stmt->concurrent != YB_CONCURRENCY_EXPLICIT_ENABLED);
+			concurrent = false;
+		}
+
+		/*
+		 * Now that we know the true value of "concurrent", take the right
+		 * lock.
+		 */
+		lockmode = concurrent ? ShareUpdateExclusiveLock : ShareLock;
+		LockRelationOid(relationId, lockmode);
+
+		/*
+		 * Ensure that system tables don't go through online schema change.  This
+		 * is curently guaranteed because
+		 * - initdb (bootstrap mode) is prevented from being concurrent
+		 * - users cannot create indexes on system tables
+		 */
+		Assert(!(concurrent && IsSystemRelation(rel)));
+	}
+
+	relIsShared = rel->rd_rel->relisshared;
 	namespaceId = RelationGetNamespace(rel);
 
 	/* Ensure that it makes sense to index this kind of relation */
@@ -708,7 +878,7 @@ DefineIndex(Oid relationId,
 		 * consistent, even though we could do it on temporary table because
 		 * we're not actually doing it concurrently.
 		 */
-		if (stmt->concurrent)
+		if (concurrent)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cannot create index on partitioned table \"%s\" concurrently",
@@ -752,13 +922,66 @@ DefineIndex(Oid relationId,
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_SCHEMA,
 						   get_namespace_name(namespaceId));
+
+		/*
+		 * If not superuser, ensure having CREATE privileges over template1 -
+		 * this is where DocDB would actually store the shared index.
+		 */
+		if (IsYugaByteEnabled() && !superuser() && relIsShared)
+		{
+			AclResult	aclresult;
+
+			aclresult = pg_database_aclcheck(Template1DbOid, GetUserId(), ACL_CREATE);
+
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_DATABASE,
+							   get_database_name(Template1DbOid));
+		}
+	}
+
+	if (IsYugaByteEnabled() &&
+		stmt->tableSpace &&
+		rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/*
+		 * Disable setting tablespaces for temporary indexes in Yugabyte
+		 * clusters.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot set tablespace for temporary index")));
 	}
 
 	/*
 	 * Select tablespace to use.  If not specified, use default tablespace
 	 * (which may in turn default to database's default).
 	 */
-	if (stmt->tableSpace)
+	if (IsYBRelation(rel) && stmt->primary)
+	{
+		/*
+		 * For Yugabyte enabled clusters, the primary key index is an intrinsic
+		 * part of the table itself. In that case, the tablespace for a primary
+		 * index must always be the same as that of the table.
+		 */
+		tablespaceId = rel->rd_rel->reltablespace;
+
+		/*
+		 * Fail if the user specified a custom tablespace for a primary key
+		 * index and it does not match the tablespace of the indexed table.
+		 */
+		if (stmt->tableSpace)
+		{
+			Oid			stmtTablespace = get_tablespace_oid(stmt->tableSpace, false);
+
+			if (stmtTablespace != tablespaceId)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("tablespace for a primary key index must "
+								" always match the tablespace of the "
+								" indexed table")));
+		}
+	}
+	else if (stmt->tableSpace)
 	{
 		tablespaceId = get_tablespace_oid(stmt->tableSpace, false);
 		if (partitioned && tablespaceId == MyDatabaseTableSpace)
@@ -787,11 +1010,191 @@ DefineIndex(Oid relationId,
 	}
 
 	/*
+	 * Get whether the indexed table is colocated
+	 * (either via database or a tablegroup).
+	 * If the indexed table is colocated, then this index is colocated as well.
+	 */
+	is_colocated =
+		IsYBRelation(rel) &&
+		!IsBootstrapProcessingMode() &&
+		!YbIsConnectedToTemplateDb() &&
+		YbGetTableProperties(rel)->is_colocated;
+
+	if (IsYugaByteEnabled())
+	{
+		/* Use tablegroup of the indexed table, if any. */
+		tablegroupId = YbTablegroupCatalogExists && IsYBRelation(rel) ?
+			YbGetTableProperties(rel)->tablegroup_oid :
+			InvalidOid;
+
+		bool		is_colocated_via_database = is_colocated && MyDatabaseColocated;
+		bool		is_colocated_tables_with_tablespace_enabled =
+			*YBCGetGFlags()->ysql_enable_colocated_tables_with_tablespaces;
+
+		/*
+		 * For colocated index tables in a colocation database, the implicit
+		 * tablegroup of the index depends on tablespace specified. If no tablespace
+		 * is specified we use the default implicit tablegroup.
+		 */
+		if (is_colocated_tables_with_tablespace_enabled &&
+			is_colocated_via_database && !MyColocatedDatabaseLegacy)
+		{
+			char	   *tablegroup_name = NULL;
+
+			if (OidIsValid(tablespaceId))
+			{
+				/*
+				 * We look in pg_shdepend rather than directly use the derived name,
+				 * as later we might need to associate an existing implicit tablegroup to a tablespace
+				 */
+				shdepFindImplicitTablegroup(tablespaceId, &tablegroupId);
+
+				/*
+				 * If we do not find a tablegroup corresponding to the given tablespace, we
+				 * would have to create one. We derive the name from tablespace OID.
+				 */
+				tablegroup_name = OidIsValid(tablegroupId) ? get_tablegroup_name(tablegroupId) :
+					get_implicit_tablegroup_name(tablespaceId);
+
+			}
+			else if (yb_binary_restore && OidIsValid(binary_upgrade_next_tablegroup_oid))
+			{
+				/*
+				 * In yb_binary_restore if tablespaceId is not valid but
+				 * binary_upgrade_next_tablegroup_oid is valid, that implies either:
+				 * 1. it is a default tablespace.
+				 * 2. we are restoring without tablespace information.
+				 * In this case all tables are restored to default tablespace,
+				 * while maintaining the colocation properties, and tablegroup's name
+				 * will be colocation_restore_tablegroupId, while default tablegroup's
+				 * name would still be default.
+				 */
+				tablegroup_name = (binary_upgrade_next_tablegroup_default ?
+								   DEFAULT_TABLEGROUP_NAME :
+								   get_restore_tablegroup_name(binary_upgrade_next_tablegroup_oid));
+				binary_upgrade_next_tablegroup_default = false;
+				tablegroupId = get_tablegroup_oid(tablegroup_name, true);
+			}
+			else if (yb_binary_restore && OidIsValid(tablegroupId))
+			{
+				/*
+				 * This case handles Primary Key's tablegroup id. The variable
+				 * tablegroupId stores the tablegroupId of the parent table.
+				 */
+				tablegroup_name = get_tablegroup_name(tablegroupId);
+			}
+			else
+			{
+				tablegroup_name = DEFAULT_TABLEGROUP_NAME;
+				tablegroupId = get_tablegroup_oid(tablegroup_name, true);
+			}
+
+			char	   *tablespace_name = (OidIsValid(tablespaceId) ?
+										   get_tablespace_name(tablespaceId) :
+										   NULL);
+
+			/* Tablegroup doesn't exist, so create it. */
+			if (!OidIsValid(tablegroupId))
+			{
+				/*
+				 * Regardless of the current user, let postgres be the owner of the
+				 * implicit tablegroup in a colocated database.
+				 */
+				RoleSpec   *spec = makeNode(RoleSpec);
+
+				spec->roletype = ROLESPEC_CSTRING;
+				spec->rolename = pstrdup("postgres");
+
+				YbCreateTableGroupStmt *tablegroup_stmt = makeNode(YbCreateTableGroupStmt);
+
+				tablegroup_stmt->tablegroupname = tablegroup_name;
+				tablegroup_stmt->tablespacename = tablespace_name;
+				tablegroup_stmt->implicit = true;
+				tablegroup_stmt->owner = spec;
+				tablegroupId = CreateTableGroup(tablegroup_stmt);
+			}
+		}
+		/*
+		 * Reset the binary_upgrade params as these are not needed anymore (only
+		 * required in CreateTableGroup), to ensure these parameter values are
+		 * not reused in subsequent unrelated statements.
+		 */
+		binary_upgrade_next_tablegroup_oid = InvalidOid;
+		binary_upgrade_next_tablegroup_default = false;
+
+
+		if (stmt->split_options)
+		{
+			if (MyDatabaseColocated && is_colocated)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("cannot create colocated index with split option")));
+			else if (OidIsValid(tablegroupId))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("cannot use TABLEGROUP with SPLIT")));
+		}
+
+		colocation_id = YbGetColocationIdFromRelOptions(stmt->options);
+
+		if (OidIsValid(colocation_id))
+		{
+			if (!is_colocated)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						 errmsg("cannot set colocation_id for non-colocated index")));
+			if (OidIsValid(yb_binary_upgrade_next_colocation_id))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						 errmsg("cannot set yb_binary_upgrade_next_colocation_id for colocated index")));
+		}
+		else if (OidIsValid(yb_binary_upgrade_next_colocation_id))
+		{
+			if (!is_colocated)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						 errmsg("cannot set colocation_id for non-colocated index")));
+			colocation_id = yb_binary_upgrade_next_colocation_id;
+			yb_binary_upgrade_next_colocation_id = InvalidOid;
+		}
+
+		/*
+		 * Fail if the index is colocated via tablegroup and tablespace
+		 * is specified while creation.
+		 */
+		if (OidIsValid(tablespaceId) && is_colocated && !MyDatabaseColocated)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("TABLESPACE is not supported for indexes on colocated tables.")));
+
+		/*
+		 * YB: Check permissions for tablegroup. To create an index within a
+		 * tablegroup, a user must either be a superuser, the owner of the
+		 * tablegroup, or have create perms on it. Skip the check in a colocated
+		 * database because any user can create tables in an implicit
+		 * tablegroup. Skip the check during binary upgrade because ACLs have
+		 * not yet been restored, and CREATE INDEX, unlike CREATE TABLE, is
+		 * normally run as the table owner due to CVE-2022-1552. (See upstream
+		 * PG commit a117cebd638dd02e5c2e791c25e43745f233111b for details.)
+		 */
+		if (!MyDatabaseColocated && !IsBinaryUpgrade &&
+			OidIsValid(tablegroupId) && !pg_tablegroup_ownercheck(tablegroupId, GetUserId()))
+		{
+			AclResult	aclresult;
+
+			aclresult = pg_tablegroup_aclcheck(tablegroupId, GetUserId(), ACL_CREATE);
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_YBTABLEGROUP,
+							   get_tablegroup_name(tablegroupId));
+		}
+	}
+
+	/*
 	 * Force shared indexes into the pg_global tablespace.  This is a bit of a
 	 * hack but seems simpler than marking them in the BKI commands.  On the
 	 * other hand, if it's not shared, don't allow it to be placed there.
 	 */
-	if (rel->rd_rel->relisshared)
+	if (relIsShared)
 		tablespaceId = GLOBALTABLESPACE_OID;
 	else if (tablespaceId == GLOBALTABLESPACE_OID)
 		ereport(ERROR,
@@ -819,6 +1222,52 @@ DefineIndex(Oid relationId,
 	 * look up the access method, verify it can handle the requested features
 	 */
 	accessMethodName = stmt->accessMethod;
+
+	/*
+	 * In Yugabyte mode, switch index method from "btree" or "hash" to "lsm" depending on whether
+	 * the table is stored in Yugabyte storage or not (such as temporary tables).
+	 */
+	if (IsYugaByteEnabled())
+	{
+		if (accessMethodName == NULL)
+		{
+			accessMethodName = IsYBRelation(rel) ? DEFAULT_YB_INDEX_TYPE : DEFAULT_INDEX_TYPE;
+		}
+		else if (IsYBRelation(rel))
+		{
+			char	   *new_name = NULL;
+
+			/* YB: Keeping the gin/hnsw index substitution message silent. */
+			if (strcmp(accessMethodName, "gin") == 0 ||
+				strcmp(accessMethodName, "hnsw") == 0)
+			{
+				new_name = psprintf("yb%s", accessMethodName);
+				ereport(LOG,
+						(errmsg("substituting access method \"%s\" for \"%s\" in YugabyteDB",
+								new_name, accessMethodName)));
+				accessMethodName = new_name;
+			}
+			else
+			{
+				if (strcmp(accessMethodName, "btree") == 0 ||
+					strcmp(accessMethodName, "hash") == 0)
+					new_name = DEFAULT_YB_INDEX_TYPE;
+
+				else if (strcmp(accessMethodName, "hnsw") == 0)
+					new_name = "ybhnsw";
+
+				if (new_name != NULL)
+				{
+					ereport(NOTICE,
+							(errmsg("substituting access method \"%s\" for \"%s\" in YugabyteDB",
+									new_name, accessMethodName)));
+					accessMethodName = new_name;
+				}
+			}
+
+		}
+	}
+
 	tuple = SearchSysCache1(AMNAME, PointerGetDatum(accessMethodName));
 	if (!HeapTupleIsValid(tuple))
 	{
@@ -840,9 +1289,25 @@ DefineIndex(Oid relationId,
 					 errmsg("access method \"%s\" does not exist",
 							accessMethodName)));
 	}
+
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
 	accessMethodId = accessMethodForm->oid;
 	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
+
+	if (IsYBRelation(rel) && !amRoutine->yb_amisforybrelation)
+		ereport(ERROR,
+				(errmsg("index method \"%s\" not supported yet",
+						accessMethodName),
+				 errhint("See https://github.com/yugabyte/yugabyte-db/issues/1337. "
+						 "React with thumbs up to raise its priority")));
+	if (!IsYBRelation(rel) && amRoutine->yb_amisforybrelation)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("access method \"%s\" only supported for indexes"
+						" using Yugabyte storage",
+						accessMethodName)));
+	if (concurrent && IsYBRelation(rel) && !amRoutine->yb_ambackfill)
+		concurrent = false;
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_ACCESS_METHOD_OID,
 								 accessMethodId);
@@ -887,6 +1352,8 @@ DefineIndex(Oid relationId,
 									 NULL, NULL, false, false);
 
 	(void) index_reloptions(amoptions, reloptions, true);
+
+	reloptions = ybExcludeNonPersistentReloptions(reloptions);
 
 	/*
 	 * Prepare arguments for index_create, primarily an IndexInfo structure.
@@ -985,7 +1452,7 @@ DefineIndex(Oid relationId,
 			 * btree opclasses; if there are ever any other index types that
 			 * support unique indexes, this logic will need extension.
 			 */
-			if (accessMethodId == BTREE_AM_OID)
+			if (accessMethodId == BTREE_AM_OID || accessMethodId == LSM_AM_OID)
 				eq_strategy = BTEqualStrategyNumber;
 			else
 				ereport(ERROR,
@@ -1132,9 +1599,14 @@ DefineIndex(Oid relationId,
 	 * step also actually builds the index, except if caller requested not to
 	 * or in concurrent mode, in which case it'll be done later, or doing a
 	 * partitioned index (because those don't have storage).
+	 *
+	 * YB NOTE:
+	 * We also create constraints for non-constraint unique system indexes
+	 * during YSQL upgrade, to simulate initdb behaviour.
 	 */
 	flags = constr_flags = 0;
-	if (stmt->isconstraint)
+	if (stmt->isconstraint || (stmt->unique && IsYBRelation(rel) &&
+							   IsYsqlUpgrade && IsCatalogRelation(rel)))
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
 	if (skip_build || concurrent || partitioned)
 		flags |= INDEX_CREATE_SKIP_BUILD;
@@ -1164,6 +1636,19 @@ DefineIndex(Oid relationId,
 	if (stmt->initdeferred)
 		constr_flags |= INDEX_CONSTR_CREATE_INIT_DEFERRED;
 
+	/* Check for WITH (table_oid = x). */
+	if (!OidIsValid(indexRelationId) && stmt->relation)
+	{
+		indexRelationId = GetTableOidFromRelOptions(stmt->options, tablespaceId,
+													stmt->relation->relpersistence);
+	}
+
+	if (IsYugaByteEnabled() &&
+		rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		YBCRecordTempRelationDDL();
+
+	yb_skip_index_creation = skip_build && is_alter_table;
+
 	indexRelationId =
 		index_create(rel, indexRelationName, indexRelationId, parentIndexId,
 					 parentConstraintId,
@@ -1173,7 +1658,9 @@ DefineIndex(Oid relationId,
 					 coloptions, reloptions,
 					 flags, constr_flags,
 					 allowSystemTableMods, !check_rights,
-					 &createdConstraintId);
+					 &createdConstraintId, stmt->split_options,
+					 !concurrent, is_colocated, tablegroupId, colocation_id,
+					 yb_skip_index_creation);
 
 	ObjectAddressSet(address, RelationRelationId, indexRelationId);
 
@@ -1274,6 +1761,7 @@ DefineIndex(Oid relationId,
 									   &child_save_sec_context);
 				SetUserIdAndSecContext(childrel->rd_rel->relowner,
 									   child_save_sec_context | SECURITY_RESTRICTED_OPERATION);
+
 				child_save_nestlevel = NewGUCNestLevel();
 
 				/*
@@ -1301,7 +1789,8 @@ DefineIndex(Oid relationId,
 				childidxs = RelationGetIndexList(childrel);
 				attmap =
 					build_attrmap_by_name(RelationGetDescr(childrel),
-										  parentDesc);
+										  parentDesc,
+										  false /* yb_ignore_type_mismatch */ );
 
 				foreach(cell, childidxs)
 				{
@@ -1519,7 +2008,8 @@ DefineIndex(Oid relationId,
 
 	/* save lockrelid and locktag for below, then close rel */
 	heaprelid = rel->rd_lockInfo.lockRelId;
-	SET_LOCKTAG_RELATION(heaplocktag, heaprelid.dbId, heaprelid.relId);
+	if (!IsYBRelation(rel))
+		SET_LOCKTAG_RELATION(heaplocktag, heaprelid.dbId, heaprelid.relId);
 	table_close(rel, NoLock);
 
 	/*
@@ -1546,157 +2036,296 @@ DefineIndex(Oid relationId,
 	LockRelationIdForSession(&heaprelid, ShareUpdateExclusiveLock);
 
 	PopActiveSnapshot();
-	CommitTransactionCommand();
-	StartTransactionCommand();
 
-	/* Tell concurrent index builds to ignore us, if index qualifies */
-	if (safe_index)
-		set_indexsafe_procflags();
-
-	/*
-	 * The index is now visible, so we can report the OID.  While on it,
-	 * include the report for the beginning of phase 2.
-	 */
+	if (!IsYugaByteEnabled())
 	{
-		const int	progress_cols[] = {
-			PROGRESS_CREATEIDX_INDEX_OID,
-			PROGRESS_CREATEIDX_PHASE
-		};
-		const int64 progress_vals[] = {
-			indexRelationId,
-			PROGRESS_CREATEIDX_PHASE_WAIT_1
-		};
+		CommitTransactionCommand();
+		StartTransactionCommand();
 
-		pgstat_progress_update_multi_param(2, progress_cols, progress_vals);
+		/* Tell concurrent index builds to ignore us, if index qualifies */
+		if (safe_index)
+			set_indexsafe_procflags();
+
+		/*
+		 * The index is now visible, so we can report the OID.  While on it,
+		 * include the report for the beginning of phase 2.
+		 */
+		{
+			const int	progress_cols[] = {
+				PROGRESS_CREATEIDX_INDEX_OID,
+				PROGRESS_CREATEIDX_PHASE
+			};
+			const int64 progress_vals[] = {
+				indexRelationId,
+				PROGRESS_CREATEIDX_PHASE_WAIT_1
+			};
+
+			pgstat_progress_update_multi_param(2, progress_cols, progress_vals);
+		}
+
+		/*
+		 * Phase 2 of concurrent index build (see comments for validate_index()
+		 * for an overview of how this works)
+		 *
+		 * Now we must wait until no running transaction could have the table open
+		 * with the old list of indexes.  Use ShareLock to consider running
+		 * transactions that hold locks that permit writing to the table.  Note we
+		 * do not need to worry about xacts that open the table for writing after
+		 * this point; they will see the new index when they open it.
+		 *
+		 * Note: the reason we use actual lock acquisition here, rather than just
+		 * checking the ProcArray and sleeping, is that deadlock is possible if
+		 * one of the transactions in question is blocked trying to acquire an
+		 * exclusive lock on our table.  The lock code will detect deadlock and
+		 * error out properly.
+		 */
+		WaitForLockers(heaplocktag, ShareLock, true);
+
+		/*
+		 * At this moment we are sure that there are no transactions with the
+		 * table open for write that don't have this new index in their list of
+		 * indexes.  We have waited out all the existing transactions and any new
+		 * transaction will have the new index in its list, but the index is still
+		 * marked as "not-ready-for-inserts".  The index is consulted while
+		 * deciding HOT-safety though.  This arrangement ensures that no new HOT
+		 * chains can be created where the new tuple and the old tuple in the
+		 * chain have different index keys.
+		 *
+		 * We now take a new snapshot, and build the index using all tuples that
+		 * are visible in this snapshot.  We can be sure that any HOT updates to
+		 * these tuples will be compatible with the index, since any updates made
+		 * by transactions that didn't know about the index are now committed or
+		 * rolled back.  Thus, each visible tuple is either the end of its
+		 * HOT-chain or the extension of the chain is HOT-safe for this index.
+		 */
+
+		/* Set ActiveSnapshot since functions in the indexes may need it */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		/* Perform concurrent build of index */
+		index_concurrently_build(relationId, indexRelationId);
+
+		/* we can do away with our snapshot */
+		PopActiveSnapshot();
+
+		/*
+		 * Commit this transaction to make the indisready update visible.
+		 */
+		CommitTransactionCommand();
+		StartTransactionCommand();
+
+		/* Tell concurrent index builds to ignore us, if index qualifies */
+		if (safe_index)
+			set_indexsafe_procflags();
+
+		/*
+		 * Phase 3 of concurrent index build
+		 *
+		 * We once again wait until no transaction can have the table open with
+		 * the index marked as read-only for updates.
+		 */
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 PROGRESS_CREATEIDX_PHASE_WAIT_2);
+		WaitForLockers(heaplocktag, ShareLock, true);
+
+		/*
+		 * Now take the "reference snapshot" that will be used by validate_index()
+		 * to filter candidate tuples.  Beware!  There might still be snapshots in
+		 * use that treat some transaction as in-progress that our reference
+		 * snapshot treats as committed.  If such a recently-committed transaction
+		 * deleted tuples in the table, we will not include them in the index; yet
+		 * those transactions which see the deleting one as still-in-progress will
+		 * expect such tuples to be there once we mark the index as valid.
+		 *
+		 * We solve this by waiting for all endangered transactions to exit before
+		 * we mark the index as valid.
+		 *
+		 * We also set ActiveSnapshot to this snap, since functions in indexes may
+		 * need a snapshot.
+		 */
+		snapshot = RegisterSnapshot(GetTransactionSnapshot());
+		PushActiveSnapshot(snapshot);
+
+		/*
+		 * Scan the index and the heap, insert any missing index entries.
+		 */
+		validate_index(relationId, indexRelationId, snapshot);
+
+		/*
+		 * Drop the reference snapshot.  We must do this before waiting out other
+		 * snapshot holders, else we will deadlock against other processes also
+		 * doing CREATE INDEX CONCURRENTLY, which would see our snapshot as one
+		 * they must wait for.  But first, save the snapshot's xmin to use as
+		 * limitXmin for GetCurrentVirtualXIDs().
+		 */
+		limitXmin = snapshot->xmin;
+
+		PopActiveSnapshot();
+		UnregisterSnapshot(snapshot);
+
+		/*
+		 * The snapshot subsystem could still contain registered snapshots that
+		 * are holding back our process's advertised xmin; in particular, if
+		 * default_transaction_isolation = serializable, there is a transaction
+		 * snapshot that is still active.  The CatalogSnapshot is likewise a
+		 * hazard.  To ensure no deadlocks, we must commit and start yet another
+		 * transaction, and do our wait before any snapshot has been taken in it.
+		 */
+		CommitTransactionCommand();
+		StartTransactionCommand();
+
+		/* Tell concurrent index builds to ignore us, if index qualifies */
+		if (safe_index)
+			set_indexsafe_procflags();
+
+		/* We should now definitely not be advertising any xmin. */
+		Assert(MyProc->xmin == InvalidTransactionId);
+
+		/*
+		 * The index is now valid in the sense that it contains all currently
+		 * interesting tuples.  But since it might not contain tuples deleted just
+		 * before the reference snap was taken, we have to wait out any
+		 * transactions that might have older snapshots.
+		 */
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 PROGRESS_CREATEIDX_PHASE_WAIT_3);
+		WaitForOlderSnapshots(limitXmin, true);
 	}
+	else
+	{
+		elog(LOG, "committing pg_index tuple with indislive=true");
+		if (yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"indislive",
+										"index state change indislive=true");
+		/*
+		 * No need to break (abort) ongoing txns since this is an online schema
+		 * change.
+		 * TODO(jason): handle nested CREATE INDEX (this assumes we're at nest
+		 * level 1).
+		 */
+		YBDecrementDdlNestingLevel();
+		CommitTransactionCommand();
 
-	/*
-	 * Phase 2 of concurrent index build (see comments for validate_index()
-	 * for an overview of how this works)
-	 *
-	 * Now we must wait until no running transaction could have the table open
-	 * with the old list of indexes.  Use ShareLock to consider running
-	 * transactions that hold locks that permit writing to the table.  Note we
-	 * do not need to worry about xacts that open the table for writing after
-	 * this point; they will see the new index when they open it.
-	 *
-	 * Note: the reason we use actual lock acquisition here, rather than just
-	 * checking the ProcArray and sleeping, is that deadlock is possible if
-	 * one of the transactions in question is blocked trying to acquire an
-	 * exclusive lock on our table.  The lock code will detect deadlock and
-	 * error out properly.
-	 */
-	WaitForLockers(heaplocktag, ShareLock, true);
+		/*
+		 * The index is now visible, so we can report the OID.
+		 */
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_INDEX_OID,
+									 indexRelationId);
 
-	/*
-	 * At this moment we are sure that there are no transactions with the
-	 * table open for write that don't have this new index in their list of
-	 * indexes.  We have waited out all the existing transactions and any new
-	 * transaction will have the new index in its list, but the index is still
-	 * marked as "not-ready-for-inserts".  The index is consulted while
-	 * deciding HOT-safety though.  This arrangement ensures that no new HOT
-	 * chains can be created where the new tuple and the old tuple in the
-	 * chain have different index keys.
-	 *
-	 * We now take a new snapshot, and build the index using all tuples that
-	 * are visible in this snapshot.  We can be sure that any HOT updates to
-	 * these tuples will be compatible with the index, since any updates made
-	 * by transactions that didn't know about the index are now committed or
-	 * rolled back.  Thus, each visible tuple is either the end of its
-	 * HOT-chain or the extension of the chain is HOT-safe for this index.
-	 */
+		/* Delay after committing pg_index update. */
+		pg_usleep(yb_index_state_flags_update_delay * 1000);
+		if (yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"indisready",
+										"index state change indisready=true");
 
-	/* Set ActiveSnapshot since functions in the indexes may need it */
-	PushActiveSnapshot(GetTransactionSnapshot());
+		StartTransactionCommand();
 
-	/* Perform concurrent build of index */
-	index_concurrently_build(relationId, indexRelationId);
+		YBIncrementDdlNestingLevel(YB_DDL_MODE_VERSION_INCREMENT);
 
-	/* we can do away with our snapshot */
-	PopActiveSnapshot();
+		/* Wait for all backends to have up-to-date version. */
+		YbWaitForBackendsCatalogVersion();
 
-	/*
-	 * Commit this transaction to make the indisready update visible.
-	 */
-	CommitTransactionCommand();
-	StartTransactionCommand();
+		YbTestGucFailIfStrEqual(yb_test_fail_index_state_change, "indisready");
 
-	/* Tell concurrent index builds to ignore us, if index qualifies */
-	if (safe_index)
-		set_indexsafe_procflags();
+		/*
+		 * Update the pg_index row to mark the index as ready for inserts.
+		 */
+		index_set_state_flags(indexRelationId, INDEX_CREATE_SET_READY);
 
-	/*
-	 * Phase 3 of concurrent index build
-	 *
-	 * We once again wait until no transaction can have the table open with
-	 * the index marked as read-only for updates.
-	 */
-	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
-								 PROGRESS_CREATEIDX_PHASE_WAIT_2);
-	WaitForLockers(heaplocktag, ShareLock, true);
+		elog(LOG, "committing pg_index tuple with indisready=true");
+		/*
+		 * No need to break (abort) ongoing txns since this is an online schema
+		 * change.
+		 * TODO(jason): handle nested CREATE INDEX (this assumes we're at nest
+		 * level 1).
+		 */
+		YBDecrementDdlNestingLevel();
+		CommitTransactionCommand();
 
-	/*
-	 * Now take the "reference snapshot" that will be used by validate_index()
-	 * to filter candidate tuples.  Beware!  There might still be snapshots in
-	 * use that treat some transaction as in-progress that our reference
-	 * snapshot treats as committed.  If such a recently-committed transaction
-	 * deleted tuples in the table, we will not include them in the index; yet
-	 * those transactions which see the deleting one as still-in-progress will
-	 * expect such tuples to be there once we mark the index as valid.
-	 *
-	 * We solve this by waiting for all endangered transactions to exit before
-	 * we mark the index as valid.
-	 *
-	 * We also set ActiveSnapshot to this snap, since functions in indexes may
-	 * need a snapshot.
-	 */
-	snapshot = RegisterSnapshot(GetTransactionSnapshot());
-	PushActiveSnapshot(snapshot);
+		/* Delay after committing pg_index update. */
+		pg_usleep(yb_index_state_flags_update_delay * 1000);
+		if (yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"backfill",
+										"concurrent index backfill");
 
-	/*
-	 * Scan the index and the heap, insert any missing index entries.
-	 */
-	validate_index(relationId, indexRelationId, snapshot);
+		StartTransactionCommand();
+		YBIncrementDdlNestingLevel(YB_DDL_MODE_VERSION_INCREMENT);
 
-	/*
-	 * Drop the reference snapshot.  We must do this before waiting out other
-	 * snapshot holders, else we will deadlock against other processes also
-	 * doing CREATE INDEX CONCURRENTLY, which would see our snapshot as one
-	 * they must wait for.  But first, save the snapshot's xmin to use as
-	 * limitXmin for GetCurrentVirtualXIDs().
-	 */
-	limitXmin = snapshot->xmin;
+		/* Wait for all backends to have up-to-date version. */
+		YbWaitForBackendsCatalogVersion();
 
-	PopActiveSnapshot();
-	UnregisterSnapshot(snapshot);
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 YB_PROGRESS_CREATEIDX_BACKFILLING);
 
-	/*
-	 * The snapshot subsystem could still contain registered snapshots that
-	 * are holding back our process's advertised xmin; in particular, if
-	 * default_transaction_isolation = serializable, there is a transaction
-	 * snapshot that is still active.  The CatalogSnapshot is likewise a
-	 * hazard.  To ensure no deadlocks, we must commit and start yet another
-	 * transaction, and do our wait before any snapshot has been taken in it.
-	 */
-	CommitTransactionCommand();
-	StartTransactionCommand();
+		/*
+		 * PG acquires ShareUpdateExclusiveLock on the main table for the
+		 * duration of the backfill so as to allow DMLs but prevent concurrent
+		 * schema changes, including parallel index creation requests. And it
+		 * acquires RowExclusiveLock on the index as backfill modifies data in
+		 * the index table.
+		 *
+		 * YB: Since backfill jobs run independently at each tablet, acquire
+		 * relevant locks here so as to hold them for the whole duration of the
+		 * backfill.
+		 */
+		LockRelationOid(relationId, ShareUpdateExclusiveLock);
+		LockRelationOid(indexRelationId, RowExclusiveLock);
 
-	/* Tell concurrent index builds to ignore us, if index qualifies */
-	if (safe_index)
-		set_indexsafe_procflags();
+		/* TODO(jason): handle exclusion constraints, possibly not here. */
 
-	/* We should now definitely not be advertising any xmin. */
-	Assert(MyProc->xmin == InvalidTransactionId);
+		/* Do backfill. */
 
-	/*
-	 * The index is now valid in the sense that it contains all currently
-	 * interesting tuples.  But since it might not contain tuples deleted just
-	 * before the reference snap was taken, we have to wait out any
-	 * transactions that might have older snapshots.
-	 */
-	pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
-								 PROGRESS_CREATEIDX_PHASE_WAIT_3);
-	WaitForOlderSnapshots(limitXmin, true);
+		/*
+		 * YB: Do backfill if this is a separate DocDB table from the main
+		 * table.
+		 */
+		HandleYBStatus(YBCPgBackfillIndex(databaseId, indexRelationId));
+
+		Relation	yb_baserel = table_open(relationId, NoLock);
+
+		if (yb_enable_update_reltuples_after_create_index)
+		{
+			Oid			index_oids[1] = {indexRelationId};
+			Oid			database_oids[1] = {databaseId};
+			uint64_t	num_rows_read_from_table;
+			double		num_rows_backfilled;
+
+			HandleYBStatus(YBCGetIndexBackfillProgress(index_oids, database_oids,
+													   &num_rows_read_from_table,
+													   &num_rows_backfilled,
+													   1));
+
+			/*
+			 * Ignore the update if there was an error getting backfill
+			 * progress.
+			 */
+			if (num_rows_backfilled != -1)
+			{
+				Relation	yb_indexrel = index_open(indexRelationId, NoLock);
+
+				yb_index_update_stats(yb_baserel,
+									  true,
+									  ((double) (num_rows_read_from_table)));
+				yb_index_update_stats(yb_indexrel,
+									  false,
+									  (num_rows_backfilled));
+				index_close(yb_indexrel, NoLock);
+			}
+		}
+
+		table_close(yb_baserel, NoLock);
+
+		YbTestGucFailIfStrEqual(yb_test_fail_index_state_change, "postbackfill");
+
+		if (yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"postbackfill",
+										"operations after concurrent "
+										"index backfill");
+	}
 
 	/*
 	 * Index can now be marked valid -- update its pg_index entry
@@ -1754,6 +2383,46 @@ CheckPredicate(Expr *predicate)
 }
 
 /*
+ * YbCheckCollationRestrictions
+ *		Checks that the given partial-index predicate is valid.
+ * Disallow some built-in operator classes if the column has non-C collation.
+ * We already accept them if the column has C collation so continue to allow that.
+ */
+static void
+YbCheckCollationRestrictions(Oid attcollation, Oid opclassoid)
+{
+	HeapTuple	classtup;
+	Form_pg_opclass classform;
+	char	   *opclassname;
+	HeapTuple	collationtup;
+	Form_pg_collation collform;
+	char	   *collname;
+
+	classtup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
+	if (!HeapTupleIsValid(classtup))
+		elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
+	classform = (Form_pg_opclass) GETSTRUCT(classtup);
+	opclassname = NameStr(classform->opcname);
+	if (strcasecmp(opclassname, "bpchar_pattern_ops") == 0 ||
+		strcasecmp(opclassname, "text_pattern_ops") == 0 ||
+		strcasecmp(opclassname, "varchar_pattern_ops") == 0)
+	{
+		collationtup = SearchSysCache1(COLLOID, ObjectIdGetDatum(attcollation));
+		if (!HeapTupleIsValid(collationtup))
+			elog(ERROR, "cache lookup failed for collation %u", attcollation);
+		collform = (Form_pg_collation) GETSTRUCT(collationtup);
+		collname = NameStr(collform->collname);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("could not use operator class \"%s\" with column collation \"%s\"",
+						opclassname, collname),
+				 errhint("Use the COLLATE clause to set \"C\" collation explicitly.")));
+		ReleaseSysCache(collationtup);
+	}
+	ReleaseSysCache(classtup);
+}
+
+/*
  * Compute per-index-column information, including indexed column numbers
  * or index expressions, opclasses and their options. Note, all output vectors
  * should be allocated for all columns, including "including" ones.
@@ -1786,6 +2455,9 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 	Oid			save_userid;
 	int			save_sec_context;
 
+	bool		use_yb_ordering = false;
+	bool		is_colocated = false;
+
 	/* Allocate space for exclusion operator info, if needed */
 	if (exclusionOpNames)
 	{
@@ -1802,14 +2474,71 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 		GetUserIdAndSecContext(&save_userid, &save_sec_context);
 
 	/*
+	 * Get whether the index will use Yugabyte ordering and whather it will be
+	 * colocated.  For now, regarding colocation, the index always follows the
+	 * indexed table, so just figure out whether the indexed table is
+	 * colocated.
+	 *
+	 * Also get whether the index is part of a tablegroup.
+	 */
+	Oid			tablegroupId = InvalidOid;
+
+	if (IsYugaByteEnabled() &&
+		!IsBootstrapProcessingMode() &&
+		!YbIsConnectedToTemplateDb())
+	{
+		Relation	rel = RelationIdGetRelation(relId);
+
+		if (IsYBRelation(rel))
+		{
+			YbcTableProperties yb_props = YbGetTableProperties(rel);
+
+			is_colocated = yb_props->is_colocated;
+			tablegroupId = yb_props->tablegroup_oid;
+			use_yb_ordering = !IsSystemRelation(rel);
+		}
+		RelationClose(rel);
+	}
+
+	/*
 	 * process attributeList
 	 */
+	bool		range_index = false;
+
 	attn = 0;
 	foreach(lc, attList)
 	{
 		IndexElem  *attribute = (IndexElem *) lfirst(lc);
 		Oid			atttype;
 		Oid			attcollation;
+
+		SortByDir	yb_ordering = attribute->ordering;
+
+		if (use_yb_ordering)
+		{
+			yb_ordering =
+				YbSortOrdering(attribute->ordering, is_colocated,
+							   OidIsValid(tablegroupId) /* is_tablegroup */ ,
+							   (attn == 0) /* is_first_key */ );
+
+			if (yb_ordering == SORTBY_DESC || yb_ordering == SORTBY_ASC)
+			{
+				range_index = true;
+			}
+			else if (yb_ordering == SORTBY_HASH)
+			{
+				if (range_index)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							 errmsg("hash column not allowed after an ASC/DESC column")));
+			}
+		}
+		else if (attribute->ordering == SORTBY_HASH)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("unsupported column sort order")));
+		}
 
 		/*
 		 * Process the column-or-expression to be indexed.
@@ -1916,7 +2645,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 			if (attribute->ordering != SORTBY_DEFAULT)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-						 errmsg("including column does not support ASC/DESC options")));
+						 errmsg("including column does not support ASC/DESC/HASH options")));
 			if (attribute->nulls_ordering != SORTBY_NULLS_DEFAULT)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -1990,6 +2719,14 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 										 atttype,
 										 accessMethodName,
 										 accessMethodId);
+
+		/*
+		 * In Yugabyte mode, disallow some built-in operator classes if the column has non-C
+		 * collation.
+		 */
+		if (IsYugaByteEnabled() && YBIsCollationValidNonC(attcollation))
+			YbCheckCollationRestrictions(attcollation, classOidP[attn]);
+
 		if (OidIsValid(ddl_userid))
 		{
 			SetUserIdAndSecContext(save_userid, save_sec_context);
@@ -2085,12 +2822,21 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 			/* default ordering is ASC */
 			if (attribute->ordering == SORTBY_DESC)
 				colOptionP[attn] |= INDOPTION_DESC;
+
+			if (yb_ordering == SORTBY_HASH)
+				colOptionP[attn] |= INDOPTION_HASH;
+
 			/* default null ordering is LAST for ASC, FIRST for DESC */
 			if (attribute->nulls_ordering == SORTBY_NULLS_DEFAULT)
 			{
 				if (attribute->ordering == SORTBY_DESC)
 					colOptionP[attn] |= INDOPTION_NULLS_FIRST;
 			}
+			else if (colOptionP[attn] == INDOPTION_HASH)
+				ereport(NOTICE,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("nulls sort ordering option is ignored, "
+								"NULLS FIRST/NULLS LAST not allowed for a HASH column")));
 			else if (attribute->nulls_ordering == SORTBY_NULLS_FIRST)
 				colOptionP[attn] |= INDOPTION_NULLS_FIRST;
 		}
@@ -2100,7 +2846,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 			if (attribute->ordering != SORTBY_DEFAULT)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("access method \"%s\" does not support ASC/DESC options",
+						 errmsg("access method \"%s\" does not support ASC/DESC/HASH options",
 								accessMethodName)));
 			if (attribute->nulls_ordering != SORTBY_NULLS_DEFAULT)
 				ereport(ERROR,
@@ -2627,6 +3373,12 @@ ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel)
 					 parser_errposition(pstate, opt->location)));
 	}
 
+	/* Yugabyte only support verbose option */
+	if (IsYugaByteEnabled() && (concurrently || tablespacename))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("only REINDEX with VERBOSE option is supported")));
+
 	if (concurrently)
 		PreventInTransactionBlock(isTopLevel,
 								  "REINDEX CONCURRENTLY");
@@ -2738,7 +3490,10 @@ ReindexIndex(RangeVar *indexRelation, ReindexParams *params, bool isTopLevel)
 		ReindexParams newparams = *params;
 
 		newparams.options |= REINDEXOPT_REPORT_PROGRESS;
-		reindex_index(indOid, false, persistence, &newparams);
+		reindex_index(indOid, false, persistence, &newparams,
+					  false /* is_yb_table_rewrite */ ,
+					  true /* yb_copy_split_options */ ,
+					  NULL  /* preserved_index_split_options */ );
 	}
 }
 
@@ -2857,7 +3612,11 @@ ReindexTable(RangeVar *relation, ReindexParams *params, bool isTopLevel)
 		result = reindex_relation(heapOid,
 								  REINDEX_REL_PROCESS_TOAST |
 								  REINDEX_REL_CHECK_CONSTRAINTS,
-								  &newparams);
+								  &newparams,
+								  false /* is_yb_table_rewrite */ ,
+								  true /* yb_copy_split_options */ ,
+								  NIL /* changedIndexNames */ ,
+								  NIL /* changedIndexSplitOpts */ );
 		if (!result)
 			ereport(NOTICE,
 					(errmsg("table \"%s\" has no indexes to reindex",
@@ -3202,8 +3961,16 @@ ReindexMultipleInternal(List *relids, ReindexParams *params)
 {
 	ListCell   *l;
 
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+	/*
+	 * YB: Handle the commit later while starting the new transaction. See the
+	 * call to YbCommitTransactionCommandIntermediate at the start of the loop
+	 * below.
+	 */
+	if (!IsYugaByteEnabled())
+	{
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
 
 	foreach(l, relids)
 	{
@@ -3211,7 +3978,14 @@ ReindexMultipleInternal(List *relids, ReindexParams *params)
 		char		relkind;
 		char		relpersistence;
 
-		StartTransactionCommand();
+		/*
+		 * YB: Commit the earlier transaction remembering the ddl state, start a
+		 * new one and set the stored ddl state.
+		 */
+		if (IsYugaByteEnabled())
+			YbCommitTransactionCommandIntermediate();
+		else
+			StartTransactionCommand();
 
 		/* functions in indexes may want a snapshot set */
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -3219,8 +3993,15 @@ ReindexMultipleInternal(List *relids, ReindexParams *params)
 		/* check if the relation still exists */
 		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
 		{
-			PopActiveSnapshot();
-			CommitTransactionCommand();
+			/*
+			 * YbCommitTransactionCommandIntermediate call in the next iteration
+			 * or after the loop will take care of the pop & commit.
+			 */
+			if (!IsYugaByteEnabled())
+			{
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+			}
 			continue;
 		}
 
@@ -3266,8 +4047,17 @@ ReindexMultipleInternal(List *relids, ReindexParams *params)
 
 			newparams.options |=
 				REINDEXOPT_REPORT_PROGRESS | REINDEXOPT_MISSING_OK;
-			reindex_index(relid, false, relpersistence, &newparams);
-			PopActiveSnapshot();
+			reindex_index(relid, false, relpersistence, &newparams,
+						  false /* is_yb_table_rewrite */ ,
+						  true /* yb_copy_split_options */ ,
+						  NULL /* preserved_index_split_options */ );
+
+			/*
+			 * YbCommitTransactionCommandIntermediate call in the next iteration
+			 * or after the loop will take care of the pop.
+			 */
+			if (!IsYugaByteEnabled())
+				PopActiveSnapshot();
 			/* reindex_index() does the verbose output */
 		}
 		else
@@ -3280,7 +4070,11 @@ ReindexMultipleInternal(List *relids, ReindexParams *params)
 			result = reindex_relation(relid,
 									  REINDEX_REL_PROCESS_TOAST |
 									  REINDEX_REL_CHECK_CONSTRAINTS,
-									  &newparams);
+									  &newparams,
+									  false /* is_yb_table_rewrite */ ,
+									  true /* yb_copy_split_options */ ,
+									  NIL /* changedIndexNames */ ,
+									  NIL /* changedIndexSplitOpts */ );
 
 			if (result && (params->options & REINDEXOPT_VERBOSE) != 0)
 				ereport(INFO,
@@ -3288,13 +4082,26 @@ ReindexMultipleInternal(List *relids, ReindexParams *params)
 								get_namespace_name(get_rel_namespace(relid)),
 								get_rel_name(relid))));
 
-			PopActiveSnapshot();
+			/*
+			 * YbCommitTransactionCommandIntermediate call in the next iteration
+			 * or after the loop will take care of the pop.
+			 */
+			if (!IsYugaByteEnabled())
+				PopActiveSnapshot();
 		}
 
-		CommitTransactionCommand();
+		/*
+		 * YbCommitTransactionCommandIntermediate call in the next iteration or
+		 * after the loop will take care of the commit.
+		 */
+		if (!IsYugaByteEnabled())
+			CommitTransactionCommand();
 	}
 
-	StartTransactionCommand();
+	if (IsYugaByteEnabled())
+		YbCommitTransactionCommandIntermediate();
+	else
+		StartTransactionCommand();
 }
 
 
@@ -4215,7 +5022,7 @@ IndexSetParentIndex(Relation partitionIdx, Oid parentOid)
 			/*
 			 * There exists a pg_inherits row, which we want to clear; do so.
 			 */
-			CatalogTupleDelete(pg_inherits, &tuple->t_self);
+			CatalogTupleDelete(pg_inherits, tuple);
 			fix_dependencies = true;
 		}
 		else
@@ -4253,6 +5060,17 @@ IndexSetParentIndex(Relation partitionIdx, Oid parentOid)
 
 	if (fix_dependencies)
 	{
+		if (IsYugaByteEnabled())
+		{
+			/*
+			* YB Note: If setting index parent, invalidate the entry for the
+			* parent table in the pg_inherits cache as the parent now has a new
+			* child. If clearing the entry for the child, then invalidate the
+			* entry in the cache pertaining to the child and its old parent.
+			*/
+			YbPgInheritsCacheInvalidate(OidIsValid(parentOid) ? parentOid : partRelid);
+		}
+
 		/*
 		 * Insert/delete pg_depend rows.  If setting a parent, add PARTITION
 		 * dependencies on the parent index and the table; if removing a
@@ -4344,4 +5162,106 @@ set_indexsafe_procflags(void)
 	MyProc->statusFlags |= PROC_IN_SAFE_IC;
 	ProcGlobal->statusFlags[MyProc->pgxactoff] = MyProc->statusFlags;
 	LWLockRelease(ProcArrayLock);
+}
+
+static void
+YbWaitForBackendsCatalogVersion()
+{
+	if (yb_disable_wait_for_backends_catalog_version)
+		return;
+
+	/*
+	 * We don't get the current catalog version after
+	 * YBDecrementDdlNestingLevel(), so we have to send another RPC to fetch
+	 * it.  This is needed because YbGetCatalogCacheVersion() may be behind in
+	 * case other DDLs happened concurrently.  This also means the version we
+	 * are waiting on may be higher than necessary in case other DDLs finished
+	 * before we collect the version.
+	 */
+	uint64_t	catalog_version = YbGetMasterCatalogVersion();
+
+	Assert(catalog_version >= YbGetCatalogCacheVersion());
+
+	int			num_lagging_backends = -1;
+	int			retries_left = 10;
+	const TimestampTz start = GetCurrentTimestamp();
+
+	while (num_lagging_backends != 0)
+	{
+		if (yb_wait_for_backends_catalog_version_timeout > 0 &&
+			TimestampDifferenceExceeds(start,
+									   GetCurrentTimestamp(),
+									   yb_wait_for_backends_catalog_version_timeout))
+		{
+			if (num_lagging_backends > 0)
+				/*
+				 * Note: keep the errhint query in sync with the actual query
+				 * internally used
+				 * (TabletServiceAdminImpl::WaitForYsqlBackendsCatalogVersion
+				 * at the time of writing).
+				 */
+				ereport(ERROR,
+						(errmsg("timed out waiting for postgres backends to catch"
+								" up"),
+						 errdetail("%d backends on database %u are still behind"
+								   " catalog version %" PRIu64 ".",
+								   num_lagging_backends,
+								   MyDatabaseId,
+								   catalog_version),
+						 errhint("Run the following query on all tservers to find"
+								 " the lagging backends: SELECT * FROM"
+								 " pg_stat_activity WHERE"
+								 " backend_type != 'walsender' AND"
+								 " backend_type != 'yb-conn-mgr walsender' AND"
+								 " backend_type != 'yb auto analyze backend' AND"
+								 " catalog_version < %" PRIu64
+								 " AND datid = %u;",
+								 catalog_version,
+								 MyDatabaseId)));
+			else
+			{
+				Assert(num_lagging_backends == -1);
+				ereport(ERROR,
+						(errmsg("timed out waiting for postgres backends to catch"
+								" up"),
+						 errdetail("Failed to determine how many backends on"
+								   " database %u are still behind"
+								   " catalog version %" PRIu64 ".",
+								   MyDatabaseId,
+								   catalog_version)));
+			}
+		}
+
+		YbcStatus	s = YBCPgWaitForBackendsCatalogVersion(MyDatabaseId,
+														   catalog_version,
+														   MyProcPid,
+														   &num_lagging_backends);
+
+		if (!s)					/* ok */
+			continue;
+		if (YBCStatusIsTryAgain(s))
+		{
+			YBCFreeStatus(s);
+			continue;
+		}
+		/*
+		 * TODO(#5030): there is a bug where master commits a catalog
+		 * version bump and the following read doesn't pick it up.  This is
+		 * short-lived, so there only needs to be a few retries.
+		 */
+		const char *msg = YBCStatusMessageBegin(s);
+
+		if (strstr(msg, "Requested catalog version is too high"))
+		{
+			elog((retries_left > 3 ? DEBUG1 : NOTICE),
+				 "Retrying wait for backends catalog version: %s",
+				 msg);
+			if (retries_left-- > 0)
+			{
+				YBCFreeStatus(s);
+				continue;
+			}
+		}
+		HandleYBStatus(s);
+	}
 }

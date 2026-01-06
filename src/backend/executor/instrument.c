@@ -164,6 +164,46 @@ InstrEndLoop(Instrumentation *instr)
 	instr->tuplecount = 0;
 }
 
+/* aggregate instrumentation information held in a YbRpcStats structure */
+static void
+InstrAggYbPgRpcStats(YbPgRpcStats *dst, YbPgRpcStats *add)
+{
+	dst->count += add->count;
+	dst->rows_scanned += add->rows_scanned;
+	dst->wait_time += add->wait_time;
+}
+
+static void
+YbInstrAggRpcMetrics(YbcPgExecStorageMetrics **dst, YbcPgExecStorageMetrics *add)
+{
+	if (!add)
+		return;
+
+	/* Aggregate metrics */
+	if (add->version == 0)
+		return;
+
+	if (*dst == NULL)
+		*dst = (YbcPgExecStorageMetrics *) palloc0(sizeof(YbcPgExecStorageMetrics));
+
+	for (int i = 0; i < YB_STORAGE_GAUGE_COUNT; i++)
+		(*dst)->gauges[i] += add->gauges[i];
+
+	for (int i = 0; i < YB_STORAGE_COUNTER_COUNT; i++)
+		(*dst)->counters[i] += add->counters[i];
+
+	for (int i = 0; i < YB_STORAGE_EVENT_COUNT; i++)
+	{
+		YbcPgExecEventMetric *add_event = &add->events[i];
+		YbcPgExecEventMetric *dst_event = &(*dst)->events[i];
+
+		dst_event->sum += add_event->sum;
+		dst_event->count += add_event->count;
+	}
+
+	(*dst)->version += add->version;
+}
+
 /* aggregate instrumentation information */
 void
 InstrAggNode(Instrumentation *dst, Instrumentation *add)
@@ -193,6 +233,21 @@ InstrAggNode(Instrumentation *dst, Instrumentation *add)
 
 	if (dst->need_walusage)
 		WalUsageAdd(&dst->walusage, &add->walusage);
+
+	/* Add Yugabyte specific instrumentation information */
+	InstrAggYbPgRpcStats(&dst->yb_instr.tbl_reads, &add->yb_instr.tbl_reads);
+	InstrAggYbPgRpcStats(&dst->yb_instr.index_reads, &add->yb_instr.index_reads);
+	InstrAggYbPgRpcStats(&dst->yb_instr.catalog_reads, &add->yb_instr.catalog_reads);
+	InstrAggYbPgRpcStats(&dst->yb_instr.write_flushes, &add->yb_instr.write_flushes);
+	dst->yb_instr.tbl_writes += add->yb_instr.tbl_writes;
+	dst->yb_instr.index_writes += add->yb_instr.index_writes;
+	dst->yb_instr.catalog_writes += add->yb_instr.catalog_writes;
+
+	/* Aggregate metrics */
+	YbInstrAggRpcMetrics(&dst->yb_instr.read_metrics, add->yb_instr.read_metrics);
+	YbInstrAggRpcMetrics(&dst->yb_instr.write_metrics, add->yb_instr.write_metrics);
+
+	dst->yb_instr.rows_removed_by_recheck += add->yb_instr.rows_removed_by_recheck;
 }
 
 /* note current values during parallel executor startup */

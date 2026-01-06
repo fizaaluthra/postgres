@@ -31,6 +31,9 @@
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 
+/* YB includes */
+#include "catalog/pg_yb_tablegroup.h"
+
 /*
  * Variables for mapping DumpId to DumpableObject
  */
@@ -126,6 +129,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	int			numDefaultACLs;
 	int			numEventTriggers;
 
+	int			numTablegroups;
+
 	/*
 	 * We must read extensions and extension membership info first, because
 	 * extension membership needs to be consultable during decisions about
@@ -170,6 +175,10 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 
 	pg_log_info("reading user-defined access methods");
 	getAccessMethods(fout, &numAccessMethods);
+
+	/* YB */
+	pg_log_info("reading user-defined tablegroups");
+	(void) getTablegroups(fout, &numTablegroups);
 
 	pg_log_info("reading user-defined operator classes");
 	getOpclasses(fout, &numOpclasses);
@@ -564,7 +573,14 @@ flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
 			}
 
 			/* Remove generation expression from child */
-			if (foundGenerated && !tbinfo->ispartition && !dopt->binary_upgrade)
+			/*
+			 * YB: For backups, dump inheritance children
+			 * the same way as PG binary upgrade  - child table
+			 * schema with all columns, including inherited columns,
+			 * is fully output first and inheritance is established later.
+			 */
+			if (foundGenerated && !tbinfo->ispartition &&
+				!dopt->binary_upgrade && !dopt->include_yb_metadata)
 				tbinfo->attrdefs[j] = NULL;
 		}
 	}
@@ -903,6 +919,24 @@ findExtensionByOid(Oid oid)
 	dobj = findObjectByCatalogId(catId);
 	Assert(dobj == NULL || dobj->objType == DO_EXTENSION);
 	return (ExtensionInfo *) dobj;
+}
+
+/*
+ * findTablegroupByOid
+ *	  finds the DumpableObject for the tablegroup with the given oid
+ *	  returns NULL if not found
+ */
+YbTablegroupInfo *
+findTablegroupByOid(Oid oid)
+{
+	CatalogId	catId;
+	DumpableObject *dobj;
+
+	catId.tableoid = YbTablegroupRelationId;
+	catId.oid = oid;
+	dobj = findObjectByCatalogId(catId);
+	Assert(dobj == NULL || dobj->objType == DO_TABLEGROUP);
+	return (YbTablegroupInfo *) dobj;
 }
 
 /*

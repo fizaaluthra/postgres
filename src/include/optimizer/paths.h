@@ -16,6 +16,9 @@
 
 #include "nodes/pathnodes.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * allpaths.c
@@ -46,6 +49,9 @@ typedef RelOptInfo *(*join_search_hook_type) (PlannerInfo *root,
 											  int levels_needed,
 											  List *initial_rels);
 extern PGDLLIMPORT join_search_hook_type join_search_hook;
+
+/* YB */
+extern PGDLLIMPORT bool yb_enable_optimizer_statistics;
 
 
 extern RelOptInfo *make_one_rel(PlannerInfo *root, List *joinlist);
@@ -186,6 +192,7 @@ extern bool eclass_useful_for_merging(PlannerInfo *root,
 extern bool is_redundant_derived_clause(RestrictInfo *rinfo, List *clauselist);
 extern bool is_redundant_with_indexclauses(RestrictInfo *rinfo,
 										   List *indexclauses);
+extern EquivalenceMember *yb_find_ec_member_for_var(PlannerInfo *root, Var *var, Index relid, Index target_relid);
 
 /*
  * pathkeys.c
@@ -212,7 +219,8 @@ extern Path *get_cheapest_fractional_path_for_pathkeys(List *paths,
 													   double fraction);
 extern Path *get_cheapest_parallel_safe_total_inner(List *paths);
 extern List *build_index_pathkeys(PlannerInfo *root, IndexOptInfo *index,
-								  ScanDirection scandir);
+								  ScanDirection scandir, int *yb_distinct_nkeys,
+								  List **yb_saop_merge_saop_cols);
 extern List *build_partition_pathkeys(PlannerInfo *root, RelOptInfo *partrel,
 									  ScanDirection scandir, bool *partialkeys);
 extern List *build_expression_pathkey(PlannerInfo *root, Expr *expr,
@@ -246,12 +254,39 @@ extern List *trim_mergeclauses_for_inner_pathkeys(PlannerInfo *root,
 												  List *pathkeys);
 extern List *truncate_useless_pathkeys(PlannerInfo *root,
 									   RelOptInfo *rel,
-									   List *pathkeys);
+									   List *pathkeys,
+									   int yb_distinct_nkeys);
 extern bool has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel);
 extern PathKey *make_canonical_pathkey(PlannerInfo *root,
 									   EquivalenceClass *eclass, Oid opfamily,
 									   int strategy, bool nulls_first);
 extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 									List *live_childrels);
+
+/* YB */
+extern int	yb_compute_parallel_worker(RelOptInfo *rel,
+									   YbTableDistribution yb_dist, int max_workers);
+extern void ybTraceRelOptInfo(PlannerInfo *root, RelOptInfo *relOptInfo, char *msg);
+extern void ybTraceRelOptInfoList(PlannerInfo *root, List *relOptInfoList, char *msg);
+extern void ybTraceRelds(PlannerInfo *root, Relids relids, char *msg);
+extern void ybTracePath(PlannerInfo *root, Path *path, char *msg);
+extern void ybTracePathList(PlannerInfo *root, List *pathList, char *msg);
+extern bool ybFindHintedJoin(PlannerInfo *root, Relids relIds1, Relids relIds2, bool trySwapped);
+extern bool ybFindProhibitedJoin(PlannerInfo *root, NodeTag joinTag, Relids joinRelids);
+extern void ybBuildRelOptInfoString(PlannerInfo *root, RelOptInfo *relOptInfo, StringInfoData *buf);
+extern void ybBuildRelidsString(PlannerInfo *root, Relids relids, StringInfoData *buf);
+extern void ybTraceCheapestPaths(RelOptInfo *rel, char *msg);
+extern Relids yb_get_batched_relids(NestPath *nest);
+extern Relids yb_get_unbatched_relids(NestPath *nest);
+extern bool yb_is_outer_inner_batched(Path *outer, Path *inner);
+extern bool yb_is_nestloop_batched(NestPath *nest);
+extern bool yb_reject_distinct_pushdown(Node *expr);
+extern List *yb_get_uniqkeys(IndexOptInfo *index, int prefixlen);
+extern int	yb_calculate_distinct_prefixlen(PlannerInfo *root,
+											IndexOptInfo *index,
+											List *index_clauses);
+extern bool yb_has_sufficient_uniqkeys(PlannerInfo *root, Path *pathnode);
+extern List *yb_get_ecs_for_query_uniqkeys(PlannerInfo *root);
+extern Path *get_singleton_append_subpath(Path *path);
 
 #endif							/* PATHS_H */

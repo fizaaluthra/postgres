@@ -71,6 +71,15 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/util/ybc_guc.h"
+#include "yb/yql/pggate/util/ybc_util.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+#include <inttypes.h>
+
 
 /*
  * GUC parameters
@@ -237,6 +246,110 @@ SnapMgrInit(void)
 	}
 }
 
+void
+YBCheckSnapshotsAllowed(bool check_isolation_level)
+{
+	if (!(*YBCGetGFlags()->ysql_enable_pg_export_snapshot))
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cannot export or import snapshot when "
+						"ysql_enable_pg_export_snapshot is disabled.")));
+
+	if (check_isolation_level)
+	{
+		switch (XactIsoLevel)
+		{
+				/*
+				 * Currently in YSQL, export & import is allowed only in REPEATABLE READ.
+				 */
+			case XACT_READ_COMMITTED:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot export/import snapshot in READ COMMITTED Isolation Level")));
+				break;
+			case XACT_SERIALIZABLE:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot export/import snapshot in SERIALIZABLE Isolation Level")));
+				break;
+		}
+	}
+
+	if (XactDeferrable)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export/import snapshot in DEFERRABLE transaction")));
+
+	if (YbIsBatchedExecution())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export/import a snapshot in Batch Execution.")));
+}
+
+void
+YbInitSnapshot(Snapshot snap, YbOptionalReadPointHandle read_point_handle)
+{
+	snap->xmin = FirstNormalTransactionId;
+	snap->xmax = FirstNormalTransactionId;
+	snap->xcnt = 0;
+	snap->subxcnt = 0;
+	snap->suboverflowed = false;
+	snap->takenDuringRecovery = false;
+	snap->snapshot_type = SNAPSHOT_MVCC;
+	snap->yb_read_point_handle = read_point_handle;
+	snap->yb_is_built_for_export = false;
+}
+
+static int
+YbSnapshotMgmtLogLevel()
+{
+	return yb_debug_log_snapshot_mgmt ? LOG : DEBUG2;
+}
+
+static void
+YBCOnActiveSnapshotChange()
+{
+	const SnapshotData *snap = ActiveSnapshot ? ActiveSnapshot->as_snap : NULL;
+
+	if (snap &&
+		snap->yb_read_point_handle.has_value)
+	{
+		YbcReadPointHandle current_read_point = YBCPgGetCurrentReadPoint();
+
+		if (snap->yb_read_point_handle.value == current_read_point)
+		{
+			elog(YbSnapshotMgmtLogLevel(),
+				 "Avoid restoring read point since it is already set to %" PRIu64, current_read_point);
+			return;
+		}
+		HandleYBStatus(YBCPgRestoreReadPoint(snap->yb_read_point_handle.value));
+	}
+}
+
+void
+YbLogSnapshotData(const char *msg, const SnapshotData *snap, bool log_stack_trace)
+{
+	elog(YbSnapshotMgmtLogLevel(),
+		 "%s read point: %" PRIu64 ", effective isolation level: %d. %s",
+		 msg,
+		 snap->yb_read_point_handle.has_value ? snap->yb_read_point_handle.value : 0,
+		 YBGetEffectivePggateIsolationLevel(),
+		 log_stack_trace ? YBCGetStackTrace() : "");
+}
+
+static void
+YbLogActiveSnapshot(const char *msg, ActiveSnapshotElt *active_snapshot, bool log_stack_trace)
+{
+	if (!active_snapshot)
+	{
+		elog(YbSnapshotMgmtLogLevel(), "%s: <none>", msg);
+		return;
+	}
+
+	elog(YbSnapshotMgmtLogLevel(), "Snapshot operation at level: %d", active_snapshot->as_level);
+	YbLogSnapshotData(msg, active_snapshot->as_snap, log_stack_trace);
+}
+
 /*
  * GetTransactionSnapshot
  *		Get the appropriate snapshot for a new query in a transaction.
@@ -392,6 +505,7 @@ GetCatalogSnapshot(Oid relid)
 	 * This is the primary reason for needing to reset the system caches after
 	 * finishing decoding.
 	 */
+	elog(YbSnapshotMgmtLogLevel(), "GetCatalogSnapshot: relid: %d", relid);
 	if (HistoricSnapshotActive())
 		return HistoricSnapshot;
 
@@ -455,6 +569,8 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 void
 InvalidateCatalogSnapshot(void)
 {
+	elog(YbSnapshotMgmtLogLevel(), "InvalidateCatalogSnapshot %s",
+		yb_debug_log_snapshot_mgmt_stack_trace ? YBCGetStackTrace() : "");
 	if (CatalogSnapshot)
 	{
 		pairingheap_remove(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
@@ -549,6 +665,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	/* NB: curcid should NOT be copied, it's a local matter */
 
 	CurrentSnapshot->snapXactCompletionCount = 0;
+	CurrentSnapshot->yb_read_point_handle = sourcesnap->yb_read_point_handle;
 
 	/*
 	 * Now we have to fix what GetSnapshotData did with MyProc->xmin and
@@ -569,7 +686,14 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 					 errmsg("could not import the requested snapshot"),
 					 errdetail("The source transaction is not running anymore.")));
 	}
-	else if (!ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcevxid))
+	/*
+	 * YB: ProcArrayInstallImportedXmin sets MyProc->xmin and also checks if
+	 * exporting snapshot is alive. In YugabyteDB, we do not need to set xmin
+	 * and also expiry of the exported snapshot has to be checked via an rpc to
+	 * master. So this step is skipped for YugabyteDB.
+	 */
+	else if (!IsYugaByteEnabled() &&
+			 !ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcevxid))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("could not import the requested snapshot"),
@@ -719,6 +843,10 @@ PushActiveSnapshotWithLevel(Snapshot snap, int snap_level)
 	ActiveSnapshot = newactive;
 	if (OldestActiveSnapshot == NULL)
 		OldestActiveSnapshot = ActiveSnapshot;
+
+	YbLogActiveSnapshot("Pushed new active snapshot: ",
+						ActiveSnapshot, yb_debug_log_snapshot_mgmt_stack_trace);
+	YBCOnActiveSnapshotChange();
 }
 
 /*
@@ -781,6 +909,9 @@ PopActiveSnapshot(void)
 
 	Assert(ActiveSnapshot->as_snap->active_count > 0);
 
+	YbLogActiveSnapshot("Pop active snapshot: ",
+						ActiveSnapshot, yb_debug_log_snapshot_mgmt_stack_trace);
+
 	ActiveSnapshot->as_snap->active_count--;
 
 	if (ActiveSnapshot->as_snap->active_count == 0 &&
@@ -792,7 +923,17 @@ PopActiveSnapshot(void)
 	if (ActiveSnapshot == NULL)
 		OldestActiveSnapshot = NULL;
 
+	YbLogActiveSnapshot("Active snapshot after pop: ", ActiveSnapshot, false /* log_stack_trace */ );
+
 	SnapshotResetXmin();
+	YBCOnActiveSnapshotChange();
+}
+
+void
+PopAllActiveSnapshots()
+{
+	while (ActiveSnapshot)
+		PopActiveSnapshot();
 }
 
 /*
@@ -1000,6 +1141,9 @@ AtSubAbort_Snapshot(int level)
 		Assert(ActiveSnapshot->as_snap->active_count >= 1);
 		ActiveSnapshot->as_snap->active_count -= 1;
 
+		YbLogActiveSnapshot("Pop active snapshot for subtransaction abort",
+							ActiveSnapshot, yb_debug_log_snapshot_mgmt_stack_trace);
+
 		if (ActiveSnapshot->as_snap->active_count == 0 &&
 			ActiveSnapshot->as_snap->regd_count == 0)
 			FreeSnapshot(ActiveSnapshot->as_snap);
@@ -1010,9 +1154,13 @@ AtSubAbort_Snapshot(int level)
 		ActiveSnapshot = next;
 		if (ActiveSnapshot == NULL)
 			OldestActiveSnapshot = NULL;
+
+		YbLogActiveSnapshot("Active after pop for subtransaction abort",
+							ActiveSnapshot, false /* log_stack_trace */ );
 	}
 
 	SnapshotResetXmin();
+	YBCOnActiveSnapshotChange();
 }
 
 /*
@@ -1042,6 +1190,9 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	/*
 	 * If we exported any snapshots, clean them up.
 	 */
+	if (IsYugaByteEnabled())
+		YBCPgClearExportedTxnSnapshots();
+
 	if (exportedSnapshots != NIL)
 	{
 		ListCell   *lc;
@@ -1112,12 +1263,27 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	Assert(resetXmin || MyProc->xmin == 0);
 }
 
+static char *
+YBCExportSnapshot(const YbcReadPointHandle *read_point)
+{
+	char	   *snapshot_id = NULL;
+	YbcPgTxnSnapshot snapshot =
+	{.db_id = MyDatabaseId,
+		.iso_level = XactIsoLevel,
+	.read_only = XactReadOnly};
+
+	HandleYBStatus(YBCPgExportSnapshot(&snapshot, &snapshot_id, read_point));
+	return snapshot_id;
+}
 
 /*
  * ExportSnapshot
  *		Export the snapshot to a file so that other backends can import it.
  *		Returns the token (the file name) that can be used to import this
  *		snapshot.
+ *
+ * YB Note:
+ * Returns snapshot_id that can be used to import this snapshot.
  */
 char *
 ExportSnapshot(Snapshot snapshot)
@@ -1133,6 +1299,9 @@ ExportSnapshot(Snapshot snapshot)
 	MemoryContext oldcxt;
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
+
+	if (IsYugaByteEnabled())
+		YBCheckSnapshotsAllowed(true /* check_isolation_level */ );
 
 	/*
 	 * It's tempting to call RequireTransactionBlock here, since it's not very
@@ -1163,6 +1332,10 @@ ExportSnapshot(Snapshot snapshot)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("cannot export a snapshot from a subtransaction")));
 
+	if (IsYugaByteEnabled())
+		return YBCExportSnapshot(snapshot->yb_is_built_for_export &&
+								 snapshot->yb_read_point_handle.has_value ?
+								 &snapshot->yb_read_point_handle.value : NULL);
 	/*
 	 * We do however allow previous committed subtransactions to exist.
 	 * Importers of the snapshot must see them as still running, so get their
@@ -1406,6 +1579,9 @@ ImportSnapshot(const char *idstr)
 	bool		src_readonly;
 	SnapshotData snapshot;
 
+	if (IsYugaByteEnabled())
+		YBCheckSnapshotsAllowed(true /* check_isolation_level */ );
+
 	/*
 	 * Must be at top level of a fresh transaction.  Note in particular that
 	 * we check we haven't acquired an XID --- if we have, it's conceivable
@@ -1428,102 +1604,126 @@ ImportSnapshot(const char *idstr)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ")));
 
-	/*
-	 * Verify the identifier: only 0-9, A-F and hyphens are allowed.  We do
-	 * this mainly to prevent reading arbitrary files.
-	 */
-	if (strspn(idstr, "0123456789ABCDEF-") != strlen(idstr))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
 
-	/* OK, read the file */
-	snprintf(path, MAXPGPATH, SNAPSHOT_EXPORT_DIR "/%s", idstr);
-
-	f = AllocateFile(path, PG_BINARY_R);
-	if (!f)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
-
-	/* get the size of the file so that we know how much memory we need */
-	if (fstat(fileno(f), &stat_buf))
-		elog(ERROR, "could not stat file \"%s\": %m", path);
-
-	/* and read the file into a palloc'd string */
-	filebuf = (char *) palloc(stat_buf.st_size + 1);
-	if (fread(filebuf, stat_buf.st_size, 1, f) != 1)
-		elog(ERROR, "could not read file \"%s\": %m", path);
-
-	filebuf[stat_buf.st_size] = '\0';
-
-	FreeFile(f);
-
-	/*
-	 * Construct a snapshot struct by parsing the file content.
-	 */
-	memset(&snapshot, 0, sizeof(snapshot));
-
-	parseVxidFromText("vxid:", &filebuf, path, &src_vxid);
-	src_pid = parseIntFromText("pid:", &filebuf, path);
-	/* we abuse parseXidFromText a bit here ... */
-	src_dbid = parseXidFromText("dbid:", &filebuf, path);
-	src_isolevel = parseIntFromText("iso:", &filebuf, path);
-	src_readonly = parseIntFromText("ro:", &filebuf, path);
-
-	snapshot.snapshot_type = SNAPSHOT_MVCC;
-
-	snapshot.xmin = parseXidFromText("xmin:", &filebuf, path);
-	snapshot.xmax = parseXidFromText("xmax:", &filebuf, path);
-
-	snapshot.xcnt = xcnt = parseIntFromText("xcnt:", &filebuf, path);
-
-	/* sanity-check the xid count before palloc */
-	if (xcnt < 0 || xcnt > GetMaxSnapshotXidCount())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid snapshot data in file \"%s\"", path)));
-
-	snapshot.xip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
-	for (i = 0; i < xcnt; i++)
-		snapshot.xip[i] = parseXidFromText("xip:", &filebuf, path);
-
-	snapshot.suboverflowed = parseIntFromText("sof:", &filebuf, path);
-
-	if (!snapshot.suboverflowed)
+	if (IsYugaByteEnabled())
 	{
-		snapshot.subxcnt = xcnt = parseIntFromText("sxcnt:", &filebuf, path);
+		/*
+		 * Verify the identifier: only 0-9, a-f and hyphens are allowed.  We do
+		 * this mainly to prevent reading arbitrary snapshot names.
+		 */
+		if (strspn(idstr, "0123456789abcdef-") != strlen(idstr))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
+
+		YbcPgTxnSnapshot yb_snapshot = {};
+
+		HandleYBStatus(YBCPgImportSnapshot(idstr, &yb_snapshot));
+		src_dbid = yb_snapshot.db_id;
+		src_isolevel = yb_snapshot.iso_level;
+		src_readonly = yb_snapshot.read_only;
+		memset(&snapshot, 0, sizeof(snapshot));
+		YbInitSnapshot(&snapshot, YbBuildCurrentReadPointHandle());
+	}
+	else
+	{
+		/*
+		 * Verify the identifier: only 0-9, A-F and hyphens are allowed.  We do
+		 * this mainly to prevent reading arbitrary files.
+		 */
+		if (strspn(idstr, "0123456789ABCDEF-") != strlen(idstr))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
+
+		/* OK, read the file */
+		snprintf(path, MAXPGPATH, SNAPSHOT_EXPORT_DIR "/%s", idstr);
+
+		f = AllocateFile(path, PG_BINARY_R);
+		if (!f)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
+
+		/* get the size of the file so that we know how much memory we need */
+		if (fstat(fileno(f), &stat_buf))
+			elog(ERROR, "could not stat file \"%s\": %m", path);
+
+		/* and read the file into a palloc'd string */
+		filebuf = (char *) palloc(stat_buf.st_size + 1);
+		if (fread(filebuf, stat_buf.st_size, 1, f) != 1)
+			elog(ERROR, "could not read file \"%s\": %m", path);
+
+		filebuf[stat_buf.st_size] = '\0';
+
+		FreeFile(f);
+
+		/*
+		 * Construct a snapshot struct by parsing the file content.
+		 */
+		memset(&snapshot, 0, sizeof(snapshot));
+
+		parseVxidFromText("vxid:", &filebuf, path, &src_vxid);
+		src_pid = parseIntFromText("pid:", &filebuf, path);
+		/* we abuse parseXidFromText a bit here ... */
+		src_dbid = parseXidFromText("dbid:", &filebuf, path);
+		src_isolevel = parseIntFromText("iso:", &filebuf, path);
+		src_readonly = parseIntFromText("ro:", &filebuf, path);
+
+		snapshot.snapshot_type = SNAPSHOT_MVCC;
+
+		snapshot.xmin = parseXidFromText("xmin:", &filebuf, path);
+		snapshot.xmax = parseXidFromText("xmax:", &filebuf, path);
+
+		snapshot.xcnt = xcnt = parseIntFromText("xcnt:", &filebuf, path);
 
 		/* sanity-check the xid count before palloc */
-		if (xcnt < 0 || xcnt > GetMaxSnapshotSubxidCount())
+		if (xcnt < 0 || xcnt > GetMaxSnapshotXidCount())
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid snapshot data in file \"%s\"", path)));
 
-		snapshot.subxip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
+		snapshot.xip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
 		for (i = 0; i < xcnt; i++)
-			snapshot.subxip[i] = parseXidFromText("sxp:", &filebuf, path);
-	}
-	else
-	{
-		snapshot.subxcnt = 0;
-		snapshot.subxip = NULL;
-	}
+			snapshot.xip[i] = parseXidFromText("xip:", &filebuf, path);
 
-	snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
+		snapshot.suboverflowed = parseIntFromText("sof:", &filebuf, path);
 
-	/*
-	 * Do some additional sanity checking, just to protect ourselves.  We
-	 * don't trouble to check the array elements, just the most critical
-	 * fields.
-	 */
-	if (!VirtualTransactionIdIsValid(src_vxid) ||
-		!OidIsValid(src_dbid) ||
-		!TransactionIdIsNormal(snapshot.xmin) ||
-		!TransactionIdIsNormal(snapshot.xmax))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid snapshot data in file \"%s\"", path)));
+		if (!snapshot.suboverflowed)
+		{
+			snapshot.subxcnt = xcnt = parseIntFromText("sxcnt:", &filebuf, path);
+
+			/* sanity-check the xid count before palloc */
+			if (xcnt < 0 || xcnt > GetMaxSnapshotSubxidCount())
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid snapshot data in file \"%s\"", path)));
+
+			snapshot.subxip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
+			for (i = 0; i < xcnt; i++)
+				snapshot.subxip[i] = parseXidFromText("sxp:", &filebuf, path);
+		}
+		else
+		{
+			snapshot.subxcnt = 0;
+			snapshot.subxip = NULL;
+		}
+
+		snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
+
+		/*
+		 * Do some additional sanity checking, just to protect ourselves.  We
+		 * don't trouble to check the array elements, just the most critical
+		 * fields.
+		 */
+		if (!VirtualTransactionIdIsValid(src_vxid) ||
+			!OidIsValid(src_dbid) ||
+			!TransactionIdIsNormal(snapshot.xmin) ||
+			!TransactionIdIsNormal(snapshot.xmax))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid snapshot data in file \"%s\"", path)));
+	}
 
 	/*
 	 * If we're serializable, the source transaction must be too, otherwise
@@ -1568,6 +1768,9 @@ ImportSnapshot(const char *idstr)
 bool
 XactHasExportedSnapshots(void)
 {
+	if (IsYugaByteEnabled())
+		return YBCPgHasExportedSnapshots();
+
 	return (exportedSnapshots != NIL);
 }
 
@@ -2233,6 +2436,7 @@ RestoreSnapshot(char *start_address)
 	snapshot->whenTaken = serialized_snapshot.whenTaken;
 	snapshot->lsn = serialized_snapshot.lsn;
 	snapshot->snapXactCompletionCount = 0;
+	snapshot->yb_read_point_handle = YbBuildCurrentReadPointHandle();
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)
@@ -2391,4 +2595,25 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 	}
 
 	return false;
+}
+
+YbcReadPointHandle
+YbGetCatalogSnapshotReadPoint(YbcPgOid table_oid, bool create_if_not_exists)
+{
+	if (create_if_not_exists)
+		GetCatalogSnapshot(table_oid);
+	return CatalogSnapshotData.yb_read_point_handle.has_value ?
+		CatalogSnapshotData.yb_read_point_handle.value : YbcInvalidReadPointHandle;
+}
+
+void
+YbInvalidateCatalogSnapshot(void)
+{
+	if (YBCIsLegacyModeForCatalogOps())
+	{
+		YBCPgResetCatalogReadTime();
+		return;
+	}
+
+	InvalidateCatalogSnapshot();
 }

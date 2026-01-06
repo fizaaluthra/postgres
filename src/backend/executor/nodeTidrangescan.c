@@ -24,6 +24,9 @@
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "utils/builtins.h"
+
 
 #define IsCTIDVar(node)  \
 	((node) != NULL && \
@@ -76,12 +79,14 @@ MakeTidOpExpr(OpExpr *expr, TidRangeScanState *tidstate)
 		case TIDLessEqOperator:
 			tidopexpr->inclusive = true;
 			/* fall through */
+			yb_switch_fallthrough();
 		case TIDLessOperator:
 			tidopexpr->exprtype = invert ? TIDEXPR_LOWER_BOUND : TIDEXPR_UPPER_BOUND;
 			break;
 		case TIDGreaterEqOperator:
 			tidopexpr->inclusive = true;
 			/* fall through */
+			yb_switch_fallthrough();
 		case TIDGreaterOperator:
 			tidopexpr->exprtype = invert ? TIDEXPR_UPPER_BOUND : TIDEXPR_LOWER_BOUND;
 			break;

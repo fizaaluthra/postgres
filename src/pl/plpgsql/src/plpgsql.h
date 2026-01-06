@@ -898,6 +898,12 @@ typedef struct PLpgSQL_stmt_execsql
 	bool		into;			/* INTO supplied? */
 	bool		strict;			/* INTO STRICT flag */
 	PLpgSQL_variable *target;	/* INTO target (record or row) */
+
+	/* YB fields */
+	/* are write buffers required to be flushed before stmt execution? */
+	bool		yb_flush_before_stmt;
+	bool		yb_flush_before_stmt_set;	/* is yb_flush_before_stmt valid
+											 * yet? */
 } PLpgSQL_stmt_execsql;
 
 /*
@@ -1012,6 +1018,11 @@ typedef struct PLpgSQL_function
 	/* these fields change when the function is used */
 	struct PLpgSQL_execstate *cur_estate;
 	unsigned long use_count;
+
+	/* YB */
+	uint64		yb_catalog_version; /* Catalog version when this function was
+									 * compiled */
+	bool		yb_invalid; /* this function is now invalid */
 } PLpgSQL_function;
 
 /*

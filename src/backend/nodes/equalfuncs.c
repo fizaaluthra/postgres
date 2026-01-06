@@ -187,6 +187,13 @@ _equalVar(const Var *a, const Var *b)
 }
 
 static bool
+_equalYbBatchedExpr(const YbBatchedExpr *a, const YbBatchedExpr *b)
+{
+	COMPARE_NODE_FIELD(orig_expr);
+	return true;
+}
+
+static bool
 _equalConst(const Const *a, const Const *b)
 {
 	COMPARE_SCALAR_FIELD(consttype);
@@ -1313,8 +1320,10 @@ _equalCreateStmt(const CreateStmt *a, const CreateStmt *b)
 	COMPARE_NODE_FIELD(options);
 	COMPARE_SCALAR_FIELD(oncommit);
 	COMPARE_STRING_FIELD(tablespacename);
+	COMPARE_STRING_FIELD(tablegroupname);
 	COMPARE_STRING_FIELD(accessMethod);
 	COMPARE_SCALAR_FIELD(if_not_exists);
+	COMPARE_NODE_FIELD(split_options);
 
 	return true;
 }
@@ -1897,6 +1906,32 @@ _equalDiscardStmt(const DiscardStmt *a, const DiscardStmt *b)
 }
 
 static bool
+_equalCreateProfileStmt(const YbCreateProfileStmt *a, const YbCreateProfileStmt *b)
+{
+	COMPARE_STRING_FIELD(prfname);
+	COMPARE_SCALAR_FIELD(prffailedloginattempts);
+	return true;
+}
+
+static bool
+_equalDropProfileStmt(const YbDropProfileStmt *a, const YbDropProfileStmt *b)
+{
+	COMPARE_STRING_FIELD(prfname);
+	COMPARE_SCALAR_FIELD(missing_ok);
+	return true;
+}
+
+static bool
+_equalYbCreateTableGroupStmt(const YbCreateTableGroupStmt *a, const YbCreateTableGroupStmt *b)
+{
+	COMPARE_STRING_FIELD(tablegroupname);
+	COMPARE_STRING_FIELD(tablespacename);
+	COMPARE_NODE_FIELD(owner);
+	COMPARE_NODE_FIELD(options);
+	return true;
+}
+
+static bool
 _equalCreateTableSpaceStmt(const CreateTableSpaceStmt *a, const CreateTableSpaceStmt *b)
 {
 	COMPARE_STRING_FIELD(tablespacename);
@@ -1936,6 +1971,8 @@ _equalAlterTableMoveAllStmt(const AlterTableMoveAllStmt *a,
 	COMPARE_NODE_FIELD(roles);
 	COMPARE_STRING_FIELD(new_tablespacename);
 	COMPARE_SCALAR_FIELD(nowait);
+	COMPARE_NODE_FIELD(yb_relation);
+	COMPARE_SCALAR_FIELD(yb_cascade);
 
 	return true;
 }
@@ -2756,6 +2793,7 @@ _equalConstraint(const Constraint *a, const Constraint *b)
 	COMPARE_SCALAR_FIELD(old_pktable_oid);
 	COMPARE_SCALAR_FIELD(skip_validation);
 	COMPARE_SCALAR_FIELD(initially_valid);
+	COMPARE_NODE_FIELD(yb_index_params);
 
 	return true;
 }
@@ -3215,6 +3253,63 @@ _equalBitString(const BitString *a, const BitString *b)
 	return true;
 }
 
+static bool
+_equalYbBackfillIndexStmt(const YbBackfillIndexStmt *a, const YbBackfillIndexStmt *b)
+{
+	COMPARE_SCALAR_FIELD(oid_list);
+	COMPARE_NODE_FIELD(bfinfo);
+	return true;
+}
+
+static bool
+_equalYbBackfillInfo(const YbBackfillInfo *a, const YbBackfillInfo *b)
+{
+	COMPARE_STRING_FIELD(bfinstr);
+	COMPARE_SCALAR_FIELD(read_time);
+	COMPARE_NODE_FIELD(row_bounds);
+	return true;
+}
+
+static bool
+_equalYbRowBounds(const YbRowBounds *a, const YbRowBounds *b)
+{
+	COMPARE_STRING_FIELD(partition_key);
+	COMPARE_STRING_FIELD(row_key_start);
+	COMPARE_STRING_FIELD(row_key_end);
+	return true;
+}
+
+static bool
+_equalYbExprColrefDesc(const YbExprColrefDesc *a, const YbExprColrefDesc *b)
+{
+	COMPARE_SCALAR_FIELD(attno);
+	COMPARE_SCALAR_FIELD(typid);
+	COMPARE_SCALAR_FIELD(typmod);
+	COMPARE_SCALAR_FIELD(collid);
+	return true;
+}
+
+static bool
+_equalYbSkippableEntities(const YbSkippableEntities *a, const YbSkippableEntities *b)
+{
+	COMPARE_NODE_FIELD(index_list);
+	COMPARE_NODE_FIELD(referencing_fkey_list);
+	COMPARE_NODE_FIELD(referenced_fkey_list);
+	return true;
+}
+
+static bool
+_equalYbUpdateAffectedEntities(const YbUpdateAffectedEntities *a,
+							   const YbUpdateAffectedEntities *b)
+{
+	COMPARE_SCALAR_FIELD(matrix.nrows);
+	COMPARE_SCALAR_FIELD(matrix.ncols);
+	COMPARE_POINTER_FIELD(entity_list, a->matrix.ncols * sizeof(struct YbUpdateEntity));
+	COMPARE_POINTER_FIELD(col_info_list, a->matrix.nrows * sizeof(struct YbUpdateColInfo));
+	COMPARE_BITMAPSET_FIELD(matrix.data);
+	return true;
+}
+
 /*
  * equal
  *	  returns whether two nodes are equal
@@ -3261,6 +3356,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_Var:
 			retval = _equalVar(a, b);
+			break;
+		case T_YbBatchedExpr:
+			retval = _equalYbBatchedExpr(a, b);
 			break;
 		case T_Const:
 			retval = _equalConst(a, b);
@@ -3683,6 +3781,15 @@ equal(const void *a, const void *b)
 		case T_DiscardStmt:
 			retval = _equalDiscardStmt(a, b);
 			break;
+		case T_YbCreateProfileStmt:
+			retval = _equalCreateProfileStmt(a, b);
+			break;
+		case T_YbDropProfileStmt:
+			retval = _equalDropProfileStmt(a, b);
+			break;
+		case T_YbCreateTableGroupStmt:
+			retval = _equalYbCreateTableGroupStmt(a, b);
+			break;
 		case T_CreateTableSpaceStmt:
 			retval = _equalCreateTableSpaceStmt(a, b);
 			break;
@@ -3988,6 +4095,27 @@ equal(const void *a, const void *b)
 			break;
 		case T_PublicationTable:
 			retval = _equalPublicationTable(a, b);
+			break;
+		case T_YbBackfillIndexStmt:
+			retval = _equalYbBackfillIndexStmt(a, b);
+			break;
+		case T_YbBackfillInfo:
+			retval = _equalYbBackfillInfo(a, b);
+			break;
+		case T_YbRowBounds:
+			retval = _equalYbRowBounds(a, b);
+			break;
+
+		case T_YbExprColrefDesc:
+			retval = _equalYbExprColrefDesc(a, b);
+			break;
+
+		case T_YbSkippableEntities:
+			retval = _equalYbSkippableEntities(a, b);
+			break;
+
+		case T_YbUpdateAffectedEntities:
+			retval = _equalYbUpdateAffectedEntities(a, b);
 			break;
 
 		default:

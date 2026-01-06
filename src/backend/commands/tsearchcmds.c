@@ -486,6 +486,32 @@ DefineTSDictionary(List *names, List *parameters)
 	return address;
 }
 
+#ifdef YB_TODO
+/*
+ * Guts of TS dictionary deletion.
+ */
+void
+RemoveTSDictionaryById(Oid dictId)
+{
+	Relation	relation;
+	HeapTuple	tup;
+
+	relation = table_open(TSDictionaryRelationId, RowExclusiveLock);
+
+	tup = SearchSysCache1(TSDICTOID, ObjectIdGetDatum(dictId));
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for text search dictionary %u",
+			 dictId);
+
+	CatalogTupleDelete(relation, tup);
+
+	ReleaseSysCache(tup);
+
+	table_close(relation, RowExclusiveLock);
+}
+#endif
+
 /*
  * ALTER TEXT SEARCH DICTIONARY
  */
@@ -776,6 +802,32 @@ DefineTSTemplate(List *names, List *parameters)
 
 	return address;
 }
+
+#ifdef YB_TODO
+/*
+ * Guts of TS template deletion.
+ */
+void
+RemoveTSTemplateById(Oid tmplId)
+{
+	Relation	relation;
+	HeapTuple	tup;
+
+	relation = table_open(TSTemplateRelationId, RowExclusiveLock);
+
+	tup = SearchSysCache1(TSTEMPLATEOID, ObjectIdGetDatum(tmplId));
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for text search template %u",
+			 tmplId);
+
+	CatalogTupleDelete(relation, tup);
+
+	ReleaseSysCache(tup);
+
+	table_close(relation, RowExclusiveLock);
+}
+#endif
 
 /* ---------------------- TS Configuration commands -----------------------*/
 
@@ -1081,7 +1133,7 @@ RemoveTSConfigurationById(Oid cfgId)
 		elog(ERROR, "cache lookup failed for text search dictionary %u",
 			 cfgId);
 
-	CatalogTupleDelete(relCfg, &tup->t_self);
+	CatalogTupleDelete(relCfg, tup);
 
 	ReleaseSysCache(tup);
 
@@ -1100,7 +1152,7 @@ RemoveTSConfigurationById(Oid cfgId)
 
 	while (HeapTupleIsValid((tup = systable_getnext(scan))))
 	{
-		CatalogTupleDelete(relMap, &tup->t_self);
+		CatalogTupleDelete(relMap, tup);
 	}
 
 	systable_endscan(scan);
@@ -1289,7 +1341,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 
 			while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 			{
-				CatalogTupleDelete(relMap, &maptup->t_self);
+				CatalogTupleDelete(relMap, maptup);
 			}
 
 			systable_endscan(scan);
@@ -1449,7 +1501,7 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
-			CatalogTupleDelete(relMap, &maptup->t_self);
+			CatalogTupleDelete(relMap, maptup);
 			found = true;
 		}
 

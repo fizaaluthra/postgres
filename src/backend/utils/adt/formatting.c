@@ -1236,6 +1236,7 @@ NUMDesc_prepare(NUMDesc *num, FormatNode *n)
 			num->flag |= NUM_F_LDECIMAL;
 			num->need_locale = true;
 			/* FALLTHROUGH */
+			yb_switch_fallthrough();
 		case NUM_DEC:
 			if (IS_DECIMAL(num))
 				ereport(ERROR,
@@ -3239,6 +3240,7 @@ DCH_to_char(FormatNode *node, bool is_interval, TmToChar *in, char *out, Oid col
 				break;
 			case DCH_RM:
 				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 			case DCH_rm:
 
 				/*
@@ -3512,7 +3514,8 @@ DCH_from_char(FormatNode *node, const char *in, TmFromChar *out,
 			case DCH_FF5:
 			case DCH_FF6:
 				out->ff = n->key->id - DCH_FF1 + 1;
-				/* fall through */
+				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 			case DCH_US:		/* microsecond */
 				len = from_char_parse_int_len(&out->us, &s,
 											  n->key->id == DCH_US ? 6 :

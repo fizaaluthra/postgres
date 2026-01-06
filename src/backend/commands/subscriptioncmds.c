@@ -1421,7 +1421,7 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	EventTriggerSQLDropAddObject(&myself, true, true);
 
 	/* Remove the tuple from catalog. */
-	CatalogTupleDelete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, tup);
 
 	ReleaseSysCache(tup);
 

@@ -32,6 +32,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/catcache.h"
+
 /*
  * Entry of a hash table used in find_all_inheritors. See below.
  */
@@ -601,7 +605,7 @@ DeleteInheritsTuple(Oid inhrelid, Oid inhparent, bool expect_detach_pending,
 								childname ? childname : "unknown relation"),
 						 errdetail("There's no pending concurrent detach.")));
 
-			CatalogTupleDelete(catalogRelation, &inheritsTuple->t_self);
+			CatalogTupleDelete(catalogRelation, inheritsTuple);
 			found = true;
 		}
 	}

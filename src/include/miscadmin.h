@@ -28,6 +28,11 @@
 #include "datatype/timestamp.h" /* for TimestampTz */
 #include "pgtime.h"				/* for pg_time_t */
 
+/* YB includes */
+#ifndef FRONTEND
+#include "storage/proc.h"		/* for MyProc */
+#endif
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 #define InvalidPid				(-1)
 
@@ -106,6 +111,7 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
 
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(void);
+extern void YBCheckForInterrupts(void);
 
 /* Test whether an interrupt is pending */
 #ifndef WIN32
@@ -145,6 +151,7 @@ do { \
 	QueryCancelHoldoffCount--; \
 } while(0)
 
+#ifdef FRONTEND					/* YB */
 #define START_CRIT_SECTION()  (CritSectionCount++)
 
 #define END_CRIT_SECTION() \
@@ -152,6 +159,23 @@ do { \
 	Assert(CritSectionCount > 0); \
 	CritSectionCount--; \
 } while(0)
+
+#else							/* YB: !FRONTEND */
+#define START_CRIT_SECTION()  \
+do { \
+	if (MyProc) \
+		MyProc->ybEnteredCriticalSection = true; \
+	CritSectionCount++; \
+} while(0)
+
+#define END_CRIT_SECTION() \
+do { \
+	Assert(CritSectionCount > 0); \
+	CritSectionCount--; \
+	if (MyProc && CritSectionCount == 0) \
+		MyProc->ybEnteredCriticalSection = false; \
+} while(0)
+#endif							/* YB: FRONTEND */
 
 
 /*****************************************************************************
@@ -336,6 +360,9 @@ typedef enum BackendType
 	B_WAL_WRITER,
 	B_ARCHIVER,
 	B_LOGGER,
+	YB_YSQL_CONN_MGR,
+	YB_YSQL_CONN_MGR_WAL_SENDER,
+	YB_AUTO_ANALYZE_BACKEND,
 } BackendType;
 
 extern PGDLLIMPORT BackendType MyBackendType;
@@ -467,6 +494,15 @@ extern void InitPostgres(const char *in_dbname, Oid dboid,
 						 bool load_session_libraries,
 						 bool override_allow_connections,
 						 char *out_dbname);
+
+extern void YbInitPostgres(const char *in_dbname, Oid dboid,
+						   const char *username, Oid useroid,
+						   bool load_session_libraries,
+						   bool override_allow_connections,
+						   char *out_dbname,
+						   const YbcPgInitPostgresInfo *yb_info);
+extern long YbGetAuthorizedConnections();
+
 extern void BaseInit(void);
 
 /* in utils/init/miscinit.c */
@@ -496,5 +532,17 @@ extern PGDLLIMPORT shmem_request_hook_type shmem_request_hook;
 
 /* in executor/nodeHash.c */
 extern size_t get_hash_memory_limit(void);
+
+/* YB */
+extern PGDLLIMPORT volatile sig_atomic_t YbLogCatcacheStatsPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPeakHeap;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPeakHeap;
+extern bool IsYsqlUpgrade;
+extern PGDLLIMPORT bool MyDatabaseColocated;
+extern PGDLLIMPORT Oid YbDatabaseIdForNewObjectId;
+extern PGDLLIMPORT bool MyColocatedDatabaseLegacy;
+extern PGDLLIMPORT bool YbTablegroupCatalogExists;
+extern PGDLLIMPORT bool YbLoginProfileCatalogsExist;
 
 #endif							/* MISCADMIN_H */

@@ -48,4 +48,15 @@ extern bool join_clause_is_movable_into(RestrictInfo *rinfo,
 										Relids currentrelids,
 										Relids current_and_outer);
 
+/* YB */
+extern bool yb_can_hash_batched_rinfo(RestrictInfo *batched_rinfo,
+									  Relids outer_relids,
+									  Relids inner_relids);
+extern bool yb_can_batch_rinfo(RestrictInfo *rinfo,
+							   Relids outer_batched_relids,
+							   Relids inner_relids);
+extern RestrictInfo *yb_get_batched_restrictinfo(RestrictInfo *rinfo,
+												 Relids outer_batched_relids,
+												 Relids inner_relids);
+
 #endif							/* RESTRICTINFO_H */

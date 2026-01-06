@@ -37,6 +37,9 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * Support for fuzzily matching columns.
@@ -850,7 +853,13 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte,
 			if (SearchSysCacheExists2(ATTNUM,
 									  ObjectIdGetDatum(rte->relid),
 									  Int16GetDatum(attnum)))
+			{
+				if (IsYBRelationById(rte->relid))
+				{
+					YbCheckUnsupportedSystemColumns(attnum, colname, rte);
+				}
 				result = attnum;
+			}
 		}
 	}
 
@@ -1025,7 +1034,7 @@ markRTEForSelectPriv(ParseState *pstate, int rtindex, AttrNumber col)
 		rte->requiredPerms |= ACL_SELECT;
 		/* Must offset the attnum to fit in a bitmapset */
 		rte->selectedCols = bms_add_member(rte->selectedCols,
-										   col - FirstLowInvalidHeapAttributeNumber);
+										   col - YBGetFirstLowInvalidAttributeNumberFromOid(rte->relid));
 	}
 	else if (rte->rtekind == RTE_JOIN)
 	{
@@ -3230,6 +3239,10 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 {
 	if (attnum == InvalidAttrNumber)
 		return "*";
+
+	/* The ybctid has no entry in pg_attribute */
+	if (attnum == YBTupleIdAttributeNumber)
+		return "ybctid";
 
 	/*
 	 * If there is a user-written column alias, use it.

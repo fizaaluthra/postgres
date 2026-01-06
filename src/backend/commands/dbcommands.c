@@ -15,6 +15,22 @@
  * IDENTIFICATION
  *	  src/backend/commands/dbcommands.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugabyteDB development.
+ *
+ * Portions Copyright (c) YugabyteDB, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -68,6 +84,12 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+
+/* YB includes */
+#include "commands/yb_cmds.h"
+#include "common/pg_yb_common.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb_ysql_conn_mgr_helper.h"
 
 /*
  * Create database strategy.
@@ -722,6 +744,21 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	CreateDBStrategy dbstrategy = CREATEDB_WAL_LOG;
 	createdb_failure_params fparms;
 
+	/* yb variables */
+	DefElem    *dcolocated = NULL;
+	DefElem    *dclonetime = NULL;
+	DefElem   **default_options[] = {&dtablespacename};
+	bool		dbcolocated = false;
+	int64		dbclonetime = 0;
+
+	/*
+	 * YB: We do insert into pg_database without explicit OID, which conflicts
+	 * with OID generation logic for YSQL upgrade.
+	 * This is mostly relevant as a sanity check for tests.
+	 */
+	if (IsYsqlUpgrade)
+		elog(ERROR, "CREATE DATABASE is disallowed in YSQL upgrade mode");
+
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
 	{
@@ -813,6 +850,18 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 					 errhint("Consider using tablespaces instead."),
 					 parser_errposition(pstate, defel->location)));
 		}
+		/* YB */
+		else if (strcmp(defel->defname, "colocated") == 0
+				 || strcmp(defel->defname, "colocation") == 0)
+		{
+			/* Ensure only one of colocation and colocated can be specified. */
+			if (dcolocated)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			dcolocated = defel;
+		}
 		else if (strcmp(defel->defname, "oid") == 0)
 		{
 			dboid = defGetObjectId(defel);
@@ -842,6 +891,16 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			if (dstrategy)
 				errorConflictingDefElem(defel, pstate);
 			dstrategy = defel;
+		}
+		/* YB */
+		else if (strcmp(defel->defname, "clone_time") == 0)
+		{
+			if (dclonetime)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			dclonetime = defel;
 		}
 		else
 			ereport(ERROR,
@@ -919,6 +978,39 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid connection limit: %d", dbconnlimit)));
 	}
+	if (dcolocated && dcolocated->arg)
+		dbcolocated = defGetBoolean(dcolocated);
+	else
+		dbcolocated = YBColocateDatabaseByDefault();
+	if (dclonetime && dclonetime->arg)
+	{
+		/*
+		 * This is a Float and not an Integer because Integer is too small to
+		 * contain a Unix epoch timestamp in microseconds (which is the format we
+		 * require).
+		 */
+		if (IsA(dclonetime->arg, Float))
+			dbclonetime = defGetInt64(dclonetime);
+		else if (IsA(dclonetime->arg, String))
+		{
+			const char *clone_time_str = defGetString(dclonetime);
+			TimestampTz clone_time = DirectFunctionCall3(timestamptz_in,
+														 CStringGetDatum(clone_time_str),
+														 ObjectIdGetDatum(InvalidOid),
+														 Int32GetDatum(-1));
+
+			dbclonetime =
+				yb_timestamptz_to_micros_time_t(DatumGetTimestampTz(clone_time));
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid clone time type: %s (must be a Unix microseconds "
+							"timestamp or a timestamptz-formatted string).",
+							nodeToString(dclonetime->arg))));
+		}
+	}
 	if (dcollversion)
 		dbcollversion = defGetString(dcollversion);
 
@@ -954,7 +1046,69 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	if (!dbtemplate)
 		dbtemplate = "template1";	/* Default template database name */
 
-	if (!get_db_info(dbtemplate, ShareLock,
+	/* Check YB options support */
+	if (YBIsUsingYBParser())
+	{
+		for (int i = lengthof(default_options); i > 0; --i)
+		{
+			DefElem    *option = *default_options[i - 1];
+
+			if (option != NULL && option->arg != NULL)
+				ereport(YBUnsupportedFeatureSignalLevel(),
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("value other than default for %s option is "
+								"not yet supported", option->defname),
+						 errhint("Please report the issue on "
+								 "https://github.com/YugaByte/yugabyte-db"
+								 "/issues."),
+						 parser_errposition(pstate, option->location)));
+		}
+
+		if (dbistemplate)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("value other than default or false for "
+							"is_template option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/YugaByte/yugabyte-db/issues."),
+					 parser_errposition(pstate, distemplate->location)));
+
+		if (encoding >= 0 && encoding != PG_UTF8)
+			ereport(YBUnsupportedFeatureSignalLevel(),
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("value other than unicode or utf8 for encoding "
+							"option is not yet supported"),
+					 errhint("Please report the issue on "
+							 "https://github.com/yugabyte/yugabyte-db/issues."),
+					 parser_errposition(pstate, dencoding->location)));
+	}
+
+	/*
+	 * In clone codepath, the locks will be taken by ysql_dump.  Additionally
+	 * taking locks here would cause a deadlock.
+	 *
+	 * Specifically, anytime we open a connection to a database, we take a
+	 * RowExclusiveLock lock on it.  Taking a ShareLock on the source database here
+	 * -- and holding onto it until the end of this command, which includes the
+	 * time when ysql_dump will be launched -- means that the ysql_dump will be
+	 * unable to connect to the source database.
+	 *
+	 * As part creating the new-cloned-database, the ALTER DATABASE ... OWNER TO
+	 * ... command tries to take an Exclusive lock on the relevant tuple. Due to
+	 * our current implementation of LockTuple, this translates into taking an
+	 * Exclusive lock on the DatabaseRelationId relation -- which may get
+	 * blocked if we take and hold onto the RowExclusiveLock here.
+	 *
+	 * Ideally, we should be fine taking no locks here as that would be
+	 * equivalent to launching the clone through yb-admin. We are a bit
+	 * conservative here and take AccessShareLock to prevent the source db from
+	 * getting dropped while this operation is in progress.
+	 */
+	bool		is_clone = strcmp(dbtemplate, "template0") != 0 && strcmp(dbtemplate, "template1") != 0;
+	LOCKMODE	lockmode_srcdb = (is_clone ? AccessShareLock : ShareLock);
+	LOCKMODE	lockmode_rel_db = (is_clone ? AccessShareLock : RowExclusiveLock);
+
+	if (!get_db_info(dbtemplate, lockmode_srcdb,
 					 &src_dboid, &src_owner, &src_encoding,
 					 &src_istemplate, &src_allowconn,
 					 &src_frozenxid, &src_minmxid, &src_deftablespace,
@@ -1028,11 +1182,13 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("invalid locale name: \"%s\"", dbcollate)));
+	YbCheckUnsupportedLibcLocale(dbcollate);
 	dbcollate = canonname;
 	if (!check_locale(LC_CTYPE, dbctype, &canonname))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("invalid locale name: \"%s\"", dbctype)));
+	YbCheckUnsupportedLibcLocale(dbctype);
 	dbctype = canonname;
 
 	check_encoding_locale_matches(encoding, dbcollate, dbctype);
@@ -1243,28 +1399,74 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 				(errcode(ERRCODE_DUPLICATE_DATABASE),
 				 errmsg("database \"%s\" already exists", dbname)));
 
-	/*
-	 * The source DB can't have any active backends, except this one
-	 * (exception is to allow CREATE DB while connected to template1).
-	 * Otherwise we might copy inconsistent data.
-	 *
-	 * This should be last among the basic error checks, because it involves
-	 * potential waiting; we may as well throw an error first if we're gonna
-	 * throw one.
-	 */
-	if (CountOtherDBBackends(src_dboid, &notherbackends, &npreparedxacts))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("source database \"%s\" is being accessed by other users",
-						dbtemplate),
-				 errdetail_busy_db(notherbackends, npreparedxacts)));
+	if (!IsYugaByteEnabled())
+		/*
+		 * The source DB can't have any active backends, except this one
+		 * (exception is to allow CREATE DB while connected to template1).
+		 * Otherwise we might copy inconsistent data.
+		 *
+		 * This should be last among the basic error checks, because it involves
+		 * potential waiting; we may as well throw an error first if we're gonna
+		 * throw one.
+		 */
+		if (CountOtherDBBackends(src_dboid, &notherbackends, &npreparedxacts))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("source database \"%s\" is being accessed by other users",
+							dbtemplate),
+					 errdetail_busy_db(notherbackends, npreparedxacts)));
 
 	/*
 	 * Select an OID for the new database, checking that it doesn't have a
 	 * filename conflict with anything already existing in the tablespace
 	 * directories.
 	 */
-	pg_database_rel = table_open(DatabaseRelationId, RowExclusiveLock);
+	pg_database_rel = table_open(DatabaseRelationId, lockmode_rel_db);
+
+	/*
+	 * YB: CREATE DATABASE using templates other than template0 and template1
+	 * will always go through the DB clone workflow.
+	 */
+	YbcCloneInfo yb_clone_info = {
+		.clone_time = dbclonetime,
+		.src_db_name = dbtemplate,
+		.src_owner = is_clone ? GetUserNameFromId(src_owner, true /* noerr */ ) : NULL,
+		.tgt_owner = is_clone ? GetUserNameFromId(datdba, true /* noerr */ ) : NULL,
+	};
+
+	if (is_clone)
+	{
+		if (!yb_clone_info.src_owner)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("could not get source database owner name from oid")));
+		if (!yb_clone_info.tgt_owner)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("could not get target database owner name from oid")));
+	}
+
+	if (IsYugaByteEnabled() &&
+		(OidIsValid(dboid) && dboid != Template0DbOid && dboid != PostgresDbOid) &&
+		!IsBinaryUpgrade && !YBIsMajorUpgradeInitDb())
+	{
+		/*
+		 * We do not allow the creation of databases with OIDs since it can
+		 * cause collisions of the catalog table data. This is because older
+		 * data in the catalog tables are lazily deleted, and there is a chance
+		 * that rows from a previous database with the same OID are still
+		 * present.
+		 * In the major upgrade case, the catalog table UUIDs between the
+		 * versions are different, and on rollbacks, we explicitly delete the
+		 * old data.
+		 * template0 and postgres databases have hard coded OIDs which are also
+		 * allowed.
+		 */
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("creation of databases with OIDs is not supported in Yugabyte. OID will be ignored")));
+		dboid = InvalidOid;
+	}
 
 	/*
 	 * If database OID is configured, check if the OID is already in use or
@@ -1284,15 +1486,68 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE)),
 					errmsg("data directory with the specified OID %u already exists", dboid));
+
+		/*
+		 * YSQL major upgrade.
+		 */
+		if (IsYugaByteEnabled())
+			YBCCreateDatabase(dboid, dbname, src_dboid,
+							  InvalidOid,	/* next_oid */
+							  dbcolocated,
+							  NULL, /* retry_on_oid_collision */
+							  NULL);	/* yb_clone_info */
 	}
 	else
 	{
-		/* Select an OID for the new database if is not explicitly configured. */
+		/*
+		 * YB: In vanilla PG, OIDs are assigned by a cluster-wide counter.
+		 * For YSQL, we allocate OIDs on a per-database level and share the
+		 * per-database OID range on tserver for all databases. OID collision
+		 * happens due to the same range of OIDs allocated to different tservers.
+		 * OID collision can happen for CREATE DATABASE. If it happens, we want to
+		 * keep retrying CREATE DATABASE using the next available OID.
+		 * This is needed for xcluster.
+		 */
+		bool		retry_on_oid_collision = false;
+
 		do
 		{
-			dboid = GetNewOidWithIndex(pg_database_rel, DatabaseOidIndexId,
-									   Anum_pg_database_oid);
-		} while (check_db_file_conflict(dboid));
+			/*
+			 * YB: Select an OID for the new database if is not explicitly
+			 * configured.
+			 */
+			do
+			{
+				dboid = GetNewOidWithIndex(pg_database_rel, DatabaseOidIndexId,
+										   Anum_pg_database_oid);
+			} while (check_db_file_conflict(dboid) ||
+					 YbIsNormalDbOidReserved(dboid));
+
+			retry_on_oid_collision = false;
+			if (IsYugaByteEnabled())
+				YBCCreateDatabase(dboid, dbname, src_dboid,
+								  InvalidOid,	/* next_oid */
+								  dbcolocated,
+								  &retry_on_oid_collision,
+								  is_clone ? &yb_clone_info : NULL);
+		} while (retry_on_oid_collision);
+	}
+
+	/*
+	 * YB: A database created using the clone workflow already has an entry in
+	 * pg_database as it is created by executing ysql_dump script.
+	 * Thus, close pg_database relation and return the dboid in case of clone.
+	 */
+	if (is_clone)
+	{
+		table_close(pg_database_rel, lockmode_rel_db);
+
+		/*
+		 * TODO(yamen): return the correct target dboid from the clone
+		 * namespace. It is fine to return InvalidOid temporarely as it isn't
+		 * used anywhere.
+		 */
+		return InvalidOid;
 	}
 
 	/*
@@ -1350,6 +1605,12 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	/* Register owner dependency */
 	recordDependencyOnOwner(DatabaseRelationId, dboid, datdba);
 
+	/*
+	 * YB: Register tablespace dependency to prevent dropping database default
+	 * tablespace.
+	 */
+	recordDependencyOnTablespace(DatabaseRelationId, dboid, dst_deftablespace);
+
 	/* Create pg_shdepend entries for objects within database */
 	copyTemplateDependencies(src_dboid, dboid);
 
@@ -1384,19 +1645,22 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	PG_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
 							PointerGetDatum(&fparms));
 	{
-		/*
-		 * If the user has asked to create a database with WAL_LOG strategy
-		 * then call CreateDatabaseUsingWalLog, which will copy the database
-		 * at the block level and it will WAL log each copied block.
-		 * Otherwise, call CreateDatabaseUsingFileCopy that will copy the
-		 * database file by file.
-		 */
-		if (dbstrategy == CREATEDB_WAL_LOG)
-			CreateDatabaseUsingWalLog(src_dboid, dboid, src_deftablespace,
-									  dst_deftablespace);
-		else
-			CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
-										dst_deftablespace);
+		if (!IsYugaByteEnabled())
+		{
+			/*
+			 * If the user has asked to create a database with WAL_LOG strategy
+			 * then call CreateDatabaseUsingWalLog, which will copy the database
+			 * at the block level and it will WAL log each copied block.
+			 * Otherwise, call CreateDatabaseUsingFileCopy that will copy the
+			 * database file by file.
+			 */
+			if (dbstrategy == CREATEDB_WAL_LOG)
+				CreateDatabaseUsingWalLog(src_dboid, dboid, src_deftablespace,
+										  dst_deftablespace);
+			else
+				CreateDatabaseUsingFileCopy(src_dboid, dboid, src_deftablespace,
+											dst_deftablespace);
+		}
 
 		/*
 		 * Close pg_database, but keep lock till commit.
@@ -1532,6 +1796,10 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 				nslots_active;
 	int			nsubscriptions;
 
+	uint32_t	yb_num_logical_conn;
+	uint32_t	yb_num_physical_conn_from_ysqlconnmgr;
+	int			yb_net_client_connections;
+
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this to ensure that no new backend starts up in the target
@@ -1588,6 +1856,13 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 				 errmsg("cannot drop the currently open database")));
 
 	/*
+	 * YugaByte allows dropping a database even when multiple sessions are dependent on that database.
+	 * Skip the following checks.
+	 */
+	if (IsYugaByteEnabled())
+		goto yb_removing_database_from_system;
+
+	/*
 	 * Check whether there are active logical slots that refer to the
 	 * to-be-dropped database. The database lock we are holding prevents the
 	 * creation of new slots using the database or existing slots becoming
@@ -1621,6 +1896,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 								  nsubscriptions, nsubscriptions)));
 
 
+yb_removing_database_from_system:
 	/*
 	 * Attempt to terminate all existing connections to the target database if
 	 * the user has requested to do so.
@@ -1634,12 +1910,74 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 *
 	 * As in CREATE DATABASE, check this after other error conditions.
 	 */
-	if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database \"%s\" is being accessed by other users",
-						dbname),
-				 errdetail_busy_db(notherbackends, npreparedxacts)));
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * YB: If attempting to drop a database when Connection Manager is
+		 * enabled, sleep until guarantee of shared memory being updated for
+		 * appropriate read of logical connection count.
+		 *
+		 * It is still possible for there to be race conditions between
+		 * updating the logical connection count and dropping the database,
+		 * but this helps resolve issues with attempting to immediately drop
+		 * a database after connecting to another database with Connection
+		 * Manager.
+		 */
+		if (YbIsClientYsqlConnMgr())
+		{
+			uint32_t	sleep = *(YBCGetGFlags()->ysql_conn_mgr_stats_interval) * 1000 * 1000;
+
+			elog(LOG_SERVER_ONLY,
+				 "connection manager: adding sleep of %d microseconds "
+				 "before DROP DATABASE",
+				 sleep);
+			pg_usleep(sleep);
+		}
+		CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts);
+
+		/*
+		 * number of actual client connections =
+		 *		number of clients connected on ysql port
+		 * 			+ number of clients connected on ysql connection manager port
+		 * 			- number of server connections b/w ysql connection manager and ysql.
+		 */
+		yb_net_client_connections = notherbackends;
+
+		/*
+		 * Ignore the number of logical or physical connections to the database
+		 * if pg_backend is unable to read the shared memory segment for
+		 * Ysql Connection Manager stats.
+		 */
+		if (YbGetNumYsqlConnMgrConnections(db_id, -1, &yb_num_logical_conn,
+										   &yb_num_physical_conn_from_ysqlconnmgr))
+		{
+			yb_net_client_connections +=
+				yb_num_logical_conn - yb_num_physical_conn_from_ysqlconnmgr;
+
+			if (YbIsYsqlConnMgrWarmupModeEnabled())
+				yb_net_client_connections = yb_num_logical_conn;
+		}
+
+		/*
+		 * yb_net_client_connections can be negative if there are broken physical connections
+		 * in ysql connection manager pool.
+		 */
+		if (yb_net_client_connections > 0 || npreparedxacts > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("database \"%s\" is being accessed by other users",
+							dbname),
+					 errdetail_busy_db(yb_net_client_connections, npreparedxacts)));
+	}
+	else
+	{
+		if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("database \"%s\" is being accessed by other users",
+							dbname),
+					 errdetail_busy_db(notherbackends, npreparedxacts)));
+	}
 
 	/*
 	 * Delete any comments or security labels associated with the database.
@@ -1683,14 +2021,15 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 		elog(ERROR, "cache lookup failed for database %u", db_id);
 	datform = (Form_pg_database) GETSTRUCT(tup);
 	datform->datconnlimit = DATCONNLIMIT_INVALID_DB;
-	systable_inplace_update_finish(inplace_state, tup);
+	systable_inplace_update_finish(inplace_state, tup,
+								   false /* yb_shared_update */ );
 	XLogFlush(XactLastRecEnd);
 
 	/*
 	 * Also delete the tuple - transactionally. If this transaction commits,
 	 * the row will be gone, but if we fail, dropdb() can be invoked again.
 	 */
-	CatalogTupleDelete(pgdbrel, &tup->t_self);
+	CatalogTupleDelete(pgdbrel, tup);
 	heap_freetuple(tup);
 
 	/*
@@ -1739,6 +2078,14 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * according to pg_database, which is not good.
 	 */
 	ForceSyncCommit();
+
+	/*
+	 * Call YugaByte to delete the entries ourselves.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YBCDropDatabase(db_id, dbname);
+	}
 }
 
 
@@ -1755,6 +2102,11 @@ RenameDatabase(const char *oldname, const char *newname)
 	int			notherbackends;
 	int			npreparedxacts;
 	ObjectAddress address;
+
+	uint32_t	yb_num_logical_conn;
+	uint32_t	yb_num_physical_conn_from_ysqlconnmgr;
+	int			yb_net_client_connections;
+
 
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
@@ -1814,12 +2166,53 @@ RenameDatabase(const char *oldname, const char *newname)
 	 *
 	 * As in CREATE DATABASE, check this after other error conditions.
 	 */
-	if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database \"%s\" is being accessed by other users",
-						oldname),
-				 errdetail_busy_db(notherbackends, npreparedxacts)));
+	if (IsYugaByteEnabled())
+	{
+		CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts);
+
+		/*
+		 * number of actual client connections =
+		 *		number of clients connected on ysql port
+		 * 			+ number of clients connected on ysql connection manager port
+		 * 			- number of server connections b/w ysql connection manager and ysql.
+		 */
+		yb_net_client_connections = notherbackends;
+
+		/*
+		 * Ignore the number of logical or physical connections to the database
+		 * if pg_backend is unable to read the shared memory segment for
+		 * Ysql Connection Manager stats.
+		 */
+		if (YbGetNumYsqlConnMgrConnections(db_id, -1, &yb_num_logical_conn,
+										   &yb_num_physical_conn_from_ysqlconnmgr))
+		{
+			yb_net_client_connections +=
+				yb_num_logical_conn - yb_num_physical_conn_from_ysqlconnmgr;
+
+			if (YbIsYsqlConnMgrWarmupModeEnabled())
+				yb_net_client_connections = yb_num_logical_conn;
+		}
+
+		/*
+		 * yb_net_client_connections can be negative if there are broken physical connections
+		 * in ysql connection manager pool.
+		 */
+		if (yb_net_client_connections > 0 || npreparedxacts > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("database \"%s\" is being accessed by other users",
+							oldname),
+					 errdetail_busy_db(yb_net_client_connections, npreparedxacts)));
+	}
+	else
+	{
+		if (CountOtherDBBackends(db_id, &notherbackends, &npreparedxacts))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("database \"%s\" is being accessed by other users",
+							oldname),
+					 errdetail_busy_db(notherbackends, npreparedxacts)));
+	}
 
 	/* rename */
 	newtup = SearchSysCacheLockedCopy1(DATABASEOID, ObjectIdGetDatum(db_id));
@@ -1829,6 +2222,15 @@ RenameDatabase(const char *oldname, const char *newname)
 	namestrcpy(&(((Form_pg_database) GETSTRUCT(newtup))->datname), newname);
 	CatalogTupleUpdate(rel, &otid, newtup);
 	UnlockTuple(rel, &otid, InplaceUpdateTupleLock);
+
+	if (IsYugaByteEnabled())
+	{
+		YbcPgStatement handle = NULL;
+
+		HandleYBStatus(YBCPgNewAlterDatabase(oldname, db_id, &handle));
+		HandleYBStatus(YBCPgAlterDatabaseRenameDatabase(handle, newname));
+		HandleYBStatus(YBCPgExecAlterDatabase(handle));
+	}
 
 	InvokeObjectPostAlterHook(DatabaseRelationId, db_id, 0);
 
@@ -2231,6 +2633,7 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 	DefElem    *dallowconnections = NULL;
 	DefElem    *dconnlimit = NULL;
 	DefElem    *dtablespace = NULL;
+	DefElem   **unsupported_options[] = {&distemplate, &dtablespace};
 	Datum		new_record[Natts_pg_database];
 	bool		new_record_nulls[Natts_pg_database];
 	bool		new_record_repl[Natts_pg_database];
@@ -2269,6 +2672,29 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("option \"%s\" not recognized", defel->defname),
 					 parser_errposition(pstate, defel->location)));
+	}
+
+	/* Check YB options support */
+	if (YBIsUsingYBParser())
+	{
+		for (int i = lengthof(unsupported_options); i > 0; --i)
+		{
+			/* Allow template during YSQL major version upgrade */
+			if (IsBinaryUpgrade && unsupported_options[i - 1] == &distemplate)
+				continue;
+
+			DefElem    *option = *unsupported_options[i - 1];
+
+			if (option != NULL && option->arg != NULL)
+				ereport(YBUnsupportedFeatureSignalLevel(),
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("altering %s option is not yet supported",
+								option->defname),
+						 errhint("Please report the issue on "
+								 "https://github.com/YugaByte/yugabyte-db"
+								 "/issues."),
+						 parser_errposition(pstate, option->location)));
+		}
 	}
 
 	if (dtablespace)

@@ -32,6 +32,12 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "libpq/pqformat.h"
+#include "pg_yb_utils.h"
+#include "utils/fmgroids.h"
+#include <pthread.h>
+
 /*
  * Hooks for function calls
  */
@@ -49,6 +55,7 @@ typedef struct
 	ItemPointerData fn_tid;
 	PGFunction	user_fn;		/* the function's address */
 	const Pg_finfo_record *inforec; /* address of its info record */
+	uint64		yb_catalog_version; /* catalog version at function load time */
 } CFuncHashTabEntry;
 
 static HTAB *CFuncHash = NULL;
@@ -65,6 +72,31 @@ static void record_C_func(HeapTuple procedureTuple,
 /* extern so it's callable via JIT */
 extern Datum fmgr_security_definer(PG_FUNCTION_ARGS);
 
+extern void int2send_direct(StringInfo buf, Datum value);
+extern void int4send_direct(StringInfo buf, Datum value);
+extern void int8send_direct(StringInfo buf, Datum value);
+
+typedef void (*YbSendDirectFn) (StringInfo, Datum);
+
+/*
+ * Initialize direct send function with specified oid with specified func.
+ */
+static void
+fmgr_init_direct_send_func(Oid oid, YbSendDirectFn func)
+{
+	fmgr_builtins[fmgr_builtin_oid_index[oid]].alt_func = func;
+}
+
+/*
+ * Initialize all direct send functions.
+ */
+static void
+fmgr_init_direct_send()
+{
+	fmgr_init_direct_send_func(F_INT2SEND, int2send_direct);
+	fmgr_init_direct_send_func(F_INT4SEND, int4send_direct);
+	fmgr_init_direct_send_func(F_INT8SEND, int8send_direct);
+}
 
 /*
  * Lookup routines for builtin-function table.  We can search by either Oid
@@ -79,6 +111,10 @@ fmgr_isbuiltin(Oid id)
 	/* fast lookup only possible if original oid still assigned */
 	if (id > fmgr_last_builtin_oid)
 		return NULL;
+
+	static pthread_once_t initialized = PTHREAD_ONCE_INIT;
+
+	pthread_once(&initialized, &fmgr_init_direct_send);
 
 	/*
 	 * Lookup function data. If there's a miss in that range it's likely a
@@ -107,6 +143,12 @@ fmgr_lookupByName(const char *name)
 			return fmgr_builtins + i;
 	}
 	return NULL;
+}
+
+bool
+is_builtin_func(Oid id)
+{
+	return fmgr_isbuiltin(id) != NULL;
 }
 
 /*
@@ -162,6 +204,7 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	finfo->fn_extra = NULL;
 	finfo->fn_mcxt = mcxt;
 	finfo->fn_expr = NULL;		/* caller may set this later */
+	finfo->fn_alt = NULL;
 
 	if ((fbp = fmgr_isbuiltin(functionId)) != NULL)
 	{
@@ -174,6 +217,7 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 		finfo->fn_stats = TRACK_FUNC_ALL;	/* ie, never track */
 		finfo->fn_addr = fbp->func;
 		finfo->fn_oid = functionId;
+		finfo->fn_alt = fbp->alt_func;
 		return;
 	}
 
@@ -540,7 +584,9 @@ lookup_C_func(HeapTuple procedureTuple)
 					NULL);
 	if (entry == NULL)
 		return NULL;			/* no such entry */
-	if (entry->fn_xmin == HeapTupleHeaderGetRawXmin(procedureTuple->t_data) &&
+
+	if (IsYugaByteEnabled() ? entry->yb_catalog_version == YBGetActiveCatalogCacheVersion() :
+		entry->fn_xmin == HeapTupleHeaderGetRawXmin(procedureTuple->t_data) &&
 		ItemPointerEquals(&entry->fn_tid, &procedureTuple->t_self))
 		return entry;			/* OK */
 	return NULL;				/* entry is out of date */
@@ -580,6 +626,7 @@ record_C_func(HeapTuple procedureTuple,
 	entry->fn_tid = procedureTuple->t_self;
 	entry->user_fn = user_fn;
 	entry->inforec = inforec;
+	entry->yb_catalog_version = YBGetActiveCatalogCacheVersion();
 }
 
 
@@ -1620,6 +1667,34 @@ bytea *
 SendFunctionCall(FmgrInfo *flinfo, Datum val)
 {
 	return DatumGetByteaP(FunctionCall1(flinfo, val));
+}
+
+/*
+ * Call a previously-looked-up datatype binary-output function.
+ *
+ * Putting output to specified StringInfo buffer.
+ */
+void
+StringInfoSendFunctionCall(StringInfo buf, FmgrInfo *flinfo, Datum val)
+{
+	void		(*alt) (StringInfo, Datum) = flinfo->fn_alt;
+
+	if (alt)
+	{
+		/*
+		 * There is function to send value directly to buf, w/o intermediate
+		 * conversion to bytea.
+		 */
+		alt(buf, val);
+		return;
+	}
+
+	bytea	   *outputbytes = SendFunctionCall(flinfo, val);
+	uint32		size = VARSIZE(outputbytes) - VARHDRSZ;
+
+	pq_sendint32(buf, size);
+	pq_sendbytes(buf, VARDATA(outputbytes), size);
+	pfree(outputbytes);
 }
 
 /*

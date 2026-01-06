@@ -34,6 +34,9 @@
  *		index_getprocid - get a support procedure OID
  *		index_getprocinfo - get a support procedure's lookup info
  *
+ *		yb_index_might_recheck - could the scan possibly recheck indexquals?
+ *		yb_index_getbitmap - get all ybctids from a scan
+ *
  * NOTES
  *		This file contains the index_ routines which used
  *		to be a scattered collection of stuff in access/genam.
@@ -62,6 +65,12 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+
+/* YB includes */
+#include "access/yb_scan.h"
+#include "catalog/pg_am.h"
+#include "catalog/pg_opfamily.h"
+#include "pg_yb_utils.h"
 
 
 /* ----------------------------------------------------------------
@@ -114,6 +123,75 @@ static IndexScanDesc index_beginscan_internal(Relation indexRelation,
 											  ParallelIndexScanDesc pscan, bool temp_snap);
 static inline void validate_relation_kind(Relation r);
 
+/*
+ * Wrapper on the top of index_open(), used during yb_index_check(). Given a
+ * base relation id, it creates a dummy primary key index object such
+ * that:
+ *   - indexrelid and indrelid both point to the base relation
+ *   - index key: ybctid column
+ */
+Relation
+yb_dummy_baserel_index_open(Oid relationId, LOCKMODE lockmode)
+{
+	Relation	relation;
+
+	relation = relation_open(relationId, lockmode);
+
+	if (relation->rd_rel->relkind == RELKIND_RELATION ||
+		relation->rd_rel->relkind == RELKIND_MATVIEW)
+	{
+		Assert(!relation->rd_index);
+		Assert(!relation->rd_indam);
+		Assert(!relation->rd_opfamily);
+		int			natts = 1;
+		Form_pg_index pg_index =
+			palloc0(sizeof(FormData_pg_index) + natts * sizeof(int16));
+
+		pg_index->indexrelid = RelationGetRelid(relation);
+		pg_index->indrelid = RelationGetRelid(relation);
+		pg_index->indnatts = natts;
+		pg_index->indnkeyatts = natts;
+		pg_index->indisunique = true;
+		pg_index->indisprimary = true;
+		pg_index->indimmediate = true;
+		pg_index->indisvalid = true;
+		pg_index->indisready = true;
+		pg_index->indislive = true;
+		pg_index->indkey.ndim = 1;
+		pg_index->indkey.dataoffset = 0;	/* never any nulls */
+		pg_index->indkey.elemtype = INT2OID;
+		pg_index->indkey.dim1 = natts;
+		pg_index->indkey.lbound1 = 0;
+		pg_index->indkey.values[0] = YBTupleIdAttributeNumber;
+
+		relation->rd_index = pg_index;
+		relation->rd_indam = GetIndexAmRoutineByAmId(LSM_AM_OID, false);
+		relation->rd_opfamily = palloc0(sizeof(Oid) * pg_index->indnkeyatts);
+		relation->rd_opfamily[0] = BYTEA_LSM_FAM_OID;
+	}
+	return relation;
+}
+
+/*
+ * Free the dummy index object created for yb_index_check().
+ */
+void
+yb_free_dummy_baserel_index(Relation relation)
+{
+	if (!(relation->rd_rel->relkind == RELKIND_RELATION ||
+		  relation->rd_rel->relkind == RELKIND_MATVIEW))
+		return;
+
+	Assert(relation->rd_index);
+	Assert(relation->rd_indam);
+	Assert(relation->rd_opfamily);
+	pfree(relation->rd_index);
+	pfree(relation->rd_indam);
+	pfree(relation->rd_opfamily);
+	relation->rd_index = NULL;
+	relation->rd_indam = NULL;
+	relation->rd_opfamily = NULL;
+}
 
 /* ----------------------------------------------------------------
  *				   index_ interface functions
@@ -219,23 +297,83 @@ index_insert(Relation indexRelation,
 			 Datum *values,
 			 bool *isnull,
 			 ItemPointer heap_t_ctid,
+			 Datum ybctid,
 			 Relation heapRelation,
 			 IndexUniqueCheck checkUnique,
 			 bool indexUnchanged,
-			 IndexInfo *indexInfo)
+			 IndexInfo *indexInfo,
+			 bool yb_shared_insert)
 {
 	RELATION_CHECKS;
-	CHECK_REL_PROCEDURE(aminsert);
+	if (IsYugaByteEnabled() && IsYBRelation(indexRelation))
+		CHECK_REL_PROCEDURE(yb_aminsert);
+	else
+		CHECK_REL_PROCEDURE(aminsert);
 
 	if (!(indexRelation->rd_indam->ampredlocks))
 		CheckForSerializableConflictIn(indexRelation,
 									   (ItemPointer) NULL,
 									   InvalidBlockNumber);
 
+	/*
+	 * For YugaByte-based index, call the variant of aminsert that takes the full tuple instead of
+	 * the tuple id.
+	 */
+	if (IsYugaByteEnabled() && IsYBRelation(indexRelation))
+	{
+		return indexRelation->rd_indam->yb_aminsert(indexRelation, values, isnull,
+													ybctid, heapRelation,
+													checkUnique, indexInfo,
+													yb_shared_insert);
+	}
+
 	return indexRelation->rd_indam->aminsert(indexRelation, values, isnull,
 											 heap_t_ctid, heapRelation,
 											 checkUnique, indexUnchanged,
 											 indexInfo);
+}
+
+/* ----------------
+ *		yb_index_delete - delete an index tuple from a relation.
+ *      This is used only for indexes backed by YugabyteDB. For Postgres, when a tuple is updated,
+ *      the ctid of the original tuple will be invalid (except for heap-only tuple (HOT)). Because
+ *      of this, index entries of the original tuple do not need to be deleted in UPDATE. For
+ *      YugaByte-based tables, the ybctid is the primary key of the tuple and will remain valid
+ *      after UPDATE. So when a tuple is updated, we need to delete all index entries associated
+ *      explicitly.
+ * ----------------
+ */
+void
+yb_index_delete(Relation indexRelation,
+				Datum *values,
+				bool *isnull,
+				Datum ybctid,
+				Relation heapRelation,
+				IndexInfo *indexInfo)
+{
+	RELATION_CHECKS;
+	CHECK_REL_PROCEDURE(yb_amdelete);
+
+	indexRelation->rd_indam->yb_amdelete(indexRelation, values, isnull,
+										 ybctid, heapRelation,
+										 indexInfo);
+}
+
+void
+yb_index_update(Relation indexRelation,
+				Datum *values,
+				bool *isnull,
+				Datum oldYbctid,
+				Datum newYbctid,
+				Relation heapRelation,
+				struct IndexInfo *indexInfo)
+{
+	RELATION_CHECKS;
+	CHECK_REL_PROCEDURE(yb_amupdate);
+
+	indexRelation->rd_indam->yb_amupdate(indexRelation, values, isnull,
+										 oldYbctid, newYbctid,
+										 heapRelation, indexInfo);
 }
 
 /*
@@ -571,6 +709,16 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 	 * keys, and puts the TID into scan->xs_heaptid.  It should also set
 	 * scan->xs_recheck and possibly scan->xs_itup/scan->xs_hitup, though we
 	 * pay no attention to those fields here.
+	 *
+	 * YB note:
+	 * TID should not be set for YB relations since it is not used.  The slot
+	 * is filled from other sources:
+	 * - aggregate pushdown: yb_agg_slot
+	 * - Index Scan: xs_hitup
+	 * - Index Only Scan: xs_itup
+	 * Upstream PG needs TID in these cases:
+	 * - Index Only Scan: heap fetch using TID in case of invisible tuples
+	 * - Index Scan: heap fetch using TID
 	 */
 	found = scan->indexRelation->rd_indam->amgettuple(scan, direction);
 
@@ -587,7 +735,16 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 
 		return NULL;
 	}
-	Assert(ItemPointerIsValid(&scan->xs_heaptid));
+	/*
+	 * YB should not set TID and should instead set at least one of
+	 * yb_agg_slot, xs_hitup, or xs_itup.  (See above note.)
+	 */
+	Assert(IsYBRelation(scan->indexRelation) ?
+		   (!ItemPointerIsValid(&scan->xs_heaptid) &&
+			(!TupIsNull(scan->yb_agg_slot) ||
+			 scan->xs_hitup != NULL ||
+			 scan->xs_itup != NULL)) :
+		   ItemPointerIsValid(&scan->xs_heaptid));
 
 	pgstat_count_index_tuples(scan->indexRelation, 1);
 
@@ -616,6 +773,18 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 bool
 index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
 {
+	if (IsYBRelation(scan->heapRelation))
+	{
+		/*
+		 * For aggregate pushdown, slot should have already been updated by YB
+		 * amgettuple.
+		 */
+		if (!scan->yb_aggrefs)
+			ExecStoreHeapTuple(scan->xs_hitup, slot, false /* shouldFree */ );
+
+		return true;
+	}
+
 	bool		all_dead = false;
 	bool		found;
 
@@ -670,15 +839,30 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 			if (tid == NULL)
 				break;
 
-			Assert(ItemPointerEquals(tid, &scan->xs_heaptid));
+			/*
+			 * YB should not set TID and should instead set at least one of
+			 * yb_agg_slot or xs_hitup.  (See index_getnext_tid note.)
+			 */
+			Assert(IsYBRelation(scan->indexRelation) ?
+				   (!ItemPointerIsValid(&scan->xs_heaptid) &&
+					(!TupIsNull(scan->yb_agg_slot) ||
+					 scan->xs_hitup != NULL)) :
+				   ItemPointerIsValid(&scan->xs_heaptid));
 		}
 
 		/*
 		 * Fetch the next (or only) visible heap tuple for this index entry.
 		 * If we don't find anything, loop around and grab the next TID from
 		 * the index.
+		 *
+		 * YB should not set TID and should instead set at least one of
+		 * yb_agg_slot or xs_hitup.  (See index_getnext_tid note.)
 		 */
-		Assert(ItemPointerIsValid(&scan->xs_heaptid));
+		Assert(IsYBRelation(scan->indexRelation) ?
+			   (!ItemPointerIsValid(&scan->xs_heaptid) &&
+				(!TupIsNull(scan->yb_agg_slot) ||
+				 scan->xs_hitup != NULL)) :
+			   ItemPointerIsValid(&scan->xs_heaptid));
 		if (index_fetch_heap(scan, slot))
 			return true;
 	}
@@ -714,6 +898,33 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	 * have the am's getbitmap proc do all the work.
 	 */
 	ntids = scan->indexRelation->rd_indam->amgetbitmap(scan, bitmap);
+
+	pgstat_count_index_tuples(scan->indexRelation, ntids);
+
+	return ntids;
+}
+
+/* ----------------
+ *		yb_index_getbitmap - get all tuples at once from an index scan
+ *
+ * Adds the ybctids of all tuples satisfying the scan keys to a bitmap.
+ *
+ * Returns the number of matching tuples found.  (Note: this might be only
+ * approximate, so it should only be used for statistical purposes.)
+ * ----------------
+ */
+int64
+yb_index_getbitmap(IndexScanDesc scan, YbTIDBitmap *ybtbm)
+{
+	int64		ntids;
+
+	SCAN_CHECKS;
+	CHECK_SCAN_PROCEDURE(yb_amgetbitmap);
+
+	/*
+	 * have the am's getbitmap proc do all the work.
+	 */
+	ntids = scan->indexRelation->rd_indam->yb_amgetbitmap(scan, ybtbm);
 
 	pgstat_count_index_tuples(scan->indexRelation, ntids);
 
@@ -1023,4 +1234,19 @@ index_opclass_options(Relation indrel, AttrNumber attnum, Datum attoptions,
 	(void) FunctionCall1(procinfo, PointerGetDatum(&relopts));
 
 	return build_local_reloptions(&relopts, attoptions, validate);
+}
+
+bool
+yb_index_might_recheck(Scan *scan,
+					   Relation heapRelation, Relation indexRelation,
+					   bool xs_want_itup, ScanKey keys, int nkeys)
+{
+	RELATION_CHECKS;
+	CHECK_REL_PROCEDURE(yb_ammightrecheck);
+
+	return indexRelation->rd_indam->yb_ammightrecheck(scan,
+													  heapRelation,
+													  indexRelation,
+													  xs_want_itup, keys,
+													  nkeys);
 }

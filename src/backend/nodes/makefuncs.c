@@ -21,6 +21,10 @@
 #include "nodes/nodeFuncs.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "pg_yb_utils.h"
+
 
 /*
  * makeA_Expr -

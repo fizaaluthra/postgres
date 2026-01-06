@@ -97,6 +97,7 @@ gin_extract_query_trgm(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
 			/* FALL THRU */
+			yb_switch_fallthrough();
 		case LikeStrategyNumber:
 
 			/*
@@ -111,6 +112,7 @@ gin_extract_query_trgm(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
 			/* FALL THRU */
+			yb_switch_fallthrough();
 		case RegExpStrategyNumber:
 			trg = createTrgmNFA(val, PG_GET_COLLATION(),
 								&graph, CurrentMemoryContext);
@@ -221,6 +223,7 @@ gin_trgm_consistent(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
 			/* FALL THRU */
+			yb_switch_fallthrough();
 		case LikeStrategyNumber:
 		case EqualStrategyNumber:
 			/* Check if all extracted trigrams are presented. */
@@ -239,6 +242,7 @@ gin_trgm_consistent(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
 			/* FALL THRU */
+			yb_switch_fallthrough();
 		case RegExpStrategyNumber:
 			if (nkeys < 1)
 			{
@@ -307,6 +311,7 @@ gin_trgm_triconsistent(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
 			/* FALL THRU */
+			yb_switch_fallthrough();
 		case LikeStrategyNumber:
 		case EqualStrategyNumber:
 			/* Check if all extracted trigrams are presented. */
@@ -325,6 +330,7 @@ gin_trgm_triconsistent(PG_FUNCTION_ARGS)
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
 			/* FALL THRU */
+			yb_switch_fallthrough();
 		case RegExpStrategyNumber:
 			if (nkeys < 1)
 			{

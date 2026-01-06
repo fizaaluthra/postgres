@@ -28,6 +28,9 @@
 #include "libpq-int.h"
 #include "mb/pg_wchar.h"
 
+/* YB includes */
+#include <stdatomic.h>
+
 /* keep this in same order as ExecStatusType in libpq-fe.h */
 char	   *const pgresStatus[] = {
 	"PGRES_EMPTY_QUERY",
@@ -55,8 +58,8 @@ static const PGresult OOM_result = {
  * static state needed by PQescapeString and PQescapeBytea; initialize to
  * values that result in backward-compatible behavior
  */
-static int	static_client_encoding = PG_SQL_ASCII;
-static bool static_std_strings = false;
+static atomic_int static_client_encoding = PG_SQL_ASCII;
+static atomic_bool static_std_strings = false;
 
 
 static PGEvent *dupEvents(PGEvent *events, int count, size_t *memSize);

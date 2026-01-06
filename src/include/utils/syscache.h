@@ -20,6 +20,9 @@
 #include "access/htup.h"
 /* we intentionally do not include utils/catcache.h here */
 
+/* YB includes */
+#include "relcache.h"
+
 /*
  *		SysCache identifiers.
  *
@@ -27,6 +30,16 @@
  *		of the entries in the array cacheinfo[] in syscache.c.
  *		Keep them in alphabetical order (renumbering only costs a
  *		backend rebuild).
+ * YB Note:
+ * Starting from 2025-03-11, we try to keep existing ids to have same integer
+ * value. In other words, newly added ids should be appended at the end
+ * and the alphabetical order can no longer be maintained. The purpose is
+ * to allow interop between different releases during YSQL upgrade so that
+ * an id of the same integer value represents the same catalog cache across
+ * different releases. In this way a catalog cache invalidation message
+ * generated in release 123 can be applicable to release 456, or vice versa.
+ * The function YbCheckCatalogCacheIds() is used to detect any change in
+ * this enum list.
  */
 
 enum SysCacheIdentifier
@@ -113,10 +126,72 @@ enum SysCacheIdentifier
 	TYPENAMENSP,
 	TYPEOID,
 	USERMAPPINGOID,
-	USERMAPPINGUSERSERVER
+	USERMAPPINGUSERSERVER,
+	YBTABLEGROUPOID,
+	YBCONSTRAINTRELIDTYPIDNAME
 
-#define SysCacheSize (USERMAPPINGUSERSERVER + 1)
+#define SysCacheSize (YBCONSTRAINTRELIDTYPIDNAME + 1)
 };
+
+typedef enum YbCatalogCacheTable
+{
+	YbCatalogCacheTable_pg_aggregate,
+	YbCatalogCacheTable_pg_am,
+	YbCatalogCacheTable_pg_amop,
+	YbCatalogCacheTable_pg_amproc,
+	YbCatalogCacheTable_pg_attribute,
+	YbCatalogCacheTable_pg_auth_members,
+	YbCatalogCacheTable_pg_authid,
+	YbCatalogCacheTable_pg_cast,
+	YbCatalogCacheTable_pg_class,
+	YbCatalogCacheTable_pg_collation,
+	YbCatalogCacheTable_pg_constraint,
+	YbCatalogCacheTable_pg_conversion,
+	YbCatalogCacheTable_pg_database,
+	YbCatalogCacheTable_pg_default_acl,
+	YbCatalogCacheTable_pg_enum,
+	YbCatalogCacheTable_pg_event_trigger,
+	YbCatalogCacheTable_pg_foreign_data_wrapper,
+	YbCatalogCacheTable_pg_foreign_server,
+	YbCatalogCacheTable_pg_foreign_table,
+	YbCatalogCacheTable_pg_index,
+	YbCatalogCacheTable_pg_language,
+	YbCatalogCacheTable_pg_namespace,
+	YbCatalogCacheTable_pg_opclass,
+	YbCatalogCacheTable_pg_operator,
+	YbCatalogCacheTable_pg_opfamily,
+	YbCatalogCacheTable_pg_parameter_acl,
+	YbCatalogCacheTable_pg_partitioned_table,
+	YbCatalogCacheTable_pg_proc,
+	YbCatalogCacheTable_pg_publication,
+	YbCatalogCacheTable_pg_publication_namespace,
+	YbCatalogCacheTable_pg_publication_rel,
+	YbCatalogCacheTable_pg_range,
+	YbCatalogCacheTable_pg_replication_origin,
+	YbCatalogCacheTable_pg_rewrite,
+	YbCatalogCacheTable_pg_sequence,
+	YbCatalogCacheTable_pg_statistic,
+	YbCatalogCacheTable_pg_statistic_ext,
+	YbCatalogCacheTable_pg_statistic_ext_data,
+	YbCatalogCacheTable_pg_subscription,
+	YbCatalogCacheTable_pg_subscription_rel,
+	YbCatalogCacheTable_pg_tablespace,
+	YbCatalogCacheTable_pg_transform,
+	YbCatalogCacheTable_pg_ts_config,
+	YbCatalogCacheTable_pg_ts_config_map,
+	YbCatalogCacheTable_pg_ts_dict,
+	YbCatalogCacheTable_pg_ts_parser,
+	YbCatalogCacheTable_pg_ts_template,
+	YbCatalogCacheTable_pg_type,
+	YbCatalogCacheTable_pg_user_mapping,
+	YbCatalogCacheTable_pg_yb_tablegroup,
+	YbAdhocCacheTable_pg_inherits
+
+#define YbNumCatalogCacheTables (YbAdhocCacheTable_pg_inherits + 1)
+} YbCatalogCacheTable;
+
+extern long YbNumCatalogCacheMisses;
+extern long YbNumCatalogCacheTableMisses[];
 
 extern void InitCatalogCache(void);
 extern void InitCatalogCachePhase2(void);
@@ -175,6 +250,21 @@ extern void SysCacheInvalidate(int cacheId, uint32 hashValue);
 extern bool RelationInvalidatesSnapshotsOnly(Oid relid);
 extern bool RelationHasSysCache(Oid relid);
 extern bool RelationSupportsSysCache(Oid relid);
+
+/* YB */
+extern void YbSetSysCacheTuple(Relation rel, HeapTuple tup);
+extern void YbPreloadCatalogCache(int cache_id, int idx_cache_id);
+#ifndef NDEBUG
+extern bool YbCheckCatalogCacheIndexNameTable();
+extern bool YbCheckSysCacheNames();
+#endif
+extern const char *YbGetCatalogCacheIndexName(int cache_id);
+extern const char *YbGetCatalogCacheTableNameFromTableId(int table_id);
+extern const char *YbGetCatalogCacheTableNameFromCacheId(int cache_id);
+extern int	YbGetCatalogCacheTableIdFromCacheId(int cache_id);
+extern uint32 YbSysCacheComputeHashValue(int cache_id, Datum v1, Datum v2, Datum v3, Datum v4);
+extern void YbCopyCacheInfoToValues(int cache_id, Datum *values);
+extern void YbSetAdditionalNegCacheIds(List *neg_cache_ids);
 
 /*
  * The use of the macros below rather than direct calls to the corresponding

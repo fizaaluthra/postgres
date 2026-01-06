@@ -33,6 +33,9 @@
 #include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 struct PlanState;				/* forward references in this file */
 struct ParallelHashJoinState;
 struct ExecRowMark;
@@ -42,6 +45,9 @@ struct RangeTblEntry;			/* avoid including parsenodes.h here */
 struct ExprEvalStep;			/* avoid including execExpr.h everywhere */
 struct CopyMultiInsertBuffer;
 struct LogicalTapeSet;
+
+/* YB forward references. */
+struct YbInsertOnConflictBatchState;
 
 
 /* ----------------
@@ -559,6 +565,26 @@ typedef struct ResultRelInfo
 	 * one of its ancestors; see ExecCrossPartitionUpdateForeignKey().
 	 */
 	List	   *ri_ancestorResultRels;
+
+	/*
+	 * YB note: For non-fast path UPDATE, the attribute number of the wholerow junk attribute
+	 * in the source plan's output tuples. This stores the old tuple.
+	 */
+	AttrNumber	ri_YbWholeRowAttNo;
+	/*
+	 * YB: is INSERT ON CONFLICT read batching possible for this table?
+	 * Possible does not mean enabled.  It is enabled when a yb_ioc_state is
+	 * created in the ModifyTableContext, and this only happens when an ON
+	 * CONFLICT clause is found and YbAddSlotToBatch is called.
+	 */
+	bool		ri_ybIocBatchingPossible;
+
+	/*
+	 * YB: can index-only scans be used to read conflicting tuples for the given
+	 * INSERT ... ON CONFLICT query on this table? Index-only scans are
+	 * currently supported only for the DO NOTHING clause.
+	 */
+	bool		ri_ybUseIndexOnlyScanForIocRead;
 } ResultRelInfo;
 
 /*
@@ -703,8 +729,50 @@ typedef struct EState
 
 	/* List of ResultRelInfoExtra structs (see above) */
 	List	   *es_resultrelinfo_extra;
-} EState;
 
+	/* YugaByte-specific fields */
+	bool		yb_es_is_single_row_modify_txn; /* Is this query a single-row
+												 * modify and the only stmt in
+												 * this txn. */
+	bool		yb_es_is_fk_check_disabled; /* Is FK check disabled? */
+	YbcPgExecParameters yb_exec_params;
+
+	/*
+	 * YB: The in_txn_limit used by all reads executed by this executor state.
+	 * This is done to satisfy requirement 1 in src/yb/yql/pggate/README i.e.,
+	 * all reads of a SQL statement should use the same in_txn_limit. A pointer
+	 * to this is passed down via YbcPgExecParameters to all PgDocOp instances
+	 * invoked by the SQL statement. The first read operation by the statement
+	 * finds that this is unset i.e., 0 and hence initializes the in txn limit
+	 * for read operations. All future operations see this to be non-zero and
+	 * hence don't change the picked in txn limit for reads.
+	 *
+	 * So, all read operations in the statement use the txn limit picked on the
+	 * first read op of the statement.
+	 *
+	 * NOTE: This is slightly incorrect and causes a bug as explained in
+	 * requirement 1 of src/yb/yql/pggate/README. But apart from that corner
+	 * case, this ensures that read operations of a SQL statement don't read
+	 * any value written by the same statement.
+	 */
+	uint64_t	yb_es_in_txn_limit_ht_for_reads;
+
+	/*
+	 * YB: A collection of entities (grouped by type) whose bookkeeping updates
+	 * can be skipped. This contains all the skippable entities computed at
+	 * planning time (see ModifyTable in plannodes.h) plus a subset of entities
+	 * in YbUpdateAffectedEntities that are discovered to be skippable at
+	 * execution time. Marking this field as a struct rather than a pointer
+	 * allows us to avoid an extra memory allocation per tuple.
+	 */
+	YbSkippableEntities yb_skip_entities;
+
+	/*
+	 * YB: List of PartitionTupleRouting to find PK partition referenced by a
+	 * FK relation. Used by YBCBuildYBTupleIdDescriptor().
+	 */
+	List	   *yb_es_pk_proutes;
+} EState;
 
 /*
  * ExecRowMark -
@@ -756,6 +824,35 @@ typedef struct ExecAuxRowMark
 	AttrNumber	toidAttNo;		/* resno of tableoid junk attribute, if any */
 	AttrNumber	wholeAttNo;		/* resno of whole-row junk attribute, if any */
 } ExecAuxRowMark;
+
+/*
+ * Yugabyte output parameter.
+ * The following parameters are not yet used.
+ * - Execution status in text. Currently, details are lost when reporting status. This OUT param
+ *   value can be used for that purpose.
+ * - Execution status code in yugabyte (This code might be different from Postgres).
+ */
+typedef struct YbPgExecOutParam
+{
+	NodeTag		type;
+
+	/* BACKFILL output */
+	StringInfo	bfoutput;
+
+	/* Not yet used */
+	StringInfo	status;
+	int64_t		status_code;
+} YbPgExecOutParam;
+
+typedef struct YbExprColrefDesc
+{
+	NodeTag		type;
+
+	int32_t		attno;
+	int32_t		typid;
+	int32_t		typmod;
+	int32_t		collid;
+} YbExprColrefDesc;
 
 
 /* ----------------------------------------------------------------
@@ -811,6 +908,15 @@ typedef struct TupleHashTableData
 	ExprState  *cur_eq_func;	/* comparator for input vs. table */
 	uint32		hash_iv;		/* hash-function IV */
 	ExprContext *exprcontext;	/* expression context */
+
+	/* YB */
+	ExprState **yb_keyColExprs; /* expressions that are input to hash
+								 * functions. If these are null, we revert to
+								 * using keyColIdx to know what tuple
+								 * attributes to hash. */
+	AttrNumber *in_keyColIdx;	/* attr numbers of input key columns */
+	ExprState **yb_in_keycolExprs;	/* equivalent of yb_keyColExprs for input
+									 * tuples */
 }			TupleHashTableData;
 
 typedef tuplehash_iterator TupleHashIterator;
@@ -1319,6 +1425,29 @@ typedef struct ModifyTableState
 	double		mt_merge_inserted;
 	double		mt_merge_updated;
 	double		mt_merge_deleted;
+
+	/* YB specific attributes. */
+	bool		yb_fetch_target_tuple;	/* Perform initial scan to populate
+										 * the ybctid. */
+	/*
+	 * YB: If enabled, execution seeks to optimize secondary index updates,
+	 * constraint checks etc. This field is set to false for single row txns.
+	 */
+	bool		yb_is_update_optimization_enabled;
+
+	/*
+	 * YB: If enabled, execution seeks to perform inplace update of non-key
+	 * columns of secondary indexes. This field is not applicable to single row
+	 * txns because they do not involve updates to secondary indexes.
+	 */
+	bool		yb_is_inplace_index_update_enabled;
+
+	/*
+	 * YB: If enabled, this struct holds the state for batched INSERT ... ON
+	 * CONFLICT. This state is shared across all the (partitioned) relations in
+	 * the ModifyTable plan.
+	 */
+	struct YbInsertOnConflictBatchState *yb_ioc_state;
 } ModifyTableState;
 
 /* ----------------
@@ -1483,6 +1612,18 @@ typedef struct SeqScanState
 } SeqScanState;
 
 /* ----------------
+ *	 YbSeqScanState information
+ * ----------------
+ */
+typedef struct YbSeqScanState
+{
+	ScanState	ss;				/* its first field is NodeTag */
+	Size		pscan_len;		/* size of parallel heap scan descriptor */
+	List	   *aggrefs;		/* aggregate pushdown information */
+	struct YBParallelPartitionKeysData *pscan;	/* parallel scan data */
+} YbSeqScanState;
+
+/* ----------------
  *	 SampleScanState information
  * ----------------
  */
@@ -1549,6 +1690,11 @@ typedef struct
  *		OrderByTypByVals   is the datatype of order by expression pass-by-value?
  *		OrderByTypLens	   typlens of the datatypes of order by expressions
  *		PscanLen		   size of parallel index scan descriptor
+ *
+ *	YB specific attributes
+ *		might_recheck	   true if the scan might recheck indexquals (currently
+ *						   only used for aggregate pushdown purposes)
+ *		aggrefs			   aggregate pushdown information
  * ----------------
  */
 typedef struct IndexScanState
@@ -1576,6 +1722,10 @@ typedef struct IndexScanState
 	bool	   *iss_OrderByTypByVals;
 	int16	   *iss_OrderByTypLens;
 	Size		iss_PscanLen;
+
+	/* YB specific attributes. */
+	bool		yb_iss_might_recheck;
+	List	   *yb_iss_aggrefs;
 } IndexScanState;
 
 /* ----------------
@@ -1597,6 +1747,11 @@ typedef struct IndexScanState
  *		PscanLen		   size of parallel index-only scan descriptor
  *		NameCStringAttNums attnums of name typed columns to pad to NAMEDATALEN
  *		NameCStringCount   number of elements in the NameCStringAttNums array
+ *
+ *	YB specific attributes
+ *		might_recheck	   true if the scan might recheck indexquals (currently
+ *						   only used for aggregate pushdown purposes)
+ *		aggrefs			   aggregate pushdown information
  * ----------------
  */
 typedef struct IndexOnlyScanState
@@ -1618,6 +1773,10 @@ typedef struct IndexOnlyScanState
 	Size		ioss_PscanLen;
 	AttrNumber *ioss_NameCStringAttNums;
 	int			ioss_NameCStringCount;
+
+	/* YB specific attributes. */
+	bool		yb_ioss_might_recheck;
+	List	   *yb_ioss_aggrefs;
 } IndexOnlyScanState;
 
 /* ----------------
@@ -1651,6 +1810,39 @@ typedef struct BitmapIndexScanState
 	Relation	biss_RelationDesc;
 	struct IndexScanDescData *biss_ScanDesc;
 } BitmapIndexScanState;
+
+/* ----------------
+ *	 YbBitmapIndexScanState information
+ *
+ *		result			   bitmap to return output into, or NULL
+ *		ScanKeys		   Skey structures for index quals
+ *		NumScanKeys		   number of ScanKeys
+ *		RuntimeKeys		   info about Skeys that must be evaluated at runtime
+ *		NumRuntimeKeys	   number of RuntimeKeys
+ *		ArrayKeys		   info about Skeys that come from ScalarArrayOpExprs
+ *		NumArrayKeys	   number of ArrayKeys
+ *		RuntimeKeysReady   true if runtime Skeys have been computed
+ *		RuntimeContext	   expr context for evaling runtime Skeys
+ *		RelationDesc	   index relation descriptor
+ *		ScanDesc		   index scan descriptor
+ * ----------------
+ */
+typedef struct YbBitmapIndexScanState
+{
+	ScanState	ss;				/* its first field is NodeTag */
+	YbTIDBitmap *biss_result;
+	struct ScanKeyData *biss_ScanKeys;
+	int			biss_NumScanKeys;
+	IndexRuntimeKeyInfo *biss_RuntimeKeys;
+	int			biss_NumRuntimeKeys;
+	IndexArrayKeyInfo *biss_ArrayKeys;
+	int			biss_NumArrayKeys;
+	bool		biss_RuntimeKeysReady;
+	ExprContext *biss_RuntimeContext;
+	Relation	biss_RelationDesc;
+	struct IndexScanDescData *biss_ScanDesc;
+	bool		biss_might_recheck;
+} YbBitmapIndexScanState;
 
 /* ----------------
  *	 SharedBitmapState information
@@ -1746,6 +1938,39 @@ typedef struct BitmapHeapScanState
 } BitmapHeapScanState;
 
 /* ----------------
+ *	 YbBitmapTableScanState information
+ *
+ *		recheck_local_quals		execution state for recheck_local_quals
+ *		fallback_local_quals	execution state for fallback_local_quals
+ *		ybtbm			   bitmap obtained from child index scan(s)
+ *		ybtbmiterator	   iterator for scanning rows from ybctids
+ *		ybtbmres		   current chunk of data
+ *		initialized		   is node is ready to iterate
+ *		recheck_required   do we have to recheck any of the results?
+ *		work_mem_exceeded  if we've exceeded work_mem, internally switch to
+ *						   seq scan
+ *		average_ybctid_bytes	an estimate of the average ybctid size
+ *		skipped_tuples	   how many tuples have we skipped fetching?
+ * ----------------
+ */
+typedef struct YbBitmapTableScanState
+{
+	ScanState	ss;				/* its first field is NodeTag */
+	ExprState  *recheck_local_quals;
+	ExprState  *fallback_local_quals;
+	YbTIDBitmap *ybtbm;
+	YbTBMIterator *ybtbmiterator;
+	YbTBMIterateResult *ybtbmres;
+	bool		btss_might_recheck;
+	bool		initialized;
+	bool		recheck_required;
+	bool		work_mem_exceeded;
+	size_t		average_ybctid_bytes;
+	int			skipped_tuples;
+	List	   *aggrefs;		/* aggregate pushdown information */
+} YbBitmapTableScanState;
+
+/* ----------------
  *	 TidScanState information
  *
  *		tidexprs	   list of TidExpr structs (see nodeTidscan.c)
@@ -1765,6 +1990,7 @@ typedef struct TidScanState
 	int			tss_TidPtr;
 	ItemPointerData *tss_TidList;
 	HeapTupleData tss_htup;
+	List	   *yb_tss_aggrefs;
 } TidScanState;
 
 /* ----------------
@@ -1957,6 +2183,9 @@ typedef struct ForeignScanState
 	/* use struct pointer to avoid including fdwapi.h here */
 	struct FdwRoutine *fdwroutine;
 	void	   *fdw_state;		/* foreign-data wrapper can keep state here */
+
+	/* YB specific attributes. */
+	List	   *yb_fdw_aggrefs; /* aggregate pushdown information */
 } ForeignScanState;
 
 /* ----------------
@@ -2004,6 +2233,49 @@ typedef struct JoinState
 	ExprState  *joinqual;		/* JOIN quals (in addition to ps.qual) */
 } JoinState;
 
+
+/*
+ * YB: Batch state of batched NL Join. These are explained in the comment for
+ * ExecYbBatchedNestLoop in nodeYbBatchedNestLoop.c.
+ */
+typedef enum YbNLBatchStatus
+{
+	BNL_INIT,
+	BNL_NEWINNER,
+	BNL_MATCHING,
+	BNL_FLUSHING
+} YbNLBatchStatus;
+
+/* YB: Struct to contain tuple and its matching info in a hash bucket */
+typedef struct YbBucketTupleInfo
+{
+	MinimalTuple tuple;
+	bool		matched;
+} YbBucketTupleInfo;
+
+/* YB: Buckets of MinimalTuples stored in the hash table. */
+typedef struct YbNLBucketInfo
+{
+	ListCell   *current;		/* The current list element being iterated on. */
+	List	   *tuples;			/* List of YbBucketTupleInfo in this bucket */
+} YbNLBucketInfo;
+
+struct YbBatchedNestLoopState;
+
+typedef bool (*YbFlushTupleFn_t) (struct YbBatchedNestLoopState *, ExprContext *);
+
+typedef bool (*YbGetNewOuterTupleFn_t) (struct YbBatchedNestLoopState *node,
+										ExprContext *econtext);
+typedef void (*YbResetBatchFn_t) (struct YbBatchedNestLoopState *node,
+								  ExprContext *econtext);
+typedef void (*YbRegisterOuterMatchFn_t) (struct YbBatchedNestLoopState *node,
+										  ExprContext *econtext);
+typedef void (*YbAddTupleToOuterBatchFn_t) (struct YbBatchedNestLoopState *node,
+											TupleTableSlot *slot);
+
+typedef void (*YbFreeBatchFn_t) (struct YbBatchedNestLoopState *node);
+typedef void (*YbEndFn_t) (struct YbBatchedNestLoopState *node);
+
 /* ----------------
  *	 NestLoopState information
  *
@@ -2018,7 +2290,59 @@ typedef struct NestLoopState
 	bool		nl_NeedNewOuter;
 	bool		nl_MatchedOuter;
 	TupleTableSlot *nl_NullInnerTupleSlot;
+
+	/* YB */
+	Tuplestorestate *batchedtuplestorestate;
+	YbNLBatchStatus nl_currentstatus;
 } NestLoopState;
+
+typedef struct YbBatchedNestLoopState
+{
+	JoinState	js;				/* its first field is NodeTag */
+	TupleTableSlot *nl_NullInnerTupleSlot;
+
+	bool		bnl_outerdone;
+	YbNLBatchStatus bnl_currentstatus;
+
+	bool		is_first_batch_done;
+	int			batch_size;
+
+	bool		bnl_needs_sorting;
+	bool		bnl_is_sorted;
+	Tuplesortstate *bnl_tuple_sort;
+	int64		bound;
+
+	/* State for tuplestore batch strategy */
+	Tuplestorestate *bnl_tupleStoreState;
+	List	   *bnl_batchMatchedInfo;
+	int			bnl_batchTupNo;
+
+	/* State for hashing batch strategy */
+
+	/*
+	 * This hash table stores instance of YbNLBucketInfo, each of which
+	 * stores lists of tuples with the same hash value.
+	 */
+	TupleHashTable hashtable;
+	bool		hashiterinit;
+	TupleHashIterator hashiter;
+	YbBucketTupleInfo *current_ht_tuple;
+	TupleHashEntry current_hash_entry;
+	FmgrInfo   *outerHashFunctions;
+	FmgrInfo   *innerHashFunctions;
+	int			numLookupAttrs;
+	AttrNumber *innerAttrs;
+	ExprState  *ht_lookup_fn;
+
+	/* Function pointers to local join methods */
+	YbFlushTupleFn_t FlushTupleImpl;
+	YbGetNewOuterTupleFn_t GetNewOuterTupleImpl;
+	YbResetBatchFn_t ResetBatchImpl;
+	YbRegisterOuterMatchFn_t RegisterOuterMatchImpl;
+	YbAddTupleToOuterBatchFn_t AddTupleToOuterBatchImpl;
+	YbFreeBatchFn_t FreeBatchImpl;
+	YbEndFn_t	EndImpl;
+} YbBatchedNestLoopState;
 
 /* ----------------
  *	 MergeJoinState information
@@ -2446,6 +2770,9 @@ typedef struct AggState
 										 * ->hash_pergroup */
 	ProjectionInfo *combinedproj;	/* projection machinery */
 	SharedAggInfo *shared_info; /* one entry per worker */
+
+	/* YB specific attributes. */
+	bool		yb_pushdown_supported;	/* YB pushdown supported for agg */
 } AggState;
 
 /* ----------------
@@ -2719,6 +3046,9 @@ typedef struct LockRowsState
 	PlanState	ps;				/* its first field is NodeTag */
 	List	   *lr_arowMarks;	/* List of ExecAuxRowMarks */
 	EPQState	lr_epqstate;	/* for evaluating EvalPlanQual rechecks */
+
+	bool		yb_are_row_marks_for_yb_rels;	/* lr_arowMarks relates to YB
+												 * relations */
 } LockRowsState;
 
 /* ----------------
@@ -2761,5 +3091,37 @@ typedef struct LimitState
 								 * option */
 	TupleTableSlot *last_slot;	/* slot for evaluation of ties */
 } LimitState;
+
+/* ----------------
+ *	 YbInsertOnConflictBatchState information
+ *
+ *		INSERT ... ON CONFLICT read batching state for Yugabyte relations.  The
+ *		batch size is taken from GUC yb_insert_on_conflict_read_batch_size.
+ * ----------------
+ */
+typedef struct YbInsertOnConflictBatchState
+{
+	TupleTableSlot **slots;		/* input slots for batch insert */
+	TupleTableSlot **planSlots; /* related slots */
+	List	   *pending_relids; /* all (partitioned) relations involved */
+	int			num_slots_initialized;	/* number of slots initialized */
+
+	/* batching mode fields */
+	int			num_slots;		/* index of next slot to add to batch */
+
+	/* flushing mode fields */
+	int			flush_idx;		/* index of next slot to flush from batch */
+
+	/*
+	 * pickup mode fields
+	 *
+	 * In case the flow was interrupted by a relation that does not support
+	 * batching (e.g. a partitioned table with triggers) plus the presence of
+	 * returned slots, these fields save where we should continue off of after
+	 * flushing is over.
+	 */
+	TupleTableSlot *pickup_slot;
+	TupleTableSlot *pickup_plan_slot;
+} YbInsertOnConflictBatchState;
 
 #endif							/* EXECNODES_H */

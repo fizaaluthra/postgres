@@ -115,6 +115,24 @@ typedef struct LogicalDecodingContext
 	 * logical replication slot.
 	 */
 	bool		in_create;
+
+	/*
+	 * YB: Don't replay commits from an LSN < this LSN. This is the YB
+	 * equivalent of start_decoding_at of SnapBuild struct. We have this field
+	 * here because we do not use the snapbuild mechanism.
+	 */
+	XLogRecPtr	yb_start_decoding_at;
+
+	/*
+	 * YB: A per table_oid to oid map.
+	 *
+	 * If an entry is present in the table, it indicates that the next
+	 * DML record should invalidate the relcache and set yb_read_time to its
+	 * commit_time.
+	 *
+	 * The entry (value) remains unused i.e. this is used like a set.
+	 */
+	HTAB	   *yb_needs_relcache_invalidation;
 } LogicalDecodingContext;
 
 
@@ -149,5 +167,12 @@ extern bool filter_prepare_cb_wrapper(LogicalDecodingContext *ctx,
 extern bool filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id);
 extern void ResetLogicalStreamingState(void);
 extern void UpdateDecodingStats(LogicalDecodingContext *ctx);
+
+/* YB */
+extern void YBValidateOutputPlugin(char *plugin);
+extern void YBValidateLsnType(char *lsn_type);
+extern YbCRSLsnType YBParseLsnType(char *lsn_type);
+extern void YBValidateOrderingMode(char *ordering_mode);
+extern YbCRSOrderingMode YBParseOrderingMode(char *ordering_mode);
 
 #endif

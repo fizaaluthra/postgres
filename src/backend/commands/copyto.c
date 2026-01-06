@@ -206,10 +206,16 @@ CopySendEndOfRow(CopyToState cstate)
 #endif
 			}
 
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_start(WAIT_EVENT_YB_COPY_COMMAND_STREAM_WRITE);
+
 			if (fwrite(fe_msgbuf->data, fe_msgbuf->len, 1,
 					   cstate->copy_file) != 1 ||
 				ferror(cstate->copy_file))
 			{
+				if (IsYugaByteEnabled())
+					pgstat_report_wait_end();
+
 				if (cstate->is_program)
 				{
 					if (errno == EPIPE)
@@ -238,6 +244,8 @@ CopySendEndOfRow(CopyToState cstate)
 							(errcode_for_file_access(),
 							 errmsg("could not write to COPY file: %m")));
 			}
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_end();
 			break;
 		case COPY_FRONTEND:
 			/* The FE/BE protocol uses \n as newline for all platforms */
@@ -329,6 +337,9 @@ EndCopy(CopyToState cstate)
 	}
 
 	pgstat_progress_end_command();
+
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_SUCCESS);
 
 	MemoryContextDelete(cstate->copycontext);
 	pfree(cstate);
@@ -660,6 +671,9 @@ BeginCopyTo(ParseState *pstate,
 
 	cstate->copy_dest = COPY_FILE;	/* default */
 
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_IN_PROG);
+
 	if (pipe)
 	{
 		progress_vals[1] = PROGRESS_COPY_TYPE_PIPE;
@@ -879,9 +893,25 @@ DoCopyTo(CopyToState cstate)
 	{
 		TupleTableSlot *slot;
 		TableScanDesc scandesc;
+		bool		is_yb_relation;
+		MemoryContext oldcontext;
+		MemoryContext yb_context;
 
 		scandesc = table_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
 		slot = table_slot_create(cstate->rel, NULL);
+		is_yb_relation = IsYBRelation(cstate->rel);
+
+		/*
+		 * Create and switch to a temporary memory context that we can reset
+		 * once per row to recover Yugabyte palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			yb_context = AllocSetContextCreate(CurrentMemoryContext,
+											   "COPY TO (YB)",
+											   ALLOCSET_DEFAULT_SIZES);
+			oldcontext = MemoryContextSwitchTo(yb_context);
+		}
 
 		processed = 0;
 		while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
@@ -900,6 +930,19 @@ DoCopyTo(CopyToState cstate)
 			 */
 			pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
 										 ++processed);
+			/* Free Yugabyte memory for this row */
+			if (is_yb_relation)
+				MemoryContextReset(yb_context);
+		}
+
+		/*
+		 * Switch out of and delete the temporary memory context for Yugabyte
+		 * palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextDelete(yb_context);
 		}
 
 		ExecDropSingleTupleTableSlot(slot);

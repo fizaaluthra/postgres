@@ -77,6 +77,9 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
@@ -177,6 +180,9 @@ static bool output_failed = false;
 static int	output_errno = 0;
 static char *pgdata_native;
 
+static char *yb_system_views_file;
+static char *yb_system_functions_file;
+
 /* defaults */
 static int	n_connections = 10;
 static int	n_buffers = 50;
@@ -248,6 +254,7 @@ static char **filter_lines_with_token(char **lines, const char *token);
 static char **readfile(const char *path);
 static void writefile(char *path, char **lines);
 static FILE *popen_check(const char *command, const char *mode);
+static void exit_nicely_with_code(int) pg_attribute_noreturn();
 static char *get_id(void);
 static int	get_encoding_id(const char *encoding_name);
 static void set_input(char **dest, const char *filename);
@@ -280,6 +287,7 @@ static void check_locale_name(int category, const char *locale,
 static bool check_locale_encoding(const char *locale, int encoding);
 static void setlocales(void);
 static void usage(const char *progname);
+static int	yb_pclose_check(FILE *stream);
 void		setup_pgdata(void);
 void		setup_bin_paths(const char *argv0);
 void		setup_data_file_paths(void);
@@ -305,8 +313,9 @@ do { \
 
 #define PG_CMD_CLOSE \
 do { \
-	if (pclose_check(cmdfd)) \
-		exit(1); /* message already printed by pclose_check */ \
+	/* message already printed by yb_pclose_check */ \
+	if (yb_pclose_check(cmdfd)) \
+		exit_nicely_with_code(1); \
 } while (0)
 
 #define PG_CMD_PUTS(line) \
@@ -320,6 +329,77 @@ do { \
 	if (fprintf(cmdfd, fmt, __VA_ARGS__) < 0 || fflush(cmdfd) < 0) \
 		output_failed = true, output_errno = errno; \
 } while (0)
+
+static bool
+IsEnvSet(const char *name)
+{
+	const char *env_var_value = getenv(name);
+
+	return env_var_value != NULL && strcmp(env_var_value, "1") == 0;
+}
+
+static bool
+IsYugaByteGlobalClusterInitdb()
+{
+	return IsEnvSet("YB_ENABLED_IN_POSTGRES");
+}
+
+static bool
+IsYugaByteLocalNodeInitdb()
+{
+	return IsEnvSet("YB_PG_LOCAL_NODE_INITDB");
+}
+
+bool
+YBIsMajorUpgradeInitDb()
+{
+	static int	cached_value = -1;
+
+	if (cached_value == -1)
+	{
+		const char *env_var_value = getenv("YB_PG_MAJOR_UPGRADE_INITDB");
+
+		cached_value = env_var_value && strcmp(env_var_value, "true") == 0;
+	}
+
+	return cached_value;
+}
+
+/*
+ * pclose() plus useful error reporting
+ *
+ * YugaByte-specific version recognizes a special status indicating that initdb
+ * has already been run, or the cluster has been initialized from a sys catalog
+ * snapshot.
+ */
+static int
+yb_pclose_check(FILE *stream)
+{
+	int			status;
+	char	   *reason;
+
+	if ((status = pclose(stream)))
+	{
+		if (status == -1)
+		{
+			/* pclose() itself failed, and hopefully set errno */
+			fprintf(stderr, _("pclose failed: %s\n"), strerror(errno));
+		}
+		else if (WEXITSTATUS(status) == YB_INITDB_ALREADY_DONE_EXIT_CODE)
+		{
+			fprintf(stderr, "initdb has already been run previously, nothing to do\n");
+			status = 0;
+		}
+		else
+		{
+			reason = wait_result_to_str(status);
+			fprintf(stderr, "%s\n", reason);
+			pfree(reason);
+		}
+	}
+	return status;
+}
+
 
 /*
  * Escape single quotes and backslashes, suitably for insertions into
@@ -582,6 +662,53 @@ cleanup_directories_atexit(void)
 	}
 }
 
+static void
+exit_nicely_with_code(int final_exit_code)
+{
+	if (!noclean)
+	{
+		if (made_new_pgdata)
+		{
+			pg_log_info("removing data directory \"%s\"", pg_data);
+			if (!rmtree(pg_data, true))
+				pg_log_error("failed to remove data directory");
+		}
+		else if (found_existing_pgdata)
+		{
+			pg_log_info("removing contents of data directory \"%s\"",
+						pg_data);
+			if (!rmtree(pg_data, false))
+				pg_log_error("failed to remove contents of data directory");
+		}
+
+		if (made_new_xlogdir)
+		{
+			pg_log_info("removing WAL directory \"%s\"", xlog_dir);
+			if (!rmtree(xlog_dir, true))
+				pg_log_error("failed to remove WAL directory");
+		}
+		else if (found_existing_xlogdir)
+		{
+			pg_log_info("removing contents of WAL directory \"%s\"", xlog_dir);
+			if (!rmtree(xlog_dir, false))
+				pg_log_error("failed to remove contents of WAL directory");
+		}
+		/* otherwise died during startup, do nothing! */
+	}
+	else
+	{
+		if (made_new_pgdata || found_existing_pgdata)
+			pg_log_info("data directory \"%s\" not removed at user's request",
+						pg_data);
+
+		if (made_new_xlogdir || found_existing_xlogdir)
+			pg_log_info("WAL directory \"%s\" not removed at user's request",
+						xlog_dir);
+	}
+
+	exit(final_exit_code);
+}
+
 /*
  * find the current user
  *
@@ -593,7 +720,8 @@ get_id(void)
 	const char *username;
 
 #ifndef WIN32
-	if (geteuid() == 0)			/* 0 is root's uid */
+	if (!YBShouldAllowRunningAsAnyUser() &&
+		geteuid() == 0)			/* 0 is root's uid */
 	{
 		pg_log_error("cannot be run as root");
 		pg_log_error_hint("Please log in (using, e.g., \"su\") as the (unprivileged) user that will own the server process.");
@@ -897,8 +1025,12 @@ test_config_settings(void)
 	 */
 #define MIN_BUFS_FOR_CONNS(nconns)	((nconns) * 10)
 
+	/*
+	 * For YugaByte we try larger number of connections (300) first.
+	 * TODO: we should also consider lowering the shared buffers below
+	 */
 	static const int trial_conns[] = {
-		100, 50, 40, 30, 20
+		300, 100, 50, 40, 30, 20
 	};
 	static const int trial_bufs[] = {
 		16384, 8192, 4096, 3584, 3072, 2560, 2048, 1536,
@@ -1205,88 +1337,91 @@ setup_config(void)
 
 	free(conflines);
 
+	/* Do not create pg_hba.conf in yugabyte */
+	if (!IsYugaByteGlobalClusterInitdb() && !IsYugaByteLocalNodeInitdb())
+	{
+		/* pg_hba.conf */
 
-	/* pg_hba.conf */
-
-	conflines = readfile(hba_file);
+		conflines = readfile(hba_file);
 
 #ifndef HAVE_UNIX_SOCKETS
-	conflines = filter_lines_with_token(conflines, "@remove-line-for-nolocal@");
+		conflines = filter_lines_with_token(conflines, "@remove-line-for-nolocal@");
 #else
-	conflines = replace_token(conflines, "@remove-line-for-nolocal@", "");
+		conflines = replace_token(conflines, "@remove-line-for-nolocal@", "");
 #endif
 
 #ifdef HAVE_IPV6
 
-	/*
-	 * Probe to see if there is really any platform support for IPv6, and
-	 * comment out the relevant pg_hba line if not.  This avoids runtime
-	 * warnings if getaddrinfo doesn't actually cope with IPv6.  Particularly
-	 * useful on Windows, where executables built on a machine with IPv6 may
-	 * have to run on a machine without.
-	 */
-	{
-		struct addrinfo *gai_result;
-		struct addrinfo hints;
-		int			err = 0;
+		/*
+		* Probe to see if there is really any platform support for IPv6, and
+		* comment out the relevant pg_hba line if not.  This avoids runtime
+		* warnings if getaddrinfo doesn't actually cope with IPv6.  Particularly
+		* useful on Windows, where executables built on a machine with IPv6 may
+		* have to run on a machine without.
+		*/
+		{
+			struct addrinfo *gai_result;
+			struct addrinfo hints;
+			int			err = 0;
 
 #ifdef WIN32
-		/* need to call WSAStartup before calling getaddrinfo */
-		WSADATA		wsaData;
+			/* need to call WSAStartup before calling getaddrinfo */
+			WSADATA		wsaData;
 
-		err = WSAStartup(MAKEWORD(2, 2), &wsaData);
+			err = WSAStartup(MAKEWORD(2, 2), &wsaData);
 #endif
 
-		/* for best results, this code should match parse_hba_line() */
-		hints.ai_flags = AI_NUMERICHOST;
-		hints.ai_family = AF_UNSPEC;
-		hints.ai_socktype = 0;
-		hints.ai_protocol = 0;
-		hints.ai_addrlen = 0;
-		hints.ai_canonname = NULL;
-		hints.ai_addr = NULL;
-		hints.ai_next = NULL;
+			/* for best results, this code should match parse_hba_line() */
+			hints.ai_flags = AI_NUMERICHOST;
+			hints.ai_family = AF_UNSPEC;
+			hints.ai_socktype = 0;
+			hints.ai_protocol = 0;
+			hints.ai_addrlen = 0;
+			hints.ai_canonname = NULL;
+			hints.ai_addr = NULL;
+			hints.ai_next = NULL;
 
-		if (err != 0 ||
-			getaddrinfo("::1", NULL, &hints, &gai_result) != 0)
-		{
-			conflines = replace_token(conflines,
-									  "host    all             all             ::1",
-									  "#host    all             all             ::1");
-			conflines = replace_token(conflines,
-									  "host    replication     all             ::1",
-									  "#host    replication     all             ::1");
+			if (err != 0 ||
+				getaddrinfo("::1", NULL, &hints, &gai_result) != 0)
+			{
+				conflines = replace_token(conflines,
+										  "host    all             all             ::1",
+										  "#host    all             all             ::1");
+				conflines = replace_token(conflines,
+										  "host    replication     all             ::1",
+										  "#host    replication     all             ::1");
+			}
 		}
-	}
 #else							/* !HAVE_IPV6 */
-	/* If we didn't compile IPV6 support at all, always comment it out */
-	conflines = replace_token(conflines,
-							  "host    all             all             ::1",
-							  "#host    all             all             ::1");
-	conflines = replace_token(conflines,
-							  "host    replication     all             ::1",
-							  "#host    replication     all             ::1");
+		/* If we didn't compile IPV6 support at all, always comment it out */
+		conflines = replace_token(conflines,
+								  "host    all             all             ::1",
+								  "#host    all             all             ::1");
+		conflines = replace_token(conflines,
+								  "host    replication     all             ::1",
+								  "#host    replication     all             ::1");
 #endif							/* HAVE_IPV6 */
 
-	/* Replace default authentication methods */
-	conflines = replace_token(conflines,
-							  "@authmethodhost@",
-							  authmethodhost);
-	conflines = replace_token(conflines,
-							  "@authmethodlocal@",
-							  authmethodlocal);
+		/* Replace default authentication methods */
+		conflines = replace_token(conflines,
+								  "@authmethodhost@",
+								  authmethodhost);
+		conflines = replace_token(conflines,
+								  "@authmethodlocal@",
+								  authmethodlocal);
 
-	conflines = replace_token(conflines,
-							  "@authcomment@",
-							  (strcmp(authmethodlocal, "trust") == 0 || strcmp(authmethodhost, "trust") == 0) ? AUTHTRUST_WARNING : "");
+		conflines = replace_token(conflines,
+								  "@authcomment@",
+								  (strcmp(authmethodlocal, "trust") == 0 || strcmp(authmethodhost, "trust") == 0) ? AUTHTRUST_WARNING : "");
 
-	snprintf(path, sizeof(path), "%s/pg_hba.conf", pg_data);
+		snprintf(path, sizeof(path), "%s/pg_hba.conf", pg_data);
 
-	writefile(path, conflines);
-	if (chmod(path, pg_file_create_mode) != 0)
-		pg_fatal("could not change permissions of \"%s\": %m", path);
+		writefile(path, conflines);
+		if (chmod(path, pg_file_create_mode) != 0)
+			pg_fatal("could not change permissions of \"%s\": %m", path);
 
-	free(conflines);
+		free(conflines);
+	}
 
 	/* pg_ident.conf */
 
@@ -1315,11 +1450,13 @@ bootstrap_template1(void)
 	char	  **bki_lines;
 	char		headerline[MAXPGPATH];
 	char		buf[64];
+	char	  **yb_orig_bki_lines;
 
 	printf(_("running bootstrap script ... "));
 	fflush(stdout);
 
 	bki_lines = readfile(bki_file);
+	yb_orig_bki_lines = bki_lines;
 
 	/* Check that bki file appears to be of the right version */
 
@@ -1334,37 +1471,44 @@ bootstrap_template1(void)
 		exit(1);
 	}
 
-	/* Substitute for various symbols used in the BKI file */
+	/*
+	 * YB: Lines from BKI file are not actually used in initdb on local node.
+	 * No need to substitute anything
+	 */
+	if (!IsYugaByteLocalNodeInitdb())
+	{
+		/* Substitute for various symbols used in the BKI file */
 
-	sprintf(buf, "%d", NAMEDATALEN);
-	bki_lines = replace_token(bki_lines, "NAMEDATALEN", buf);
+		sprintf(buf, "%d", NAMEDATALEN);
+		bki_lines = replace_token(bki_lines, "NAMEDATALEN", buf);
 
-	sprintf(buf, "%d", (int) sizeof(Pointer));
-	bki_lines = replace_token(bki_lines, "SIZEOF_POINTER", buf);
+		sprintf(buf, "%d", (int) sizeof(Pointer));
+		bki_lines = replace_token(bki_lines, "SIZEOF_POINTER", buf);
 
-	bki_lines = replace_token(bki_lines, "ALIGNOF_POINTER",
-							  (sizeof(Pointer) == 4) ? "i" : "d");
+		bki_lines = replace_token(bki_lines, "ALIGNOF_POINTER",
+								  (sizeof(Pointer) == 4) ? "i" : "d");
 
-	bki_lines = replace_token(bki_lines, "FLOAT8PASSBYVAL",
-							  FLOAT8PASSBYVAL ? "true" : "false");
+		bki_lines = replace_token(bki_lines, "FLOAT8PASSBYVAL",
+								  FLOAT8PASSBYVAL ? "true" : "false");
 
-	bki_lines = replace_token(bki_lines, "POSTGRES",
-							  escape_quotes_bki(username));
+		bki_lines = replace_token(bki_lines, "POSTGRES",
+								  escape_quotes_bki(username));
 
-	bki_lines = replace_token(bki_lines, "ENCODING",
-							  encodingid_to_string(encodingid));
+		bki_lines = replace_token(bki_lines, "ENCODING",
+								  encodingid_to_string(encodingid));
 
-	bki_lines = replace_token(bki_lines, "LC_COLLATE",
-							  escape_quotes_bki(lc_collate));
+		bki_lines = replace_token(bki_lines, "LC_COLLATE",
+								  escape_quotes_bki(lc_collate));
 
-	bki_lines = replace_token(bki_lines, "LC_CTYPE",
-							  escape_quotes_bki(lc_ctype));
+		bki_lines = replace_token(bki_lines, "LC_CTYPE",
+								  escape_quotes_bki(lc_ctype));
 
-	bki_lines = replace_token(bki_lines, "ICU_LOCALE",
-							  locale_provider == COLLPROVIDER_ICU ? escape_quotes_bki(icu_locale) : "_null_");
+		bki_lines = replace_token(bki_lines, "ICU_LOCALE",
+								  locale_provider == COLLPROVIDER_ICU ? escape_quotes_bki(icu_locale) : "_null_");
 
-	sprintf(buf, "%c", locale_provider);
-	bki_lines = replace_token(bki_lines, "LOCALE_PROVIDER", buf);
+		sprintf(buf, "%c", locale_provider);
+		bki_lines = replace_token(bki_lines, "LOCALE_PROVIDER", buf);
+	}
 
 	/* Also ensure backend isn't confused by this environment var: */
 	unsetenv("PGCLIENTENCODING");
@@ -1382,13 +1526,21 @@ bootstrap_template1(void)
 
 	for (line = bki_lines; *line != NULL; line++)
 	{
-		PG_CMD_PUTS(*line);
+		if (!IsYugaByteLocalNodeInitdb())
+			PG_CMD_PUTS(*line);
 		free(*line);
 	}
 
 	PG_CMD_CLOSE;
 
 	free(bki_lines);
+
+	/*
+	 * YB note: free the memory allocated by readfile(), if not done already.
+	 * Without this, initdb fails on ASAN intermittently.
+	 */
+	if (yb_orig_bki_lines != bki_lines)
+		free(yb_orig_bki_lines);
 
 	check_ok();
 }
@@ -1493,7 +1645,12 @@ setup_depend(FILE *cmdfd)
 	};
 
 	for (line = pg_depend_setup; *line != NULL; line++)
+	{
+		/* Skip VACUUM commands in YugaByte mode */
+		if (IsYugaByteGlobalClusterInitdb() && strncmp(*line, "VACUUM", 6) == 0)
+			continue;
 		PG_CMD_PUTS(*line);
+	}
 }
 
 /*
@@ -1553,8 +1710,11 @@ setup_collation(FILE *cmdfd)
 				  "VALUES (pg_nextoid('pg_catalog.pg_collation', 'oid', 'pg_catalog.pg_collation_oid_index'), 'ucs_basic', 'pg_catalog'::regnamespace, %u, '%c', true, %d, 'C', 'C');\n\n",
 				  BOOTSTRAP_SUPERUSERID, COLLPROVIDER_LIBC, PG_UTF8);
 
-	/* Now import all collations we can find in the operating system */
-	PG_CMD_PUTS("SELECT pg_import_system_collations('pg_catalog');\n\n");
+	if (!IsYugaByteGlobalClusterInitdb() || YBIsCollationEnabled())
+	{
+		/* Now import all collations we can find in the operating system */
+		PG_CMD_PUTS("SELECT pg_import_system_collations('pg_catalog');\n\n");
+	}
 }
 
 /*
@@ -1815,6 +1975,10 @@ make_template0(FILE *cmdfd)
 	 * a little bit slower and make the new cluster a little bit bigger.
 	 */
 	static const char *const template0_setup[] = {
+		/*
+		 * YB: Must be kept in sync with the below version using the provided
+		 * OID.
+		 */
 		"CREATE DATABASE template0 IS_TEMPLATE = true ALLOW_CONNECTIONS = false"
 		" OID = " CppAsString2(Template0DbOid)
 		" STRATEGY = file_copy;\n\n",
@@ -1848,8 +2012,44 @@ make_template0(FILE *cmdfd)
 		NULL
 	};
 
-	for (line = template0_setup; *line; line++)
-		PG_CMD_PUTS(*line);
+	/*
+	 * Skip some commands in YB mode as we do not need/support them as of
+	 * 14/12/2018.
+	 * TODO revert this change when we do support it.
+	 */
+	if (IsYugaByteGlobalClusterInitdb())
+	{
+		/*
+		 * In an online YSQL major version upgrade, we maintain catalogs for the
+		 * old and new PG versions. Because the YB master has its own data
+		 * structures tracking databases/namespaces in addition to the PG
+		 * catalog tracking them, it makes the most sense to preserve the old PG
+		 * version's database OIDs. For a new installation, we use PG's expected
+		 * OID.
+		 */
+		if (YBIsMajorUpgradeInitDb())
+		{
+			Oid			template0_oid = YBGetDatabaseOidFromEnv("template0");
+
+			if (!OidIsValid(template0_oid))
+				pg_fatal("missing oid for template0 database");
+
+			PG_CMD_PRINTF("CREATE DATABASE template0 IS_TEMPLATE = true"
+						  " ALLOW_CONNECTIONS = false OID = %u"
+						  " STRATEGY = file_copy;\n\n",
+						  template0_oid);
+		}
+		else
+			PG_CMD_PUTS(template0_setup[0]);
+		PG_CMD_PUTS(template0_setup[2]);
+		PG_CMD_PUTS(template0_setup[3]);
+		PG_CMD_PUTS(template0_setup[4]);
+	}
+	else
+	{
+		for (line = template0_setup; *line; line++)
+			PG_CMD_PUTS(*line);
+	}
 }
 
 /*
@@ -1873,6 +2073,82 @@ make_postgres(FILE *cmdfd)
 
 	for (line = postgres_setup; *line; line++)
 		PG_CMD_PUTS(*line);
+}
+
+/*
+ * Create yugabyte user and database.
+ */
+static void
+make_yugabyte(FILE *cmdfd)
+{
+	char	   *const *line;
+	char	  **lines;
+	static char *yugabyte_setup[] = {
+		"CREATE USER yugabyte SUPERUSER INHERIT CREATEROLE CREATEDB LOGIN REPLICATION BYPASSRLS PASSWORD $YB_PASSWORD;\n\n",
+		"CREATE DATABASE yugabyte $YB_OID;\n\n",
+		"COMMENT ON DATABASE yugabyte IS 'default administrative connection database';\n\n",
+		NULL,
+	};
+
+	lines = yugabyte_setup;
+
+	char		oidtok[MAXPGPATH] = "";
+
+	if (YBIsMajorUpgradeInitDb())
+	{
+		/*
+		 * Create without password. The restore will set the password from the
+		 * old version.
+		 */
+		lines = replace_token(lines, "$YB_PASSWORD", "NULL");
+
+		/*
+		 * As we did for template0, set the yugabyte database OID to the
+		 * existing database OID for online upgrade. However, for a clean
+		 * install, we don't have a reserved OID and just let one be assigned.
+		 */
+		Oid			yugabyte_oid = YBGetDatabaseOidFromEnv("yugabyte");
+
+		if (!OidIsValid(yugabyte_oid))
+			pg_fatal("missing oid for yugabyte database");
+
+		snprintf(oidtok, sizeof(oidtok), "OID = %u", yugabyte_oid);
+	}
+	else
+		lines =
+			replace_token(lines, "$YB_PASSWORD", "'yugabyte'");
+
+	lines = replace_token(lines, "$YB_OID", oidtok);
+
+	for (line = lines; *line; line++)
+		PG_CMD_PUTS(*line);
+}
+
+
+/*
+ * Create system_platform database.
+ */
+static void
+make_system_platform(FILE *cmdfd)
+{
+	const char *const *line;
+	static const char *const system_platform_setup[] = {
+		"CREATE DATABASE system_platform;\n\n",
+		"COMMENT ON DATABASE system_platform IS 'system database for YugaByte platform';\n\n",
+		NULL,
+	};
+
+	for (line = system_platform_setup; *line; line++)
+		PG_CMD_PUTS(*line);
+}
+
+/*
+ * Create pg_stat_statements extension by default
+ */
+static void
+enable_pg_stat_statements(FILE *cmdfd)
+{
+	PG_CMD_PUTS("CREATE EXTENSION pg_stat_statements schema pg_catalog;\n\n");
 }
 
 /*
@@ -2121,6 +2397,28 @@ static void
 setlocales(void)
 {
 	char	   *canonname;
+
+	/*
+	 * Use LC_COLLATE=C with everything else as en_US.UTF-8 as default locale in
+	 * YB mode.
+	 * This is because as of 06/15/2019 we don't support collation-aware string
+	 * comparisons, but we still want to support storing UTF-8 strings.
+	 * This should be kept in line with TabletServerMain.
+	 */
+	if (!locale &&
+		(IsYugaByteLocalNodeInitdb() || IsYugaByteGlobalClusterInitdb()))
+	{
+		const char *kYBDefaultLocaleForSortOrder = "C";
+		const char *kYBDefaultLocaleForEncoding = "en_US.UTF-8";
+
+		locale = pg_strdup(kYBDefaultLocaleForEncoding);
+		lc_collate = pg_strdup(kYBDefaultLocaleForSortOrder);
+		fprintf(stderr,
+				_("In YugabyteDB, setting LC_COLLATE to %s and all other locale settings to %s "
+				  "by default. Locale support will be enhanced as part of addressing "
+				  "https://github.com/yugabyte/yugabyte-db/issues/1557\n"),
+				lc_collate, locale);
+	}
 
 	/* set empty lc_* values to locale config if set */
 
@@ -2446,7 +2744,11 @@ setup_locale_encoding(void)
 void
 setup_data_file_paths(void)
 {
-	set_input(&bki_file, "postgres.bki");
+	if (IsYugaByteGlobalClusterInitdb())
+		set_input(&bki_file, "yb_postgres.bki");
+	else
+		set_input(&bki_file, "postgres.bki");
+
 	set_input(&hba_file, "pg_hba.conf.sample");
 	set_input(&ident_file, "pg_ident.conf.sample");
 	set_input(&conf_file, "postgresql.conf.sample");
@@ -2456,6 +2758,9 @@ setup_data_file_paths(void)
 	set_input(&system_constraints_file, "system_constraints.sql");
 	set_input(&system_functions_file, "system_functions.sql");
 	set_input(&system_views_file, "system_views.sql");
+
+	set_input(&yb_system_functions_file, "yb_system_functions.sql");
+	set_input(&yb_system_views_file, "yb_system_views.sql");
 
 	if (show_setting || debug)
 	{
@@ -2484,6 +2789,11 @@ setup_data_file_paths(void)
 	check_input(system_constraints_file);
 	check_input(system_functions_file);
 	check_input(system_views_file);
+	if (IsYugaByteGlobalClusterInitdb())
+	{
+		check_input(yb_system_functions_file);
+		check_input(yb_system_views_file);
+	}
 }
 
 
@@ -2763,6 +3073,9 @@ initialize_data_directory(void)
 	/* Bootstrap template1 */
 	bootstrap_template1();
 
+	if (IsYugaByteLocalNodeInitdb())
+		return;
+
 	/*
 	 * Make the per-database PG_VERSION for template1 only after init'ing it
 	 */
@@ -2797,7 +3110,15 @@ initialize_data_directory(void)
 
 	setup_run_file(cmdfd, system_views_file);
 
-	setup_description(cmdfd);
+	if (IsYugaByteGlobalClusterInitdb())
+	{
+		setup_run_file(cmdfd, yb_system_functions_file);
+		setup_run_file(cmdfd, yb_system_views_file);
+	}
+
+	/* Do not support copy in YB yet */
+	if (!IsYugaByteGlobalClusterInitdb())
+		setup_description(cmdfd);
 
 	setup_collation(cmdfd);
 
@@ -2809,11 +3130,41 @@ initialize_data_directory(void)
 
 	load_plpgsql(cmdfd);
 
+	enable_pg_stat_statements(cmdfd);
+
+	/*
+	 * YB: we used to skip the call of vacuum_db() because we don't need
+	 * to vacuum in YB. As of 04/30/2024, we want to ANALYZE catalog tables
+	 * to get initial stats.
+	 * vacuum_db() runs both ANALYZE and VACUUM. Since VACUUM is a no-op in
+	 * YB. It is safe to just call vacuum_db().
+	 * All other databases: template0, postgres, yugabyte use template1 as the
+	 * template database. The initial stats of their catalog tables is copied
+	 * from template1 stats, so we don't need to do extra work to run ANALYZE
+	 * for each of them.
+	 */
 	vacuum_db(cmdfd);
 
 	make_template0(cmdfd);
 
-	make_postgres(cmdfd);
+	if (YBIsMajorUpgradeInitDb())
+	{
+		/*
+		 * pg_upgrade uses the yugabyte user and database to prepare all other
+		 * databases.
+		 */
+		make_yugabyte(cmdfd);
+	}
+	else
+	{
+		make_postgres(cmdfd);
+
+		if (IsYugaByteGlobalClusterInitdb())
+		{
+			make_yugabyte(cmdfd);
+			make_system_platform(cmdfd);
+		}
+	}
 
 	PG_CMD_CLOSE;
 
@@ -2824,6 +3175,9 @@ initialize_data_directory(void)
 int
 main(int argc, char *argv[])
 {
+	if (IsYugaByteGlobalClusterInitdb() || IsYugaByteLocalNodeInitdb())
+		YBSetInitDbModeEnvVar();
+
 	static struct option long_options[] = {
 		{"pgdata", required_argument, NULL, 'D'},
 		{"encoding", required_argument, NULL, 'E'},
@@ -3023,6 +3377,14 @@ main(int argc, char *argv[])
 		}
 	}
 
+	const char *yb_log_file_path = getenv("YB_INITDB_LOG_FILE_PATH");
+
+	if (yb_log_file_path && yb_log_file_path[0] != '\0')
+	{
+		const char *yb_log_option = psprintf("-r %s", yb_log_file_path);
+
+		extra_options = psprintf("%s %s", extra_options, yb_log_option);
+	}
 
 	/*
 	 * Non-option argument specifies data directory as long as it wasn't
@@ -3142,7 +3504,13 @@ main(int argc, char *argv[])
 	else
 		printf(_("\nSync to disk skipped.\nThe data directory might become corrupt if the operating system crashes.\n"));
 
-	if (authwarning)
+	if (IsYugaByteLocalNodeInitdb())
+	{
+		success = true;
+		return 0;
+	}
+
+	if (authwarning && !IsYugaByteGlobalClusterInitdb())
 	{
 		printf("\n");
 		pg_log_warning("enabling \"trust\" authentication for local connections");
@@ -3150,7 +3518,11 @@ main(int argc, char *argv[])
 							"--auth-local and --auth-host, the next time you run initdb.");
 	}
 
-	if (!noinstructions)
+	/*
+	 * In YugaByte mode we only call this indirectly and manage starting the
+	 * server automatically
+	 */
+	if (!noinstructions && !IsYugaByteGlobalClusterInitdb())
 	{
 		/*
 		 * Build up a shell command to tell the user how to start the server

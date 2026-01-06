@@ -185,6 +185,7 @@ DecodeISO8601Interval(char *str,
 					}
 					/* Else fall through to extended alternative format */
 					/* FALLTHROUGH */
+					yb_switch_fallthrough();
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -264,6 +265,7 @@ DecodeISO8601Interval(char *str,
 					}
 					/* Else fall through to extended alternative format */
 					/* FALLTHROUGH */
+					yb_switch_fallthrough();
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -392,6 +394,7 @@ DecodeInterval(char **field, int *ftype, int nf,	/* int range, */
 					break;
 				}
 				/* FALL THROUGH */
+				yb_switch_fallthrough();
 
 			case DTK_DATE:
 			case DTK_NUMBER:
