@@ -454,10 +454,29 @@ CopySendEndOfRow(CopyToState cstate)
 	switch (cstate->copy_dest)
 	{
 		case COPY_FILE:
+<<<<<<< HEAD
+=======
+			if (!cstate->opts.binary)
+			{
+				/* Default line termination depends on platform */
+#ifndef WIN32
+				CopySendChar(cstate, '\n');
+#else
+				CopySendString(cstate, "\r\n");
+#endif
+			}
+
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_start(WAIT_EVENT_YB_COPY_COMMAND_STREAM_WRITE);
+
+>>>>>>> 939dce21892 (yb changes)
 			if (fwrite(fe_msgbuf->data, fe_msgbuf->len, 1,
 					   cstate->copy_file) != 1 ||
 				ferror(cstate->copy_file))
 			{
+				if (IsYugaByteEnabled())
+					pgstat_report_wait_end();
+
 				if (cstate->is_program)
 				{
 					if (errno == EPIPE)
@@ -486,6 +505,8 @@ CopySendEndOfRow(CopyToState cstate)
 							(errcode_for_file_access(),
 							 errmsg("could not write to COPY file: %m")));
 			}
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_end();
 			break;
 		case COPY_FRONTEND:
 			/* Dump the accumulated row as one CopyData message */
@@ -605,6 +626,9 @@ EndCopy(CopyToState cstate)
 	}
 
 	pgstat_progress_end_command();
+
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_SUCCESS);
 
 	MemoryContextDelete(cstate->copycontext);
 
@@ -939,6 +963,7 @@ BeginCopyTo(ParseState *pstate,
 
 	cstate->copy_dest = COPY_FILE;	/* default */
 
+<<<<<<< HEAD
 	if (data_dest_cb)
 	{
 		progress_vals[1] = PROGRESS_COPY_TYPE_CALLBACK;
@@ -946,6 +971,12 @@ BeginCopyTo(ParseState *pstate,
 		cstate->data_dest_cb = data_dest_cb;
 	}
 	else if (pipe)
+=======
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_IN_PROG);
+
+	if (pipe)
+>>>>>>> 939dce21892 (yb changes)
 	{
 		progress_vals[1] = PROGRESS_COPY_TYPE_PIPE;
 
@@ -1105,21 +1136,76 @@ DoCopyTo(CopyToState cstate)
 
 	if (cstate->rel)
 	{
+<<<<<<< HEAD
 		/*
 		 * If COPY TO source table is a partitioned table, then open each
 		 * partition and process each individual partition.
 		 */
 		if (cstate->rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+=======
+		TupleTableSlot *slot;
+		TableScanDesc scandesc;
+		bool		is_yb_relation;
+		MemoryContext oldcontext;
+		MemoryContext yb_context;
+
+		scandesc = table_beginscan(cstate->rel, GetActiveSnapshot(), 0, NULL);
+		slot = table_slot_create(cstate->rel, NULL);
+		is_yb_relation = IsYBRelation(cstate->rel);
+
+		/*
+		 * Create and switch to a temporary memory context that we can reset
+		 * once per row to recover Yugabyte palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			yb_context = AllocSetContextCreate(CurrentMemoryContext,
+											   "COPY TO (YB)",
+											   ALLOCSET_DEFAULT_SIZES);
+			oldcontext = MemoryContextSwitchTo(yb_context);
+		}
+
+		processed = 0;
+		while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
+>>>>>>> 939dce21892 (yb changes)
 		{
 			foreach_oid(child, cstate->partitions)
 			{
 				Relation	scan_rel;
 
+<<<<<<< HEAD
 				/* We already got the lock in BeginCopyTo */
 				scan_rel = table_open(child, NoLock);
 				CopyRelationTo(cstate, scan_rel, cstate->rel, &processed);
 				table_close(scan_rel, NoLock);
 			}
+=======
+			/* Deconstruct the tuple ... */
+			slot_getallattrs(slot);
+
+			/* Format and send the data */
+			CopyOneRowTo(cstate, slot);
+
+			/*
+			 * Increment the number of processed tuples, and report the
+			 * progress.
+			 */
+			pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
+										 ++processed);
+			/* Free Yugabyte memory for this row */
+			if (is_yb_relation)
+				MemoryContextReset(yb_context);
+		}
+
+		/*
+		 * Switch out of and delete the temporary memory context for Yugabyte
+		 * palloc'd memory.
+		 */
+		if (is_yb_relation)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			MemoryContextDelete(yb_context);
+>>>>>>> 939dce21892 (yb changes)
 		}
 		else
 			CopyRelationTo(cstate, cstate->rel, NULL, &processed);

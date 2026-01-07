@@ -62,12 +62,19 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+<<<<<<< HEAD
 /*
  * Minimum interval for cost-based vacuum delay reports from a parallel worker.
  * This aims to avoid sending too many messages and waking up the leader too
  * frequently.
  */
 #define PARALLEL_VACUUM_DELAY_REPORT_INTERVAL_NS	(NS_PER_S)
+=======
+/* YB includes */
+#include "access/sysattr.h"
+#include "pg_yb_utils.h"
+
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * GUC parameters
@@ -409,12 +416,71 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	/* user-invoked vacuum is never "for wraparound" */
 	params.is_wraparound = false;
 
+<<<<<<< HEAD
 	/*
 	 * user-invoked vacuum uses VACOPT_VERBOSE instead of
 	 * log_vacuum_min_duration and log_analyze_min_duration
 	 */
 	params.log_vacuum_min_duration = -1;
 	params.log_analyze_min_duration = -1;
+=======
+	/* user-invoked vacuum uses VACOPT_VERBOSE instead of log_min_duration */
+	params.log_min_duration = -1;
+
+	/* Now go through the common routine */
+	vacuum(vacstmt->rels, &params, NULL, isTopLevel);
+}
+
+/*
+ * Internal entry point for VACUUM and ANALYZE commands.
+ *
+ * relations, if not NIL, is a list of VacuumRelation to process; otherwise,
+ * we process all relevant tables in the database.  For each VacuumRelation,
+ * if a valid OID is supplied, the table with that OID is what to process;
+ * otherwise, the VacuumRelation's RangeVar indicates what to process.
+ *
+ * params contains a set of parameters that can be used to customize the
+ * behavior.
+ *
+ * bstrategy is normally given as NULL, but in autovacuum it can be passed
+ * in to use the same buffer strategy object across multiple vacuum() calls.
+ *
+ * isTopLevel should be passed down from ProcessUtility.
+ *
+ * It is the caller's responsibility that all parameters are allocated in a
+ * memory context that will not disappear at transaction commit.
+ */
+void
+vacuum(List *relations, VacuumParams *params,
+	   BufferAccessStrategy bstrategy, bool isTopLevel)
+{
+	static bool in_vacuum = false;
+
+	const char *stmttype;
+	volatile bool in_outer_xact,
+				use_own_xacts;
+
+	/*
+	 * VACUUM currently not supported for Yugabyte.
+	 */
+	if (params->options & VACOPT_VACUUM)
+	{
+		ereport(NOTICE,
+				(errmsg("VACUUM is a no-op statement since YugabyteDB performs garbage collection of dead tuples automatically")));
+		if (params->options & VACOPT_ANALYZE)
+		{
+			params->options &= ~VACOPT_VACUUM;
+		}
+		else
+		{
+			return;
+		}
+	}
+
+	Assert(params != NULL);
+
+	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
+>>>>>>> 939dce21892 (yb changes)
 
 	/*
 	 * Later, in vacuum_rel(), we check if a reloption override was specified.
@@ -595,8 +661,11 @@ vacuum(List *relations, const VacuumParams params, BufferAccessStrategy bstrateg
 	 * commit the transaction started in PostgresMain() here, and start
 	 * another one before exiting to match the commit waiting for us back in
 	 * PostgresMain().
+	 *
+	 * YB: Handle the commit later while starting the new transaction. See the
+	 * call to YbCommitTransactionCommandIntermediate.
 	 */
-	if (use_own_xacts)
+	if (!IsYugaByteEnabled() && use_own_xacts)
 	{
 		Assert(!in_outer_xact);
 
@@ -642,7 +711,15 @@ vacuum(List *relations, const VacuumParams params, BufferAccessStrategy bstrateg
 				 */
 				if (use_own_xacts)
 				{
-					StartTransactionCommand();
+					/*
+					 * YB: Commit the earlier transaction remembering the ddl
+					 * state, start a new one and set the stored ddl state.
+					 */
+					if (IsYugaByteEnabled())
+						YbCommitTransactionCommandIntermediate();
+					else
+						StartTransactionCommand();
+
 					/* functions in indexes may want a snapshot set */
 					PushActiveSnapshot(GetTransactionSnapshot());
 				}
@@ -650,14 +727,14 @@ vacuum(List *relations, const VacuumParams params, BufferAccessStrategy bstrateg
 				analyze_rel(vrel->oid, vrel->relation, params,
 							vrel->va_cols, in_outer_xact, bstrategy);
 
-				if (use_own_xacts)
+				if (!IsYugaByteEnabled() && use_own_xacts)
 				{
 					PopActiveSnapshot();
 					/* standard_ProcessUtility() does CCI if !use_own_xacts */
 					CommandCounterIncrement();
 					CommitTransactionCommand();
 				}
-				else
+				else if (!use_own_xacts)
 				{
 					/*
 					 * If we're not using separate xacts, better separate the
@@ -689,13 +766,18 @@ vacuum(List *relations, const VacuumParams params, BufferAccessStrategy bstrateg
 	 */
 	if (use_own_xacts)
 	{
-		/* here, we are not in a transaction */
+		if (IsYugaByteEnabled())
+			YbCommitTransactionCommandIntermediate();
+		else
+		{
+			/* here, we are not in a transaction */
 
-		/*
-		 * This matches the CommitTransaction waiting for us in
-		 * PostgresMain().
-		 */
-		StartTransactionCommand();
+			/*
+			 * This matches the CommitTransaction waiting for us in
+			 * PostgresMain().
+			 */
+			StartTransactionCommand();
+		}
 	}
 
 	if ((params.options & VACOPT_VACUUM) &&
@@ -1565,7 +1647,8 @@ vac_update_relstats(Relation relation,
 
 	/* If anything changed, write out the tuple. */
 	if (dirty)
-		systable_inplace_update_finish(inplace_state, ctup);
+		systable_inplace_update_finish(inplace_state, ctup,
+									   false /* yb_shared_update */ );
 	else
 		systable_inplace_update_cancel(inplace_state);
 
@@ -1788,7 +1871,8 @@ vac_update_datfrozenxid(void)
 		newMinMulti = dbform->datminmxid;
 
 	if (dirty)
-		systable_inplace_update_finish(inplace_state, tuple);
+		systable_inplace_update_finish(inplace_state, tuple,
+									   false /* yb_shared_update */ );
 	else
 		systable_inplace_update_cancel(inplace_state);
 

@@ -25,7 +25,213 @@ jsonb_9_4_check_applicable(ClusterInfo *cluster)
 		cluster->controldata.cat_ver < JSONB_FORMAT_CHANGE_CAT_VER)
 		return true;
 
+<<<<<<< HEAD
 	return false;
+=======
+	for (dbnum = 0; dbnum < cluster->dbarr.ndbs; dbnum++)
+	{
+		DbInfo	   *active_db = &cluster->dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(cluster, active_db->db_name);
+		PQExpBufferData querybuf;
+		PGresult   *res;
+		bool		db_used = false;
+		int			ntups;
+		int			rowno;
+		int			i_nspname,
+					i_relname,
+					i_attname;
+
+		/*
+		 * The type(s) of interest might be wrapped in a domain, array,
+		 * composite, or range, and these container types can be nested (to
+		 * varying extents depending on server version, but that's not of
+		 * concern here).  To handle all these cases we need a recursive CTE.
+		 */
+		initPQExpBuffer(&querybuf);
+		appendPQExpBuffer(&querybuf,
+						  "WITH RECURSIVE oids AS ( "
+		/* start with the type(s) returned by base_query */
+						  "	%s "
+						  "	UNION ALL "
+						  "	SELECT * FROM ( "
+		/* inner WITH because we can only reference the CTE once */
+						  "		WITH x AS (SELECT oid FROM oids) "
+		/* domains on any type selected so far */
+						  "			SELECT t.oid FROM pg_catalog.pg_type t, x WHERE typbasetype = x.oid AND typtype = 'd' "
+						  "			UNION ALL "
+		/* arrays over any type selected so far */
+						  "			SELECT t.oid FROM pg_catalog.pg_type t, x WHERE typelem = x.oid AND typtype = 'b' "
+						  "			UNION ALL "
+		/* composite types containing any type selected so far */
+						  "			SELECT t.oid FROM pg_catalog.pg_type t, pg_catalog.pg_class c, pg_catalog.pg_attribute a, x "
+						  "			WHERE t.typtype = 'c' AND "
+						  "				  t.oid = c.reltype AND "
+						  "				  c.oid = a.attrelid AND "
+						  "				  NOT a.attisdropped AND "
+						  "				  a.atttypid = x.oid "
+						  "			UNION ALL "
+		/* ranges containing any type selected so far */
+						  "			SELECT t.oid FROM pg_catalog.pg_type t, pg_catalog.pg_range r, x "
+						  "			WHERE t.typtype = 'r' AND r.rngtypid = t.oid AND r.rngsubtype = x.oid"
+						  "	) foo "
+						  ") "
+		/* now look for stored columns of any such type */
+						  "SELECT n.nspname, c.relname, a.attname "
+						  "FROM	pg_catalog.pg_class c, "
+						  "		pg_catalog.pg_namespace n, "
+						  "		pg_catalog.pg_attribute a "
+						  "WHERE	c.oid = a.attrelid AND "
+						  "		NOT a.attisdropped AND "
+						  "		a.atttypid IN (SELECT oid FROM oids) AND "
+						  "		c.relkind IN ("
+						  CppAsString2(RELKIND_RELATION) ", "
+						  CppAsString2(RELKIND_MATVIEW) ", "
+						  CppAsString2(RELKIND_INDEX) ") AND "
+						  "		c.relnamespace = n.oid AND "
+		/* exclude possible orphaned temp tables */
+						  "		n.nspname !~ '^pg_temp_' AND "
+						  "		n.nspname !~ '^pg_toast_temp_' AND "
+		/* exclude system catalogs, too */
+						  "		n.nspname NOT IN ('pg_catalog', 'information_schema')",
+						  base_query);
+
+		res = executeQueryOrDie(conn, "%s", querybuf.data);
+
+		ntups = PQntuples(res);
+		i_nspname = PQfnumber(res, "nspname");
+		i_relname = PQfnumber(res, "relname");
+		i_attname = PQfnumber(res, "attname");
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s\n", output_path,
+						 strerror(errno));
+			if (!db_used)
+			{
+				yb_fprintf_and_log(script, "In database: %s\n", active_db->db_name);
+				db_used = true;
+			}
+			yb_fprintf_and_log(script, "  %s.%s.%s\n",
+							   PQgetvalue(res, rowno, i_nspname),
+							   PQgetvalue(res, rowno, i_relname),
+							   PQgetvalue(res, rowno, i_attname));
+		}
+
+		PQclear(res);
+
+		termPQExpBuffer(&querybuf);
+
+		PQfinish(conn);
+	}
+
+	if (script)
+		fclose(script);
+
+	return found;
+}
+
+/*
+ * check_for_data_type_usage()
+ *	Detect whether there are any stored columns depending on the given type
+ *
+ * If so, write a report to the given file name, and return true.
+ *
+ * type_name should be a fully qualified type name.  This is just a
+ * trivial wrapper around check_for_data_types_usage() to convert a
+ * type name into a base query.
+ */
+bool
+check_for_data_type_usage(ClusterInfo *cluster,
+						  const char *type_name,
+						  const char *output_path)
+{
+	bool		found;
+	char	   *base_query;
+
+	base_query = psprintf("SELECT '%s'::pg_catalog.regtype AS oid",
+						  type_name);
+
+	found = check_for_data_types_usage(cluster, base_query, output_path);
+
+	free(base_query);
+
+	return found;
+}
+
+
+/*
+ * old_9_3_check_for_line_data_type_usage()
+ *	9.3 -> 9.4
+ *	Fully implement the 'line' data type in 9.4, which previously returned
+ *	"not enabled" by default and was only functionally enabled with a
+ *	compile-time switch; as of 9.4 "line" has a different on-disk
+ *	representation format.
+ */
+void
+old_9_3_check_for_line_data_type_usage(ClusterInfo *cluster)
+{
+	char		output_path[MAXPGPATH];
+
+	prep_status("Checking for incompatible \"line\" data type");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "tables_using_line.txt");
+
+	if (check_for_data_type_usage(cluster, "pg_catalog.line", output_path))
+	{
+		pg_log(PG_REPORT, "fatal\n");
+		pg_fatal("Your installation contains the \"line\" data type in user tables.\n"
+				 "This data type changed its internal and input/output format\n"
+				 "between your old and new versions so this\n"
+				 "cluster cannot currently be upgraded.  You can\n"
+				 "drop the problem columns and restart the upgrade.\n"
+				 "A list of the problem columns is in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+		check_ok();
+}
+
+
+/*
+ * old_9_6_check_for_unknown_data_type_usage()
+ *	9.6 -> 10
+ *	It's no longer allowed to create tables or views with "unknown"-type
+ *	columns.  We do not complain about views with such columns, because
+ *	they should get silently converted to "text" columns during the DDL
+ *	dump and reload; it seems unlikely to be worth making users do that
+ *	by hand.  However, if there's a table with such a column, the DDL
+ *	reload will fail, so we should pre-detect that rather than failing
+ *	mid-upgrade.  Worse, if there's a matview with such a column, the
+ *	DDL reload will silently change it to "text" which won't match the
+ *	on-disk storage (which is like "cstring").  So we *must* reject that.
+ */
+void
+old_9_6_check_for_unknown_data_type_usage(ClusterInfo *cluster)
+{
+	char		output_path[MAXPGPATH];
+
+	prep_status("Checking for invalid \"unknown\" user columns");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "tables_using_unknown.txt");
+
+	if (check_for_data_type_usage(cluster, "pg_catalog.unknown", output_path))
+	{
+		pg_log(PG_REPORT, "fatal\n");
+		pg_fatal("Your installation contains the \"unknown\" data type in user tables.\n"
+				 "This data type is no longer allowed in tables, so this\n"
+				 "cluster cannot currently be upgraded.  You can\n"
+				 "drop the problem columns and restart the upgrade.\n"
+				 "A list of the problem columns is in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+		check_ok();
+>>>>>>> 939dce21892 (yb changes)
 }
 
 /*
@@ -157,6 +363,7 @@ process_extension_updates(DbInfo *dbinfo, PGresult *res, void *arg)
 	if (ntups == 0)
 		return;
 
+<<<<<<< HEAD
 	if (report->file == NULL &&
 		(report->file = fopen_priv(report->path, "w")) == NULL)
 		pg_fatal("could not open file \"%s\": %m", report->path);
@@ -169,6 +376,22 @@ process_extension_updates(DbInfo *dbinfo, PGresult *res, void *arg)
 	for (int rowno = 0; rowno < ntups; rowno++)
 		fprintf(report->file, "ALTER EXTENSION %s UPDATE;\n",
 				quote_identifier(PQgetvalue(res, rowno, i_name)));
+=======
+	if (check_for_data_type_usage(cluster, "information_schema.sql_identifier",
+								  output_path))
+	{
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal\n");
+		yb_fatal("Your installation contains the \"sql_identifier\" data type in user tables.\n"
+				 "The on-disk format for this data type has changed, so this\n"
+				 "cluster cannot currently be upgraded.  You can\n"
+				 "drop the problem columns and restart the upgrade.\n"
+				 "A list of the problem columns is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+		check_ok();
+>>>>>>> 939dce21892 (yb changes)
 }
 
 /*

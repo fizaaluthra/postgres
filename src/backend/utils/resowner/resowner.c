@@ -53,7 +53,18 @@
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+<<<<<<< HEAD
 #include "utils/resowner.h"
+=======
+#include "utils/rel.h"
+#include "utils/resowner_private.h"
+#include "utils/snapmgr.h"
+
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/yb_inheritscache.h"
+
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * ResourceElem represents a reference associated with a resource owner.
@@ -116,6 +127,7 @@ struct ResourceOwnerData
 	ResourceOwner nextchild;	/* next child of same parent */
 	const char *name;			/* name (just for debugging) */
 
+<<<<<<< HEAD
 	/*
 	 * When ResourceOwnerRelease is called, we sort the 'hash' and 'arr' by
 	 * the release priority.  After that, no new resources can be remembered
@@ -125,6 +137,22 @@ struct ResourceOwnerData
 	 */
 	bool		releasing;
 	bool		sorted;			/* are 'hash' and 'arr' sorted by priority? */
+=======
+	/* We have built-in support for remembering: */
+	ResourceArray bufferarr;	/* owned buffers */
+	ResourceArray catrefarr;	/* catcache references */
+	ResourceArray catlistrefarr;	/* catcache-list pins */
+	ResourceArray relrefarr;	/* relcache references */
+	ResourceArray planrefarr;	/* plancache references */
+	ResourceArray tupdescarr;	/* tupdesc references */
+	ResourceArray snapshotarr;	/* snapshot references */
+	ResourceArray filearr;		/* open temporary files */
+	ResourceArray dsmarr;		/* dynamic shmem segments */
+	ResourceArray jitarr;		/* JIT contexts */
+	ResourceArray cryptohasharr;	/* cryptohash contexts */
+	ResourceArray hmacarr;		/* HMAC contexts */
+	ResourceArray ybinheritsrefarr; /* YbPgInherits cache references */
+>>>>>>> 939dce21892 (yb changes)
 
 	/*
 	 * Number of items in the locks cache, array, and hash table respectively.
@@ -210,6 +238,8 @@ static void ResourceOwnerReleaseInternal(ResourceOwner owner,
 										 bool isTopLevel);
 static void ReleaseAuxProcessResourcesCallback(int code, Datum arg);
 
+
+static void PrintYbPgInheritsCacheLeakWarning(YbPgInheritsCacheEntry entry);
 
 /*****************************************************************************
  *	  INTERNAL ROUTINES														 *
@@ -430,7 +460,23 @@ ResourceOwnerCreate(ResourceOwner parent, const char *name)
 		parent->firstchild = owner;
 	}
 
+<<<<<<< HEAD
 	dlist_init(&owner->aio_handles);
+=======
+	ResourceArrayInit(&(owner->bufferarr), BufferGetDatum(InvalidBuffer));
+	ResourceArrayInit(&(owner->catrefarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->catlistrefarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->relrefarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->planrefarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->tupdescarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->snapshotarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->filearr), FileGetDatum(-1));
+	ResourceArrayInit(&(owner->dsmarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->jitarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->cryptohasharr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->hmacarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->ybinheritsrefarr), PointerGetDatum(NULL));
+>>>>>>> 939dce21892 (yb changes)
 
 	return owner;
 }
@@ -739,6 +785,16 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 
 			pgaio_io_release_resowner(node, !isCommit);
 		}
+
+		/* Ditto for ybinheritsrefarr */
+		while (ResourceArrayGetAny(&owner->ybinheritsrefarr, &foundres))
+		{
+			YbPgInheritsCacheEntry entry = (YbPgInheritsCacheEntry) DatumGetPointer(foundres);
+
+			if (isCommit)
+				PrintYbPgInheritsCacheLeakWarning(entry);
+			ReleaseYbPgInheritsCacheEntry(entry);
+		}
 	}
 	else if (phase == RESOURCE_RELEASE_LOCKS)
 	{
@@ -871,8 +927,24 @@ ResourceOwnerDelete(ResourceOwner owner)
 	Assert(owner != CurrentResourceOwner);
 
 	/* And it better not own any resources, either */
+<<<<<<< HEAD
 	Assert(owner->narr == 0);
 	Assert(owner->nhash == 0);
+=======
+	Assert(owner->bufferarr.nitems == 0);
+	Assert(owner->catrefarr.nitems == 0);
+	Assert(owner->catlistrefarr.nitems == 0);
+	Assert(owner->relrefarr.nitems == 0);
+	Assert(owner->planrefarr.nitems == 0);
+	Assert(owner->tupdescarr.nitems == 0);
+	Assert(owner->snapshotarr.nitems == 0);
+	Assert(owner->filearr.nitems == 0);
+	Assert(owner->dsmarr.nitems == 0);
+	Assert(owner->jitarr.nitems == 0);
+	Assert(owner->cryptohasharr.nitems == 0);
+	Assert(owner->hmacarr.nitems == 0);
+	Assert(owner->ybinheritsrefarr.nitems == 0);
+>>>>>>> 939dce21892 (yb changes)
 	Assert(owner->nlocks == 0 || owner->nlocks == MAX_RESOWNER_LOCKS + 1);
 
 	/*
@@ -890,8 +962,25 @@ ResourceOwnerDelete(ResourceOwner owner)
 	ResourceOwnerNewParent(owner, NULL);
 
 	/* And free the object. */
+<<<<<<< HEAD
 	if (owner->hash)
 		pfree(owner->hash);
+=======
+	ResourceArrayFree(&(owner->bufferarr));
+	ResourceArrayFree(&(owner->catrefarr));
+	ResourceArrayFree(&(owner->catlistrefarr));
+	ResourceArrayFree(&(owner->relrefarr));
+	ResourceArrayFree(&(owner->planrefarr));
+	ResourceArrayFree(&(owner->tupdescarr));
+	ResourceArrayFree(&(owner->snapshotarr));
+	ResourceArrayFree(&(owner->filearr));
+	ResourceArrayFree(&(owner->dsmarr));
+	ResourceArrayFree(&(owner->jitarr));
+	ResourceArrayFree(&(owner->cryptohasharr));
+	ResourceArrayFree(&(owner->hmacarr));
+	ResourceArrayFree(&(owner->ybinheritsrefarr));
+
+>>>>>>> 939dce21892 (yb changes)
 	pfree(owner);
 }
 
@@ -1106,5 +1195,498 @@ ResourceOwnerRememberAioHandle(ResourceOwner owner, struct dlist_node *ioh_node)
 void
 ResourceOwnerForgetAioHandle(ResourceOwner owner, struct dlist_node *ioh_node)
 {
+<<<<<<< HEAD
 	dlist_delete_from(&owner->aio_handles, ioh_node);
+=======
+	ResourceArrayAdd(&(owner->catrefarr), PointerGetDatum(tuple));
+}
+
+/*
+ * Forget that a catcache reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetCatCacheRef(ResourceOwner owner, HeapTuple tuple)
+{
+	if (!ResourceArrayRemove(&(owner->catrefarr), PointerGetDatum(tuple)))
+		elog(ERROR, "catcache reference %p is not owned by resource owner %s",
+			 tuple, owner->name);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * catcache-list reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeCatCacheListRefs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->catlistrefarr));
+}
+
+/*
+ * Remember that a catcache-list reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeCatCacheListRefs()
+ */
+void
+ResourceOwnerRememberCatCacheListRef(ResourceOwner owner, CatCList *list)
+{
+	ResourceArrayAdd(&(owner->catlistrefarr), PointerGetDatum(list));
+}
+
+/*
+ * Forget that a catcache-list reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetCatCacheListRef(ResourceOwner owner, CatCList *list)
+{
+	if (!ResourceArrayRemove(&(owner->catlistrefarr), PointerGetDatum(list)))
+		elog(ERROR, "catcache list reference %p is not owned by resource owner %s",
+			 list, owner->name);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * relcache reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeRelationRefs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->relrefarr));
+}
+
+/*
+ * Remember that a relcache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeRelationRefs()
+ */
+void
+ResourceOwnerRememberRelationRef(ResourceOwner owner, Relation rel)
+{
+	ResourceArrayAdd(&(owner->relrefarr), PointerGetDatum(rel));
+}
+
+/*
+ * Forget that a relcache reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetRelationRef(ResourceOwner owner, Relation rel)
+{
+	if (!ResourceArrayRemove(&(owner->relrefarr), PointerGetDatum(rel)))
+		elog(ERROR, "relcache reference %s is not owned by resource owner %s",
+			 RelationGetRelationName(rel), owner->name);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * YbPgInherits reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeYbPgInheritsRefs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&owner->ybinheritsrefarr);
+}
+
+/*
+ * Remember that a YbPgInherits cache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeYbPgInheritsRefs()
+ */
+void
+ResourceOwnerRememberYbPgInheritsRef(ResourceOwner owner,
+									 YbPgInheritsCacheEntry entry)
+{
+	ResourceArrayAdd(&owner->ybinheritsrefarr, PointerGetDatum(entry));
+}
+
+
+/*
+ * Forget that a YbPgInherits cache reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetYbPgInheritsRef(ResourceOwner owner,
+								   YbPgInheritsCacheEntry entry)
+{
+	if (!ResourceArrayRemove(&owner->ybinheritsrefarr, PointerGetDatum(entry)))
+		elog(ERROR, "YbPgInheritsCache entry %d is not owned by resource owner %s",
+			 entry->oid, owner->name);
+}
+
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintRelCacheLeakWarning(Relation rel)
+{
+	elog(WARNING, "relcache reference leak: relation \"%s\" not closed",
+		 RelationGetRelationName(rel));
+}
+
+static void
+PrintYbPgInheritsCacheLeakWarning(YbPgInheritsCacheEntry entry)
+{
+	elog(WARNING,
+		 "YbPgInheritsCache reference leak: Entry for oid \"%d\" not released",
+		 entry->oid);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * plancache reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargePlanCacheRefs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->planrefarr));
+}
+
+/*
+ * Remember that a plancache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargePlanCacheRefs()
+ */
+void
+ResourceOwnerRememberPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
+{
+	ResourceArrayAdd(&(owner->planrefarr), PointerGetDatum(plan));
+}
+
+/*
+ * Forget that a plancache reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
+{
+	if (!ResourceArrayRemove(&(owner->planrefarr), PointerGetDatum(plan)))
+		elog(ERROR, "plancache reference %p is not owned by resource owner %s",
+			 plan, owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintPlanCacheLeakWarning(CachedPlan *plan)
+{
+	elog(WARNING, "plancache reference leak: plan %p not closed", plan);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * tupdesc reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeTupleDescs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->tupdescarr));
+}
+
+/*
+ * Remember that a tupdesc reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeTupleDescs()
+ */
+void
+ResourceOwnerRememberTupleDesc(ResourceOwner owner, TupleDesc tupdesc)
+{
+	ResourceArrayAdd(&(owner->tupdescarr), PointerGetDatum(tupdesc));
+}
+
+/*
+ * Forget that a tupdesc reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetTupleDesc(ResourceOwner owner, TupleDesc tupdesc)
+{
+	if (!ResourceArrayRemove(&(owner->tupdescarr), PointerGetDatum(tupdesc)))
+		elog(ERROR, "tupdesc reference %p is not owned by resource owner %s",
+			 tupdesc, owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintTupleDescLeakWarning(TupleDesc tupdesc)
+{
+	elog(WARNING,
+		 "TupleDesc reference leak: TupleDesc %p (%u,%d) still referenced",
+		 tupdesc, tupdesc->tdtypeid, tupdesc->tdtypmod);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * snapshot reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeSnapshots(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->snapshotarr));
+}
+
+/*
+ * Remember that a snapshot reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeSnapshots()
+ */
+void
+ResourceOwnerRememberSnapshot(ResourceOwner owner, Snapshot snapshot)
+{
+	ResourceArrayAdd(&(owner->snapshotarr), PointerGetDatum(snapshot));
+}
+
+/*
+ * Forget that a snapshot reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot)
+{
+	if (!ResourceArrayRemove(&(owner->snapshotarr), PointerGetDatum(snapshot)))
+		elog(ERROR, "snapshot reference %p is not owned by resource owner %s",
+			 snapshot, owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintSnapshotLeakWarning(Snapshot snapshot)
+{
+	elog(WARNING, "Snapshot reference leak: Snapshot %p still referenced",
+		 snapshot);
+}
+
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * files reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeFiles(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->filearr));
+}
+
+/*
+ * Remember that a temporary file is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeFiles()
+ */
+void
+ResourceOwnerRememberFile(ResourceOwner owner, File file)
+{
+	ResourceArrayAdd(&(owner->filearr), FileGetDatum(file));
+}
+
+/*
+ * Forget that a temporary file is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetFile(ResourceOwner owner, File file)
+{
+	if (!ResourceArrayRemove(&(owner->filearr), FileGetDatum(file)))
+		elog(ERROR, "temporary file %d is not owned by resource owner %s",
+			 file, owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintFileLeakWarning(File file)
+{
+	elog(WARNING, "temporary file leak: File %d still referenced",
+		 file);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * dynamic shmem segment reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeDSMs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->dsmarr));
+}
+
+/*
+ * Remember that a dynamic shmem segment is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeDSMs()
+ */
+void
+ResourceOwnerRememberDSM(ResourceOwner owner, dsm_segment *seg)
+{
+	ResourceArrayAdd(&(owner->dsmarr), PointerGetDatum(seg));
+}
+
+/*
+ * Forget that a dynamic shmem segment is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetDSM(ResourceOwner owner, dsm_segment *seg)
+{
+	if (!ResourceArrayRemove(&(owner->dsmarr), PointerGetDatum(seg)))
+		elog(ERROR, "dynamic shared memory segment %u is not owned by resource owner %s",
+			 dsm_segment_handle(seg), owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintDSMLeakWarning(dsm_segment *seg)
+{
+	elog(WARNING, "dynamic shared memory leak: segment %u still referenced",
+		 dsm_segment_handle(seg));
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * JIT context reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out of
+ * memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeJIT(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->jitarr));
+}
+
+/*
+ * Remember that a JIT context is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeJIT()
+ */
+void
+ResourceOwnerRememberJIT(ResourceOwner owner, Datum handle)
+{
+	ResourceArrayAdd(&(owner->jitarr), handle);
+}
+
+/*
+ * Forget that a JIT context is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetJIT(ResourceOwner owner, Datum handle)
+{
+	if (!ResourceArrayRemove(&(owner->jitarr), handle))
+		elog(ERROR, "JIT context %p is not owned by resource owner %s",
+			 DatumGetPointer(handle), owner->name);
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * cryptohash context reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out of
+ * memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeCryptoHash(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->cryptohasharr));
+}
+
+/*
+ * Remember that a cryptohash context is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeCryptoHash()
+ */
+void
+ResourceOwnerRememberCryptoHash(ResourceOwner owner, Datum handle)
+{
+	ResourceArrayAdd(&(owner->cryptohasharr), handle);
+}
+
+/*
+ * Forget that a cryptohash context is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetCryptoHash(ResourceOwner owner, Datum handle)
+{
+	if (!ResourceArrayRemove(&(owner->cryptohasharr), handle))
+		elog(ERROR, "cryptohash context %p is not owned by resource owner %s",
+			 DatumGetPointer(handle), owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintCryptoHashLeakWarning(Datum handle)
+{
+	elog(WARNING, "cryptohash context reference leak: context %p still referenced",
+		 DatumGetPointer(handle));
+}
+
+/*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * hmac context reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out of
+ * memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeHMAC(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&(owner->hmacarr));
+}
+
+/*
+ * Remember that a HMAC context is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeHMAC()
+ */
+void
+ResourceOwnerRememberHMAC(ResourceOwner owner, Datum handle)
+{
+	ResourceArrayAdd(&(owner->hmacarr), handle);
+}
+
+/*
+ * Forget that a HMAC context is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetHMAC(ResourceOwner owner, Datum handle)
+{
+	if (!ResourceArrayRemove(&(owner->hmacarr), handle))
+		elog(ERROR, "HMAC context %p is not owned by resource owner %s",
+			 DatumGetPointer(handle), owner->name);
+}
+
+/*
+ * Debugging subroutine
+ */
+static void
+PrintHMACLeakWarning(Datum handle)
+{
+	elog(WARNING, "HMAC context reference leak: context %p still referenced",
+		 DatumGetPointer(handle));
+>>>>>>> 939dce21892 (yb changes)
 }

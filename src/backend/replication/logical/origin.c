@@ -96,12 +96,17 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+<<<<<<< HEAD
 /* paths for replication origin checkpoint files */
 #define PG_REPLORIGIN_CHECKPOINT_FILENAME PG_LOGICAL_DIR "/replorigin_checkpoint"
 #define PG_REPLORIGIN_CHECKPOINT_TMPFILE PG_REPLORIGIN_CHECKPOINT_FILENAME ".tmp"
 
 /* GUC variables */
 int			max_active_replication_origins = 10;
+=======
+/* YB includes */
+#include "pg_yb_utils.h"
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Replay progress of a single remote node.
@@ -344,7 +349,26 @@ replorigin_create(const char *roname)
 			values[Anum_pg_replication_origin_roname - 1] = roname_d;
 
 			tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+
+			bool yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+			if (IsYugaByteEnabled())
+			{
+				if (yb_use_regular_txn_block)
+					YBAddDdlTxnState(YB_DDL_MODE_SILENT_ALTERING);
+				else
+					YBIncrementDdlNestingLevel(YB_DDL_MODE_SILENT_ALTERING);
+			}
+
 			CatalogTupleInsert(rel, tuple);
+
+			if (IsYugaByteEnabled())
+			{
+				if (yb_use_regular_txn_block)
+					YBMergeDdlTxnState();
+				else
+					YBDecrementDdlNestingLevel();
+			}
+
 			CommandCounterIncrement();
 			break;
 		}
@@ -428,6 +452,40 @@ restart:
 	}
 	LWLockRelease(ReplicationOriginLock);
 	ConditionVariableCancelSleep();
+<<<<<<< HEAD
+=======
+
+	/*
+	 * Now, we can delete the catalog entry.
+	 */
+	tuple = SearchSysCache1(REPLORIGIDENT, ObjectIdGetDatum(roident));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for replication origin with ID %d",
+			 roident);
+
+	bool yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBAddDdlTxnState(YB_DDL_MODE_SILENT_ALTERING);
+		else
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_SILENT_ALTERING);
+	}
+
+	CatalogTupleDelete(rel, tuple);
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBMergeDdlTxnState();
+		else
+			YBDecrementDdlNestingLevel();
+	}
+
+	ReleaseSysCache(tuple);
+
+	CommandCounterIncrement();
+>>>>>>> 939dce21892 (yb changes)
 }
 
 /*

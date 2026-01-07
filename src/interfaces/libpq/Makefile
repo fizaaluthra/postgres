@@ -122,6 +122,7 @@ all: all-lib libpq-refs-stamp
 include $(top_srcdir)/src/Makefile.shlib
 backend_src = $(top_srcdir)/src/backend
 
+<<<<<<< HEAD
 # Add shlib-/stlib-specific objects.
 $(shlib): override OBJS += $(OBJS_SHLIB)
 $(shlib): $(OBJS_SHLIB)
@@ -137,6 +138,26 @@ $(stlib): $(OBJS_STATIC)
 libpq-refs-stamp: $(shlib)
 ifneq ($(enable_coverage), yes)
 	$(PERL) $(srcdir)/libpq_check.pl --input_file $< --nm='$(NM)'
+=======
+# Check for functions that libpq must not call, currently just exit().
+# (Ideally we'd reject abort() too, but there are various scenarios where
+# build toolchains insert abort() calls, e.g. to implement assert().)
+# If nm doesn't exist or doesn't work on shlibs, this test will do nothing,
+# which is fine.  The exclusion of __cxa_atexit is necessary on OpenBSD,
+# which seems to insert references to that even in pure C code.
+# Skip the test when profiling, as gcc may insert exit() calls for that.
+# Also skip the test on platforms where libpq infrastructure may be provided
+# by statically-linked libraries, as we can't expect them to honor this
+# coding rule.
+# YB: exclude __tsan_func_exit as well for TSAN build.
+libpq-refs-stamp: $(shlib)
+ifneq ($(enable_coverage), yes)
+ifeq (,$(filter aix solaris,$(PORTNAME)))
+	@if nm -A -u $< 2>/dev/null | grep -v '__cxa_atexit\|__tsan_func_exit' | grep exit; then \
+		echo 'libpq must not be calling any function which invokes exit'; exit 1; \
+	fi
+endif
+>>>>>>> 939dce21892 (yb changes)
 endif
 	touch $@
 

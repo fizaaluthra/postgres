@@ -767,8 +767,13 @@ my %tests = (
 	'ALTER COLLATION test0 OWNER TO' => {
 		regexp => qr/^\QALTER COLLATION public.test0 OWNER TO \E.+;/m,
 		collation => 1,
+<<<<<<< HEAD
 		like => { %full_runs, section_pre_data => 1, },
 		unlike => { no_owner => 1, },
+=======
+		like      => { %full_runs, section_pre_data => 1, },
+		unlike    => { %dump_test_schema_runs, no_owner => 1, },
+>>>>>>> 939dce21892 (yb changes)
 	},
 
 	'ALTER FOREIGN DATA WRAPPER dummy OWNER TO' => {
@@ -930,7 +935,7 @@ my %tests = (
 		create_sql =>
 		  'ALTER SCHEMA public OWNER TO "regress_quoted  \"" role";',
 		regexp => qr/^(GRANT|REVOKE)/m,
-		like => {},
+		unlike => { defaults_public_owner => 1 },
 	},
 
 	'ALTER SEQUENCE test_table_col1_seq' => {
@@ -1378,8 +1383,14 @@ my %tests = (
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
 		unlike => {
 			exclude_dump_test_schema => 1,
+<<<<<<< HEAD
 			no_owner => 1,
 			only_dump_measurement => 1,
+=======
+			only_dump_test_table     => 1,
+			no_owner                 => 1,
+			role                     => 1,
+>>>>>>> 939dce21892 (yb changes)
 		},
 	},
 
@@ -3619,7 +3630,12 @@ my %tests = (
 	# We should never see the creation of a trigger on a partition
 	'Disabled trigger on partition is not created' => {
 		regexp => qr/CREATE TRIGGER test_trigger.*ON dump_test_second_schema/,
+<<<<<<< HEAD
 		like => {},
+=======
+		like   => {},
+		unlike => { %full_runs, %dump_test_schema_runs },
+>>>>>>> 939dce21892 (yb changes)
 	},
 
 	# Triggers on partitions should not be dropped individually
@@ -3999,11 +4015,41 @@ my %tests = (
 		\QCREATE INDEX measurement_city_id_logdate_idx ON ONLY dump_test.measurement USING\E
 		/xm,
 		like => {
+<<<<<<< HEAD
 			%full_runs, %dump_test_schema_runs, section_post_data => 1,
 		},
 		unlike => {
 			exclude_dump_test_schema => 1,
 			exclude_measurement => 1,
+=======
+			binary_upgrade          => 1,
+			clean                   => 1,
+			clean_if_exists         => 1,
+			compression             => 1,
+			createdb                => 1,
+			defaults                => 1,
+			exclude_test_table      => 1,
+			exclude_test_table_data => 1,
+			no_toast_compression    => 1,
+			no_blobs                => 1,
+			no_privs                => 1,
+			no_owner                => 1,
+			no_table_access_method  => 1,
+			only_dump_test_schema   => 1,
+			pg_dumpall_dbprivs      => 1,
+			pg_dumpall_exclude      => 1,
+			schema_only             => 1,
+			section_post_data       => 1,
+			test_schema_plus_blobs  => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_test_table     => 1,
+			pg_dumpall_globals       => 1,
+			pg_dumpall_globals_clean => 1,
+			role                     => 1,
+			section_pre_data         => 1,
+>>>>>>> 939dce21892 (yb changes)
 		},
 	},
 
@@ -4064,6 +4110,7 @@ my %tests = (
 		\QALTER INDEX dump_test.measurement_pkey ATTACH PARTITION dump_test_second_schema.measurement_y2006m2_pkey\E
 		/xm,
 		like => {
+<<<<<<< HEAD
 			%full_runs,
 			role => 1,
 			section_post_data => 1,
@@ -4071,6 +4118,35 @@ my %tests = (
 		},
 		unlike => {
 			exclude_measurement => 1,
+=======
+			binary_upgrade           => 1,
+			clean                    => 1,
+			clean_if_exists          => 1,
+			compression              => 1,
+			createdb                 => 1,
+			defaults                 => 1,
+			exclude_dump_test_schema => 1,
+			exclude_test_table       => 1,
+			exclude_test_table_data  => 1,
+			no_toast_compression     => 1,
+			no_blobs                 => 1,
+			no_privs                 => 1,
+			no_owner                 => 1,
+			no_table_access_method   => 1,
+			pg_dumpall_dbprivs       => 1,
+			pg_dumpall_exclude       => 1,
+			role                     => 1,
+			schema_only              => 1,
+			section_post_data        => 1,
+		},
+		unlike => {
+			only_dump_test_schema    => 1,
+			only_dump_test_table     => 1,
+			pg_dumpall_globals       => 1,
+			pg_dumpall_globals_clean => 1,
+			section_pre_data         => 1,
+			test_schema_plus_blobs   => 1,
+>>>>>>> 939dce21892 (yb changes)
 		},
 	},
 
@@ -5159,6 +5235,7 @@ foreach my $run (sort keys %pgdump_runs)
 			$test_db = $tests{$test}->{database};
 		}
 
+<<<<<<< HEAD
 		# Check for proper test definitions
 		#
 		# Either "all_runs" should be set or there should be a "like" list,
@@ -5176,6 +5253,8 @@ foreach my $run (sort keys %pgdump_runs)
 			die "useless \"unlike\" entry \"$test_key\" in test \"$test\"";
 		}
 
+=======
+>>>>>>> 939dce21892 (yb changes)
 		# Skip any collation-related commands if there is no collation support
 		if (!$collation_support && defined($tests{$test}->{collation}))
 		{

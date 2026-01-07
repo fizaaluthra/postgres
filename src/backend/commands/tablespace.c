@@ -34,6 +34,9 @@
  * default tablespace.  Without this, CREATE DATABASE would have to go in
  * and munge the system catalogs of the new database.
  *
+ * If Yugabyte is enabled, tablespaces are not used to specify their
+ * location on disk, rather the tablespace options specify the replication
+ * factor and the location of the data as cloud, region, zone blocks.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -79,9 +82,18 @@
 #include "utils/rel.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "catalog/pg_type_d.h"
+#include "commands/yb_cmds.h"
+#include "pg_yb_utils.h"
+#include "utils/jsonfuncs.h"
+#include "utils/syscache.h"
+#include <string.h>
+
 /* GUC variables */
 char	   *default_tablespace = NULL;
 char	   *temp_tablespaces = NULL;
+
 bool		allow_in_place_tablespaces = false;
 
 Oid			binary_upgrade_next_pg_tablespace_oid = InvalidOid;
@@ -90,6 +102,23 @@ static void create_tablespace_directories(const char *location,
 										  const Oid tablespaceoid);
 static bool destroy_tablespace_directories(Oid tablespaceoid, bool redo);
 
+/*
+ * A valid placement configuration is a JSON formatted string with array of
+ * placement policies. Each placement policy has the keys "cloud", "region",
+ * "zone" and "min_number_of_replicas".
+ */
+void
+validatePlacementConfigurations(const char *live_placement,
+								const char *read_replica_placement)
+{
+	/*
+	 * Do not validate that the current set of tservers can satisfy the placement
+	 * because some users add tservers after creating a tablespace (but
+	 * before creating any associated table).
+	 */
+	YBCValidatePlacements(live_placement, read_replica_placement,
+						  /* check_satisfiable */ false);
+}
 
 /*
  * Each database using a table space is isolated into its own name space
@@ -218,12 +247,13 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	bool		in_place;
 
 	/* Must be superuser */
-	if (!superuser())
+	if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create tablespace \"%s\"",
 						stmt->tablespacename),
-				 errhint("Must be superuser to create a tablespace.")));
+				 errhint("Must be superuser or a member of the yb_db_admin "
+						 "role to create a tablespace.")));
 
 	/* However, the eventual owner of the tablespace need not be */
 	if (stmt->owner)
@@ -231,47 +261,54 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	else
 		ownerId = GetUserId();
 
-	/* Unix-ify the offered path, and strip any trailing slashes */
-	location = pstrdup(stmt->location);
-	canonicalize_path(location);
-
-	/* disallow quotes, else CREATE DATABASE would be at risk */
-	if (strchr(location, '\''))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_NAME),
-				 errmsg("tablespace location cannot contain single quotes")));
-
-	in_place = allow_in_place_tablespaces && strlen(location) == 0;
-
 	/*
-	 * Allowing relative paths seems risky
-	 *
-	 * This also helps us ensure that location is not empty or whitespace,
-	 * unless specifying a developer-only in-place tablespace.
+	 *  Skip checks based on the tablespace directory location if this is
+	 *  a Yugabyte enabled cluster.
 	 */
-	if (!in_place && !is_absolute_path(location))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("tablespace location must be an absolute path")));
+	if (!IsYugaByteEnabled())
+	{
+		/* Unix-ify the offered path, and strip any trailing slashes */
+		location = pstrdup(stmt->location);
+		canonicalize_path(location);
 
-	/*
-	 * Check that location isn't too long. Remember that we're going to append
-	 * 'PG_XXX/<dboid>/<relid>_<fork>.<nnn>'.  FYI, we never actually
-	 * reference the whole path here, but MakePGDirectory() uses the first two
-	 * parts.
-	 */
-	if (strlen(location) + 1 + strlen(TABLESPACE_VERSION_DIRECTORY) + 1 +
-		OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1 + OIDCHARS > MAXPGPATH)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("tablespace location \"%s\" is too long",
-						location)));
+		/* disallow quotes, else CREATE DATABASE would be at risk */
+		if (strchr(location, '\''))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_NAME),
+					 errmsg("tablespace location cannot contain single quotes")));
 
-	/* Warn if the tablespace is in the data directory. */
-	if (path_is_prefix_of_path(DataDir, location))
-		ereport(WARNING,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("tablespace location should not be inside the data directory")));
+		in_place = allow_in_place_tablespaces && strlen(location) == 0;
+
+		/*
+		 * Allowing relative paths seems risky
+		 *
+		 * This also helps us ensure that location is not empty or whitespace,
+		 * unless specifying a developer-only in-place tablespace.
+		 */
+		if (!in_place && !is_absolute_path(location))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("tablespace location must be an absolute path")));
+
+		/*
+		 * Check that location isn't too long. Remember that we're going to append
+		 * 'PG_XXX/<dboid>/<relid>_<fork>.<nnn>'.  FYI, we never actually
+		 * reference the whole path here, but MakePGDirectory() uses the first two
+		 * parts.
+		 */
+		if (strlen(location) + 1 + strlen(TABLESPACE_VERSION_DIRECTORY) + 1 +
+			OIDCHARS + 1 + OIDCHARS + 1 + FORKNAMECHARS + 1 + OIDCHARS > MAXPGPATH)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("tablespace location \"%s\" is too long",
+							location)));
+
+		/* Warn if the tablespace is in the data directory. */
+		if (path_is_prefix_of_path(DataDir, location))
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("tablespace location should not be inside the data directory")));
+	}
 
 	/*
 	 * Disallow creation of tablespaces named "pg_xxx"; we reserve this
@@ -336,7 +373,11 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	newOptions = transformRelOptions((Datum) 0,
 									 stmt->options,
 									 NULL, NULL, false, false);
-	(void) tablespace_reloptions(newOptions, true);
+	if (IsYugaByteEnabled())
+		(void) yb_tablespace_reloptions(newOptions, true);
+	else
+		(void) tablespace_reloptions(newOptions, true);
+
 	if (newOptions != (Datum) 0)
 		values[Anum_pg_tablespace_spcoptions - 1] = newOptions;
 	else
@@ -354,31 +395,45 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	/* Post creation hook for new tablespace */
 	InvokeObjectPostCreateHook(TableSpaceRelationId, tablespaceoid, 0);
 
-	create_tablespace_directories(location, tablespaceoid);
-
-	/* Record the filesystem change in XLOG */
+	/* Skip tablespace directory creation for YB clusters */
+	if (!IsYugaByteEnabled())
 	{
-		xl_tblspc_create_rec xlrec;
+		create_tablespace_directories(location, tablespaceoid);
 
-		xlrec.ts_id = tablespaceoid;
+		/* Record the filesystem change in XLOG */
+		{
+			xl_tblspc_create_rec xlrec;
 
+<<<<<<< HEAD
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec,
 						 offsetof(xl_tblspc_create_rec, ts_path));
 		XLogRegisterData(location, strlen(location) + 1);
+=======
+			xlrec.ts_id = tablespaceoid;
+>>>>>>> 939dce21892 (yb changes)
 
-		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_CREATE);
+			XLogBeginInsert();
+			XLogRegisterData((char *) &xlrec,
+							 offsetof(xl_tblspc_create_rec, ts_path));
+			XLogRegisterData((char *) location, strlen(location) + 1);
+
+			(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_CREATE);
+		}
+		/*
+		 * Force synchronous commit, to minimize the window between creating the
+		 * symlink on-disk and marking the transaction committed.  It's not great
+		 * that there is any window at all, but definitely we don't want to make
+		 * it larger than necessary.
+		 */
+		ForceSyncCommit();
+
+		pfree(location);
 	}
-
-	/*
-	 * Force synchronous commit, to minimize the window between creating the
-	 * symlink on-disk and marking the transaction committed.  It's not great
-	 * that there is any window at all, but definitely we don't want to make
-	 * it larger than necessary.
-	 */
-	ForceSyncCommit();
-
-	pfree(location);
+	else
+	{
+		ForceSyncCommit();
+	}
 
 	/* We keep the lock on pg_tablespace until commit */
 	table_close(rel, NoLock);
@@ -452,12 +507,36 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	/* Check for pg_shdepend entries depending on this tablespace */
 	if (checkSharedDependencies(TableSpaceRelationId, tablespaceoid,
 								&detail, &detail_log))
+	{
+		if (IsYugaByteEnabled() && detail != NULL)
+		{
+			detail = YBDetailSorted(detail);
+		}
 		ereport(ERROR,
 				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 				 errmsg("tablespace \"%s\" cannot be dropped because some objects depend on it",
 						tablespacename),
 				 errdetail_internal("%s", detail),
 				 errdetail_log("%s", detail_log)));
+	}
+
+	/*
+	 * YB: Check if there are snapshot schedules, disallow dropping in such
+	 * cases
+	 */
+	if (IsYugaByteEnabled())
+	{
+		bool		is_active;
+
+		HandleYBStatus(YBCPgCheckIfPitrActive(&is_active));
+		if (is_active)
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("tablespace \"%s\" cannot be dropped. "
+							"Dropping tablespaces is not allowed on clusters "
+							"with Point in Time Restore activated.",
+							tablespacename)));
+	}
 
 	/* DROP hook for the tablespace being removed */
 	InvokeObjectDropHook(TableSpaceRelationId, tablespaceoid, 0);
@@ -465,7 +544,7 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	/*
 	 * Remove the pg_tablespace tuple (this will roll back if we fail below)
 	 */
-	CatalogTupleDelete(rel, &tuple->t_self);
+	CatalogTupleDelete(rel, tuple);
 
 	table_endscan(scandesc);
 
@@ -487,19 +566,15 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	LWLockAcquire(TablespaceCreateLock, LW_EXCLUSIVE);
 
 	/*
-	 * Try to remove the physical infrastructure.
+	 * For YB clusters there are no directories associated with a tablespace.
+	 * Hence no need to clean up any physical infrastructure.
 	 */
-	if (!destroy_tablespace_directories(tablespaceoid, false))
+	if (!IsYugaByteEnabled())
 	{
 		/*
-		 * Not all files deleted?  However, there can be lingering empty files
-		 * in the directories, left behind by for example DROP TABLE, that
-		 * have been scheduled for deletion at next checkpoint (see comments
-		 * in mdunlink() for details).  We could just delete them immediately,
-		 * but we can't tell them apart from important data files that we
-		 * mustn't delete.  So instead, we force a checkpoint which will clean
-		 * out any lingering files, and try again.
+		 * Try to remove the physical infrastructure.
 		 */
+<<<<<<< HEAD
 		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 		/*
@@ -516,26 +591,61 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 		LWLockAcquire(TablespaceCreateLock, LW_EXCLUSIVE);
 
 		/* And now try again. */
+=======
+>>>>>>> 939dce21892 (yb changes)
 		if (!destroy_tablespace_directories(tablespaceoid, false))
 		{
-			/* Still not empty, the files must be important then */
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("tablespace \"%s\" is not empty",
-							tablespacename)));
+			/*
+			 * Not all files deleted?  However, there can be lingering empty files
+			 * in the directories, left behind by for example DROP TABLE, that
+			 * have been scheduled for deletion at next checkpoint (see comments
+			 * in mdunlink() for details).  We could just delete them immediately,
+			 * but we can't tell them apart from important data files that we
+			 * mustn't delete.  So instead, we force a checkpoint which will clean
+			 * out any lingering files, and try again.
+			 */
+			RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+
+			/*
+			 * On Windows, an unlinked file persists in the directory listing
+			 * until no process retains an open handle for the file.  The DDL
+			 * commands that schedule files for unlink send invalidation messages
+			 * directing other PostgreSQL processes to close the files, but
+			 * nothing guarantees they'll be processed in time.  So, we'll also
+			 * use a global barrier to ask all backends to close all files, and
+			 * wait until they're finished.
+			 */
+			LWLockRelease(TablespaceCreateLock);
+			WaitForProcSignalBarrier(EmitProcSignalBarrier(PROCSIGNAL_BARRIER_SMGRRELEASE));
+			LWLockAcquire(TablespaceCreateLock, LW_EXCLUSIVE);
+
+			/* And now try again. */
+			if (!destroy_tablespace_directories(tablespaceoid, false))
+			{
+				/* Still not empty, the files must be important then */
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("tablespace \"%s\" is not empty",
+								tablespacename)));
+			}
 		}
-	}
 
-	/* Record the filesystem change in XLOG */
-	{
-		xl_tblspc_drop_rec xlrec;
+		/* Record the filesystem change in XLOG */
+		{
+			xl_tblspc_drop_rec xlrec;
 
-		xlrec.ts_id = tablespaceoid;
+			xlrec.ts_id = tablespaceoid;
 
+<<<<<<< HEAD
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, sizeof(xl_tblspc_drop_rec));
+=======
+			XLogBeginInsert();
+			XLogRegisterData((char *) &xlrec, sizeof(xl_tblspc_drop_rec));
+>>>>>>> 939dce21892 (yb changes)
 
-		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_DROP);
+			(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_DROP);
+		}
 	}
 
 	/*
@@ -685,6 +795,16 @@ create_tablespace_directories(const char *location, const Oid tablespaceoid)
 static bool
 destroy_tablespace_directories(Oid tablespaceoid, bool redo)
 {
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * For Yugabyte clusters, tablespaces are not directories.
+		 * They are logical groupings of tables to specify options
+		 * like geo-placement. Thus destroying directories is not
+		 * applicable for YB clusters.
+		 */
+		return true;
+	}
 	char	   *linkloc;
 	char	   *linkloc_with_version_dir;
 	DIR		   *dirdesc;
@@ -1055,7 +1175,11 @@ AlterTableSpaceOptions(AlterTableSpaceOptionsStmt *stmt)
 	newOptions = transformRelOptions(isnull ? (Datum) 0 : datum,
 									 stmt->options, NULL, NULL, false,
 									 stmt->isReset);
-	(void) tablespace_reloptions(newOptions, true);
+
+	if (IsYugaByteEnabled())
+		(void) yb_tablespace_reloptions(newOptions, true);
+	else
+		(void) tablespace_reloptions(newOptions, true);
 
 	/* Build new tuple. */
 	memset(repl_null, false, sizeof(repl_null));
@@ -1118,6 +1242,15 @@ check_default_tablespace(char **newval, void **extra, GucSource source)
 				return false;
 			}
 		}
+	}
+
+	/*
+	 * YB: If Connection Manager is enabled, make the connection sticky.
+	 */
+	if (YbIsClientYsqlConnMgr())
+	{
+		elog(LOG, "Setting sticky connection for default_tablespace");
+		yb_ysql_conn_mgr_sticky_guc = true;
 	}
 
 	return true;
@@ -1297,6 +1430,15 @@ check_temp_tablespaces(char **newval, void **extra, GucSource source)
 
 	pfree(rawname);
 	list_free(namelist);
+
+	/*
+	 * YB: If Connection Manager is enabled, make the connection sticky.
+	 */
+	if (YbIsClientYsqlConnMgr())
+	{
+		elog(LOG, "Setting sticky connection for temp_tablespaces");
+		yb_ysql_conn_mgr_sticky_guc = true;
+	}
 
 	return true;
 }
@@ -1503,6 +1645,54 @@ get_tablespace_name(Oid spc_oid)
 	return result;
 }
 
+/*
+ * yb_get_tablespace_options - given a tablespace OID, look up the
+ * tablespace options
+ *
+ * Returns a palloc'd string if options are found, NULL otherwise.
+ */
+void
+yb_get_tablespace_options(Datum **options, int *num_options, Oid spc_oid)
+{
+	bool		isnull;
+	Datum		datum;
+	HeapTuple	tuple;
+
+	/*
+	 * Search pg_tablespace.
+	 */
+	tuple = SearchSysCache1(TABLESPACEOID, ObjectIdGetDatum(spc_oid));
+
+	if (HeapTupleIsValid(tuple))
+	{
+		datum = SysCacheGetAttr(TABLESPACEOID, tuple,
+								Anum_pg_tablespace_spcoptions, &isnull);
+		if (!isnull)
+		{
+			Assert(PointerIsValid(DatumGetPointer(datum)));
+			ArrayType  *array = DatumGetArrayTypeP(datum);
+
+			deconstruct_array(array, TEXTOID, -1, false, 'i',
+							  options, NULL, num_options);
+		}
+		else
+		{
+			/*
+			 * No custom options for this tablespace.
+			 */
+			*num_options = 0;
+			*options = NULL;
+		}
+	}
+
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("tablespace %i does not exist",
+						spc_oid)));
+
+	ReleaseSysCache(tuple);
+}
 
 /*
  * TABLESPACE resource manager's routines

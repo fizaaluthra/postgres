@@ -166,9 +166,18 @@ PrepareSortSupportFromIndexRel(Relation indexRel, bool reverse,
 
 	Assert(ssup->comparator == NULL);
 
+<<<<<<< HEAD
 	if (!indexRel->rd_indam->amcanorder)
 		elog(ERROR, "unexpected non-amcanorder AM: %u", indexRel->rd_rel->relam);
 	ssup->ssup_reverse = reverse;
+=======
+	if (indexRel->rd_rel->relam != BTREE_AM_OID && indexRel->rd_rel->relam != LSM_AM_OID)
+		elog(ERROR, "unexpected non-btree AM: %u", indexRel->rd_rel->relam);
+	if (strategy != BTGreaterStrategyNumber &&
+		strategy != BTLessStrategyNumber)
+		elog(ERROR, "unexpected sort support strategy: %d", strategy);
+	ssup->ssup_reverse = (strategy == BTGreaterStrategyNumber);
+>>>>>>> 939dce21892 (yb changes)
 
 	FinishSortSupportFunction(opfamily, opcintype, ssup);
 }

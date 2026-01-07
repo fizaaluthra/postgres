@@ -172,6 +172,42 @@ main(int argc, char *const argv[])
 	{
 		switch (c)
 		{
+<<<<<<< HEAD
+=======
+			case ECPG_GETOPT_LONG_REGRESSION:
+				regression_mode = true;
+				break;
+			case 'o':
+				output_filename = mm_strdup(optarg);
+				if (strcmp(output_filename, "-") == 0)
+					base_yyout = stdout;
+				else
+					base_yyout = fopen(output_filename, PG_BINARY_W);
+
+				if (base_yyout == NULL)
+				{
+					fprintf(stderr, _("%s: could not open file \"%s\": %s\n"),
+							progname, output_filename, strerror(errno));
+					output_filename = NULL;
+				}
+				else
+					out_option = 1;
+				break;
+			case 'I':
+				add_include_path(optarg);
+				break;
+			case 't':
+				autocommit = true;
+				break;
+			case 'v':
+				verbose = true;
+				break;
+			case 'h':
+				header_mode = true;
+				/* this must include "-c" to make sense, so fall through */
+				/* FALLTHROUGH */
+				yb_switch_fallthrough();
+>>>>>>> 939dce21892 (yb changes)
 			case 'c':
 				auto_create_c = true;
 				break;

@@ -25,6 +25,7 @@
 #include "storage/itemptr.h"
 #include "utils/dsa.h"
 
+<<<<<<< HEAD
 /*
  * The maximum number of tuples per page is not large (typically 256 with
  * 8K pages, or 1024 with 32K pages).  So there's not much point in making
@@ -32,6 +33,11 @@
  * is this:
  */
 #define TBM_MAX_TUPLES_PER_PAGE  MaxHeapTuplesPerPage
+=======
+/* YB includes */
+#include "nodes/ybtidbitmap.h"
+
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Actual bitmap representation is private to tidbitmap.c.  Callers can
@@ -39,8 +45,19 @@
  */
 typedef struct TIDBitmap TIDBitmap;
 
+<<<<<<< HEAD
 /* Likewise, TBMPrivateIterator is private */
 typedef struct TBMPrivateIterator TBMPrivateIterator;
+=======
+typedef union
+{
+	TIDBitmap  *tbm;
+	YbTIDBitmap *ybtbm;
+} YbTupleBitmap;
+
+/* Likewise, TBMIterator is private */
+typedef struct TBMIterator TBMIterator;
+>>>>>>> 939dce21892 (yb changes)
 typedef struct TBMSharedIterator TBMSharedIterator;
 
 /*

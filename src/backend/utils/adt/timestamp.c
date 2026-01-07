@@ -40,6 +40,10 @@
 #include "utils/skipsupport.h"
 #include "utils/sortsupport.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
 /*
  * gcc's -ffast-math switch breaks routines that expect exact results from
  * expressions like timeval / SECS_PER_HOUR, where timeval is double.
@@ -776,6 +780,7 @@ Datum
 timestamptz_out(PG_FUNCTION_ARGS)
 {
 	TimestampTz dt = PG_GETARG_TIMESTAMPTZ(0);
+	YbDatumDecodeOptions *decode_options = NULL;
 	char	   *result;
 	int			tz;
 	struct pg_tm tt,
@@ -784,9 +789,17 @@ timestamptz_out(PG_FUNCTION_ARGS)
 	const char *tzn;
 	char		buf[MAXDATELEN + 1];
 
+	/* YB */
+	if (PG_NARGS() == 2)
+	{
+		decode_options = (YbDatumDecodeOptions *) PG_GETARG_POINTER(1);
+	}
+
 	if (TIMESTAMP_NOT_FINITE(dt))
 		EncodeSpecialTimestamp(dt, buf);
-	else if (timestamp2tm(dt, &tz, tm, &fsec, &tzn, NULL) == 0)
+	else if (((decode_options != NULL && decode_options->from_YB) ?
+			  (timestamp2tm(dt, &tz, tm, &fsec, &tzn, pg_tzset(decode_options->timezone))) :
+			  (timestamp2tm(dt, &tz, tm, &fsec, &tzn, NULL))) == 0)
 		EncodeDateTime(tm, fsec, true, tz, tzn, DateStyle, buf);
 	else
 		ereport(ERROR,
@@ -1633,6 +1646,15 @@ Datum
 pg_conf_load_time(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_TIMESTAMPTZ(PgReloadTime);
+}
+
+/*
+ * Get the current operating system time value as hybrid time.
+ */
+Datum
+yb_get_current_hybrid_time_lsn(PG_FUNCTION_ARGS)
+{
+	return Int64GetDatum(YBCGetCurrentHybridTimeLsn());
 }
 
 /*
@@ -4745,6 +4767,7 @@ timestamp_trunc(PG_FUNCTION_ARGS)
 				else
 					tm->tm_year = -((999 - (tm->tm_year - 1)) / 1000) * 1000 + 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_CENTURY:
 				/* see comments in timestamptz_trunc */
 				if (tm->tm_year > 0)
@@ -4752,6 +4775,7 @@ timestamp_trunc(PG_FUNCTION_ARGS)
 				else
 					tm->tm_year = -((99 - (tm->tm_year - 1)) / 100) * 100 + 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_DECADE:
 				/* see comments in timestamptz_trunc */
 				if (val != DTK_MILLENNIUM && val != DTK_CENTURY)
@@ -4762,24 +4786,31 @@ timestamp_trunc(PG_FUNCTION_ARGS)
 						tm->tm_year = -((8 - (tm->tm_year - 1)) / 10) * 10;
 				}
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_YEAR:
 				tm->tm_mon = 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_QUARTER:
 				tm->tm_mon = (3 * ((tm->tm_mon - 1) / 3)) + 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_MONTH:
 				tm->tm_mday = 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_DAY:
 				tm->tm_hour = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_HOUR:
 				tm->tm_min = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_MINUTE:
 				tm->tm_sec = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_SECOND:
 				fsec = 0;
 				break;
@@ -4991,6 +5022,7 @@ timestamptz_trunc_internal(text *units, TimestampTz timestamp, pg_tz *tzp)
 				else
 					tm->tm_year = -((999 - (tm->tm_year - 1)) / 1000) * 1000 + 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_CENTURY:
 				/* truncating to the century? as above: -100, 1, 101... */
 				if (tm->tm_year > 0)
@@ -4998,6 +5030,7 @@ timestamptz_trunc_internal(text *units, TimestampTz timestamp, pg_tz *tzp)
 				else
 					tm->tm_year = -((99 - (tm->tm_year - 1)) / 100) * 100 + 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_DECADE:
 
 				/*
@@ -5012,25 +5045,32 @@ timestamptz_trunc_internal(text *units, TimestampTz timestamp, pg_tz *tzp)
 						tm->tm_year = -((8 - (tm->tm_year - 1)) / 10) * 10;
 				}
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_YEAR:
 				tm->tm_mon = 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_QUARTER:
 				tm->tm_mon = (3 * ((tm->tm_mon - 1) / 3)) + 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_MONTH:
 				tm->tm_mday = 1;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_DAY:
 				tm->tm_hour = 0;
 				redotz = true;	/* for all cases >= DAY */
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_HOUR:
 				tm->tm_min = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_MINUTE:
 				tm->tm_sec = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_SECOND:
 				fsec = 0;
 				break;
@@ -5172,32 +5212,41 @@ interval_trunc(PG_FUNCTION_ARGS)
 				/* caution: C division may have negative remainder */
 				tm->tm_year = (tm->tm_year / 1000) * 1000;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_CENTURY:
 				/* caution: C division may have negative remainder */
 				tm->tm_year = (tm->tm_year / 100) * 100;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_DECADE:
 				/* caution: C division may have negative remainder */
 				tm->tm_year = (tm->tm_year / 10) * 10;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_YEAR:
 				tm->tm_mon = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_QUARTER:
 				tm->tm_mon = 3 * (tm->tm_mon / 3);
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_MONTH:
 				tm->tm_mday = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_DAY:
 				tm->tm_hour = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_HOUR:
 				tm->tm_min = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_MINUTE:
 				tm->tm_sec = 0;
 				/* FALL THRU */
+				yb_switch_fallthrough();
 			case DTK_SECOND:
 				tm->tm_usec = 0;
 				break;
@@ -6827,6 +6876,7 @@ generate_series_timestamptz_internal(FunctionCallInfo fcinfo)
 	}
 }
 
+<<<<<<< HEAD
 Datum
 generate_series_timestamptz(PG_FUNCTION_ARGS)
 {
@@ -6944,4 +6994,18 @@ Datum
 timestamptz_at_local(PG_FUNCTION_ARGS)
 {
 	return timestamptz_timestamp(fcinfo);
+=======
+/*
+ * Same as timestamptz_to_time_t, but with microsecond precision.
+ */
+pg_time_t
+yb_timestamptz_to_micros_time_t(TimestampTz t)
+{
+	pg_time_t	result;
+
+	result = (pg_time_t) (t +
+						  ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * USECS_PER_DAY));
+
+	return result;
+>>>>>>> 939dce21892 (yb changes)
 }

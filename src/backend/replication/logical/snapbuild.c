@@ -144,6 +144,117 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/snapshot.h"
+<<<<<<< HEAD
+=======
+
+/* YB includes */
+#include "pg_yb_utils.h"
+
+/*
+ * This struct contains the current state of the snapshot building
+ * machinery. Besides a forward declaration in the header, it is not exposed
+ * to the public, so we can easily change its contents.
+ */
+struct SnapBuild
+{
+	/* how far are we along building our first full snapshot */
+	SnapBuildState state;
+
+	/* private memory context used to allocate memory for this module. */
+	MemoryContext context;
+
+	/* all transactions < than this have committed/aborted */
+	TransactionId xmin;
+
+	/* all transactions >= than this are uncommitted */
+	TransactionId xmax;
+
+	/*
+	 * Don't replay commits from an LSN < this LSN. This can be set externally
+	 * but it will also be advanced (never retreat) from within snapbuild.c.
+	 */
+	XLogRecPtr	start_decoding_at;
+
+	/*
+	 * LSN at which two-phase decoding was enabled or LSN at which we found a
+	 * consistent point at the time of slot creation.
+	 *
+	 * The prepared transactions, that were skipped because previously
+	 * two-phase was not enabled or are not covered by initial snapshot, need
+	 * to be sent later along with commit prepared and they must be before
+	 * this point.
+	 */
+	XLogRecPtr	two_phase_at;
+
+	/*
+	 * Don't start decoding WAL until the "xl_running_xacts" information
+	 * indicates there are no running xids with an xid smaller than this.
+	 */
+	TransactionId initial_xmin_horizon;
+
+	/* Indicates if we are building full snapshot or just catalog one. */
+	bool		building_full_snapshot;
+
+	/*
+	 * Snapshot that's valid to see the catalog state seen at this moment.
+	 */
+	Snapshot	snapshot;
+
+	/*
+	 * LSN of the last location we are sure a snapshot has been serialized to.
+	 */
+	XLogRecPtr	last_serialized_snapshot;
+
+	/*
+	 * The reorderbuffer we need to update with usable snapshots et al.
+	 */
+	ReorderBuffer *reorder;
+
+	/*
+	 * TransactionId at which the next phase of initial snapshot building will
+	 * happen. InvalidTransactionId if not known (i.e. SNAPBUILD_START), or
+	 * when no next phase necessary (SNAPBUILD_CONSISTENT).
+	 */
+	TransactionId next_phase_at;
+
+	/*
+	 * Array of transactions which could have catalog changes that committed
+	 * between xmin and xmax.
+	 */
+	struct
+	{
+		/* number of committed transactions */
+		size_t		xcnt;
+
+		/* available space for committed transactions */
+		size_t		xcnt_space;
+
+		/*
+		 * Until we reach a CONSISTENT state, we record commits of all
+		 * transactions, not just the catalog changing ones. Record when that
+		 * changes so we know we cannot export a snapshot safely anymore.
+		 */
+		bool		includes_all_transactions;
+
+		/*
+		 * Array of committed transactions that have modified the catalog.
+		 *
+		 * As this array is frequently modified we do *not* keep it in
+		 * xidComparator order. Instead we sort the array when building &
+		 * distributing a snapshot.
+		 *
+		 * TODO: It's unclear whether that reasoning has much merit. Every
+		 * time we add something here after becoming consistent will also
+		 * require distributing a snapshot. Storing them sorted would
+		 * potentially also make it easier to purge (but more complicated wrt
+		 * wraparound?). Should be improved if sorting while building the
+		 * snapshot shows up in profiles.
+		 */
+		TransactionId *xip;
+	}			committed;
+};
+
+>>>>>>> 939dce21892 (yb changes)
 /*
  * Starting a transaction -- which we need to do while exporting a snapshot --
  * removes knowledge about the previously used resowner, so we save it here.
@@ -533,9 +644,11 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
  * For that we need to start a transaction in the current backend as the
  * importing side checks whether the source transaction is still open to make
  * sure the xmin horizon hasn't advanced since then.
+ *
+ * YB Note: yb_read_time is used to build snapshot with associated read time.
  */
-const char *
-SnapBuildExportSnapshot(SnapBuild *builder)
+static const char *
+SnapBuildExportSnapshotImpl(SnapBuild *builder, const uint64_t *yb_read_time)
 {
 	Snapshot	snap;
 	char	   *snapname;
@@ -555,7 +668,21 @@ SnapBuildExportSnapshot(SnapBuild *builder)
 	XactIsoLevel = XACT_REPEATABLE_READ;
 	XactReadOnly = true;
 
-	snap = SnapBuildInitialSnapshot(builder);
+	SnapshotData yb_snap = {};
+
+	/* YB */
+	if (builder)
+	{
+		Assert(!yb_read_time);
+		snap = SnapBuildInitialSnapshot(builder);
+	}
+	else
+	{
+		Assert(yb_read_time);
+		snap = &yb_snap;
+		YbInitSnapshot(snap, YbRegisterSnapshotReadTime(*yb_read_time));
+		snap->yb_is_built_for_export = true;
+	}
 
 	/*
 	 * now that we've built a plain snapshot, make it active and use the
@@ -569,6 +696,18 @@ SnapBuildExportSnapshot(SnapBuild *builder)
 						   snap->xcnt,
 						   snapname, snap->xcnt)));
 	return snapname;
+}
+
+const char *
+SnapBuildExportSnapshot(SnapBuild *builder)
+{
+	return SnapBuildExportSnapshotImpl(builder, NULL /* yb_read_time */ );
+}
+
+const char *
+YbSnapBuildExportSnapshotWithReadTime(uint64_t read_time)
+{
+	return SnapBuildExportSnapshotImpl(NULL /* builder */ , &read_time);
 }
 
 /*

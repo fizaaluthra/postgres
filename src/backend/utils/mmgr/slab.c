@@ -372,6 +372,8 @@ SlabContextCreate(MemoryContext parent,
 						   name)));
 	}
 
+	YbPgMemAddConsumption(headerSize);
+
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
 	 * we'd leak the header if we ereport in this stretch.
@@ -477,10 +479,18 @@ SlabReset(MemoryContext context)
 			wipe_mem(block, slab->blockSize);
 #endif
 
+<<<<<<< HEAD
 			/* As in aset.c, free block-header vchunks explicitly */
 			VALGRIND_MEMPOOL_FREE(slab, block);
 
 			free(block);
+=======
+			size_t		freed_sz = slab->blockSize;
+
+			free(block);
+			YbPgMemSubConsumption(freed_sz);
+			slab->nblocks--;
+>>>>>>> 939dce21892 (yb changes)
 			context->mem_allocated -= slab->blockSize;
 		}
 	}
@@ -508,11 +518,16 @@ SlabDelete(MemoryContext context)
 	/* Reset to release all the SlabBlocks */
 	SlabReset(context);
 
+<<<<<<< HEAD
 	/* Destroy the vpool -- see notes in aset.c */
 	VALGRIND_DESTROY_MEMPOOL(context);
+=======
+	size_t		freed_sz = ((SlabContext *) context)->headerSize;
+>>>>>>> 939dce21892 (yb changes)
 
 	/* And free the context header */
 	free(context);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -529,9 +544,115 @@ SlabAllocSetupNewChunk(MemoryContext context, SlabBlock *block,
 	 * Check that the chunk pointer is actually somewhere on the block and is
 	 * aligned as expected.
 	 */
+<<<<<<< HEAD
 	Assert(chunk >= SlabBlockGetChunk(slab, block, 0));
 	Assert(chunk <= SlabBlockGetChunk(slab, block, slab->chunksPerBlock - 1));
 	Assert(SlabChunkMod(slab, block, chunk) == 0);
+=======
+	if (slab->minFreeChunks == 0)
+	{
+		block = (SlabBlock *) malloc(slab->blockSize);
+
+		if (block == NULL)
+			return NULL;
+
+		YbPgMemAddConsumption(slab->blockSize);
+
+		block->nfree = slab->chunksPerBlock;
+		block->firstFreeChunk = 0;
+
+		/*
+		 * Put all the chunks on a freelist. Walk the chunks and point each
+		 * one to the next one.
+		 */
+		for (idx = 0; idx < slab->chunksPerBlock; idx++)
+		{
+			chunk = SlabBlockGetChunk(slab, block, idx);
+			*(int32 *) SlabChunkGetPointer(chunk) = (idx + 1);
+		}
+
+		/*
+		 * And add it to the last freelist with all chunks empty.
+		 *
+		 * We know there are no blocks in the freelist, otherwise we wouldn't
+		 * need a new block.
+		 */
+		Assert(dlist_is_empty(&slab->freelist[slab->chunksPerBlock]));
+
+		dlist_push_head(&slab->freelist[slab->chunksPerBlock], &block->node);
+
+		slab->minFreeChunks = slab->chunksPerBlock;
+		slab->nblocks += 1;
+		context->mem_allocated += slab->blockSize;
+	}
+
+	/* grab the block from the freelist (even the new block is there) */
+	block = dlist_head_element(SlabBlock, node,
+							   &slab->freelist[slab->minFreeChunks]);
+
+	/* make sure we actually got a valid block, with matching nfree */
+	Assert(block != NULL);
+	Assert(slab->minFreeChunks == block->nfree);
+	Assert(block->nfree > 0);
+
+	/* we know index of the first free chunk in the block */
+	idx = block->firstFreeChunk;
+
+	/* make sure the chunk index is valid, and that it's marked as empty */
+	Assert((idx >= 0) && (idx < slab->chunksPerBlock));
+
+	/* compute the chunk location block start (after the block header) */
+	chunk = SlabBlockGetChunk(slab, block, idx);
+
+	/*
+	 * Update the block nfree count, and also the minFreeChunks as we've
+	 * decreased nfree for a block with the minimum number of free chunks
+	 * (because that's how we chose the block).
+	 */
+	block->nfree--;
+	slab->minFreeChunks = block->nfree;
+
+	/*
+	 * Remove the chunk from the freelist head. The index of the next free
+	 * chunk is stored in the chunk itself.
+	 */
+	VALGRIND_MAKE_MEM_DEFINED(SlabChunkGetPointer(chunk), sizeof(int32));
+	block->firstFreeChunk = *(int32 *) SlabChunkGetPointer(chunk);
+
+	Assert(block->firstFreeChunk >= 0);
+	Assert(block->firstFreeChunk <= slab->chunksPerBlock);
+
+	Assert((block->nfree != 0 &&
+			block->firstFreeChunk < slab->chunksPerBlock) ||
+		   (block->nfree == 0 &&
+			block->firstFreeChunk == slab->chunksPerBlock));
+
+	/* move the whole block to the right place in the freelist */
+	dlist_delete(&block->node);
+	dlist_push_head(&slab->freelist[block->nfree], &block->node);
+
+	/*
+	 * And finally update minFreeChunks, i.e. the index to the block with the
+	 * lowest number of free chunks. We only need to do that when the block
+	 * got full (otherwise we know the current block is the right one). We'll
+	 * simply walk the freelist until we find a non-empty entry.
+	 */
+	if (slab->minFreeChunks == 0)
+	{
+		for (idx = 1; idx <= slab->chunksPerBlock; idx++)
+		{
+			if (dlist_is_empty(&slab->freelist[idx]))
+				continue;
+
+			/* found a non-empty freelist */
+			slab->minFreeChunks = idx;
+			break;
+		}
+	}
+
+	if (slab->minFreeChunks == slab->chunksPerBlock)
+		slab->minFreeChunks = 0;
+>>>>>>> 939dce21892 (yb changes)
 
 	/* Prepare to initialize the chunk header. */
 	VALGRIND_MAKE_MEM_UNDEFINED(chunk, Slab_CHUNKHDRSZ);
@@ -805,8 +926,20 @@ SlabFree(void *pointer)
 	/* Handle when a block becomes completely empty */
 	if (unlikely(block->nfree == slab->chunksPerBlock))
 	{
+<<<<<<< HEAD
 		/* remove the block */
 		dlist_delete_from(&slab->blocklist[newBlocklistIdx], &block->node);
+=======
+		size_t		freed_sz = slab->blockSize;
+
+		free(block);
+		YbPgMemSubConsumption(freed_sz);
+		slab->nblocks--;
+		context->mem_allocated -= slab->blockSize;
+	}
+	else
+		dlist_push_head(&slab->freelist[block->nfree], &block->node);
+>>>>>>> 939dce21892 (yb changes)
 
 		/*
 		 * To avoid thrashing malloc/free, we keep a list of empty blocks that

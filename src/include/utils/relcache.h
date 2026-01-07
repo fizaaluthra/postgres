@@ -18,6 +18,9 @@
 #include "common/relpath.h"
 #include "nodes/bitmapset.h"
 
+/* YB includes */
+#include "nodes/parsenodes.h"
+
 
 /*
  * Name of relcache init file(s), used to speed up backend startup
@@ -125,8 +128,15 @@ extern Relation RelationBuildLocalRelation(const char *relname,
 /*
  * Routines to manage assignment of new relfilenumber to a relation
  */
+<<<<<<< HEAD
 extern void RelationSetNewRelfilenumber(Relation relation, char persistence);
 extern void RelationAssumeNewRelfilelocator(Relation relation);
+=======
+extern void RelationSetNewRelfilenode(Relation relation, char persistence,
+									  bool yb_copy_split_options,
+									  YbOptSplit *preserved_index_split_options);
+extern void RelationAssumeNewRelfilenode(Relation relation);
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Routines for flushing/rebuilding relcache entries in various scenarios
@@ -159,5 +169,25 @@ extern PGDLLIMPORT bool criticalRelcachesBuilt;
 
 /* should be used only by relcache.c and postinit.c */
 extern PGDLLIMPORT bool criticalSharedRelcachesBuilt;
+
+/* YB */
+extern List *YbRelationGetFKeyReferencedByList(Relation relation);
+extern void YbComputeIndexExprOrPredicateAttrs(Bitmapset **indexattrs,
+											   Relation indexDesc,
+											   const int Anum_pg_index,
+											   AttrNumber attr_offset);
+extern bool CheckIndexForUpdate(Oid indexoid,
+								const Bitmapset *updated_attrs, AttrNumber attr_offset);
+extern bool CheckUpdateExprOrPred(const Bitmapset *updated_attrs,
+								  Relation indexDesc,
+								  const int Anum_pg_index,
+								  AttrNumber attr_offset);
+extern void YBPreloadRelCache();
+extern void YbRelationCacheInvalidate(void);
+extern bool YbRelationIdIsInInitFileAndNotCached(Oid relationId);
+extern bool YbSharedRelationIdNeedsGlobalImpact(Oid relationId);
+extern Relation YbRelationIdCacheLookup(Oid relid);
+
+extern long YbGetRelCachePreloads(void);
 
 #endif							/* RELCACHE_H */

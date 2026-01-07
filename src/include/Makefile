@@ -17,6 +17,7 @@ all: pg_config.h pg_config_os.h
 
 
 # Subdirectories containing installable headers
+<<<<<<< HEAD
 SUBDIRS = \
 	access \
 	archive \
@@ -57,6 +58,16 @@ SUBDIRS = \
 	port/win32/netinet \
 	port/win32/sys \
 	portability
+=======
+SUBDIRS = access bootstrap catalog commands common datatype \
+	executor fe_utils foreign jit \
+	lib libpq mb nodes optimizer parser partitioning postmaster \
+	regex replication rewrite \
+	statistics storage tcop snowball snowball/libstemmer tsearch \
+	tsearch/dicts utils port port/atomics port/win32 port/win32_msvc \
+	port/win32_msvc/sys port/win32/arpa port/win32/netinet \
+	port/win32/sys portability ybgate
+>>>>>>> 939dce21892 (yb changes)
 
 # Install all headers
 install: all installdirs

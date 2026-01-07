@@ -195,6 +195,7 @@ static void pgstat_build_snapshot_fixed(PgStat_Kind kind);
 
 static inline bool pgstat_is_kind_valid(PgStat_Kind kind);
 
+uint64_t   *yb_new_conn = NULL;
 
 /* ----------
  * GUC parameters
@@ -213,10 +214,17 @@ int			pgstat_fetch_consistency = PGSTAT_FETCH_CONSISTENCY_CACHE;
 PgStat_LocalState pgStatLocal;
 
 /*
+<<<<<<< HEAD
  * Track pending reports for fixed-numbered stats, used by
  * pgstat_report_stat().
  */
 bool		pgstat_report_fixed = false;
+=======
+ * Used in YB to indicate whether the statuses for ongoing concurrent
+ * indexes have been retrieved in this transaction.
+ */
+bool		yb_retrieved_concurrent_index_progress = false;
+>>>>>>> 939dce21892 (yb changes)
 
 /* ----------
  * Local data
@@ -365,6 +373,7 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.reset_timestamp_cb = pgstat_subscription_reset_timestamp_cb,
 	},
 
+<<<<<<< HEAD
 	[PGSTAT_KIND_BACKEND] = {
 		.name = "backend",
 
@@ -381,6 +390,8 @@ static const PgStat_KindInfo pgstat_kind_builtin_infos[PGSTAT_KIND_BUILTIN_SIZE]
 		.reset_timestamp_cb = pgstat_backend_reset_timestamp_cb,
 	},
 
+=======
+>>>>>>> 939dce21892 (yb changes)
 	/* stats for fixed-numbered (mostly 1) objects */
 
 	[PGSTAT_KIND_ARCHIVER] = {
@@ -939,6 +950,8 @@ pgstat_clear_snapshot(void)
 
 	/* Reset this flag, as it may be possible that a cleanup was forced. */
 	force_stats_snapshot_clear = false;
+
+	yb_retrieved_concurrent_index_progress = false;
 }
 
 void *

@@ -87,6 +87,31 @@ installdirs-tests: installdirs
 	$(MKDIR_P)  $(patsubst $(srcdir)/%/,'$(DESTDIR)$(pkglibdir)/regress/%',$(sort $(dir $(regress_data_files))))
 
 
+<<<<<<< HEAD
+=======
+# Get some extra C modules from contrib/spi
+
+ifneq ($(YB_BUILD_TYPE), compilecmds)
+all: refint$(DLSUFFIX) autoinc$(DLSUFFIX)
+
+refint$(DLSUFFIX): $(top_builddir)/contrib/spi/refint$(DLSUFFIX)
+	cp $< $@
+
+autoinc$(DLSUFFIX): $(top_builddir)/contrib/spi/autoinc$(DLSUFFIX)
+	cp $< $@
+
+$(top_builddir)/contrib/spi/refint$(DLSUFFIX): | submake-contrib-spi ;
+
+$(top_builddir)/contrib/spi/autoinc$(DLSUFFIX): | submake-contrib-spi ;
+
+submake-contrib-spi: | submake-libpgport submake-generated-headers
+	$(MAKE) -C $(top_builddir)/contrib/spi
+
+.PHONY: submake-contrib-spi
+endif	# YB
+
+
+>>>>>>> 939dce21892 (yb changes)
 ##
 ## Run tests
 ##

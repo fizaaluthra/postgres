@@ -2064,7 +2064,25 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 				if (ptype != 0)
 				{
 					char	   *cp;
+<<<<<<< HEAD
 					int			value;
+=======
+					int			val;
+
+					/* Only accept a date under limited circumstances */
+					switch (ptype)
+					{
+						case DTK_JULIAN:
+						case DTK_YEAR:
+						case DTK_MONTH:
+						case DTK_DAY:
+							if (tzp == NULL)
+								return DTERR_BAD_FORMAT;
+							yb_switch_fallthrough();
+						default:
+							break;
+					}
+>>>>>>> 939dce21892 (yb changes)
 
 					errno = 0;
 					value = strtoint(field[i], &cp, 10);
@@ -3595,6 +3613,7 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 				 */
 
 				/* FALLTHROUGH */
+				yb_switch_fallthrough();
 
 			case DTK_DATE:
 			case DTK_NUMBER:
@@ -4029,6 +4048,7 @@ DecodeISO8601Interval(char *str,
 					}
 					/* Else fall through to extended alternative format */
 					/* FALLTHROUGH */
+					yb_switch_fallthrough();
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -4112,6 +4132,7 @@ DecodeISO8601Interval(char *str,
 					}
 					/* Else fall through to extended alternative format */
 					/* FALLTHROUGH */
+					yb_switch_fallthrough();
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)

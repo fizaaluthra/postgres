@@ -167,7 +167,19 @@
 #define PROGRESS_COPY_TUPLES_EXCLUDED 3
 #define PROGRESS_COPY_COMMAND 4
 #define PROGRESS_COPY_TYPE 5
+<<<<<<< HEAD
 #define PROGRESS_COPY_TUPLES_SKIPPED 6
+=======
+/* See YbProgressType below */
+#define PROGRESS_COPY_STATUS 6
+
+enum YbProgressType
+{
+	CP_IN_PROG,
+	CP_ERROR,
+	CP_SUCCESS
+};
+>>>>>>> 939dce21892 (yb changes)
 
 /* Commands of COPY (as advertised via PROGRESS_COPY_COMMAND) */
 #define PROGRESS_COPY_COMMAND_FROM 1
@@ -178,5 +190,15 @@
 #define PROGRESS_COPY_TYPE_PROGRAM 2
 #define PROGRESS_COPY_TYPE_PIPE 3
 #define PROGRESS_COPY_TYPE_CALLBACK 4
+
+/* YB phases for CREATE INDEX */
+#define YB_PROGRESS_CREATEIDX_INITIALIZING 0
+#define YB_PROGRESS_CREATEIDX_BACKFILLING 1
+
+/*
+ * YB constant used to indicate that the progress parameter for CREATE INDEX
+ * is not computed.
+ */
+#define YB_PROGRESS_CREATEIDX_INVALID -10
 
 #endif

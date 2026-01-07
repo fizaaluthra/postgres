@@ -61,6 +61,11 @@
 #include "utils/datetime.h"
 #include "utils/xml.h"
 
+/* YB includes */
+#include "miscadmin.h"
+#include "utils/builtins.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 
 /*
  * Location tracking support.  Unlike bison's default, we only want
@@ -151,8 +156,42 @@ typedef struct KeyActions
 #define parser_yyerror(msg)  scanner_yyerror(msg, yyscanner)
 #define parser_errposition(pos)  scanner_errposition(pos, yyscanner)
 
+#define parser_ybc_not_support(pos, feature) \
+	ybc_not_support(pos, yyscanner, feature " not supported yet", -1, NULL)
+
+#define parser_ybc_warn_ignored(pos, feature, issue) \
+	ybc_not_support_signal(pos, yyscanner,                                   \
+						   feature " not supported yet and will be ignored", \
+						   issue, NULL, WARNING)
+
+#define parser_ybc_signal_unsupported(pos, feature, issue) \
+	ybc_not_support(pos, yyscanner, feature " not supported yet", issue, NULL)
+
+#define parser_ybc_signal_unsupported_by_flag(pos, feature, flag, extra_hint) \
+	ybc_not_support(pos, yyscanner,										  \
+					feature " not supported due to setting of flag --" flag,  \
+					-2, extra_hint)
+
+#define parser_ybc_not_support_in_templates(pos, feature) \
+	ybc_not_support_in_templates(pos, yyscanner, feature " is not supported in template0/template1 yet")
+
+#define parser_ybc_beta_feature(pos, feature, has_own_flag) \
+	check_beta_feature(pos, yyscanner, has_own_flag ? "FLAGS_ysql_beta_feature_" feature : NULL, feature)
+
+#define parser_ybc_deprecated_feature_warning(pos, feature) \
+	ybc_deprecated_feature_warning(pos, yyscanner, feature)
+
 static void base_yyerror(YYLTYPE *yylloc, core_yyscan_t yyscanner,
 						 const char *msg);
+static void ybc_not_support_signal(int pos, core_yyscan_t yyscanner,
+								   const char *msg, int issue,
+								   const char *extra_hint, int signal_level);
+static void ybc_not_support(int pos, core_yyscan_t yyscanner, const char *msg,
+							int issue, const char *extra_hint);
+static void ybc_not_support_in_templates(int pos, core_yyscan_t yyscanner, const char *msg);
+static void check_beta_feature(int pos, core_yyscan_t yyscanner, const char* flag, const char* feature);
+static void ybc_deprecated_feature_warning(int pos, core_yyscan_t yyscanner, const char *feature);
+
 static RawStmt *makeRawStmt(Node *stmt, int stmt_location);
 static void updateRawStmtEnd(RawStmt *rs, int end_location);
 static Node *makeColumnRef(char *colname, List *indirection,
@@ -273,8 +312,15 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	MergeWhenClause *mergewhen;
 	struct KeyActions *keyactions;
 	struct KeyAction *keyaction;
+<<<<<<< HEAD
 	ReturningClause *retclause;
 	ReturningOptionKind retoptionkind;
+=======
+
+	YbOptSplit *splitopt;
+	char *grpopt;
+	YbRowBounds *rowbounds;
+>>>>>>> 939dce21892 (yb changes)
 }
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
@@ -431,8 +477,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				old_aggr_definition old_aggr_list
 				oper_argtypes RuleActionList RuleActionMulti
 				opt_column_list columnList opt_name_list
+<<<<<<< HEAD
 				sort_clause opt_sort_clause sortby_list index_params
 				stats_params
+=======
+				sort_clause opt_sort_clause sortby_list yb_index_params stats_params
+>>>>>>> 939dce21892 (yb changes)
 				opt_include opt_c_include index_including_params
 				name_list role_list from_clause from_list opt_array_bounds
 				qualified_name_list any_name any_name_list type_name_list
@@ -654,6 +704,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <list>		hash_partbound
 %type <defelt>		hash_partbound_elem
 
+<<<<<<< HEAD
 %type <node>	json_format_clause
 				json_format_clause_opt
 				json_value_expr
@@ -681,6 +732,23 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <boolean>	json_key_uniqueness_constraint_opt
 				json_object_constructor_null_clause_opt
 				json_array_constructor_null_clause_opt
+=======
+/* YB types */
+%type <boolean> opt_concurrently_matview yb_opt_cascade
+%type <grpopt>	OptTableGroup
+%type <ival>	Oid opt_yb_hash opt_yb_index_sort_order yb_hash
+				yb_opt_concurrently_index
+%type <list>	oid_list yb_hash_index_expr_list yb_hash_index_expr_with_alias
+				yb_index_expr_list_hash_elems yb_split_point yb_split_points
+%type <node>	YbBackfillIndexStmt YbCreateTableGroupStmt YbCreateProfileStmt
+				YbDropProfileStmt
+%type <rolespec> OptTableGroupOwner
+%type <rowbounds> YbRowBounds
+%type <splitopt> SplitClause YbOptSplit
+%type <str>		OptTableSpaceLocation opt_for_bfinstr partition_key row_key
+				read_time row_key_end row_key_start yb_opt_alias
+
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Non-keyword token types.  These are hard-wired into the "flex" lexer.
@@ -786,6 +854,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	TABLE TABLES TABLESAMPLE TABLESPACE TARGET TEMP TEMPLATE TEMPORARY TEXT_P THEN
 	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
+
 	TREAT TRIGGER TRIM TRUE_P
 	TRUNCATE TRUSTED TYPE_P TYPES_P
 
@@ -803,6 +872,26 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	YEAR_P YES_P
 
 	ZONE
+
+	_YB_ACCOUNT_P
+
+	_YB_BACKFILL_P
+
+	_YB_CHANGE_P _YB_COLOCATED_P _YB_COLOCATION_P
+
+	_YB_FAILED_LOGIN_ATTEMPTS_P
+
+	_YB_HASH_P
+
+	_YB_NONCONCURRENTLY_P _YB_NOPROFILE_P
+
+	_YB_PROFILE_P
+
+	_YB_SPLIT_P
+
+	_YB_TABLEGROUP_P _YB_TABLEGROUPS_P _YB_TABLETS_P
+
+	_YB_UNLOCK_P
 
 /*
  * The grammar thinks these are keywords, but they are not in the kwlist.h
@@ -890,7 +979,23 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  */
 %nonassoc	UNBOUNDED NESTED /* ideally would have same precedence as IDENT */
 %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
+<<<<<<< HEAD
 			SET KEYS OBJECT_P SCALAR VALUE_P WITH WITHOUT PATH
+=======
+
+ /*
+  * YB: Break shift/reduce conflict in hash column declaration "col HASH" by
+  * giving a higher precedence to HASH as a sort order over operator class.
+  */
+%nonassoc   _YB_HASH_P
+%nonassoc   NO_OPCLASS
+ /*
+  * YB: Break shift/reduce conflict in hash column declaration "(col) HASH" by
+  * giving a higher precedence to col as an expression list over a single expression.
+  */
+%nonassoc   EXPR_LIST
+
+>>>>>>> 939dce21892 (yb changes)
 %left		Op OPERATOR		/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
@@ -998,6 +1103,11 @@ toplevel_stmt:
 			| TransactionStmtLegacy
 		;
 
+/*
+ * YB: The checks in the "stmt" rule are only for bug-prevention. If we miss an
+ * error check on an unsupported feature, these checks will stop unsupported
+ * statements from being processed further.
+ */
 stmt:
 			AlterEventTrigStmt
 			| AlterCollationStmt
@@ -1006,44 +1116,44 @@ stmt:
 			| AlterDefaultPrivilegesStmt
 			| AlterDomainStmt
 			| AlterEnumStmt
-			| AlterExtensionStmt
-			| AlterExtensionContentsStmt
+			| AlterExtensionStmt { parser_ybc_beta_feature(@1, "extension", true); }
+			| AlterExtensionContentsStmt { parser_ybc_beta_feature(@1, "extension", true); }
 			| AlterFdwStmt
 			| AlterForeignServerStmt
 			| AlterFunctionStmt
 			| AlterGroupStmt
-			| AlterObjectDependsStmt
+			| AlterObjectDependsStmt { parser_ybc_not_support(@1, "This statement"); }
 			| AlterObjectSchemaStmt
 			| AlterOwnerStmt
 			| AlterOperatorStmt
 			| AlterTypeStmt
 			| AlterPolicyStmt
 			| AlterSeqStmt
-			| AlterSystemStmt
+			| AlterSystemStmt { parser_ybc_not_support(@1, "This statement"); }
 			| AlterTableStmt
-			| AlterTblSpcStmt
-			| AlterCompositeTypeStmt
+			| AlterTblSpcStmt { parser_ybc_signal_unsupported(@1, "This statement", 1153); }
+			| AlterCompositeTypeStmt { parser_ybc_not_support(@1, "This statement"); }
 			| AlterPublicationStmt
 			| AlterRoleSetStmt
 			| AlterRoleStmt
-			| AlterSubscriptionStmt
+			| AlterSubscriptionStmt { parser_ybc_not_support(@1, "This statement"); }
 			| AlterStatsStmt
-			| AlterTSConfigurationStmt
-			| AlterTSDictionaryStmt
+			| AlterTSConfigurationStmt { parser_ybc_beta_feature(@1, "alter text search configuration", false); }
+			| AlterTSDictionaryStmt { parser_ybc_not_support(@1, "This statement"); }
 			| AlterUserMappingStmt
 			| AnalyzeStmt
 			| CallStmt
-			| CheckPointStmt
+			| CheckPointStmt { parser_ybc_beta_feature(@1, "checkpoint", false); }
 			| ClosePortalStmt
-			| ClusterStmt
+			| ClusterStmt { parser_ybc_not_support(@1, "This statement"); }
 			| CommentStmt
 			| ConstraintsSetStmt
 			| CopyStmt
 			| CreateAmStmt
-			| CreateAsStmt
-			| CreateAssertionStmt
+			| CreateAsStmt { parser_ybc_not_support_in_templates(@1, "This statement"); }
+			| CreateAssertionStmt { parser_ybc_not_support(@1, "This statement"); }
 			| CreateCastStmt
-			| CreateConversionStmt
+			| CreateConversionStmt { parser_ybc_not_support(@1, "This statement"); }
 			| CreateDomainStmt
 			| CreateExtensionStmt
 			| CreateFdwStmt
@@ -1059,12 +1169,12 @@ stmt:
 			| CreatePolicyStmt
 			| CreatePLangStmt
 			| CreateSchemaStmt
-			| CreateSeqStmt
-			| CreateStmt
-			| CreateSubscriptionStmt
+			| CreateSeqStmt { parser_ybc_not_support_in_templates(@1, "This statement"); }
+			| CreateStmt { parser_ybc_not_support_in_templates(@1, "This statement"); }
+			| CreateSubscriptionStmt { parser_ybc_not_support(@1, "This statement"); }
 			| CreateStatsStmt
 			| CreateTableSpaceStmt
-			| CreateTransformStmt
+			| CreateTransformStmt { parser_ybc_not_support(@1, "This statement"); }
 			| CreateTrigStmt
 			| CreateEventTrigStmt
 			| CreateRoleStmt
@@ -1082,9 +1192,9 @@ stmt:
 			| DropOpFamilyStmt
 			| DropOwnedStmt
 			| DropStmt
-			| DropSubscriptionStmt
+			| DropSubscriptionStmt { parser_ybc_not_support(@1, "This statement"); }
 			| DropTableSpaceStmt
-			| DropTransformStmt
+			| DropTransformStmt { parser_ybc_not_support(@1, "This statement"); }
 			| DropRoleStmt
 			| DropUserMappingStmt
 			| DropdbStmt
@@ -1093,15 +1203,15 @@ stmt:
 			| FetchStmt
 			| GrantStmt
 			| GrantRoleStmt
-			| ImportForeignSchemaStmt
+			| ImportForeignSchemaStmt { parser_ybc_beta_feature(@1, "foreign data wrapper", false); }
 			| IndexStmt
 			| InsertStmt
-			| ListenStmt
+			| ListenStmt { parser_ybc_warn_ignored(@1, "LISTEN", 1872); }
 			| RefreshMatViewStmt
-			| LoadStmt
+			| LoadStmt { parser_ybc_not_support(@1, "This statement"); }
 			| LockStmt
-			| MergeStmt
-			| NotifyStmt
+			| MergeStmt { parser_ybc_not_support(@1, "This statement"); }
+			| NotifyStmt { parser_ybc_warn_ignored(@1, "NOTIFY", 1872); }
 			| PrepareStmt
 			| ReassignOwnedStmt
 			| ReindexStmt
@@ -1116,7 +1226,7 @@ stmt:
 			| SelectStmt
 			| TransactionStmt
 			| TruncateStmt
-			| UnlistenStmt
+			| UnlistenStmt { parser_ybc_warn_ignored(@1, "UNLISTEN", 1872); }
 			| UpdateStmt
 			| VacuumStmt
 			| VariableResetStmt
@@ -1126,6 +1236,13 @@ stmt:
 			| WaitStmt
 			| /*EMPTY*/
 				{ $$ = NULL; }
+
+			/* YB stmts */
+			| YbBackfillIndexStmt
+			| YbCreateProfileStmt
+			| YbDropProfileStmt
+			/* YB deprecated stmts */
+			| YbCreateTableGroupStmt
 		;
 
 /*
@@ -1286,6 +1403,30 @@ AlterOptRoleElem:
 				{
 					$$ = makeDefElem("rolemembers", (Node *) $2, @1);
 				}
+			| _YB_PROFILE_P name
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					$$ = makeDefElem("profile", (Node *)makeString($2), @1);
+				}
+			| _YB_NOPROFILE_P
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					$$ = makeDefElem("noprofile", (Node *)makeInteger(false), @1);
+				}
+			| _YB_ACCOUNT_P LOCK_P
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					$$ = makeDefElem("unlocked", (Node *)makeInteger(false), @1);
+				}
+			| _YB_ACCOUNT_P _YB_UNLOCK_P
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					$$ = makeDefElem("unlocked", (Node *)makeInteger(true), @1);
+				}
 			| IDENT
 				{
 					/*
@@ -1325,6 +1466,10 @@ AlterOptRoleElem:
 						 */
 						$$ = makeDefElem("inherit", (Node *) makeBoolean(false), @1);
 					}
+					else if (strcmp($1, "lock") == 0)
+						$$ = makeDefElem("islocked", (Node *)makeInteger(true), @1);
+					else if (strcmp($1, "open") == 0)
+						$$ = makeDefElem("islocked", (Node *)makeInteger(false), @1);
 					else
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
@@ -1568,6 +1713,8 @@ CreateSchemaStmt:
 					/* One can omit the schema name or the authorization id. */
 					n->schemaname = $3;
 					n->authrole = $5;
+					if ($6 != NIL)
+						parser_ybc_not_support(@6, "CREATE SCHEMA with elements");
 					n->schemaElts = $6;
 					n->if_not_exists = false;
 					$$ = (Node *) n;
@@ -1579,6 +1726,8 @@ CreateSchemaStmt:
 					/* ...but not both */
 					n->schemaname = $3;
 					n->authrole = NULL;
+					if ($4 != NIL)
+						parser_ybc_not_support(@4, "CREATE SCHEMA with elements");
 					n->schemaElts = $4;
 					n->if_not_exists = false;
 					$$ = (Node *) n;
@@ -2199,7 +2348,7 @@ AlterTableStmt:
 					n->missing_ok = true;
 					$$ = (Node *) n;
 				}
-		|	ALTER TABLE ALL IN_P TABLESPACE name SET TABLESPACE name opt_nowait
+		|	ALTER TABLE ALL IN_P TABLESPACE name SET TABLESPACE name opt_nowait yb_opt_cascade
 				{
 					AlterTableMoveAllStmt *n =
 						makeNode(AlterTableMoveAllStmt);
@@ -2207,11 +2356,13 @@ AlterTableStmt:
 					n->orig_tablespacename = $6;
 					n->objtype = OBJECT_TABLE;
 					n->roles = NIL;
+					n->yb_relation = NULL;
 					n->new_tablespacename = $9;
 					n->nowait = $10;
+					n->yb_cascade = $11;
 					$$ = (Node *) n;
 				}
-		|	ALTER TABLE ALL IN_P TABLESPACE name OWNED BY role_list SET TABLESPACE name opt_nowait
+		|	ALTER TABLE ALL IN_P TABLESPACE name OWNED BY role_list SET TABLESPACE name opt_nowait yb_opt_cascade
 				{
 					AlterTableMoveAllStmt *n =
 						makeNode(AlterTableMoveAllStmt);
@@ -2219,9 +2370,24 @@ AlterTableStmt:
 					n->orig_tablespacename = $6;
 					n->objtype = OBJECT_TABLE;
 					n->roles = $9;
+					n->yb_relation = NULL;
 					n->new_tablespacename = $12;
 					n->nowait = $13;
+					n->yb_cascade = $14;
 					$$ = (Node *) n;
+				}
+		|	ALTER TABLE ALL IN_P TABLESPACE name _YB_COLOCATED_P WITH relation_expr SET TABLESPACE name opt_nowait yb_opt_cascade
+				{
+					AlterTableMoveAllStmt *n =
+						makeNode(AlterTableMoveAllStmt);
+					n->orig_tablespacename = $6;
+					n->objtype = OBJECT_TABLE;
+					n->roles = NIL;
+					n->yb_relation = $9;
+					n->new_tablespacename = $12;
+					n->nowait = $13;
+					n->yb_cascade = $14;
+					$$ = (Node *)n;
 				}
 		|	ALTER INDEX qualified_name alter_table_cmds
 				{
@@ -2253,7 +2419,7 @@ AlterTableStmt:
 					n->missing_ok = false;
 					$$ = (Node *) n;
 				}
-		|	ALTER INDEX ALL IN_P TABLESPACE name SET TABLESPACE name opt_nowait
+		|	ALTER INDEX ALL IN_P TABLESPACE name SET TABLESPACE name opt_nowait yb_opt_cascade
 				{
 					AlterTableMoveAllStmt *n =
 						makeNode(AlterTableMoveAllStmt);
@@ -2261,11 +2427,13 @@ AlterTableStmt:
 					n->orig_tablespacename = $6;
 					n->objtype = OBJECT_INDEX;
 					n->roles = NIL;
+					n->yb_relation = NULL;
 					n->new_tablespacename = $9;
 					n->nowait = $10;
+					n->yb_cascade = $11;
 					$$ = (Node *) n;
 				}
-		|	ALTER INDEX ALL IN_P TABLESPACE name OWNED BY role_list SET TABLESPACE name opt_nowait
+		|	ALTER INDEX ALL IN_P TABLESPACE name OWNED BY role_list SET TABLESPACE name opt_nowait yb_opt_cascade
 				{
 					AlterTableMoveAllStmt *n =
 						makeNode(AlterTableMoveAllStmt);
@@ -2273,8 +2441,10 @@ AlterTableStmt:
 					n->orig_tablespacename = $6;
 					n->objtype = OBJECT_INDEX;
 					n->roles = $9;
+					n->yb_relation = NULL;
 					n->new_tablespacename = $12;
 					n->nowait = $13;
+					n->yb_cascade = $14;
 					$$ = (Node *) n;
 				}
 		|	ALTER SEQUENCE qualified_name alter_table_cmds
@@ -2337,7 +2507,7 @@ AlterTableStmt:
 					n->missing_ok = true;
 					$$ = (Node *) n;
 				}
-		|	ALTER MATERIALIZED VIEW ALL IN_P TABLESPACE name SET TABLESPACE name opt_nowait
+		|	ALTER MATERIALIZED VIEW ALL IN_P TABLESPACE name SET TABLESPACE name opt_nowait yb_opt_cascade
 				{
 					AlterTableMoveAllStmt *n =
 						makeNode(AlterTableMoveAllStmt);
@@ -2345,11 +2515,13 @@ AlterTableStmt:
 					n->orig_tablespacename = $7;
 					n->objtype = OBJECT_MATVIEW;
 					n->roles = NIL;
+					n->yb_relation = NULL;
 					n->new_tablespacename = $10;
 					n->nowait = $11;
+					n->yb_cascade = $12;
 					$$ = (Node *) n;
 				}
-		|	ALTER MATERIALIZED VIEW ALL IN_P TABLESPACE name OWNED BY role_list SET TABLESPACE name opt_nowait
+		|	ALTER MATERIALIZED VIEW ALL IN_P TABLESPACE name OWNED BY role_list SET TABLESPACE name opt_nowait yb_opt_cascade
 				{
 					AlterTableMoveAllStmt *n =
 						makeNode(AlterTableMoveAllStmt);
@@ -2357,8 +2529,10 @@ AlterTableStmt:
 					n->orig_tablespacename = $7;
 					n->objtype = OBJECT_MATVIEW;
 					n->roles = $10;
+					n->yb_relation = NULL;
 					n->new_tablespacename = $13;
 					n->nowait = $14;
+					n->yb_cascade = $15;
 					$$ = (Node *) n;
 				}
 		|	ALTER FOREIGN TABLE relation_expr alter_table_cmds
@@ -2624,6 +2798,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET ( column_parameter = value [, ... ] ) */
 			| ALTER opt_column ColId SET reloptions
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action ALTER COLUMN ... SET", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_SetOptions;
@@ -2634,6 +2809,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> RESET ( column_parameter [, ... ] ) */
 			| ALTER opt_column ColId RESET reloptions
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action ALTER COLUMN ... RESET", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_ResetOptions;
@@ -2644,6 +2820,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ALTER [COLUMN] <colname> SET STORAGE <storagemode> */
 			| ALTER opt_column ColId SET column_storage
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action ALTER COLUMN ... SET STORAGE", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_SetStorage;
@@ -2855,6 +3032,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> CLUSTER ON <indexname> */
 			| CLUSTER ON name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action CLUSTER ON", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_ClusterOn;
@@ -2864,6 +3042,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> SET WITHOUT CLUSTER */
 			| SET WITHOUT CLUSTER
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action SET WITHOUT CLUSTER", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_DropCluster;
@@ -2957,6 +3136,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ENABLE RULE <rule> */
 			| ENABLE_P RULE name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action ENABLE RULE", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_EnableRule;
@@ -2966,6 +3146,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ENABLE ALWAYS RULE <rule> */
 			| ENABLE_P ALWAYS RULE name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action ENABLE ALWAYS RULE", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_EnableAlwaysRule;
@@ -2975,6 +3156,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ENABLE REPLICA RULE <rule> */
 			| ENABLE_P REPLICA RULE name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action ENABLE REPLICA RULE", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_EnableReplicaRule;
@@ -2984,6 +3166,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> DISABLE RULE <rule> */
 			| DISABLE_P RULE name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER action DISABLE RULE", 1124);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_DisableRule;
@@ -2993,6 +3176,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> INHERIT <parent> */
 			| INHERIT qualified_name
 				{
+					parser_ybc_beta_feature(@1, "inheritance", false);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_AddInherit;
@@ -3002,6 +3186,7 @@ alter_table_cmd:
 			/* ALTER TABLE <name> NO INHERIT <parent> */
 			| NO INHERIT qualified_name
 				{
+					parser_ybc_beta_feature(@1, "inheritance", false);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_DropInherit;
@@ -3052,6 +3237,7 @@ alter_table_cmd:
 
 					n->subtype = AT_SetTableSpace;
 					n->name = $3;
+					n->yb_cascade = false;
 					$$ = (Node *) n;
 				}
 			/* ALTER TABLE <name> SET (...) */
@@ -3146,6 +3332,11 @@ alter_using:
 			| /* EMPTY */				{ $$ = NULL; }
 		;
 
+yb_opt_cascade:
+			CASCADE     				{ $$ = true; }
+			| /* EMPTY */				{ $$ = false; }
+		;
+
 replica_identity:
 			NOTHING
 				{
@@ -3171,8 +3362,16 @@ replica_identity:
 					n->name = NULL;
 					$$ = (Node *) n;
 				}
+			| _YB_CHANGE_P
+				{
+					ReplicaIdentityStmt *n = makeNode(ReplicaIdentityStmt);
+					n->identity_type = YB_REPLICA_IDENTITY_CHANGE;
+					n->name = NULL;
+					$$ = (Node *) n;
+				}
 			| USING INDEX name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TABLE REPLICA IDENTITY USING INDEX", 1124);
 					ReplicaIdentityStmt *n = makeNode(ReplicaIdentityStmt);
 
 					n->identity_type = REPLICA_IDENTITY_INDEX;
@@ -3189,6 +3388,8 @@ opt_reloptions:		WITH reloptions					{ $$ = $2; }
 			 |		/* EMPTY */						{ $$ = NIL; }
 		;
 
+/* YB: TODO: add interleaved to reloption_list.
+   Eventually deprecate using colocated */
 reloption_list:
 			reloption_elem							{ $$ = list_make1($1); }
 			| reloption_list ',' reloption_elem		{ $$ = lappend($1, $3); }
@@ -3381,6 +3582,7 @@ hash_partbound:
 AlterCompositeTypeStmt:
 			ALTER TYPE_P any_name alter_type_cmds
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TYPE", 1893);
 					AlterTableStmt *n = makeNode(AlterTableStmt);
 
 					/* can't use qualified_name, sigh */
@@ -3400,6 +3602,7 @@ alter_type_cmd:
 			/* ALTER TYPE <name> ADD ATTRIBUTE <coldef> [RESTRICT|CASCADE] */
 			ADD_P ATTRIBUTE TableFuncElement opt_drop_behavior
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TYPE ADD ATTRIBUTE", 1893);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_AddColumn;
@@ -3410,6 +3613,7 @@ alter_type_cmd:
 			/* ALTER TYPE <name> DROP ATTRIBUTE IF EXISTS <attname> [RESTRICT|CASCADE] */
 			| DROP ATTRIBUTE IF_P EXISTS ColId opt_drop_behavior
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TYPE DROP ATTRIBUTE", 1893);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_DropColumn;
@@ -3421,6 +3625,7 @@ alter_type_cmd:
 			/* ALTER TYPE <name> DROP ATTRIBUTE <attname> [RESTRICT|CASCADE] */
 			| DROP ATTRIBUTE ColId opt_drop_behavior
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TYPE DROP ATTRIBUTE", 1893);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 
 					n->subtype = AT_DropColumn;
@@ -3432,6 +3637,7 @@ alter_type_cmd:
 			/* ALTER TYPE <name> ALTER ATTRIBUTE <attname> [SET DATA] TYPE <typename> [RESTRICT|CASCADE] */
 			| ALTER ATTRIBUTE ColId opt_set_data TYPE_P Typename opt_collate_clause opt_drop_behavior
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TYPE ALTER ATTRIBUTE", 1893);
 					AlterTableCmd *n = makeNode(AlterTableCmd);
 					ColumnDef *def = makeNode(ColumnDef);
 
@@ -3729,6 +3935,7 @@ copy_generic_opt_arg_list_item:
 CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit OptPartitionSpec table_access_method_clause OptWith
 			OnCommitOption OptTableSpace
+			YbOptSplit OptTableGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3744,11 +3951,45 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
+
+					n->split_options = $14;
+					n->tablegroupname = $15;
+					if ($14 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(WARNING,
+								(errmsg("split options on TEMP table will be ignored")));
+					}
+					if ($9 && $14)
+					{
+						n->split_options = NULL;
+						ereport(WARNING,
+								(errmsg("split options on a partitioned table will be ignored")));
+					}
+					if ($15 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TEMP table")));
+					}
+					if ($13 && $15)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TABLESPACE"),
+								 errdetail("The tablespace of the tablegroup will be used.")));
+					}
+					if ($14 && $15)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with SPLIT")));
+					}
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
 			OptTableElementList ')' OptInherit OptPartitionSpec table_access_method_clause
 			OptWith OnCommitOption OptTableSpace
+			YbOptSplit OptTableGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3764,11 +4005,45 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
+
+					n->split_options = $17;
+					n->tablegroupname = $18;
+					if ($17 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(WARNING,
+								(errmsg("split options on TEMP table will be ignored")));
+					}
+					if ($12 && $17)
+					{
+						n->split_options = NULL;
+						ereport(WARNING,
+								(errmsg("split options on a partitioned table will be ignored")));
+					}
+					if ($18 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TEMP table")));
+					}
+					if ($16 && $18)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TABLESPACE"),
+								 errdetail("The tablespace of the tablegroup will be used.")));
+					}
+					if ($17 && $18)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with SPLIT")));
+					}
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name OF any_name
 			OptTypedTableElementList OptPartitionSpec table_access_method_clause
 			OptWith OnCommitOption OptTableSpace
+			YbOptSplit OptTableGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3785,11 +4060,45 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $11;
 					n->tablespacename = $12;
 					n->if_not_exists = false;
+
+					n->split_options = $13;
+					n->tablegroupname = $14;
+					if ($13 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(WARNING,
+								(errmsg("split options on TEMP table will be ignored")));
+					}
+					if ($8 && $13)
+					{
+						n->split_options = NULL;
+						ereport(WARNING,
+								(errmsg("split options on a partitioned table will be ignored")));
+					}
+					if ($14 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TEMP table")));
+					}
+					if ($12 && $14)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TABLESPACE"),
+								 errdetail("The tablespace of the tablegroup will be used.")));
+					}
+					if ($13 && $14)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with SPLIT")));
+					}
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name OF any_name
 			OptTypedTableElementList OptPartitionSpec table_access_method_clause
 			OptWith OnCommitOption OptTableSpace
+			YbOptSplit OptTableGroup
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3806,11 +4115,45 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $14;
 					n->tablespacename = $15;
 					n->if_not_exists = true;
+
+					n->split_options = $16;
+					n->tablegroupname = $17;
+					if ($16 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(WARNING,
+								(errmsg("split options on TEMP table will be ignored")));
+					}
+					if ($11 && $16)
+					{
+						n->split_options = NULL;
+						ereport(WARNING,
+								(errmsg("split options on a partitioned table will be ignored")));
+					}
+					if ($17 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TEMP table")));
+					}
+					if ($15 && $17)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with TABLESPACE"),
+								 errdetail("The tablespace of the tablegroup will be used.")));
+					}
+					if ($16 && $17)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot use TABLEGROUP with SPLIT")));
+					}
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name PARTITION OF qualified_name
 			OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
 			table_access_method_clause OptWith OnCommitOption OptTableSpace
+			YbOptSplit
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3827,11 +4170,24 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $13;
 					n->tablespacename = $14;
 					n->if_not_exists = false;
+
+					n->split_options = $15;
+					if ($15 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(WARNING,
+								(errmsg("split options on TEMP table will be ignored")));
+					}
+					if ($10 && $15)
+					{
+						n->split_options = NULL;
+						ereport(WARNING,
+								(errmsg("split options on a partitioned table will be ignored")));
+					}
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name PARTITION OF
 			qualified_name OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
-			table_access_method_clause OptWith OnCommitOption OptTableSpace
+			table_access_method_clause OptWith OnCommitOption OptTableSpace	YbOptSplit
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3848,6 +4204,19 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $16;
 					n->tablespacename = $17;
 					n->if_not_exists = true;
+
+					n->split_options = $18;
+					if ($18 && $2 == RELPERSISTENCE_TEMP)
+					{
+						ereport(WARNING,
+								(errmsg("split options on TEMP table will be ignored")));
+					}
+					if ($13 && $18)
+					{
+						n->split_options = NULL;
+						ereport(WARNING,
+								(errmsg("split options on a partitioned table will be ignored")));
+					}
 					$$ = (Node *) n;
 				}
 		;
@@ -4030,6 +4399,8 @@ ColConstraint:
 			| ConstraintAttr						{ $$ = $1; }
 			| COLLATE any_name
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_signal_unsupported(@1, "COLLATE", 1127);
 					/*
 					 * Note: the CollateClause is momentarily included in
 					 * the list built by ColQualList, but we split it out
@@ -4095,6 +4466,13 @@ ColConstraintElem:
 				}
 			| PRIMARY KEY opt_definition OptConsTableSpace
 				{
+					if ($4)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot set TABLESPACE for PRIMARY KEY INDEX"),
+								 errdetail("The tablespace of the indexed table will be used.")));
+					}
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_PRIMARY;
@@ -4288,7 +4666,11 @@ TableLikeOptionList:
 
 TableLikeOption:
 				COMMENTS			{ $$ = CREATE_TABLE_LIKE_COMMENTS; }
-				| COMPRESSION		{ $$ = CREATE_TABLE_LIKE_COMPRESSION; }
+				| COMPRESSION
+					{
+						parser_ybc_signal_unsupported(@1, "LIKE COMPRESSION", 1129);
+						$$ = CREATE_TABLE_LIKE_COMPRESSION;
+					}
 				| CONSTRAINTS		{ $$ = CREATE_TABLE_LIKE_CONSTRAINTS; }
 				| DEFAULTS			{ $$ = CREATE_TABLE_LIKE_DEFAULTS; }
 				| IDENTITY_P		{ $$ = CREATE_TABLE_LIKE_IDENTITY; }
@@ -4360,7 +4742,27 @@ ConstraintElem:
 					n->indexspace = $9;
 					processCASbits($10, @10, "UNIQUE",
 								   &n->deferrable, &n->initdeferred, NULL,
+<<<<<<< HEAD
 								   NULL, NULL, yyscanner);
+=======
+								   NULL, yyscanner);
+
+					/* YB: Make column list available as index params also */
+					ListCell *lc;
+					foreach(lc, $4)
+					{
+						IndexElem *index_elem = makeNode(IndexElem);
+						index_elem->name = pstrdup(strVal(lfirst(lc)));
+						index_elem->expr = NULL;
+						index_elem->indexcolname = NULL;
+						index_elem->collation = NIL;
+						index_elem->opclass = NIL;
+						index_elem->ordering = SORTBY_DEFAULT;
+						index_elem->nulls_ordering = SORTBY_NULLS_DEFAULT;
+						n->yb_index_params = lappend(n->yb_index_params, index_elem);
+					}
+
+>>>>>>> 939dce21892 (yb changes)
 					$$ = (Node *) n;
 				}
 			| UNIQUE ExistingIndex ConstraintAttributeSpec
@@ -4379,13 +4781,18 @@ ConstraintElem:
 								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
+<<<<<<< HEAD
 			| PRIMARY KEY '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
+=======
+			| PRIMARY KEY '(' yb_index_params ')' opt_c_include opt_definition OptConsTableSpace
+>>>>>>> 939dce21892 (yb changes)
 				ConstraintAttributeSpec
 				{
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_PRIMARY;
 					n->location = @1;
+<<<<<<< HEAD
 					n->keys = $4;
 					n->without_overlaps = $5;
 					n->including = $7;
@@ -4395,6 +4802,35 @@ ConstraintElem:
 					processCASbits($10, @10, "PRIMARY KEY",
 								   &n->deferrable, &n->initdeferred, NULL,
 								   NULL, NULL, yyscanner);
+=======
+					/*
+					 * YB: For Postgres' purpose, make index params available
+					 * as a column list also
+					 */
+					ListCell *lc;
+					foreach(lc, $4)
+					{
+						IndexElem *index_elem = (IndexElem *)lfirst(lc);
+						n->keys = lappend(n->keys, makeString(index_elem->name));
+					}
+					n->including = $6;
+					n->options = $7;
+					n->indexname = NULL;
+					if ($8)
+					{
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("cannot set TABLESPACE for PRIMARY KEY INDEX"),
+								 errdetail("The tablespace of the indexed table will be used.")));
+					}
+					n->indexspace = $8;
+					processCASbits($9, @9, "PRIMARY KEY",
+								   &n->deferrable, &n->initdeferred, NULL,
+								   NULL, yyscanner);
+
+					n->yb_index_params = $4;
+
+>>>>>>> 939dce21892 (yb changes)
 					$$ = (Node *) n;
 				}
 			| PRIMARY KEY ExistingIndex ConstraintAttributeSpec
@@ -4417,6 +4853,7 @@ ConstraintElem:
 				opt_c_include opt_definition OptConsTableSpace OptWhereClause
 				ConstraintAttributeSpec
 				{
+					parser_ybc_signal_unsupported(@1, "EXCLUDE constraint", 3944);
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_EXCLUSION;
@@ -4466,6 +4903,7 @@ ConstraintElem:
 				}
 		;
 
+<<<<<<< HEAD
 /*
  * DomainConstraint is separate from TableConstraint because the syntax for
  * NOT NULL constraints is different.  For table constraints, we need to
@@ -4522,6 +4960,13 @@ DomainConstraintElem:
 		;
 
 opt_no_inherit:	NO INHERIT							{  $$ = true; }
+=======
+opt_no_inherit:	NO INHERIT
+				{
+					parser_ybc_beta_feature(@1, "inheritance", false);
+					$$ = true;
+				}
+>>>>>>> 939dce21892 (yb changes)
 			| /* EMPTY */							{  $$ = false; }
 		;
 
@@ -4716,7 +5161,11 @@ key_action:
 				}
 		;
 
-OptInherit: INHERITS '(' qualified_name_list ')'	{ $$ = $3; }
+OptInherit: INHERITS '(' qualified_name_list ')'
+				{
+					parser_ybc_beta_feature(@1, "inheritance", false);
+					$$ = $3;
+				}
 			| /*EMPTY*/								{ $$ = NIL; }
 		;
 
@@ -4794,6 +5243,18 @@ OnCommitOption:  ON COMMIT DROP				{ $$ = ONCOMMIT_DROP; }
 			| /*EMPTY*/						{ $$ = ONCOMMIT_NOOP; }
 		;
 
+OptTableGroup:
+			_YB_TABLEGROUP_P name
+				{
+					parser_ybc_beta_feature(@1, "tablegroup", true);
+					$$ = $2;
+				}
+			| /*EMPTY*/
+				{
+					$$ = NULL;
+				}
+		;
+
 OptTableSpace:   TABLESPACE name					{ $$ = $2; }
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
@@ -4803,6 +5264,47 @@ OptConsTableSpace:   USING INDEX TABLESPACE name	{ $$ = $4; }
 		;
 
 ExistingIndex:   USING INDEX name					{ $$ = $3; }
+		;
+
+YbOptSplit:
+			_YB_SPLIT_P '(' SplitClause ')'
+				{
+					$$ = $3;
+				}
+			| _YB_SPLIT_P SplitClause
+        {
+        	$$ = $2;
+        }
+			| /* EMPTY */
+				{
+					$$ = (YbOptSplit*) NULL;
+				}
+		;
+
+SplitClause:
+      INTO Iconst _YB_TABLETS_P
+      	{
+      		$$ = makeNode(YbOptSplit);
+      		$$->split_type = NUM_TABLETS;
+      		$$->num_tablets = $2;
+      		$$->split_points = NULL;
+      	}
+      | AT VALUES '(' yb_split_points ')'
+        {
+      	  $$ = makeNode(YbOptSplit);
+      	  $$->split_type = SPLIT_POINTS;
+      	  $$->num_tablets = -1;
+      	  $$->split_points = $4;
+        }
+      ;
+
+yb_split_points:
+			yb_split_point							{ $$ = list_make1($1); }
+			| yb_split_points ',' yb_split_point	{ $$ = lappend($1, $3); }
+		;
+
+yb_split_point:
+			'(' expr_list ')'				{ $$ = $2; }
 		;
 
 /*****************************************************************************
@@ -5040,7 +5542,7 @@ OptNoLog:	UNLOGGED					{ $$ = RELPERSISTENCE_UNLOGGED; }
  *****************************************************************************/
 
 RefreshMatViewStmt:
-			REFRESH MATERIALIZED VIEW opt_concurrently qualified_name opt_with_data
+			REFRESH MATERIALIZED VIEW opt_concurrently_matview qualified_name opt_with_data
 				{
 					RefreshMatViewStmt *n = makeNode(RefreshMatViewStmt);
 
@@ -5051,6 +5553,20 @@ RefreshMatViewStmt:
 				}
 		;
 
+opt_concurrently_matview:
+			CONCURRENTLY
+				{
+					$$ = true;
+				}
+			| _YB_NONCONCURRENTLY_P
+				{
+					$$ = false;
+				}
+			| /*EMPTY*/
+				{
+					$$ = false;
+				}
+		;
 
 /*****************************************************************************
  *
@@ -5217,6 +5733,11 @@ NumericOnly_list:	NumericOnly						{ $$ = list_make1($1); }
 CreatePLangStmt:
 			CREATE opt_or_replace opt_trusted opt_procedural LANGUAGE name
 			{
+				/* YB: Old code structure.
+				 *	n->replace = $2; (if_not_exists)
+				 *  n->plname = $6; (extname)
+				 */
+
 				/*
 				 * We now interpret parameterless CREATE LANGUAGE as
 				 * CREATE EXTENSION.  "OR REPLACE" is silently translated
@@ -5283,21 +5804,58 @@ opt_procedural:
 /*****************************************************************************
  *
  *		QUERY:
+ *             CREATE TABLEGROUP tablegroup
+ *
+ *		TODO: Later extend this to include INTERLEAVED
+ *
+ *****************************************************************************/
+
+YbCreateTableGroupStmt:
+ 		CREATE _YB_TABLEGROUP_P name OptTableGroupOwner opt_reloptions OptTableSpace
+ 				{
+					parser_ybc_not_support_in_templates(@1, "Tablegroup");
+ 					parser_ybc_beta_feature(@1, "tablegroup", true);
+
+ 					YbCreateTableGroupStmt *n = makeNode(YbCreateTableGroupStmt);
+ 					n->tablegroupname = $3;
+ 					n->owner = $4;
+ 					n->options = $5;
+					n->tablespacename = $6;
+					n->implicit = false;
+ 					$$ = (Node *) n;
+ 				}
+ 		;
+
+OptTableGroupOwner: OWNER RoleSpec		{ $$ = $2; }
+			| /*EMPTY */				{ $$ = NULL; }
+		;
+
+/*****************************************************************************
+ *
+ *		QUERY:
  *             CREATE TABLESPACE tablespace LOCATION '/path/to/tablespace/'
  *
  *****************************************************************************/
 
-CreateTableSpaceStmt: CREATE TABLESPACE name OptTableSpaceOwner LOCATION Sconst opt_reloptions
+CreateTableSpaceStmt: CREATE TABLESPACE name OptTableSpaceOwner OptTableSpaceLocation opt_reloptions
 				{
 					CreateTableSpaceStmt *n = makeNode(CreateTableSpaceStmt);
 
 					n->tablespacename = $3;
 					n->owner = $4;
-					n->location = $6;
-					n->options = $7;
+					n->options = $6;
+					if (n->options == NULL && $5 == NULL) {
+						parser_yyerror("While creating tablespaces, one of "
+							       "LOCATION or WITH options should be present");
+					}
 					$$ = (Node *) n;
+
 				}
 		;
+
+OptTableSpaceLocation: LOCATION Sconst              { parser_ybc_warn_ignored(@1, "LOCATION", 6569); $$ = $2; }
+                        | /*EMPTY */                            { $$ = NULL; }
+                ;
 
 OptTableSpaceOwner: OWNER RoleSpec		{ $$ = $2; }
 			| /*EMPTY */				{ $$ = NULL; }
@@ -5326,6 +5884,75 @@ DropTableSpaceStmt: DROP TABLESPACE name
 					DropTableSpaceStmt *n = makeNode(DropTableSpaceStmt);
 
 					n->tablespacename = $5;
+					n->missing_ok = true;
+					$$ = (Node *) n;
+				}
+		;
+
+/*****************************************************************************
+ *
+ *		QUERY:
+ *				CREATE PROFILE name LIMIT FAILED_LOGIN_ATTEMPTS <number>
+ *
+ *****************************************************************************/
+
+YbCreateProfileStmt: CREATE _YB_PROFILE_P name LIMIT _YB_FAILED_LOGIN_ATTEMPTS_P Iconst
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					YbCreateProfileStmt *n = makeNode(YbCreateProfileStmt);
+
+					n->prfname = $3;
+					if (strcmp(n->prfname, "default") == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_RESERVED_NAME),
+								 errmsg("profile name \"%s\" is reserved",
+										"default"),
+								 parser_errposition(@3)));
+
+					n->prffailedloginattempts = makeInteger($6);
+					$$ = (Node *) n;
+				}
+		;
+
+/*****************************************************************************
+ *
+ *		QUERY:
+ *				DROP PROFILE [IF EXISTS] name
+ *
+ *****************************************************************************/
+
+YbDropProfileStmt: DROP _YB_PROFILE_P name
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					YbDropProfileStmt *n = makeNode(YbDropProfileStmt);
+
+					n->prfname = $3;
+					if (strcmp(n->prfname, "default") == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_RESERVED_NAME),
+								 errmsg("profile name \"%s\" is reserved",
+										"default"),
+								 parser_errposition(@3)));
+
+					n->missing_ok = false;
+					$$ = (Node *) n;
+				}
+			|  DROP _YB_PROFILE_P IF_P EXISTS name
+				{
+					if (!*YBCGetGFlags()->ysql_enable_profile)
+						parser_ybc_not_support(@1, "PROFILE");
+					YbDropProfileStmt *n = makeNode(YbDropProfileStmt);
+
+					n->prfname = $5;
+					if (strcmp(n->prfname, "default") == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_RESERVED_NAME),
+								 errmsg("profile name \"%s\" is reserved",
+										"default"),
+								 parser_errposition(@3)));
+
 					n->missing_ok = true;
 					$$ = (Node *) n;
 				}
@@ -6157,6 +6784,7 @@ CreateTrigStmt:
 			FOR EACH ROW TriggerWhen
 			EXECUTE FUNCTION_or_PROCEDURE func_name '(' TriggerFuncArgs ')'
 				{
+					parser_ybc_signal_unsupported(@1, "CREATE CONSTRAINT TRIGGER", 1709);
 					CreateTrigStmt *n = makeNode(CreateTrigStmt);
 					bool		dummy;
 
@@ -6248,7 +6876,11 @@ TriggerOneEvent:
 		;
 
 TriggerReferencing:
-			REFERENCING TriggerTransitions			{ $$ = $2; }
+			REFERENCING TriggerTransitions
+				{
+					parser_ybc_signal_unsupported(@1, "REFERENCING clause (transition tables)", 1668);
+					$$ = $2;
+				}
 			| /*EMPTY*/								{ $$ = NIL; }
 		;
 
@@ -6470,6 +7102,7 @@ enable_trigger:
 CreateAssertionStmt:
 			CREATE ASSERTION any_name CHECK '(' a_expr ')' ConstraintAttributeSpec
 				{
+					parser_ybc_not_support(@1, "CREATE ASSERTION");
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("CREATE ASSERTION is not yet implemented"),
@@ -6614,6 +7247,8 @@ DefineStmt:
 				}
 			| CREATE COLLATION any_name definition
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "CREATE COLLATION");
 					DefineStmt *n = makeNode(DefineStmt);
 
 					n->kind = OBJECT_COLLATION;
@@ -6624,6 +7259,8 @@ DefineStmt:
 				}
 			| CREATE COLLATION IF_P NOT EXISTS any_name definition
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "CREATE COLLATION");
 					DefineStmt *n = makeNode(DefineStmt);
 
 					n->kind = OBJECT_COLLATION;
@@ -6635,6 +7272,8 @@ DefineStmt:
 				}
 			| CREATE COLLATION any_name FROM any_name
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "CREATE COLLATION");
 					DefineStmt *n = makeNode(DefineStmt);
 
 					n->kind = OBJECT_COLLATION;
@@ -6645,6 +7284,8 @@ DefineStmt:
 				}
 			| CREATE COLLATION IF_P NOT EXISTS any_name FROM any_name
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "CREATE COLLATION");
 					DefineStmt *n = makeNode(DefineStmt);
 
 					n->kind = OBJECT_COLLATION;
@@ -7057,6 +7698,8 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 					n->removeType = $2;
 					n->missing_ok = true;
 					n->objects = $5;
+					if (list_length($5) > 1 && n->removeType != OBJECT_TABLE)
+						parser_ybc_signal_unsupported(@5, "DROP multiple objects", 880);
 					n->behavior = $6;
 					n->concurrent = false;
 					$$ = (Node *) n;
@@ -7068,6 +7711,8 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 					n->removeType = $2;
 					n->missing_ok = false;
 					n->objects = $3;
+					if (list_length($3) > 1 && n->removeType != OBJECT_TABLE)
+						parser_ybc_signal_unsupported(@3, "DROP multiple objects", 880);
 					n->behavior = $4;
 					n->concurrent = false;
 					$$ = (Node *) n;
@@ -7079,6 +7724,8 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 					n->removeType = $2;
 					n->missing_ok = true;
 					n->objects = $5;
+					if (list_length($5) > 1 && n->removeType != OBJECT_TABLE)
+						parser_ybc_signal_unsupported(@5, "DROP multiple objects", 880);
 					n->behavior = $6;
 					n->concurrent = false;
 					$$ = (Node *) n;
@@ -7090,6 +7737,8 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 					n->removeType = $2;
 					n->missing_ok = false;
 					n->objects = $3;
+					if (list_length($3) > 1 && n->removeType != OBJECT_TABLE)
+						parser_ybc_signal_unsupported(@3, "DROP multiple objects", 880);
 					n->behavior = $4;
 					n->concurrent = false;
 					$$ = (Node *) n;
@@ -7162,6 +7811,7 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 				}
 			| DROP INDEX CONCURRENTLY any_name_list opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "DROP INDEX CONCURRENTLY");
 					DropStmt *n = makeNode(DropStmt);
 
 					n->removeType = OBJECT_INDEX;
@@ -7173,6 +7823,7 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 				}
 			| DROP INDEX CONCURRENTLY IF_P EXISTS any_name_list opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "DROP INDEX CONCURRENTLY");
 					DropStmt *n = makeNode(DropStmt);
 
 					n->removeType = OBJECT_INDEX;
@@ -7192,8 +7843,13 @@ object_type_any_name:
 			| MATERIALIZED VIEW						{ $$ = OBJECT_MATVIEW; }
 			| INDEX									{ $$ = OBJECT_INDEX; }
 			| FOREIGN TABLE							{ $$ = OBJECT_FOREIGN_TABLE; }
-			| COLLATION								{ $$ = OBJECT_COLLATION; }
-			| CONVERSION_P							{ $$ = OBJECT_CONVERSION; }
+			| COLLATION
+				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "DROP COLLATION");
+					$$ = OBJECT_COLLATION;
+				}
+			| CONVERSION_P							{ parser_ybc_not_support(@1, "DROP CONVERSION"); $$ = OBJECT_CONVERSION; }
 			| STATISTICS							{ $$ = OBJECT_STATISTIC_EXT; }
 			| TEXT_P SEARCH PARSER					{ $$ = OBJECT_TSPARSER; }
 			| TEXT_P SEARCH DICTIONARY				{ $$ = OBJECT_TSDICTIONARY; }
@@ -7224,6 +7880,11 @@ drop_type_name:
 			| PUBLICATION							{ $$ = OBJECT_PUBLICATION; }
 			| SCHEMA								{ $$ = OBJECT_SCHEMA; }
 			| SERVER								{ $$ = OBJECT_FOREIGN_SERVER; }
+			| _YB_TABLEGROUP_P
+				{
+					parser_ybc_beta_feature(@1, "tablegroup", true);
+					$$ = OBJECT_YBTABLEGROUP;
+				}
 		;
 
 /* object types attached to a table */
@@ -7606,6 +8267,7 @@ FetchStmt:	FETCH fetch_args
 				}
 			| MOVE fetch_args
 				{
+					parser_ybc_not_support(@1, "MOVE");
 					FetchStmt *n = (FetchStmt *) $2;
 
 					n->ismove = true;
@@ -7631,12 +8293,77 @@ fetch_args:	cursor_name
 					n->portalname = $2;
 					n->direction = FETCH_FORWARD;
 					n->howMany = 1;
+<<<<<<< HEAD
 					n->location = -1;
 					n->direction_keyword = FETCH_KEYWORD_NONE;
+=======
+					$$ = (Node *) n;
+				}
+			| NEXT opt_from_in cursor_name
+				{
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_FORWARD;
+					n->howMany = 1;
+					$$ = (Node *) n;
+				}
+			| PRIOR opt_from_in cursor_name
+				{
+					parser_ybc_signal_unsupported(@1, "FETCH PRIOR", 6514);
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_BACKWARD;
+					n->howMany = 1;
+					$$ = (Node *) n;
+				}
+			| FIRST_P opt_from_in cursor_name
+				{
+					parser_ybc_signal_unsupported(@1, "FETCH FIRST", 6514);
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_ABSOLUTE;
+					n->howMany = 1;
+					$$ = (Node *) n;
+				}
+			| LAST_P opt_from_in cursor_name
+				{
+					parser_ybc_signal_unsupported(@1, "FETCH LAST", 6514);
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $3;
+					n->direction = FETCH_ABSOLUTE;
+					n->howMany = -1;
+					$$ = (Node *) n;
+				}
+			| ABSOLUTE_P SignedIconst opt_from_in cursor_name
+				{
+					parser_ybc_signal_unsupported(@1, "FETCH ABSOLUTE", 6514);
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $4;
+					n->direction = FETCH_ABSOLUTE;
+					n->howMany = $2;
+					$$ = (Node *) n;
+				}
+			| RELATIVE_P SignedIconst opt_from_in cursor_name
+				{
+					parser_ybc_signal_unsupported(@1, "FETCH RELATIVE", 6514);
+					FetchStmt *n = makeNode(FetchStmt);
+
+					n->portalname = $4;
+					n->direction = FETCH_RELATIVE;
+					n->howMany = $2;
+>>>>>>> 939dce21892 (yb changes)
 					$$ = (Node *) n;
 				}
 			| SignedIconst opt_from_in cursor_name
 				{
+					if ($1 < 0) {
+						parser_ybc_signal_unsupported(@1, "FETCH -", 6514);
+					}
 					FetchStmt *n = makeNode(FetchStmt);
 
 					n->portalname = $3;
@@ -7736,6 +8463,9 @@ fetch_args:	cursor_name
 				}
 			| FORWARD SignedIconst opt_from_in cursor_name
 				{
+					if ($2 < 0) {
+						parser_ybc_signal_unsupported(@1, "FETCH FORWARD -", 6514);
+					}
 					FetchStmt *n = makeNode(FetchStmt);
 
 					n->portalname = $4;
@@ -7758,6 +8488,7 @@ fetch_args:	cursor_name
 				}
 			| BACKWARD opt_from_in cursor_name
 				{
+					parser_ybc_signal_unsupported(@1, "FETCH BACKWARD", 6514);
 					FetchStmt *n = makeNode(FetchStmt);
 
 					n->portalname = $3;
@@ -7769,6 +8500,7 @@ fetch_args:	cursor_name
 				}
 			| BACKWARD SignedIconst opt_from_in cursor_name
 				{
+					parser_ybc_signal_unsupported(@1, "FETCH BACKWARD", 6514);
 					FetchStmt *n = makeNode(FetchStmt);
 
 					n->portalname = $4;
@@ -7780,6 +8512,7 @@ fetch_args:	cursor_name
 				}
 			| BACKWARD ALL opt_from_in cursor_name
 				{
+					parser_ybc_signal_unsupported(@1, "FETCH BACKWARD", 6514);
 					FetchStmt *n = makeNode(FetchStmt);
 
 					n->portalname = $4;
@@ -8089,6 +8822,14 @@ privilege_target:
 					n->objs = $2;
 					$$ = n;
 				}
+			| _YB_TABLEGROUP_P name_list
+				{
+					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
+					n->targtype = ACL_TARGET_OBJECT;
+					n->objtype = OBJECT_YBTABLEGROUP;
+					n->objs = $2;
+					$$ = n;
+				}
 			| TABLESPACE name_list
 				{
 					PrivTarget *n = palloc_object(PrivTarget);
@@ -8347,6 +9088,7 @@ defacl_privilege_target:
 			| FUNCTIONS		{ $$ = OBJECT_FUNCTION; }
 			| ROUTINES		{ $$ = OBJECT_FUNCTION; }
 			| SEQUENCES		{ $$ = OBJECT_SEQUENCE; }
+			| _YB_TABLEGROUPS_P	{ $$ = OBJECT_YBTABLEGROUP; }
 			| TYPES_P		{ $$ = OBJECT_TYPE; }
 			| SCHEMAS		{ $$ = OBJECT_SCHEMA; }
 			| LARGE_P OBJECTS_P	{ $$ = OBJECT_LARGEOBJECT; }
@@ -8357,13 +9099,19 @@ defacl_privilege_target:
  *
  *		QUERY: CREATE INDEX
  *
- * Note: we cannot put TABLESPACE clause after WHERE clause unless we are
- * willing to make TABLESPACE a fully reserved word.
+ * Note: we cannot put TABLESPACE / SPLIT clause after WHERE clause
+ * unless we are willing to make them fully reserved words.
  *****************************************************************************/
 
+<<<<<<< HEAD
 IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			ON relation_expr access_method_clause '(' index_params ')'
 			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+=======
+IndexStmt:	CREATE opt_unique INDEX yb_opt_concurrently_index opt_index_name
+			ON relation_expr access_method_clause '(' yb_index_params ')'
+			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace YbOptSplit where_clause
+>>>>>>> 939dce21892 (yb changes)
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8377,7 +9125,8 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->nulls_not_distinct = !$13;
 					n->options = $14;
 					n->tableSpace = $15;
-					n->whereClause = $16;
+					n->split_options = $16;
+					n->whereClause = $17;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -8393,9 +9142,9 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->reset_default_tblspc = false;
 					$$ = (Node *) n;
 				}
-			| CREATE opt_unique INDEX opt_concurrently IF_P NOT EXISTS name
-			ON relation_expr access_method_clause '(' index_params ')'
-			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			| CREATE opt_unique INDEX yb_opt_concurrently_index IF_P NOT EXISTS name
+			ON relation_expr access_method_clause '(' yb_index_params ')'
+			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace YbOptSplit where_clause
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8409,7 +9158,8 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->nulls_not_distinct = !$16;
 					n->options = $17;
 					n->tableSpace = $18;
-					n->whereClause = $19;
+					n->split_options = $19;
+					n->whereClause = $20;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -8432,23 +9182,103 @@ opt_unique:
 			| /*EMPTY*/								{ $$ = false; }
 		;
 
-access_method_clause:
-			USING name								{ $$ = $2; }
-			| /*EMPTY*/								{ $$ = DEFAULT_INDEX_TYPE; }
+<<<<<<< HEAD
+=======
+opt_concurrently:
+			CONCURRENTLY							{ $$ = true; }
+			| /*EMPTY*/								{ $$ = false; }
 		;
 
-index_params:	index_elem							{ $$ = list_make1($1); }
-			| index_params ',' index_elem			{ $$ = lappend($1, $3); }
+yb_opt_concurrently_index:
+			CONCURRENTLY
+				{
+					parser_ybc_not_support_in_templates(@1, "Concurrent index creation");
+					$$ = YB_CONCURRENCY_EXPLICIT_ENABLED;
+				}
+			| _YB_NONCONCURRENTLY_P
+				{
+					$$ = YB_CONCURRENCY_DISABLED;
+				}
+			| /*EMPTY*/
+				{
+					$$ = (*YBCGetGFlags()->ysql_disable_index_backfill ||
+						  YbIsConnectedToTemplateDb())
+						? YB_CONCURRENCY_DISABLED
+						: YB_CONCURRENCY_IMPLICIT_ENABLED;
+				}
+		;
+
+opt_index_name:
+			name									{ $$ = $1; }
+			| /*EMPTY*/								{ $$ = NULL; }
+		;
+
+>>>>>>> 939dce21892 (yb changes)
+access_method_clause:
+			USING name								{ $$ = $2; }
+			| /*EMPTY*/								{ $$ = IsYugaByteEnabled() ? NULL : DEFAULT_INDEX_TYPE;	}
+		;
+
+yb_opt_alias:
+			AS ColId
+				{
+					if (!IsBinaryUpgrade)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("syntax error at or near \"AS\"")));
+					$$ = $2;
+				}
+			| /* empty */								{ $$ = NULL; }
+		;
+
+yb_index_params: index_elem
+				{
+					$$ = list_make1($1);
+				}
+			| yb_index_expr_list_hash_elems
+				{
+					$$ = $1;
+				}
+			| yb_index_params ',' index_elem
+				{
+					if ($3->ordering == SORTBY_HASH)
+					{
+						IndexElem *last_elem = (IndexElem *)llast($1);
+						if (last_elem->ordering == SORTBY_HASH)
+							ereport(ERROR,
+									(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+									 errmsg("multiple hash columns must be defined as a "
+											"single hash column group"),
+									 parser_errposition(@3)));
+						else
+							ereport(ERROR,
+									(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+									 errmsg("hash column not allowed after an ASC/DESC column"),
+									 parser_errposition(@3)));
+					}
+					$$ = lappend($1, $3);
+				}
+			| yb_index_params ',' yb_index_expr_list_hash_elems
+				{
+						ereport(ERROR,
+								(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+								 errmsg("hash column not allowed after an ASC/DESC column"),
+								 parser_errposition(@3)));
+				}
 		;
 
 
 index_elem_options:
+<<<<<<< HEAD
 	opt_collate opt_qualified_name opt_asc_desc opt_nulls_order
+=======
+	opt_collate opt_class opt_yb_index_sort_order opt_nulls_order yb_opt_alias
+>>>>>>> 939dce21892 (yb changes)
 		{
 			$$ = makeNode(IndexElem);
 			$$->name = NULL;
 			$$->expr = NULL;
-			$$->indexcolname = NULL;
+			$$->indexcolname = $5;
 			$$->collation = $1;
 			$$->opclass = $2;
 			$$->opclassopts = NIL;
@@ -8456,12 +9286,12 @@ index_elem_options:
 			$$->nulls_ordering = $4;
 			/* location will be filled in index_elem production */
 		}
-	| opt_collate any_name reloptions opt_asc_desc opt_nulls_order
+	| opt_collate any_name reloptions opt_yb_index_sort_order opt_nulls_order yb_opt_alias
 		{
 			$$ = makeNode(IndexElem);
 			$$->name = NULL;
 			$$->expr = NULL;
-			$$->indexcolname = NULL;
+			$$->indexcolname = $6;
 			$$->collation = $1;
 			$$->opclass = $2;
 			$$->opclassopts = $3;
@@ -8491,8 +9321,82 @@ index_elem: ColId index_elem_options
 			| '(' a_expr ')' index_elem_options
 				{
 					$$ = $4;
+<<<<<<< HEAD
 					$$->expr = $2;
 					$$->location = @1;
+=======
+					Node *node = $2;
+					if (node->type == T_ColumnRef) {
+							$$->name = strVal(linitial(((ColumnRef *)node)->fields));
+							$$->expr = NULL;
+					} else {
+							$$->expr = node;
+					}
+				}
+		;
+
+/*
+ * expr_list index element is not allowed as ASC/DESC key. Always treat it as HASH.
+ */
+opt_yb_hash: yb_hash		{ $$ = $1; }
+			 | /* EMPTY */	{ $$ = SORTBY_HASH; }
+		;
+
+yb_hash_index_expr_with_alias:
+			a_expr AS ColId
+				{
+					if (!IsBinaryUpgrade)
+						ereport(ERROR,
+								(errcode(ERRCODE_SYNTAX_ERROR),
+								 errmsg("syntax error at or near \"AS\"")));
+					$$ = list_make2($1, makeString($3));
+				}
+			| a_expr %prec EXPR_LIST
+				{
+					$$ = list_make2($1, NULL);
+				}
+		;
+
+
+yb_hash_index_expr_list:
+			yb_hash_index_expr_with_alias
+				{
+					$$ = list_make1($1);
+				}
+			| yb_hash_index_expr_list ',' yb_hash_index_expr_with_alias
+
+				{
+					$$ = lappend($1, $3);
+				}
+		;
+
+
+yb_index_expr_list_hash_elems: '(' yb_hash_index_expr_list ')' opt_yb_hash
+				{
+					$$ = NULL;
+					ListCell *lc;
+					foreach (lc, $2)
+					{
+							IndexElem *index_elem = makeNode(IndexElem);
+							List *pair = (List *) lfirst(lc);
+							Node *node = (Node *) linitial(pair);
+							char *alias = lsecond(pair) != NULL ?
+								strVal(lsecond(pair)) : NULL;
+							if (node->type == T_ColumnRef) {
+									index_elem->name = strVal(linitial(((ColumnRef *)node)->fields));
+									index_elem->expr = NULL;
+							} else {
+									index_elem->name = NULL;
+									index_elem->expr = copyObject(node);
+							}
+							index_elem->indexcolname = alias;
+							index_elem->collation = NIL;
+							index_elem->opclass = NIL;
+							index_elem->ordering = $4;
+							index_elem->nulls_ordering = SORTBY_NULLS_DEFAULT;
+							$$ = lappend($$, index_elem);
+					}
+>>>>>>> 939dce21892 (yb changes)
 				}
 		;
 
@@ -8504,20 +9408,139 @@ index_including_params:	index_elem						{ $$ = list_make1($1); }
 			| index_including_params ',' index_elem		{ $$ = lappend($1, $3); }
 		;
 
-opt_collate: COLLATE any_name						{ $$ = $2; }
+opt_collate: COLLATE any_name						{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "CREATE INDEX COLLATE");
+                                                      $$ = $2; }
 			| /*EMPTY*/								{ $$ = NIL; }
 		;
 
+<<<<<<< HEAD
+=======
+opt_class:	any_name								{ $$ = $1; }
+			| /*EMPTY*/	%prec NO_OPCLASS			{ $$ = NIL; }
+		;
+>>>>>>> 939dce21892 (yb changes)
 
 opt_asc_desc: ASC							{ $$ = SORTBY_ASC; }
 			| DESC							{ $$ = SORTBY_DESC; }
 			| /*EMPTY*/						{ $$ = SORTBY_DEFAULT; }
 		;
 
+/*
+ * For YugabyteDB, index column can be hash-distributed also.
+ */
+yb_hash: _YB_HASH_P							{ $$ = SORTBY_HASH; }
+		;
+
+opt_yb_index_sort_order: opt_asc_desc		{ $$ = $1; }
+			| yb_hash	     	            { $$ = $1; }
+		;
+
 opt_nulls_order: NULLS_LA FIRST_P			{ $$ = SORTBY_NULLS_FIRST; }
 			| NULLS_LA LAST_P				{ $$ = SORTBY_NULLS_LAST; }
 			| /*EMPTY*/						{ $$ = SORTBY_NULLS_DEFAULT; }
 		;
+
+YbBackfillIndexStmt:
+			_YB_BACKFILL_P INDEX oid_list opt_for_bfinstr
+				READ TIME read_time YbRowBounds
+				{
+					parser_ybc_not_support_in_templates(@1, "Index backfill");
+
+					YbBackfillIndexStmt *n = makeNode(YbBackfillIndexStmt);
+					n->oid_list = $3;
+
+					n->bfinfo = makeNode(YbBackfillInfo);
+					n->bfinfo->bfinstr = $4;
+					{
+						char *nptr = $7;
+						char *end;
+						errno = 0;
+						n->bfinfo->read_time = strtou64(nptr, &end, 10);
+						if (!(*nptr != '\0' && *end == '\0')
+								|| errno == ERANGE)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("read time must be uint64"),
+									 parser_errposition(@6)));
+						if (!n->bfinfo->read_time)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("read time must be larger than 0"),
+									 parser_errposition(@6)));
+					}
+					n->bfinfo->row_bounds = $8;
+					$$ = (Node *)n;
+				}
+		;
+
+opt_for_bfinstr:
+			/*EMPTY*/		{ $$ = NULL; }
+			| WITH XCONST
+				{
+					/* Strip the leading 'x' */
+					$$ = $2 + 1;
+				}
+		;
+
+oid_list:	Oid
+				{
+					$$ = list_make1_oid($1);
+				}
+			| oid_list ',' Oid
+				{
+					$$ = lappend_oid($1, $3);
+				}
+		;
+
+read_time:
+			Iconst
+			{
+				$$ = psprintf("%d", $1);
+			}
+			| FCONST
+			{
+				$$ = $1;
+			}
+		;
+
+YbRowBounds:	PARTITION partition_key
+				{
+					$$ = makeNode(YbRowBounds);
+					/* Strip the leading 'x' */
+					$$->partition_key = $2 + 1;
+					$$->row_key_start = NULL;
+					$$->row_key_end = NULL;
+				}
+			| PARTITION partition_key FROM row_key_start
+				{
+					$$ = makeNode(YbRowBounds);
+					/* Strip the leading 'x' */
+					$$->partition_key = $2 + 1;
+					$$->row_key_start = $4 + 1;
+					$$->row_key_end = NULL;
+				}
+			| PARTITION partition_key FROM row_key_start TO row_key_end
+				{
+					$$ = makeNode(YbRowBounds);
+					/* Strip the leading 'x' */
+					$$->partition_key = $2 + 1;
+					$$->row_key_start = $4 + 1;
+					$$->row_key_end = $6 + 1;
+				}
+		;
+
+partition_key:
+			XCONST									{ $$ = $1; };
+
+row_key_start:
+			row_key									{ $$ = $1; };
+
+row_key_end:
+			row_key									{ $$ = $1; };
+
+row_key:	XCONST									{ $$ = $1; };
 
 
 /*****************************************************************************
@@ -9104,6 +10127,7 @@ AlterFunctionStmt:
 				}
 			| ALTER PROCEDURE function_with_argtypes alterfunc_opt_list opt_restrict
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER PROCEDURE", 2717);
 					AlterFunctionStmt *n = makeNode(AlterFunctionStmt);
 
 					n->objtype = OBJECT_PROCEDURE;
@@ -9113,6 +10137,7 @@ AlterFunctionStmt:
 				}
 			| ALTER ROUTINE function_with_argtypes alterfunc_opt_list opt_restrict
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER ROUTINE", 2717);
 					AlterFunctionStmt *n = makeNode(AlterFunctionStmt);
 
 					n->objtype = OBJECT_ROUTINE;
@@ -9417,6 +10442,7 @@ opt_if_exists: IF_P EXISTS						{ $$ = true; }
 
 CreateTransformStmt: CREATE opt_or_replace TRANSFORM FOR Typename LANGUAGE name '(' transform_element_list ')'
 				{
+					parser_ybc_not_support(@1, "CREATE TRANSFORM");
 					CreateTransformStmt *n = makeNode(CreateTransformStmt);
 
 					n->replace = $2;
@@ -9449,6 +10475,7 @@ transform_element_list: FROM SQL_P WITH FUNCTION function_with_argtypes ',' TO S
 
 DropTransformStmt: DROP TRANSFORM opt_if_exists FOR Typename LANGUAGE name opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "DROP TRANSFORM");
 					DropStmt *n = makeNode(DropStmt);
 
 					n->removeType = OBJECT_TRANSFORM;
@@ -9471,19 +10498,39 @@ DropTransformStmt: DROP TRANSFORM opt_if_exists FOR Typename LANGUAGE name opt_d
 ReindexStmt:
 			REINDEX opt_utility_option_list reindex_target_relation opt_concurrently qualified_name
 				{
+					if (!*YBCGetGFlags()->ysql_enable_reindex)
+						parser_ybc_not_support(@1, "REINDEX");
 					ReindexStmt *n = makeNode(ReindexStmt);
 
 					n->kind = $3;
 					n->relation = $5;
 					n->name = NULL;
+<<<<<<< HEAD
 					n->params = $2;
 					if ($4)
 						n->params = lappend(n->params,
 											makeDefElem("concurrently", NULL, @4));
+=======
+					n->params = NIL;
+					if ($3)
+					{
+						parser_ybc_not_support(@1, "REINDEX CONCURRENTLY");
+						n->params = lappend(n->params,
+											makeDefElem("concurrently", NULL, @3));
+					}
+					/* YB: Only support INDEX target. */
+					if (n->kind != REINDEX_OBJECT_INDEX)
+					{
+						Assert(n->kind == REINDEX_OBJECT_TABLE);
+						parser_ybc_not_support(@2, "REINDEX TABLE");
+					}
+
+>>>>>>> 939dce21892 (yb changes)
 					$$ = (Node *) n;
 				}
 			| REINDEX opt_utility_option_list SCHEMA opt_concurrently name
 				{
+					parser_ybc_not_support(@1, "REINDEX SCHEMA/DATABASE/SYSTEM");
 					ReindexStmt *n = makeNode(ReindexStmt);
 
 					n->kind = REINDEX_OBJECT_SCHEMA;
@@ -9497,9 +10544,40 @@ ReindexStmt:
 				}
 			| REINDEX opt_utility_option_list reindex_target_all opt_concurrently opt_single_name
 				{
+					if (!*YBCGetGFlags()->ysql_enable_reindex)
+						parser_ybc_not_support(@1, "REINDEX");
 					ReindexStmt *n = makeNode(ReindexStmt);
 
+<<<<<<< HEAD
 					n->kind = $3;
+=======
+					n->kind = $5;
+					n->relation = $7;
+					n->name = NULL;
+					n->params = $3;
+					if ($6)
+					{
+						parser_ybc_not_support(@1, "REINDEX CONCURRENTLY");
+						n->params = lappend(n->params,
+											makeDefElem("concurrently", NULL, @6));
+					}
+
+					/* Only support INDEX target. */
+					if (n->kind != REINDEX_OBJECT_INDEX)
+					{
+						Assert(n->kind == REINDEX_OBJECT_TABLE);
+						parser_ybc_not_support(@5, "REINDEX TABLE");
+					}
+					$$ = (Node *) n;
+				}
+			| REINDEX '(' utility_option_list ')' reindex_target_multitable opt_concurrently name
+				{
+					parser_ybc_not_support(@1, "REINDEX SCHEMA/DATABASE/SYSTEM");
+					ReindexStmt *n = makeNode(ReindexStmt);
+
+					n->kind = $5;
+					n->name = $7;
+>>>>>>> 939dce21892 (yb changes)
 					n->relation = NULL;
 					n->name = $5;
 					n->params = $2;
@@ -9527,6 +10605,7 @@ reindex_target_all:
 AlterTblSpcStmt:
 			ALTER TABLESPACE name SET reloptions
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TABLESPACE", 1153);
 					AlterTableSpaceOptionsStmt *n =
 						makeNode(AlterTableSpaceOptionsStmt);
 
@@ -9537,6 +10616,7 @@ AlterTblSpcStmt:
 				}
 			| ALTER TABLESPACE name RESET reloptions
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TABLESPACE", 1153);
 					AlterTableSpaceOptionsStmt *n =
 						makeNode(AlterTableSpaceOptionsStmt);
 
@@ -9565,6 +10645,8 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER COLLATION any_name RENAME TO name
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "ALTER COLLATION");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_COLLATION;
@@ -9575,6 +10657,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER CONVERSION_P any_name RENAME TO name
 				{
+					parser_ybc_not_support(@1, "ALTER CONVERSION");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_CONVERSION;
@@ -9605,6 +10688,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER DOMAIN_P any_name RENAME CONSTRAINT name TO name
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN RENAME CONSTRAINT");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_DOMCONSTRAINT;
@@ -9645,6 +10729,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER opt_procedural LANGUAGE name RENAME TO name
 				{
+					parser_ybc_not_support(@1, "ALTER LANGUAGE");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_LANGUAGE;
@@ -9655,6 +10740,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER OPERATOR CLASS any_name USING name RENAME TO name
 				{
+					parser_ybc_not_support(@1, "ALTER OPERATOR CLASS");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_OPCLASS;
@@ -9697,6 +10783,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER PROCEDURE function_with_argtypes RENAME TO name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER PROCEDURE", 2717);
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_PROCEDURE;
@@ -9717,6 +10804,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER ROUTINE function_with_argtypes RENAME TO name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER ROUTINE", 2717);
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_ROUTINE;
@@ -9747,6 +10835,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER SUBSCRIPTION name RENAME TO name
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_SUBSCRIPTION;
@@ -10007,6 +11096,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER RULE name ON qualified_name RENAME TO name
 				{
+					parser_ybc_not_support(@1, "ALTER RULE");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_RULE;
@@ -10056,8 +11146,19 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->missing_ok = false;
 					$$ = (Node *) n;
 				}
+			| ALTER _YB_TABLEGROUP_P name RENAME TO name
+				{
+					parser_ybc_beta_feature(@1, "tablegroup", true);
+					RenameStmt *n = makeNode(RenameStmt);
+					n->renameType = OBJECT_YBTABLEGROUP;
+					n->subname = $3;
+					n->newname = $6;
+					n->missing_ok = false;
+					$$ = (Node *)n;
+				}
 			| ALTER TABLESPACE name RENAME TO name
 				{
+					parser_ybc_not_support(@1, "ALTER TABLESPACE");
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_TABLESPACE;
@@ -10128,6 +11229,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 				}
 			| ALTER TYPE_P any_name RENAME ATTRIBUTE name TO name opt_drop_behavior
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TYPE", 1893);
 					RenameStmt *n = makeNode(RenameStmt);
 
 					n->renameType = OBJECT_ATTRIBUTE;
@@ -10168,6 +11270,7 @@ AlterObjectDependsStmt:
 				}
 			| ALTER PROCEDURE function_with_argtypes opt_no DEPENDS ON EXTENSION name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER PROCEDURE DEPENDS ON EXTENSION", 2717);
 					AlterObjectDependsStmt *n = makeNode(AlterObjectDependsStmt);
 
 					n->objectType = OBJECT_PROCEDURE;
@@ -10178,6 +11281,7 @@ AlterObjectDependsStmt:
 				}
 			| ALTER ROUTINE function_with_argtypes opt_no DEPENDS ON EXTENSION name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER ROUTINE DEPENDS ON EXTENSION", 2717);
 					AlterObjectDependsStmt *n = makeNode(AlterObjectDependsStmt);
 
 					n->objectType = OBJECT_ROUTINE;
@@ -10188,6 +11292,7 @@ AlterObjectDependsStmt:
 				}
 			| ALTER TRIGGER name ON qualified_name opt_no DEPENDS ON EXTENSION name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER TRIGGER DEPENDS ON EXTENSION", 1156);
 					AlterObjectDependsStmt *n = makeNode(AlterObjectDependsStmt);
 
 					n->objectType = OBJECT_TRIGGER;
@@ -10199,6 +11304,7 @@ AlterObjectDependsStmt:
 				}
 			| ALTER MATERIALIZED VIEW qualified_name opt_no DEPENDS ON EXTENSION name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER MATERIALIZED VIEW DEPENDS ON EXTENSION", 1131);
 					AlterObjectDependsStmt *n = makeNode(AlterObjectDependsStmt);
 
 					n->objectType = OBJECT_MATVIEW;
@@ -10209,6 +11315,7 @@ AlterObjectDependsStmt:
 				}
 			| ALTER INDEX qualified_name opt_no DEPENDS ON EXTENSION name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER INDEX DEPENDS ON EXTENSION", 1130);
 					AlterObjectDependsStmt *n = makeNode(AlterObjectDependsStmt);
 
 					n->objectType = OBJECT_INDEX;
@@ -10232,6 +11339,7 @@ opt_no:		NO				{ $$ = true; }
 AlterObjectSchemaStmt:
 			ALTER AGGREGATE aggregate_with_argtypes SET SCHEMA name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER AGGREGATE SET SCHEMA", 2717);
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_AGGREGATE;
@@ -10242,6 +11350,8 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER COLLATION any_name SET SCHEMA name
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "ALTER COLLATION SET SCHEMA");
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_COLLATION;
@@ -10252,6 +11362,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER CONVERSION_P any_name SET SCHEMA name
 				{
+					parser_ybc_not_support(@1, "ALTER CONVERSION SET SCHEMA");
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_CONVERSION;
@@ -10262,6 +11373,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER DOMAIN_P any_name SET SCHEMA name
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN SET SCHEMA");
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_DOMAIN;
@@ -10302,6 +11414,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER OPERATOR CLASS any_name USING name SET SCHEMA name
 				{
+					parser_ybc_not_support(@1, "ALTER OPERATOR CLASS SET SCHEMA");
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_OPCLASS;
@@ -10322,6 +11435,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER PROCEDURE function_with_argtypes SET SCHEMA name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER PROCEDURE SET SCHEMA", 2717);
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_PROCEDURE;
@@ -10332,6 +11446,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER ROUTINE function_with_argtypes SET SCHEMA name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER ROUTINE SET SCHEMA", 2717);
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_ROUTINE;
@@ -10452,6 +11567,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER MATERIALIZED VIEW qualified_name SET SCHEMA name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER MATERIALIZED VIEW SET SCHEMA", 1131);
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_MATVIEW;
@@ -10462,6 +11578,7 @@ AlterObjectSchemaStmt:
 				}
 			| ALTER MATERIALIZED VIEW IF_P EXISTS qualified_name SET SCHEMA name
 				{
+					parser_ybc_signal_unsupported(@1, "ALTER MATERIALIZED VIEW SET SCHEMA", 1131);
 					AlterObjectSchemaStmt *n = makeNode(AlterObjectSchemaStmt);
 
 					n->objectType = OBJECT_MATVIEW;
@@ -10700,6 +11817,15 @@ AlterOwnerStmt: ALTER AGGREGATE aggregate_with_argtypes OWNER TO RoleSpec
 					n->newowner = $6;
 					$$ = (Node *) n;
 				}
+			| ALTER _YB_TABLEGROUP_P name OWNER TO RoleSpec
+				{
+					parser_ybc_beta_feature(@1, "tablegroup", true);
+					AlterOwnerStmt *n = makeNode(AlterOwnerStmt);
+					n->objectType = OBJECT_YBTABLEGROUP;
+					n->object = (Node *) makeString($3);
+					n->newowner = $6;
+					$$ = (Node *)n;
+				}
 			| ALTER TABLESPACE name OWNER TO RoleSpec
 				{
 					AlterOwnerStmt *n = makeNode(AlterOwnerStmt);
@@ -10861,6 +11987,7 @@ PublicationObjSpec:
 				}
 			| TABLES IN_P SCHEMA ColId
 				{
+					parser_ybc_not_support(@1, "CREATE/ALTER PUBLICATION SCHEMA");
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_TABLES_IN_SCHEMA;
 					$$->name = $4;
@@ -10868,6 +11995,7 @@ PublicationObjSpec:
 				}
 			| TABLES IN_P SCHEMA CURRENT_SCHEMA
 				{
+					parser_ybc_not_support(@1, "CREATE/ALTER PUBLICATION SCHEMA");
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_TABLES_IN_CUR_SCHEMA;
 					$$->location = @4;
@@ -10921,6 +12049,7 @@ PublicationObjSpec:
 				}
 			| CURRENT_SCHEMA
 				{
+					parser_ybc_not_support(@1, "CREATE/ALTER PUBLICATION SCHEMA");
 					$$ = makeNode(PublicationObjSpec);
 					$$->pubobjtype = PUBLICATIONOBJ_CONTINUATION;
 					$$->location = @1;
@@ -11022,6 +12151,7 @@ AlterPublicationStmt:
 CreateSubscriptionStmt:
 			CREATE SUBSCRIPTION name CONNECTION Sconst PUBLICATION name_list opt_definition
 				{
+					parser_ybc_not_support(@1, "CREATE SUBSCRIPTION");
 					CreateSubscriptionStmt *n =
 						makeNode(CreateSubscriptionStmt);
 					n->subname = $3;
@@ -11041,6 +12171,7 @@ CreateSubscriptionStmt:
 AlterSubscriptionStmt:
 			ALTER SUBSCRIPTION name SET definition
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11051,6 +12182,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name CONNECTION Sconst
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11061,6 +12193,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name REFRESH PUBLICATION opt_definition
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11080,6 +12213,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name ADD_P PUBLICATION name_list opt_definition
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11091,6 +12225,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name DROP PUBLICATION name_list opt_definition
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11102,6 +12237,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name SET PUBLICATION name_list opt_definition
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11113,6 +12249,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name ENABLE_P
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11124,6 +12261,7 @@ AlterSubscriptionStmt:
 				}
 			| ALTER SUBSCRIPTION name DISABLE_P
 				{
+					parser_ybc_not_support(@1, "ALTER SUBSCRIPTION");
 					AlterSubscriptionStmt *n =
 						makeNode(AlterSubscriptionStmt);
 
@@ -11153,6 +12291,7 @@ AlterSubscriptionStmt:
 
 DropSubscriptionStmt: DROP SUBSCRIPTION name opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "DROP SUBSCRIPTION");
 					DropSubscriptionStmt *n = makeNode(DropSubscriptionStmt);
 
 					n->subname = $3;
@@ -11162,6 +12301,7 @@ DropSubscriptionStmt: DROP SUBSCRIPTION name opt_drop_behavior
 				}
 				|  DROP SUBSCRIPTION IF_P EXISTS name opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "DROP SUBSCRIPTION");
 					DropSubscriptionStmt *n = makeNode(DropSubscriptionStmt);
 
 					n->subname = $5;
@@ -11388,6 +12528,7 @@ TransactionStmt:
 				}
 			| PREPARE TRANSACTION Sconst
 				{
+					parser_ybc_signal_unsupported(@1, "PREPARE TRANSACTION", 1125);
 					TransactionStmt *n = makeNode(TransactionStmt);
 
 					n->kind = TRANS_STMT_PREPARE;
@@ -11397,6 +12538,7 @@ TransactionStmt:
 				}
 			| COMMIT PREPARED Sconst
 				{
+					parser_ybc_signal_unsupported(@1, "COMMIT PREPARED", 1125);
 					TransactionStmt *n = makeNode(TransactionStmt);
 
 					n->kind = TRANS_STMT_COMMIT_PREPARED;
@@ -11406,6 +12548,7 @@ TransactionStmt:
 				}
 			| ROLLBACK PREPARED Sconst
 				{
+					parser_ybc_signal_unsupported(@1, "ROLLBACK PREPARED", 1125);
 					TransactionStmt *n = makeNode(TransactionStmt);
 
 					n->kind = TRANS_STMT_ROLLBACK_PREPARED;
@@ -11560,9 +12703,21 @@ ViewStmt: CREATE OptTemp VIEW qualified_name opt_column_list opt_reloptions
 		;
 
 opt_check_option:
-		WITH CHECK OPTION				{ $$ = CASCADED_CHECK_OPTION; }
-		| WITH CASCADED CHECK OPTION	{ $$ = CASCADED_CHECK_OPTION; }
-		| WITH LOCAL CHECK OPTION		{ $$ = LOCAL_CHECK_OPTION; }
+		WITH CHECK OPTION
+			{
+				parser_ybc_not_support(@1, "VIEW WITH CHECK OPTION");
+				$$ = CASCADED_CHECK_OPTION;
+			}
+		| WITH CASCADED CHECK OPTION
+			{
+				parser_ybc_not_support(@1, "VIEW WITH CASCADED CHECK OPTION");
+				$$ = CASCADED_CHECK_OPTION;
+			}
+		| WITH LOCAL CHECK OPTION
+			{
+				parser_ybc_not_support(@1, "VIEW WITH LOCAL CHECK OPTION");
+				$$ = LOCAL_CHECK_OPTION;
+			}
 		| /* EMPTY */					{ $$ = NO_CHECK_OPTION; }
 		;
 
@@ -11575,6 +12730,7 @@ opt_check_option:
 
 LoadStmt:	LOAD file_name
 				{
+					parser_ybc_not_support(@1, "LOAD");
 					LoadStmt   *n = makeNode(LoadStmt);
 
 					n->filename = $2;
@@ -11644,6 +12800,17 @@ createdb_opt_name:
 			| OWNER							{ $$ = pstrdup($1); }
 			| TABLESPACE					{ $$ = pstrdup($1); }
 			| TEMPLATE						{ $$ = pstrdup($1); }
+			| _YB_COLOCATED_P
+				{
+					ereport(WARNING,
+    						(errcode(ERRCODE_WARNING_DEPRECATED_FEATURE),
+							 errmsg("'colocated' syntax is deprecated and will be removed in a future release"),
+							 errhint("Use 'colocation' instead of 'colocated'."),
+							 parser_errposition(@1)));
+					$$ = pstrdup($1);
+				}
+			| _YB_COLOCATION_P				{ $$ = pstrdup($1); }
+			| AS OF							{ $$ = pstrdup("clone_time"); }
 		;
 
 /*
@@ -11680,6 +12847,9 @@ AlterDatabaseStmt:
 				 }
 			| ALTER DATABASE name SET TABLESPACE name
 				 {
+					parser_ybc_not_support(@1, "ALTER DATABASE SET TABLESPACE");
+					// TODO(Deepayan): Ensure database shdep on tablespace updates to
+					// new tablespace
 					AlterDatabaseStmt *n = makeNode(AlterDatabaseStmt);
 
 					n->dbname = $3;
@@ -11783,6 +12953,8 @@ drop_option:
 
 AlterCollationStmt: ALTER COLLATION any_name REFRESH VERSION_P
 				{
+					if (!YBIsCollationEnabled())
+						parser_ybc_not_support(@1, "ALTER COLLATION");
 					AlterCollationStmt *n = makeNode(AlterCollationStmt);
 
 					n->collname = $3;
@@ -11801,6 +12973,7 @@ AlterCollationStmt: ALTER COLLATION any_name REFRESH VERSION_P
 AlterSystemStmt:
 			ALTER SYSTEM_P SET generic_set
 				{
+					parser_ybc_not_support(@1, "ALTER SYSTEM");
 					AlterSystemStmt *n = makeNode(AlterSystemStmt);
 
 					n->setstmt = $4;
@@ -11808,6 +12981,7 @@ AlterSystemStmt:
 				}
 			| ALTER SYSTEM_P RESET generic_reset
 				{
+					parser_ybc_not_support(@1, "ALTER SYSTEM RESET");
 					AlterSystemStmt *n = makeNode(AlterSystemStmt);
 
 					n->setstmt = $4;
@@ -11849,6 +13023,7 @@ AlterDomainStmt:
 			/* ALTER DOMAIN <domain> DROP NOT NULL */
 			| ALTER DOMAIN_P any_name DROP NOT NULL_P
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN DROP NOT NULL");
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
 					n->subtype = AD_DropNotNull;
@@ -11858,6 +13033,7 @@ AlterDomainStmt:
 			/* ALTER DOMAIN <domain> SET NOT NULL */
 			| ALTER DOMAIN_P any_name SET NOT NULL_P
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN SET NOT NULL");
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
 					n->subtype = AD_SetNotNull;
@@ -11867,6 +13043,7 @@ AlterDomainStmt:
 			/* ALTER DOMAIN <domain> ADD CONSTRAINT ... */
 			| ALTER DOMAIN_P any_name ADD_P DomainConstraint
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN ADD CONSTRAINT");
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
 					n->subtype = AD_AddConstraint;
@@ -11877,6 +13054,7 @@ AlterDomainStmt:
 			/* ALTER DOMAIN <domain> DROP CONSTRAINT <name> [RESTRICT|CASCADE] */
 			| ALTER DOMAIN_P any_name DROP CONSTRAINT name opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN DROP CONSTRAINT");
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
 					n->subtype = AD_DropConstraint;
@@ -11889,6 +13067,7 @@ AlterDomainStmt:
 			/* ALTER DOMAIN <domain> DROP CONSTRAINT IF EXISTS <name> [RESTRICT|CASCADE] */
 			| ALTER DOMAIN_P any_name DROP CONSTRAINT IF_P EXISTS name opt_drop_behavior
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN DROP CONSTRAINT");
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
 					n->subtype = AD_DropConstraint;
@@ -11901,6 +13080,7 @@ AlterDomainStmt:
 			/* ALTER DOMAIN <domain> VALIDATE CONSTRAINT <name> */
 			| ALTER DOMAIN_P any_name VALIDATE CONSTRAINT name
 				{
+					parser_ybc_not_support(@1, "ALTER DOMAIN VALIDATE CONSTRAINT");
 					AlterDomainStmt *n = makeNode(AlterDomainStmt);
 
 					n->subtype = AD_ValidateConstraint;
@@ -11924,6 +13104,7 @@ opt_as:		AS
 AlterTSDictionaryStmt:
 			ALTER TEXT_P SEARCH DICTIONARY any_name definition
 				{
+					parser_ybc_not_support(@1, "ALTER TEXT SEARCH DICTIONARY");
 					AlterTSDictionaryStmt *n = makeNode(AlterTSDictionaryStmt);
 
 					n->dictname = $5;
@@ -12022,6 +13203,7 @@ CreateConversionStmt:
 			CREATE opt_default CONVERSION_P any_name FOR Sconst
 			TO Sconst FROM any_name
 			{
+				parser_ybc_not_support(@1, "CREATE CONVERSION");
 				CreateConversionStmt *n = makeNode(CreateConversionStmt);
 
 				n->conversion_name = $4;
@@ -12043,7 +13225,24 @@ CreateConversionStmt:
  *****************************************************************************/
 
 ClusterStmt:
+<<<<<<< HEAD
 			CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
+=======
+			CLUSTER opt_verbose qualified_name cluster_index_specification
+				{
+					parser_ybc_not_support(@1, "CLUSTER");
+					ClusterStmt *n = makeNode(ClusterStmt);
+
+					n->relation = $3;
+					n->indexname = $4;
+					n->params = NIL;
+					if ($2)
+						n->params = lappend(n->params, makeDefElem("verbose", NULL, @2));
+					$$ = (Node *) n;
+				}
+
+			| CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification
+>>>>>>> 939dce21892 (yb changes)
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 
@@ -12054,6 +13253,7 @@ ClusterStmt:
 				}
 			| CLUSTER opt_utility_option_list
 				{
+					parser_ybc_not_support(@1, "CLUSTER");
 					ClusterStmt *n = makeNode(ClusterStmt);
 
 					n->relation = NULL;
@@ -12085,6 +13285,7 @@ ClusterStmt:
 			/* kept for pre-8.3 compatibility */
 			| CLUSTER opt_verbose name ON qualified_name
 				{
+					parser_ybc_not_support(@1, "CLUSTER");
 					ClusterStmt *n = makeNode(ClusterStmt);
 
 					n->relation = $5;
@@ -12316,6 +13517,7 @@ ExecuteStmt: EXECUTE name execute_param_clause
 			| CREATE OptTemp TABLE create_as_target AS
 				EXECUTE name execute_param_clause opt_with_data
 				{
+					parser_ybc_not_support(@1, "CREATE TABLE AS EXECUTE");
 					CreateTableAsStmt *ctas = makeNode(CreateTableAsStmt);
 					ExecuteStmt *n = makeNode(ExecuteStmt);
 
@@ -12522,7 +13724,7 @@ opt_on_conflict:
 		;
 
 opt_conf_expr:
-			'(' index_params ')' where_clause
+			'(' yb_index_params ')' where_clause
 				{
 					$$ = makeNode(InferClause);
 					$$->indexElems = $2;
@@ -12634,17 +13836,57 @@ LockStmt:	LOCK_P opt_table relation_expr_list opt_lock opt_nowait
 		;
 
 opt_lock:	IN_P lock_type MODE				{ $$ = $2; }
-			| /*EMPTY*/						{ $$ = AccessExclusiveLock; }
+			| /*EMPTY*/
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@0, "ACCESS EXCLUSIVE lock mode");
+			    	$$ = AccessExclusiveLock;
+				}
 		;
 
 lock_type:	ACCESS SHARE					{ $$ = AccessShareLock; }
-			| ROW SHARE						{ $$ = RowShareLock; }
-			| ROW EXCLUSIVE					{ $$ = RowExclusiveLock; }
-			| SHARE UPDATE EXCLUSIVE		{ $$ = ShareUpdateExclusiveLock; }
-			| SHARE							{ $$ = ShareLock; }
-			| SHARE ROW EXCLUSIVE			{ $$ = ShareRowExclusiveLock; }
-			| EXCLUSIVE						{ $$ = ExclusiveLock; }
-			| ACCESS EXCLUSIVE				{ $$ = AccessExclusiveLock; }
+			| ROW SHARE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "ROW SHARE");
+			    	$$ = RowShareLock;
+				}
+			| ROW EXCLUSIVE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "ROW EXCLUSIVE");
+			    	$$ = RowExclusiveLock;
+				}
+			| SHARE UPDATE EXCLUSIVE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "SHARE UPDATE EXCLUSIVE");
+			    	$$ = ShareUpdateExclusiveLock;
+				}
+			| SHARE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "SHARE");
+			    	$$ = ShareLock;
+				}
+			| SHARE ROW EXCLUSIVE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "SHARE ROW EXCLUSIVE");
+			    	$$ = ShareRowExclusiveLock;
+				}
+			| EXCLUSIVE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "EXCLUSIVE");
+			    	$$ = ExclusiveLock;
+				}
+			| ACCESS EXCLUSIVE
+				{
+					if (!*YBCGetGFlags()->enable_object_locking_for_table_locks)
+						parser_ybc_not_support(@1, "ACCESS EXCLUSIVE");
+			    	$$ = AccessExclusiveLock;
+				}
 		;
 
 opt_nowait:	NOWAIT							{ $$ = true; }
@@ -14264,6 +15506,7 @@ where_or_current_clause:
 			WHERE a_expr							{ $$ = $2; }
 			| WHERE CURRENT_P OF cursor_name
 				{
+					parser_ybc_signal_unsupported(@1, "WHERE CURRENT OF", 737);
 					CurrentOfExpr *n = makeNode(CurrentOfExpr);
 
 					/* cvarno is filled in by parse analysis */
@@ -16901,7 +18144,7 @@ subquery_Op:
  */
 			;
 
-expr_list:	a_expr
+expr_list:	a_expr %prec EXPR_LIST
 				{
 					$$ = list_make1($1);
 				}
@@ -17667,6 +18910,13 @@ SignedIconst: Iconst								{ $$ = $1; }
 			| '-' Iconst							{ $$ = - $2; }
 		;
 
+/*
+ * YB: Iconst does not accept large OID such as 2147500041, use SignedIconst to
+ * convert it to -2147467255 instead. See process_integer_literal and strtoint
+ * for details.
+ */
+Oid:		SignedIconst							{ $$ = $1; };
+
 /* Role specifications */
 RoleId:		RoleSpec
 				{
@@ -18230,6 +19480,20 @@ unreserved_keyword:
 			| YEAR_P
 			| YES_P
 			| ZONE
+			| _YB_ACCOUNT_P
+			| _YB_BACKFILL_P
+			| _YB_CHANGE_P
+			| _YB_COLOCATED_P
+			| _YB_COLOCATION_P
+			| _YB_FAILED_LOGIN_ATTEMPTS_P
+			| _YB_HASH_P
+			| _YB_NOPROFILE_P
+			| _YB_PROFILE_P
+			| _YB_SPLIT_P
+			| _YB_TABLEGROUP_P
+			| _YB_TABLEGROUPS_P
+			| _YB_TABLETS_P
+			| _YB_UNLOCK_P
 		;
 
 /* Column identifier --- keywords that can be column, table, etc names.
@@ -18342,6 +19606,7 @@ type_func_name_keyword:
 			| SIMILAR
 			| TABLESAMPLE
 			| VERBOSE
+			| _YB_NONCONCURRENTLY_P
 		;
 
 /* Reserved keyword --- these keywords are usable only as a ColLabel.
@@ -18900,6 +20165,21 @@ bare_label_keyword:
 			| XMLTABLE
 			| YES_P
 			| ZONE
+			| _YB_ACCOUNT_P
+			| _YB_BACKFILL_P
+			| _YB_CHANGE_P
+			| _YB_COLOCATED_P
+			| _YB_COLOCATION_P
+			| _YB_FAILED_LOGIN_ATTEMPTS_P
+			| _YB_HASH_P
+			| _YB_NONCONCURRENTLY_P
+			| _YB_NOPROFILE_P
+			| _YB_PROFILE_P
+			| _YB_SPLIT_P
+			| _YB_TABLEGROUP_P
+			| _YB_TABLEGROUPS_P
+			| _YB_TABLETS_P
+			| _YB_UNLOCK_P
 		;
 
 %%
@@ -19987,4 +21267,144 @@ void
 parser_init(base_yy_extra_type *yyext)
 {
 	yyext->parsetree = NIL;		/* in case grammar forgets to set it */
+}
+
+static int
+errhint_for_not_supported(int issue, const char *extra_hint)
+{
+	if (issue > 0)
+	{
+		errhint("See https://github.com/yugabyte/yugabyte-db/issues/%d. "
+				"React with thumbs up to raise its priority",
+				issue);
+	}
+	else if (issue == -2)
+	{
+		if (extra_hint)
+		{
+			errhint("%s", extra_hint);
+		}
+	}
+	else
+	{
+		errhint("Please report the issue on "
+			"https://github.com/YugaByte/yugabyte-db/issues");
+	}
+	return 0;					/* return value does not matter */
+}
+
+/*----------
+ * Signal that a feature is currently unsupported.
+ *
+ * Issue helps explain why:
+ *
+ *     issue>0:     The feature hasn't been (fully) implemented yet;
+ *                  GitHub issue # issue tracks this.
+ *     issue == -1: Ditto but no GitHub issue has been assigned for this yet
+ *     issue == -2: Custom hint message (e.g., the feature is implemented but
+ *                  is currently turned off at the moment due to a flag)
+ * ----------
+ */
+static void
+raise_feature_not_supported_signal(int pos, core_yyscan_t yyscanner,
+								   const char *msg, int issue,
+								   const char *extra_hint, int signal_level)
+{
+	ereport(signal_level,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s", msg),
+			 errhint_for_not_supported(issue, extra_hint),
+			 parser_errposition(pos)));
+}
+
+static void
+raise_feature_not_supported(int pos, core_yyscan_t yyscanner, const char *msg,
+							int issue, const char *extra_hint)
+{
+	raise_feature_not_supported_signal(pos, yyscanner, msg, issue, extra_hint,
+									   YBUnsupportedFeatureSignalLevel());
+}
+
+static void
+ybc_not_support_signal(int pos, core_yyscan_t yyscanner, const char *msg,
+					   int issue, const char *extra_hint, int signal_level)
+{
+	static int use_yb_parser = -1;
+	if (use_yb_parser == -1)
+	{
+		use_yb_parser = YBIsUsingYBParser();
+	}
+
+	if (use_yb_parser)
+	{
+		raise_feature_not_supported_signal(pos, yyscanner, msg, issue,
+										   extra_hint, signal_level);
+	}
+}
+
+static void
+ybc_not_support(int pos, core_yyscan_t yyscanner, const char *msg, int issue,
+				const char *extra_hint)
+{
+	ybc_not_support_signal(pos, yyscanner, msg, issue, extra_hint,
+						   YBUnsupportedFeatureSignalLevel());
+}
+
+static void
+ybc_not_support_in_templates(int pos, core_yyscan_t yyscanner, const char *msg)
+{
+	static int restricted = -1;
+	if (restricted == -1)
+	{
+		restricted = YBIsUsingYBParser() && YbIsConnectedToTemplateDb();
+	}
+
+	if (restricted && !IsYsqlUpgrade)
+	{
+		raise_feature_not_supported(pos, yyscanner, msg, -1, NULL);
+	}
+}
+
+static bool
+beta_features_enabled()
+{
+	static int beta_enabled = -1;
+	if (beta_enabled == -1)
+	{
+		beta_enabled = YBCIsEnvVarTrueWithDefault("FLAGS_ysql_beta_features", false);
+	}
+	return beta_enabled;
+}
+
+static void
+check_beta_feature(int pos, core_yyscan_t yyscanner, const char *flag, const char *feature)
+{
+	if (YBIsUsingYBParser() && !beta_features_enabled() && !(flag && YBCIsEnvVarTrue(flag)))
+	{
+		const char* general_hint =
+			"Set 'ysql_beta_features' yb-tserver gflag to true to suppress the warning"
+			" for all beta features.";
+
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("'%s' is a beta feature!", feature),
+				 flag != NULL ?
+					 errhint("To suppress this warning, set the '%s' yb-tserver gflag to true.\n(%s)",
+					         (flag + 6), general_hint) :
+					 errhint("%s", general_hint),
+				 parser_errposition(pos)));
+		if (strcmp(feature, "tablegroup") == 0)
+		{
+			ybc_deprecated_feature_warning(pos, yyscanner, feature);
+		}
+	}
+}
+
+static void
+ybc_deprecated_feature_warning(int pos, core_yyscan_t yyscanner, const char *feature)
+{
+	ereport(WARNING,
+			(errcode(ERRCODE_WARNING_DEPRECATED_FEATURE),
+			 errmsg("'%s' feature is deprecated and will be removed in a future release", feature),
+			 parser_errposition(pos)));
 }

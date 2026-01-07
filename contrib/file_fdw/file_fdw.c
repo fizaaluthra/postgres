@@ -42,10 +42,18 @@
 #include "utils/sampling.h"
 #include "utils/varlena.h"
 
+<<<<<<< HEAD
 PG_MODULE_MAGIC_EXT(
 					.name = "file_fdw",
 					.version = PG_VERSION
 );
+=======
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
+PG_MODULE_MAGIC;
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Describes the valid options for objects that use this wrapper.
@@ -260,6 +268,8 @@ file_fdw_validator(PG_FUNCTION_ARGS)
 		if (strcmp(def->defname, "filename") == 0 ||
 			strcmp(def->defname, "program") == 0)
 		{
+			YBCheckServerAccessIsAllowed();
+
 			if (filename)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
@@ -765,6 +775,7 @@ retry:
 	 *
 	 */
 	ExecClearTuple(slot);
+<<<<<<< HEAD
 
 	if (NextCopyFrom(cstate, econtext, slot->tts_values, slot->tts_isnull))
 	{
@@ -805,6 +816,12 @@ retry:
 			goto retry;
 		}
 
+=======
+	found = NextCopyFrom(festate->cstate, NULL,
+						 slot->tts_values, slot->tts_isnull,
+						 false /* skip_row */ );
+	if (found)
+>>>>>>> 939dce21892 (yb changes)
 		ExecStoreVirtualTuple(slot);
 	}
 
@@ -1246,7 +1263,7 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 		MemoryContextReset(tupcontext);
 		MemoryContextSwitchTo(tupcontext);
 
-		found = NextCopyFrom(cstate, NULL, values, nulls);
+		found = NextCopyFrom(cstate, NULL, values, nulls, false /* skip_row */ );
 
 		MemoryContextSwitchTo(oldcontext);
 

@@ -153,6 +153,7 @@ get_hba_options(HbaLine *hba)
 				CStringGetTextDatum(psprintf("radiusports=%s", hba->radiusports_s));
 	}
 
+<<<<<<< HEAD
 	if (hba->auth_method == uaOAuth)
 	{
 		if (hba->oauth_issuer)
@@ -170,6 +171,34 @@ get_hba_options(HbaLine *hba)
 		if (hba->oauth_skip_usermap)
 			options[noptions++] =
 				CStringGetTextDatum(psprintf("delegate_ident_mapping=true"));
+=======
+	if (hba->auth_method == uaYbJWT)
+	{
+		if (hba->yb_jwt_jwks_path)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_jwks_path=%s",
+											 hba->yb_jwt_jwks_path));
+
+		if (hba->yb_jwt_jwks_url)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_jwks_url=%s",
+											 hba->yb_jwt_jwks_url));
+
+		if (hba->yb_jwt_audiences_s)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_audiences=%s",
+											 hba->yb_jwt_audiences_s));
+
+		if (hba->yb_jwt_issuers_s)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_issuers=%s",
+											 hba->yb_jwt_issuers_s));
+
+		if (hba->yb_jwt_matching_claim_key)
+			options[noptions++] =
+				CStringGetTextDatum(psprintf("jwt_matching_claim_key=%s",
+											 hba->yb_jwt_matching_claim_key));
+>>>>>>> 939dce21892 (yb changes)
 	}
 
 	/* If you add more options, consider increasing MAX_HBA_OPTIONS. */

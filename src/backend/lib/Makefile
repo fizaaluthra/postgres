@@ -13,6 +13,12 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+<<<<<<< HEAD
+=======
+	yb_percentile.o \
+	\
+	binaryheap.o \
+>>>>>>> 939dce21892 (yb changes)
 	bipartite_match.o \
 	bloomfilter.o \
 	dshash.o \

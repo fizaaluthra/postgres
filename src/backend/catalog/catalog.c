@@ -48,6 +48,22 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "catalog/pg_yb_catalog_version.h"
+#include "catalog/pg_yb_invalidation_messages.h"
+#include "catalog/pg_yb_logical_client_version.h"
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "commands/defrem.h"
+#include "executor/spi.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
+#include "utils/syscache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 /*
  * Parameters to determine when to emit a log message in
  * GetNewOidWithIndex()
@@ -246,6 +262,22 @@ IsCatalogNamespace(Oid namespaceId)
 }
 
 /*
+ * Same logic as with IsCatalogNamespace, to be used when OID isn't known.
+ * NULL name results in InvalidOid.
+ */
+bool
+YbIsCatalogNamespaceByName(const char *namespace_name)
+{
+	Oid			namespace_oid;
+
+	namespace_oid = namespace_name ?
+		LookupExplicitNamespace(namespace_name, true) :
+		InvalidOid;
+
+	return IsCatalogNamespace(namespace_oid);
+}
+
+/*
  * IsToastNamespace
  *		True iff namespace is pg_toast or my temporary-toast-table namespace.
  *
@@ -314,7 +346,12 @@ IsSharedRelation(Oid relationId)
 		relationId == SharedDescriptionRelationId ||
 		relationId == SharedSecLabelRelationId ||
 		relationId == SubscriptionRelationId ||
-		relationId == TableSpaceRelationId)
+		relationId == TableSpaceRelationId ||
+		relationId == YBCatalogVersionRelationId ||
+		relationId == YbInvalidationMessagesRelationId ||
+		relationId == YbProfileRelationId ||
+		relationId == YbRoleProfileRelationId ||
+		relationId == YBLogicalClientVersionRelationId)
 		return true;
 	/* These are their indexes */
 	if (relationId == AuthIdOidIndexId ||
@@ -337,7 +374,13 @@ IsSharedRelation(Oid relationId)
 		relationId == SubscriptionNameIndexId ||
 		relationId == SubscriptionObjectIndexId ||
 		relationId == TablespaceNameIndexId ||
-		relationId == TablespaceOidIndexId)
+		relationId == TablespaceOidIndexId ||
+		relationId == YBCatalogVersionDbOidIndexId ||
+		relationId == YbInvalidationMessagesIndexId ||
+		relationId == YbProfileOidIndexId ||
+		relationId == YbProfileRolnameIndexId ||
+		relationId == YbRoleProfileOidIndexId ||
+		relationId == YBLogicalClientVersionDbOidIndexId)
 		return true;
 	/* These are their toast tables and toast indexes */
 	if (relationId == PgDatabaseToastTable ||
@@ -355,6 +398,32 @@ IsSharedRelation(Oid relationId)
 		relationId == PgTablespaceToastTable ||
 		relationId == PgTablespaceToastIndex)
 		return true;
+
+	/*
+	 * In test mode, there might be shared relations other than predefined
+	 * ones.
+	 */
+	if (yb_test_system_catalogs_creation)
+	{
+		/* To avoid cycle */
+		if (relationId == RelationRelationId)
+			return false;
+
+		Relation	pg_class = table_open(RelationRelationId, AccessShareLock);
+		HeapTuple	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relationId));
+
+		bool		result = (HeapTupleIsValid(tuple) ?
+							  ((Form_pg_class) GETSTRUCT(tuple))->relisshared :
+							  false);
+
+		if (HeapTupleIsValid(tuple))
+			heap_freetuple(tuple);
+
+		table_close(pg_class, AccessShareLock);
+
+		return result;
+	}
+
 	return false;
 }
 
@@ -411,6 +480,20 @@ IsPinnedObject(Oid classId, Oid objectId)
 		return false;
 
 	/*
+	 * YB: Vector type is not pinned so that it can be dropped by the vector
+	 * extension.
+	 */
+	if (objectId == VECTOROID)
+		return false;
+
+	/*
+	 * YB: BSON type is not pinned so that it can be dropped by the documentdb
+	 * extension.
+	 */
+	if (objectId == BSONOID)
+		return false;
+
+	/*
 	 * All other initdb-created objects are pinned.  This is overkill (the
 	 * system doesn't really depend on having every last weird datatype, for
 	 * instance) but generating only the minimum required set of dependencies
@@ -420,6 +503,93 @@ IsPinnedObject(Oid classId, Oid objectId)
 	return true;
 }
 
+/*
+ * GetBackendOidFromRelPersistence
+ *		Returns backend oid for the given type of relation persistence.
+ */
+Oid
+GetBackendOidFromRelPersistence(char relpersistence)
+{
+	switch (relpersistence)
+	{
+		case RELPERSISTENCE_TEMP:
+			return BackendIdForTempRelations();
+		case RELPERSISTENCE_UNLOGGED:
+		case RELPERSISTENCE_PERMANENT:
+			return InvalidBackendId;
+		default:
+			elog(ERROR, "invalid relpersistence: %c", relpersistence);
+			return InvalidOid;	/* placate compiler */
+	}
+}
+
+/*
+ * DoesRelFileExist
+ *		True iff there is an existing file of the same name for this relation.
+ */
+bool
+DoesRelFileExist(const RelFileNodeBackend *rnode)
+{
+	bool		collides;
+	char	   *rpath = relpath(*rnode, MAIN_FORKNUM);
+	int			fd = BasicOpenFile(rpath, O_RDONLY | PG_BINARY);
+
+	if (fd >= 0)
+	{
+		/* definite collision */
+		close(fd);
+		collides = true;
+	}
+	else
+	{
+		/*
+		 * Here we have a little bit of a dilemma: if errno is something
+		 * other than ENOENT, should we declare a collision and loop? In
+		 * particular one might think this advisable for, say, EPERM.
+		 * However there really shouldn't be any unreadable files in a
+		 * tablespace directory, and if the EPERM is actually complaining
+		 * that we can't read the directory itself, we'd be in an infinite
+		 * loop.  In practice it seems best to go ahead regardless of the
+		 * errno.  If there is a colliding file we will get an smgr
+		 * failure when we attempt to create the new relation file.
+		 */
+		collides = false;
+	}
+
+	pfree(rpath);
+	return collides;
+}
+
+/*
+ * DoesOidExistInRelation
+ *		True iff the oid already exists in the relation.
+ *		Used typically with relation = pg_class, to check if a new oid is
+ *		already in use.
+ */
+bool
+DoesOidExistInRelation(Oid oid,
+					   Relation relation,
+					   Oid indexId,
+					   AttrNumber oidcolumn)
+{
+	SysScanDesc scan;
+	ScanKeyData key;
+	bool		collides;
+
+	ScanKeyInit(&key,
+				oidcolumn,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(oid));
+
+	/* see notes above about using SnapshotAny */
+	scan = systable_beginscan(relation, indexId, true, SnapshotAny, 1, &key);
+
+	collides = HeapTupleIsValid(systable_getnext(scan));
+
+	systable_endscan(scan);
+
+	return collides;
+}
 
 /*
  * GetNewOidWithIndex
@@ -448,9 +618,6 @@ Oid
 GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 {
 	Oid			newOid;
-	SysScanDesc scan;
-	ScanKeyData key;
-	bool		collides;
 	uint64		retries = 0;
 	uint64		retries_before_log = GETNEWOID_LOG_THRESHOLD;
 
@@ -466,8 +633,20 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 	 * pg_upgrade; doing so would risk collisions with the OIDs it wants to
 	 * assign.  Hitting this assert means there's some path where we failed to
 	 * ensure that a type OID is determined by commands in the dump script.
+	 * YB: We may get here during extension upgrade (while executing
+	 * ALTER EXTENSION). Extension upgrade in YB is done as part of
+	 * pg_upgrade.
 	 */
-	Assert(!IsBinaryUpgrade || RelationGetRelid(relation) != TypeRelationId);
+	Assert(!IsBinaryUpgrade || yb_binary_restore || RelationGetRelid(relation) != TypeRelationId
+		   || yb_extension_upgrade);
+
+	if (IsYugaByteEnabled())
+	{
+		if (relation->rd_rel->relisshared)
+			YbDatabaseIdForNewObjectId = Template1DbOid;
+		else
+			YbDatabaseIdForNewObjectId = MyDatabaseId;
+	}
 
 	/* Generate new OIDs until we find one not in the table */
 	do
@@ -475,19 +654,6 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 		CHECK_FOR_INTERRUPTS();
 
 		newOid = GetNewObjectId();
-
-		ScanKeyInit(&key,
-					oidcolumn,
-					BTEqualStrategyNumber, F_OIDEQ,
-					ObjectIdGetDatum(newOid));
-
-		/* see notes above about using SnapshotAny */
-		scan = systable_beginscan(relation, indexId, true,
-								  SnapshotAny, 1, &key);
-
-		collides = HeapTupleIsValid(systable_getnext(scan));
-
-		systable_endscan(scan);
 
 		/*
 		 * Log that we iterate more than GETNEWOID_LOG_THRESHOLD but have not
@@ -519,6 +685,7 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 		}
 
 		retries++;
+<<<<<<< HEAD
 	} while (collides);
 
 	/*
@@ -533,8 +700,112 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 							   retries,
 							   RelationGetRelationName(relation), retries)));
 	}
+=======
+	} while (DoesOidExistInRelation(newOid, relation, indexId, oidcolumn));
+>>>>>>> 939dce21892 (yb changes)
 
 	return newOid;
+}
+
+static HTAB *
+YbGetAllRelfilenodes()
+{
+	static HTAB *relfilenode_htab = NULL;
+
+	if (YBCIsInitDbModeEnvVarSet())
+		return NULL;
+
+	/* For backward compatibility and keep unit test happy. */
+	if (!*YBCGetGFlags()->ysql_enable_pg_per_database_oid_allocator)
+		return NULL;
+
+	/*
+	 * For practical purpose, there is no need to refresh the hash table during
+	 * a session. We only need to find out existing relfilenode in pg_class
+	 * before the session starts. After a session starts, a newly allocated OID
+	 * cannot cause collision.
+	 */
+	if (relfilenode_htab)
+		return relfilenode_htab;
+
+	/*
+	 * Connect to SPI manager
+	 */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	char		query[100];
+
+	sprintf(query, "SELECT relfilenode FROM pg_catalog.pg_class WHERE relfilenode >= %u",
+			FirstNormalObjectId);
+	SPIPlanPtr	plan = SPI_prepare(query, 0, NULL);
+
+	if (plan == NULL)
+		elog(ERROR, "SPI_prepare failed for \"%s\"", query);
+
+	int			saved_yb_fetch_row_limit = yb_fetch_row_limit;
+	bool		saved_yb_is_calling_internal_sql_for_ddl = yb_is_calling_internal_sql_for_ddl;
+
+	/*
+	 * We are fetching relfilenode column, each row has only 4-bytes, let's
+	 * fetch 256K rows at a time.
+	 */
+	yb_fetch_row_limit = 1024 * 256;
+	yb_is_calling_internal_sql_for_ddl = true;
+	PG_TRY();
+	{
+		int			spirc = SPI_execute_plan(plan, NULL, NULL, true, 0);
+
+		yb_fetch_row_limit = saved_yb_fetch_row_limit;
+		yb_is_calling_internal_sql_for_ddl = saved_yb_is_calling_internal_sql_for_ddl;
+		if (spirc != SPI_OK_SELECT)
+			elog(ERROR, "failed to get relfilenode tuple");
+		YBC_LOG_INFO("SPI_processed = %lu", SPI_processed);
+	}
+	PG_CATCH();
+	{
+		yb_fetch_row_limit = saved_yb_fetch_row_limit;
+		yb_is_calling_internal_sql_for_ddl = saved_yb_is_calling_internal_sql_for_ddl;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	/* Build a hash table of all the relfilenodes in pg_class. */
+	HASHCTL		ctl;
+
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	ctl.hcxt = CacheMemoryContext;
+	relfilenode_htab = hash_create("relfilenode_htab", 1024, &ctl, HASH_ELEM | HASH_BLOBS);
+	uint64		i;
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		qdata = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+
+		Assert(!isnull);
+		Oid			relfilenode = DatumGetObjectId(qdata);
+
+		hash_search(relfilenode_htab, &relfilenode, HASH_ENTER, NULL);
+	}
+
+	/*
+	 * Disconnect from SPI manager
+	 */
+	if (SPI_finish() != SPI_OK_FINISH)
+	{
+		hash_destroy(relfilenode_htab);
+		relfilenode_htab = NULL;
+		elog(ERROR, "SPI_finish failed");
+	}
+
+	return relfilenode_htab;
+}
+
+static bool
+YbDoesRelfilenodeExist(HTAB *htab, Oid relfilenode)
+{
+	return htab && hash_search(htab, &relfilenode, HASH_FIND, NULL);
 }
 
 /*
@@ -556,16 +827,29 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 RelFileNumber
 GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 {
+<<<<<<< HEAD
 	RelFileLocatorBackend rlocator;
 	RelPathStr	rpath;
 	bool		collides;
 	ProcNumber	procNumber;
+=======
+	RelFileNodeBackend rnode;
+
+	HTAB	   *htab = NULL;
+
+	if (IsYugaByteEnabled() && relpersistence != RELPERSISTENCE_TEMP)
+		htab = YbGetAllRelfilenodes();
+>>>>>>> 939dce21892 (yb changes)
 
 	/*
 	 * If we ever get here during pg_upgrade, there's something wrong; all
 	 * relfilenumber assignments during a binary-upgrade run should be
 	 * determined by commands in the dump script.
+	 * YB: We may get here during extension upgrade (while executing
+	 * ALTER EXTENSION). Extension upgrade in YB is done as part of
+	 * pg_upgrade.
 	 */
+<<<<<<< HEAD
 	Assert(!IsBinaryUpgrade);
 
 	switch (relpersistence)
@@ -581,6 +865,9 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 			elog(ERROR, "invalid relpersistence: %c", relpersistence);
 			return InvalidRelFileNumber;	/* placate compiler */
 	}
+=======
+	Assert(!IsBinaryUpgrade || yb_binary_restore || yb_extension_upgrade);
+>>>>>>> 939dce21892 (yb changes)
 
 	/* This logic should match RelationInitPhysicalAddr */
 	rlocator.locator.spcOid = reltablespace ? reltablespace : MyDatabaseTableSpace;
@@ -593,7 +880,22 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 	 * initialize that properly here to make sure that any collisions based on
 	 * filename are properly detected.
 	 */
+<<<<<<< HEAD
 	rlocator.backend = procNumber;
+=======
+	rnode.backend = GetBackendOidFromRelPersistence(relpersistence);
+
+	/*
+	 * All the shared relations have relfilenode value as 0, which suggests
+	 * that relfilenode is only used for non-shared relations. That's why
+	 * MyDatabaseId should be used for new relfilenode OID allocation.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		Assert(!pg_class || !pg_class->rd_rel->relisshared);
+		YbDatabaseIdForNewObjectId = MyDatabaseId;
+	}
+>>>>>>> 939dce21892 (yb changes)
 
 	do
 	{
@@ -607,6 +909,7 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 			rlocator.locator.relNumber = GetNewObjectId();
 
 		/* Check for existing file of same name */
+<<<<<<< HEAD
 		rpath = relpath(rlocator, MAIN_FORKNUM);
 
 		if (access(rpath.str, F_OK) == 0)
@@ -626,6 +929,13 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 			collides = false;
 		}
 	} while (collides);
+=======
+		/*
+		 * YB: also check for existing relfilenode in the pg_class catalog table.
+		 */
+	} while (DoesRelFileExist(&rnode) ||
+			 YbDoesRelfilenodeExist(htab, rnode.node.relNode));
+>>>>>>> 939dce21892 (yb changes)
 
 	return rlocator.locator.relNumber;
 }
@@ -732,4 +1042,288 @@ pg_stop_making_pinned_objects(PG_FUNCTION_ARGS)
 	StopGeneratingPinnedObjectIds();
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * IsTableOidUnused
+ *		Returns true iff the given table oid is not used by any other table
+ *		within the database of the given tablespace.
+ *
+ * First checks pg_class to see if the oid is in use (similar to
+ * GetNewOidWithIndex), and then checks if there are any existing relfiles that
+ * have the same oid (similar to GetNewRelFileNode).
+ *
+ * Similar to GetNewOidWithIndex and GetNewRelFileNode, there is a theoretical
+ * race condition, but since we don't worry about it there, it should be fine
+ * here as well.
+ */
+bool
+IsTableOidUnused(Oid table_oid,
+				 Oid reltablespace,
+				 Relation pg_class,
+				 char relpersistence)
+{
+	RelFileNodeBackend rnode;
+	Oid			oidIndex;
+	bool		collides;
+
+	/* First check for if the oid is used in pg_class. */
+
+	/*
+	 * TODO(Alex): The relcache will cache the identity of the OID index for
+	 * us
+	 */
+	oidIndex = ClassOidIndexId;
+
+	if (!OidIsValid(oidIndex))
+	{
+		elog(WARNING, "Could not find oid index of pg_class.");
+	}
+
+	collides = DoesOidExistInRelation(table_oid,
+									  pg_class,
+									  oidIndex,
+									  Anum_pg_class_oid);
+
+	if (!collides)
+	{
+		/*
+		 * Check if there are existing relfiles with the oid.
+		 * YB Note: It looks like we only run into collisions here for
+		 * 			temporary tables.
+		 */
+
+		/*
+		 * The relpath will vary based on the backend ID, so we must initialize
+		 * that properly here to make sure that any collisions based on filename
+		 * are properly detected.
+		 */
+		rnode.backend = GetBackendOidFromRelPersistence(relpersistence);
+
+		/* This logic should match RelationInitPhysicalAddr */
+		rnode.node.spcNode = (reltablespace ?
+							  reltablespace :
+							  MyDatabaseTableSpace);
+		rnode.node.dbNode = ((rnode.node.spcNode == GLOBALTABLESPACE_OID) ?
+							 InvalidOid :
+							 MyDatabaseId);
+
+		rnode.node.relNode = table_oid;
+
+		/* Check for existing file of same name */
+		collides = DoesRelFileExist(&rnode);
+	}
+
+	return !collides;
+}
+
+/*
+ * GetTableOidFromRelOptions
+ *		Scans through relOptions for any 'table_oid' options, and ensures
+ *		that oid is available. Returns that oid, or InvalidOid if unspecified.
+ */
+Oid
+GetTableOidFromRelOptions(List *relOptions,
+						  Oid reltablespace,
+						  char relpersistence)
+{
+	ListCell   *opt_cell;
+	Oid			table_oid;
+	bool		is_oid_free;
+
+	foreach(opt_cell, relOptions)
+	{
+		DefElem    *def = (DefElem *) lfirst(opt_cell);
+
+		if (strcmp(def->defname, "table_oid") == 0)
+		{
+			const char *hintmsg;
+
+			if (!parse_oid(defGetString(def), &table_oid, &hintmsg))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for OID option \"table_oid\""),
+						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+			if (OidIsValid(table_oid))
+			{
+				Relation	pg_class_desc = table_open(RelationRelationId,
+													   RowExclusiveLock);
+
+				is_oid_free = IsTableOidUnused(table_oid,
+											   reltablespace,
+											   pg_class_desc,
+											   relpersistence);
+				table_close(pg_class_desc, RowExclusiveLock);
+
+				if (is_oid_free)
+					return table_oid;
+				else
+					ereport(ERROR,
+							(errcode(ERRCODE_DUPLICATE_OBJECT),
+							 errmsg("table OID %u is in use", table_oid)));
+
+				/* Only process the first table_oid. */
+				break;
+			}
+		}
+	}
+
+	return InvalidOid;
+}
+
+/*
+ * YbGetColocationIdFromRelOptions
+ *		Scans through relOptions for any 'colocation_id' options.
+ *		Returns that ID, or InvalidOid if unspecified.
+ *
+ * This is only used during table/index creation, as this reloption is not
+ * persisted.
+ */
+Oid
+YbGetColocationIdFromRelOptions(List *relOptions)
+{
+	ListCell   *opt_cell;
+	Oid			colocation_id;
+
+	foreach(opt_cell, relOptions)
+	{
+		DefElem    *def = (DefElem *) lfirst(opt_cell);
+
+		if (strcmp(def->defname, "colocation_id") == 0)
+		{
+			const char *hintmsg;
+
+			if (!parse_oid(defGetString(def), &colocation_id, &hintmsg))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for OID option \"colocation_id\""),
+						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+			if (OidIsValid(colocation_id))
+				return colocation_id;
+		}
+	}
+
+	return InvalidOid;
+}
+
+/*
+ * GetRowTypeOidFromRelOptions
+ *		Scans through relOptions for any 'row_type_oid' options, and ensures
+ *		that oid is available. Returns that oid, or InvalidOid if unspecified.
+ */
+Oid
+GetRowTypeOidFromRelOptions(List *relOptions)
+{
+	ListCell   *opt_cell;
+	Oid			row_type_oid;
+	Relation	pg_type_desc;
+	HeapTuple	tuple;
+
+	foreach(opt_cell, relOptions)
+	{
+		DefElem    *def = (DefElem *) lfirst(opt_cell);
+
+		if (strcmp(def->defname, "row_type_oid") == 0)
+		{
+			const char *hintmsg;
+
+			if (!parse_oid(defGetString(def), &row_type_oid, &hintmsg))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for OID option \"row_type_oid\""),
+						 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+			if (OidIsValid(row_type_oid))
+			{
+				pg_type_desc = table_open(TypeRelationId, AccessExclusiveLock);
+
+				tuple = SearchSysCacheCopy1(TYPEOID, ObjectIdGetDatum(row_type_oid));
+				if (HeapTupleIsValid(tuple))
+					ereport(ERROR,
+							(errcode(ERRCODE_DUPLICATE_OBJECT),
+							 errmsg("type OID %u is in use", row_type_oid)));
+
+				table_close(pg_type_desc, AccessExclusiveLock);
+
+				return row_type_oid;
+			}
+		}
+	}
+
+	return InvalidOid;
+}
+
+bool
+YbGetUseInitdbAclFromRelOptions(List *options)
+{
+	ListCell   *opt_cell;
+
+	foreach(opt_cell, options)
+	{
+		/* Don't care about multiple occurrences, this reloption is internal. */
+		DefElem    *def = lfirst_node(DefElem, opt_cell);
+
+		if (strcmp(def->defname, "use_initdb_acl") == 0)
+			return defGetBoolean(def);
+	}
+
+	return InvalidOid;
+}
+
+/*
+ * Is this relation stored into the YB system catalog tablet?
+ */
+bool
+YbIsSysCatalogTabletRelation(Relation rel)
+{
+	Oid			namespaceId = RelationGetNamespace(rel);
+	char	   *namespace_name = get_namespace_name_or_temp(namespaceId);
+
+	return YbIsSysCatalogTabletRelationByIds(RelationGetRelid(rel),
+											 namespaceId,
+											 namespace_name);
+}
+
+/*
+ * Same as above but potentially faster by avoiding get_namespace_name_or_temp
+ * call in case the caller already has the namespace name.
+ */
+bool
+YbIsSysCatalogTabletRelationByIds(Oid relationId, Oid namespaceId,
+								  char *namespace_name)
+{
+	Assert(namespace_name);
+	/* Re-evaluate this when toast relations are supported. */
+	Assert(!IsToastNamespace(namespaceId));
+
+	/*
+	 * YB puts catalog relations and information_schema relations in the sys
+	 * catalog tablet.  From commit 5c28dc4a654cc246d0da0807e18d07b81cfe45eb
+	 * to the time of writing (2024-05-22), it is not possible to create user
+	 * relations in pg_catalog because it hits an error if IsYsqlUpgrade is
+	 * false, and if that is true, then relations are created as system
+	 * relations.  Before that commit, it seems to segfault when attempting to
+	 * create table in pg_catalog (at least when testing on v2.0.11.0).
+	 */
+	if (IsCatalogNamespace(namespaceId) ||
+		strcmp(namespace_name, "information_schema") == 0)
+	{
+		if (relationId >= FirstNormalObjectId)
+		{
+			/*
+			 * At the time of writing (2024-05-22), it is possible for users
+			 * (with the correct privileges) to create user relations in
+			 * information_schema.  Since these are persisted in the sys
+			 * catalog tablet and this function may be called with such tables,
+			 * don't hard fail upon encountering such tables.
+			 */
+			Assert(strcmp(namespace_name, "information_schema") == 0);
+			ereport(WARNING,
+					(errmsg("unexpected user relation in system namespace"),
+					 errdetail("Table with oid %u should not be in namespace"
+							   " %s.",
+							   relationId, namespace_name)));
+		}
+		return true;
+	}
+	return false;
 }

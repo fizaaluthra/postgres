@@ -16,7 +16,79 @@
 #include "executor/executor.h"
 #include "parser/parse_node.h"
 
+<<<<<<< HEAD
 typedef struct ExplainState ExplainState;	/* defined in explain_state.h */
+=======
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
+typedef enum ExplainFormat
+{
+	EXPLAIN_FORMAT_TEXT,
+	EXPLAIN_FORMAT_XML,
+	EXPLAIN_FORMAT_JSON,
+	EXPLAIN_FORMAT_YAML
+} ExplainFormat;
+
+typedef struct ExplainWorkersState
+{
+	int			num_workers;	/* # of worker processes the plan used */
+	bool	   *worker_inited;	/* per-worker state-initialized flags */
+	StringInfoData *worker_str; /* per-worker transient output buffers */
+	int		   *worker_state_save;	/* per-worker grouping state save areas */
+	StringInfo	prev_str;		/* saved output buffer while redirecting */
+} ExplainWorkersState;
+
+typedef struct YbExplainExecStats
+{
+	YbPgRpcStats read;
+	YbPgRpcStats catalog_read;
+	YbPgRpcStats flush;
+	double		read_op_count;
+	double		catalog_read_op_count;
+	double		write_count;
+	double		catalog_write_count;
+
+	YbcPgExecStorageMetrics *read_metrics;
+	YbcPgExecStorageMetrics *write_metrics;
+} YbExplainExecStats;
+
+typedef struct ExplainState
+{
+	StringInfo	str;			/* output buffer */
+	/* options */
+	bool		verbose;		/* be verbose */
+	bool		analyze;		/* print actual times */
+	bool		costs;			/* print estimated costs */
+	bool		buffers;		/* print buffer usage */
+	bool		wal;			/* print WAL usage */
+	bool		timing;			/* print detailed node timing */
+	bool		summary;		/* print total planning and execution timing */
+	bool		settings;		/* print modified settings */
+	ExplainFormat format;		/* output format */
+	/* state for output formatting --- not reset for each new plan tree */
+	int			indent;			/* current indentation level */
+	List	   *grouping_stack; /* format-specific grouping state */
+	/* state related to the current plan tree (filled by ExplainPrintPlan) */
+	PlannedStmt *pstmt;			/* top of plan */
+	List	   *rtable;			/* range table */
+	List	   *rtable_names;	/* alias names for RTEs */
+	List	   *deparse_cxt;	/* context list for deparsing expressions */
+	Bitmapset  *printed_subplans;	/* ids of SubPlans we've printed */
+	bool		hide_workers;	/* set if we find an invisible Gather */
+	/* state related to the current plan node */
+	ExplainWorkersState *workers_state; /* needed if parallel plan */
+
+	/* YB */
+	bool		rpc;			/* print RPC stats */
+	YbExplainExecStats yb_stats;	/* hold YB-specific exec stats */
+	bool		yb_debug;		/* print debug information */
+	bool		yb_commit;		/* print commit stats (when available) */
+	bool		ybShowHints;	/* generate and display hints that will
+								 * produce the same plan as one Explained */
+	bool		ybShowUniqueIds;	/* show unique Path/Plan ids */
+} ExplainState;
+>>>>>>> 939dce21892 (yb changes)
 
 /* Hook for plugins to get control in ExplainOneQuery() */
 typedef void (*ExplainOneQuery_hook_type) (Query *query,
@@ -80,5 +152,7 @@ extern void ExplainPrintJITSummary(ExplainState *es,
 extern void ExplainQueryText(ExplainState *es, QueryDesc *queryDesc);
 extern void ExplainQueryParameters(ExplainState *es,
 								   ParamListInfo params, int maxlen);
+
+extern void YbExplainCommitStats(DestReceiver *dest);
 
 #endif							/* EXPLAIN_H */
