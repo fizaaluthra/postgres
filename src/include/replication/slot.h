@@ -17,6 +17,7 @@
 #include "storage/spin.h"
 #include "replication/walreceiver.h"
 
+<<<<<<< HEAD
 /* directory to store replication slot data in */
 #define PG_REPLSLOT_DIR     "pg_replslot"
 
@@ -26,6 +27,11 @@
  * maybe_advance_nonremovable_xid() for detail.
  */
 #define CONFLICT_DETECTION_SLOT "pg_conflict_detection"
+=======
+/* YB includes */
+#include "replication/walsender.h"
+#include "utils/uuid.h"
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Behaviour of replication slots, upon release or crash.
@@ -149,6 +155,7 @@ typedef struct ReplicationSlotPersistentData
 	/* plugin name */
 	NameData	plugin;
 
+<<<<<<< HEAD
 	/*
 	 * Was this slot synchronized from the primary server?
 	 */
@@ -159,6 +166,27 @@ typedef struct ReplicationSlotPersistentData
 	 * for logical slots on the primary server.
 	 */
 	bool		failover;
+=======
+	/* YB: The CDC stream_id (32 bytes + 1 for null terminator) */
+	char		yb_stream_id[33];
+
+	/*
+	 * YB: Stores the replica identity value of the tables as they existed
+	 * during the creation of the replication slot.
+	 */
+	HTAB	   *yb_replica_identities;
+
+	/*
+	 * YB: The record_commit_time of the replication slot as received at the
+	 * time this information was fetched from the CDC state table. This
+	 * information is not kept up to date, it should only be used at the start
+	 * of streaming right after fetching the replication slot information.
+	 */
+	uint64_t	yb_initial_record_commit_time_ht;
+
+	/* YB: The last time at which a publication's table list was refreshed */
+	uint64_t	yb_last_pub_refresh_time;
+>>>>>>> 939dce21892 (yb changes)
 } ReplicationSlotPersistentData;
 
 /*
@@ -324,15 +352,32 @@ extern PGDLLIMPORT int max_replication_slots;
 extern PGDLLIMPORT char *synchronized_standby_slots;
 extern PGDLLIMPORT int idle_replication_slot_timeout_secs;
 
+/* YB */
+extern PGDLLIMPORT const char *YB_OUTPUT_PLUGIN;
+extern PGDLLIMPORT const char *PG_OUTPUT_PLUGIN;
+extern PGDLLIMPORT const char *LSN_TYPE_SEQUENCE;
+extern PGDLLIMPORT const char *LSN_TYPE_HYBRID_TIME;
+extern PGDLLIMPORT const char *ORDERING_MODE_ROW;
+extern PGDLLIMPORT const char *ORDERING_MODE_TRANSACTION;
+
 /* shmem initialization functions */
 extern Size ReplicationSlotsShmemSize(void);
 extern void ReplicationSlotsShmemInit(void);
 
 /* management of individual slots */
 extern void ReplicationSlotCreate(const char *name, bool db_specific,
+<<<<<<< HEAD
 								  ReplicationSlotPersistency persistency,
 								  bool two_phase, bool failover,
 								  bool synced);
+=======
+								  ReplicationSlotPersistency p, bool two_phase,
+								  char *yb_plugin_name,
+								  CRSSnapshotAction yb_snapshot_action,
+								  uint64_t *yb_consistent_snapshot_time,
+								  YbCRSLsnType lsn_type,
+								  YbCRSOrderingMode yb_ordering_mode);
+>>>>>>> 939dce21892 (yb changes)
 extern void ReplicationSlotPersist(void);
 extern void ReplicationSlotDrop(const char *name, bool nowait);
 extern void ReplicationSlotDropAcquired(void);
@@ -383,5 +428,9 @@ extern const char *GetSlotInvalidationCauseName(ReplicationSlotInvalidationCause
 extern bool SlotExistsInSyncStandbySlots(const char *slot_name);
 extern bool StandbySlotsHaveCaughtup(XLogRecPtr wait_for_lsn, int elevel);
 extern void WaitForStandbyConfirmation(XLogRecPtr wait_for_lsn);
+
+/* YB */
+extern void ReplicationSlotCleanupForProc(PGPROC *proc);
+extern char YBCGetReplicaIdentityForRelation(Oid relid);
 
 #endif							/* SLOT_H */

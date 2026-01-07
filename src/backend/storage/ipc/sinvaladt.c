@@ -26,6 +26,9 @@
 #include "storage/sinvaladt.h"
 #include "storage/spin.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Conceptually, the shared cache invalidation messages are stored in an
  * infinite array, where maxMsgNum is the next array subscript to store a
@@ -195,6 +198,7 @@ typedef struct SISeg
 	ProcState	procState[FLEXIBLE_ARRAY_MEMBER];
 } SISeg;
 
+<<<<<<< HEAD
 /*
  * We reserve a slot for each possible ProcNumber, plus one for each
  * possible auxiliary process type.  (This scheme assumes there is not
@@ -204,11 +208,12 @@ typedef struct SISeg
 #define NumProcStateSlots	(MaxBackends + NUM_AUXILIARY_PROCS)
 
 static SISeg *shmInvalBuffer;	/* pointer to the shared inval buffer */
+=======
+struct SISeg *shmInvalBuffer;	/* pointer to the shared inval buffer */
+>>>>>>> 939dce21892 (yb changes)
 
 
 static LocalTransactionId nextLocalTransactionId;
-
-static void CleanupInvalidationState(int status, Datum arg);
 
 
 /*
@@ -319,15 +324,10 @@ SharedInvalBackendInit(bool sendOnly)
 /*
  * CleanupInvalidationState
  *		Mark the current backend as no longer active.
- *
- * This function is called via on_shmem_exit() during backend shutdown.
- *
- * arg is really of type "SISeg*".
  */
 static void
-CleanupInvalidationState(int status, Datum arg)
+CleanupInvalidationStateInternal(SISeg *segP, PGPROC *proc)
 {
-	SISeg	   *segP = (SISeg *) DatumGetPointer(arg);
 	ProcState  *stateP;
 	int			i;
 
@@ -335,7 +335,11 @@ CleanupInvalidationState(int status, Datum arg)
 
 	LWLockAcquire(SInvalWriteLock, LW_EXCLUSIVE);
 
+<<<<<<< HEAD
 	stateP = &segP->procState[MyProcNumber];
+=======
+	stateP = &segP->procState[proc->backendId - 1];
+>>>>>>> 939dce21892 (yb changes)
 
 	/* Update next local transaction ID for next holder of this proc number */
 	stateP->nextLXID = nextLocalTransactionId;
@@ -348,7 +352,98 @@ CleanupInvalidationState(int status, Datum arg)
 
 	for (i = segP->numProcs - 1; i >= 0; i--)
 	{
+<<<<<<< HEAD
 		if (segP->pgprocnos[i] == MyProcNumber)
+=======
+		if (segP->procState[i - 1].procPid != 0)
+			break;
+	}
+	segP->lastBackend = i;
+
+	LWLockRelease(SInvalWriteLock);
+}
+
+/*
+ * CleanupInvalidationState
+ *		Mark the current backend as no longer active.
+ *
+ * This function is called via on_shmem_exit() during backend shutdown.
+ *
+ * arg is really of type "SISeg*".
+ */
+void
+CleanupInvalidationState(int status, Datum arg)
+{
+	SISeg	   *segP = (SISeg *) DatumGetPointer(arg);
+
+	CleanupInvalidationStateInternal(segP, MyProc);
+}
+
+/*
+ * CleanupInvalidationStateForProc
+ *		Mark the current backend as no longer active.
+ *
+ * This function is called from reaper() when the parent is notified that its
+ * child died unexpectedly.
+ */
+void
+CleanupInvalidationStateForProc(PGPROC *proc)
+{
+	CleanupInvalidationStateInternal(shmInvalBuffer, proc);
+}
+
+/*
+ * BackendIdGetProc
+ *		Get the PGPROC structure for a backend, given the backend ID.
+ *		The result may be out of date arbitrarily quickly, so the caller
+ *		must be careful about how this information is used.  NULL is
+ *		returned if the backend is not active.
+ */
+PGPROC *
+BackendIdGetProc(int backendID)
+{
+	PGPROC	   *result = NULL;
+	SISeg	   *segP = shmInvalBuffer;
+
+	/* Need to lock out additions/removals of backends */
+	LWLockAcquire(SInvalWriteLock, LW_SHARED);
+
+	if (backendID > 0 && backendID <= segP->lastBackend)
+	{
+		ProcState  *stateP = &segP->procState[backendID - 1];
+
+		result = stateP->proc;
+	}
+
+	LWLockRelease(SInvalWriteLock);
+
+	return result;
+}
+
+/*
+ * BackendIdGetTransactionIds
+ *		Get the xid and xmin of the backend. The result may be out of date
+ *		arbitrarily quickly, so the caller must be careful about how this
+ *		information is used.
+ */
+void
+BackendIdGetTransactionIds(int backendID, TransactionId *xid, TransactionId *xmin)
+{
+	SISeg	   *segP = shmInvalBuffer;
+
+	*xid = InvalidTransactionId;
+	*xmin = InvalidTransactionId;
+
+	/* Need to lock out additions/removals of backends */
+	LWLockAcquire(SInvalWriteLock, LW_SHARED);
+
+	if (backendID > 0 && backendID <= segP->lastBackend)
+	{
+		ProcState  *stateP = &segP->procState[backendID - 1];
+		PGPROC	   *proc = stateP->proc;
+
+		if (proc != NULL)
+>>>>>>> 939dce21892 (yb changes)
 		{
 			if (i != segP->numProcs - 1)
 				segP->pgprocnos[i] = segP->pgprocnos[segP->numProcs - 1];
@@ -414,7 +509,10 @@ SIInsertDataEntries(const SharedInvalidationMessage *data, int n)
 		max = segP->maxMsgNum;
 		while (nthistime-- > 0)
 		{
-			segP->buffer[max % MAXNUMMESSAGES] = *data++;
+			SharedInvalidationMessage *dest = &segP->buffer[max % MAXNUMMESSAGES];
+
+			*dest = *data++;
+			dest->yb_header.yb_sender_pid = getpid();
 			max++;
 		}
 
@@ -600,7 +698,29 @@ SICleanupQueue(bool callerHasWriteLock, int minFree)
 	minsig = min - SIG_THRESHOLD;
 	lowbound = min - MAXNUMMESSAGES + minFree;
 
+<<<<<<< HEAD
 	for (i = 0; i < segP->numProcs; i++)
+=======
+	/*
+	 * YB: We only support concurrent non-global-impact DDLs in per-database
+	 * catalog version mode. Let's say this is backend A and in order to
+	 * free some space it needs to discard some invalidation messages in
+	 * the shared invalidation message buffer that backend B hasn't consumed
+	 * yet. PG will set backend B's resetState to true. This will trigger
+	 * backend B to call InvalidateSystemCaches when it tries to process its
+	 * next invalidation message. InvalidateSystemCaches will call
+	 * YbResetCatalogCacheVersion to reset yb_catalog_cache_version to 0,
+	 * leading to "Catalog snapshot used for this transaction has been
+	 * invalidated" error in backend B. To reduce such likehood, we try to
+	 * avoid resetState for backend B if possible: backend B only processes
+	 * an invalidation message when the yb_sender_pid of the message matches
+	 * backend B's pid.
+	 */
+	ProcState **yb_reset_candidates = NULL;
+	int			yb_num_reset_candidates = 0;
+
+	for (i = 0; i < segP->lastBackend; i++)
+>>>>>>> 939dce21892 (yb changes)
 	{
 		ProcState  *stateP = &segP->procState[segP->pgprocnos[i]];
 		int			n = stateP->nextMsgNum;
@@ -616,6 +736,24 @@ SICleanupQueue(bool callerHasWriteLock, int minFree)
 		 */
 		if (n < lowbound)
 		{
+			/*
+			 * In YSQL per-database catalog version mode, we don't just set
+			 * resetState to true for stateP. We save stateP as a potential
+			 * candidate and will do a post-pass after min (the new minMsgNum)
+			 * is computed.
+			 */
+			if (YBIsDBCatalogVersionMode())
+			{
+				if (!yb_reset_candidates)
+				{
+					Size		sz = sizeof(ProcState *) * segP->lastBackend;
+
+					yb_reset_candidates = (ProcState **) palloc(sz);
+				}
+				yb_reset_candidates[yb_num_reset_candidates++] = stateP;
+				continue;
+			}
+
 			stateP->resetState = true;
 			/* no point in signaling him ... */
 			continue;
@@ -631,6 +769,40 @@ SICleanupQueue(bool callerHasWriteLock, int minFree)
 			minsig = n;
 			needSig = stateP;
 		}
+	}
+	if (YBIsDBCatalogVersionMode())
+	{
+		int			cand;
+		int			next;
+
+		for (cand = 0; cand < yb_num_reset_candidates; cand++)
+		{
+			ProcState  *stateP = yb_reset_candidates[cand];
+			pid_t		procPid = stateP->procPid;
+
+			/*
+			 * In YSQL, the backend of stateP only applies messages sent
+			 * by itself. Therefore we do not need to set stateP->resetState
+			 * to true if those discarded messages that have not been consumed
+			 * by the backend of stateP yet were sent by other backends.
+			 */
+			for (next = stateP->nextMsgNum; next < min; next++)
+			{
+				SharedInvalidationMessage *msg = &segP->buffer[next %
+															   MAXNUMMESSAGES];
+
+				if (msg->yb_header.yb_sender_pid == procPid)
+				{
+					elog(LOG, "resetState of %d", procPid);
+					stateP->resetState = true;
+					break;
+				}
+			}
+			if (next == min)
+				stateP->nextMsgNum = min;
+		}
+		if (yb_reset_candidates)
+			pfree(yb_reset_candidates);
 	}
 	segP->minMsgNum = min;
 

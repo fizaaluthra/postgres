@@ -45,6 +45,10 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "catalog/yb_catalog_version.h"
+#include "pg_yb_utils.h"
+
 /*
  * We don't want to waste a lot of memory on an error queue which, most of
  * the time, will process only a handful of small messages.  However, it is
@@ -94,7 +98,13 @@ typedef struct FixedParallelState
 	bool		role_is_superuser;
 	PGPROC	   *parallel_leader_pgproc;
 	pid_t		parallel_leader_pid;
+<<<<<<< HEAD
 	ProcNumber	parallel_leader_proc_number;
+=======
+	BackendId	parallel_leader_backend_id;
+	bool		parallel_master_is_yb_session;
+	YbcPgSessionState parallel_master_yb_session_state;
+>>>>>>> 939dce21892 (yb changes)
 	TimestampTz xact_ts;
 	TimestampTz stmt_ts;
 	SerializableXactHandle serializable_xact_handle;
@@ -182,6 +192,10 @@ CreateParallelContext(const char *library_name, const char *function_name,
 	/* Number of workers should be non-negative. */
 	Assert(nworkers >= 0);
 
+	/* YB: TODO GHI 23549 */
+	if (IsolationIsSerializable())
+		nworkers = 0;
+
 	/* We might be running in a short-lived memory context. */
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 
@@ -226,7 +240,20 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	int			i;
 	FixedParallelState *fps;
 	dsm_handle	session_dsm_handle = DSM_HANDLE_INVALID;
-	Snapshot	transaction_snapshot = GetTransactionSnapshot();
+	Snapshot	transaction_snapshot;
+
+	/*
+	 * Postgres unconditionally takes the snapshot, however Yugabyte has
+	 * undesired side effect if transaction isolation is READ COMMITTED: it
+	 * resets the read point, so the next DocDB request picks new read time.
+	 * This can result in a change of read snapshot in the middle of the query.
+	 * Fortunately we can skip that call in READ COMMITTED mode, because
+	 * the transaction_snapshot is only used if the isolation level is
+	 * REPEATABLE READ or SERIALIZABLE.
+	 * For safety, keep original behavior if Yugabyte is not enabled.
+	 */
+	if (IsolationUsesXactSnapshot() || !IsYugaByteEnabled())
+		transaction_snapshot = GetTransactionSnapshot();
 	Snapshot	active_snapshot = GetActiveSnapshot();
 
 	/* We might be running in a very short-lived memory context. */
@@ -352,7 +379,15 @@ InitializeParallelDSM(ParallelContext *pcxt)
 						  &fps->temp_toast_namespace_id);
 	fps->parallel_leader_pgproc = MyProc;
 	fps->parallel_leader_pid = MyProcPid;
+<<<<<<< HEAD
 	fps->parallel_leader_proc_number = MyProcNumber;
+=======
+	fps->parallel_leader_backend_id = MyBackendId;
+	/* Capture our Session ID to share with the background workers. */
+	fps->parallel_master_is_yb_session = IsYugaByteEnabled();
+	if (fps->parallel_master_is_yb_session)
+		YBCDumpCurrentPgSessionState(&fps->parallel_master_yb_session_state);
+>>>>>>> 939dce21892 (yb changes)
 	fps->xact_ts = GetCurrentTransactionStartTimestamp();
 	fps->stmt_ts = GetCurrentStatementStartTimestamp();
 	fps->serializable_xact_handle = ShareSerializableXact();
@@ -588,6 +623,17 @@ LaunchParallelWorkers(ParallelContext *pcxt)
 	/* Skip this if we have no workers. */
 	if (pcxt->nworkers == 0 || pcxt->nworkers_to_launch == 0)
 		return;
+
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * Semantics of the "EnsureReadPoint" contradicts "RestartReadPoint".
+		 * Hence, if we are restarting, proceed without parallel workers.
+		 */
+		if (YBCIsRestartReadPointRequested())
+			return;
+		HandleYBStatus(YBCPgEnsureReadPoint());
+	}
 
 	/* We need to be a lock group leader. */
 	BecomeLockGroupLeader();
@@ -1326,6 +1372,9 @@ ParallelWorkerMain(Datum main_arg)
 	/* Set flag to indicate that we're initializing a parallel worker. */
 	InitializingParallelWorker = true;
 
+	if (YBIsEnabledInPostgresEnvVar())
+		YbSetParallelWorker();
+
 	/* Establish signal handlers. */
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -1335,9 +1384,9 @@ ParallelWorkerMain(Datum main_arg)
 	memcpy(&ParallelWorkerNumber, MyBgworkerEntry->bgw_extra, sizeof(int));
 
 	/* Set up a memory context to work in, just for cleanliness. */
-	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
-												 "Parallel worker",
-												 ALLOCSET_DEFAULT_SIZES);
+	YbCurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
+												   "Parallel worker",
+												   ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Attach to the dynamic shared memory segment for the parallel query, and
@@ -1436,10 +1485,31 @@ ParallelWorkerMain(Datum main_arg)
 	 * (b) we do not want parallel mode to cause these failures, because that
 	 * would make use of parallel query plans not transparent to applications.
 	 */
+<<<<<<< HEAD
 	BackgroundWorkerInitializeConnectionByOid(fps->database_id,
 											  fps->authenticated_user_id,
 											  BGWORKER_BYPASS_ALLOWCONN |
 											  BGWORKER_BYPASS_ROLELOGINCHECK);
+=======
+	if (fps->parallel_master_is_yb_session)
+	{
+		YbcPgInitPostgresInfo yb_init_info = {
+			.parallel_leader_session_id = &fps->parallel_master_yb_session_state.session_id,
+			.shared_data = &fps->parallel_leader_pgproc->yb_shared_data
+		};
+
+		YbBackgroundWorkerInitializeConnectionByOid(fps->database_id,
+													fps->authenticated_user_id,
+													BGWORKER_BYPASS_ALLOWCONN,
+													&yb_init_info);
+	}
+	else
+	{
+		BackgroundWorkerInitializeConnectionByOid(fps->database_id,
+												  fps->authenticated_user_id,
+												  BGWORKER_BYPASS_ALLOWCONN);
+	}
+>>>>>>> 939dce21892 (yb changes)
 
 	/*
 	 * Set the client encoding to the database encoding, since that is what
@@ -1485,6 +1555,9 @@ ParallelWorkerMain(Datum main_arg)
 	session_dsm_handle_space =
 		shm_toc_lookup(toc, PARALLEL_KEY_SESSION_DSM, false);
 	AttachSession(*(dsm_handle *) session_dsm_handle_space);
+
+	if (fps->parallel_master_is_yb_session)
+		YBCRestorePgSessionState(&fps->parallel_master_yb_session_state);
 
 	/*
 	 * If the transaction isolation level is REPEATABLE READ or SERIALIZABLE,
@@ -1556,6 +1629,15 @@ ParallelWorkerMain(Datum main_arg)
 
 	/* Attach to the leader's serializable transaction, if SERIALIZABLE. */
 	AttachSerializableXact(fps->serializable_xact_handle);
+
+	/*
+	 * TODO Revisit initialization of the catalog cache version.
+	 * DocDB scans running in background workers need a catalog cache version
+	 * to put into the request. However, I'm not sure what is the right way to
+	 * obtain it. Perhaps master scan should share the value it has.
+	 */
+	if (IsYugaByteEnabled())
+		YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
 
 	/*
 	 * We've initialized all of our state now; nothing should change

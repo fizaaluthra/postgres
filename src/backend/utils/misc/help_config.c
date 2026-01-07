@@ -23,8 +23,29 @@
 #include "utils/help_config.h"
 
 
+<<<<<<< HEAD
 static void printMixedStruct(const struct config_generic *structToPrint);
 static bool displayStruct(const struct config_generic *structToDisplay);
+=======
+/*
+ * This union allows us to mix the numerous different types of structs
+ * that we are organizing.
+ */
+typedef union
+{
+	struct config_generic generic;
+	struct config_bool _bool;
+	struct config_real real;
+	struct config_int integer;
+	struct yb_config_oid oid;
+	struct config_string string;
+	struct config_enum _enum;
+} mixedStruct;
+
+
+static void printMixedStruct(mixedStruct *structToPrint);
+static bool displayStruct(mixedStruct *structToDisplay);
+>>>>>>> 939dce21892 (yb changes)
 
 
 void
@@ -89,6 +110,13 @@ printMixedStruct(const struct config_generic *structToPrint)
 				   structToPrint->_int.reset_val,
 				   structToPrint->_int.min,
 				   structToPrint->_int.max);
+			break;
+
+		case PGC_OID:
+			printf("OID\t%d\t%d\t%d\t",
+				   structToPrint->oid.reset_val,
+				   structToPrint->oid.min,
+				   structToPrint->oid.max);
 			break;
 
 		case PGC_REAL:

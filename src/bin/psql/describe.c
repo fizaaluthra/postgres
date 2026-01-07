@@ -60,6 +60,12 @@ static bool validateSQLNamePattern(PQExpBuffer buf, const char *pattern,
 								   const char *visibilityrule,
 								   bool *added_clause, int maxparts);
 
+/* YB functions */
+static void add_tablegroup_footer(printTableContent *const cont, char relkind,
+								  const char *grpname, const bool newline);
+static void add_colocation_footer(printTableContent *const cont, char relkind,
+								  bool colocation, const bool newline);
+
 
 /*----------------
  * Handlers for various slash commands displaying some sort of list
@@ -1223,9 +1229,13 @@ listDefaultACLs(const char *pattern)
 	printfPQExpBuffer(&buf,
 					  "SELECT pg_catalog.pg_get_userbyid(d.defaclrole) AS \"%s\",\n"
 					  "  n.nspname AS \"%s\",\n"
+<<<<<<< HEAD
 					  "  CASE d.defaclobjtype "
 					  "    WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s'"
 					  "    WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' END AS \"%s\",\n"
+=======
+					  "  CASE d.defaclobjtype WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' WHEN '%c' THEN '%s' END AS \"%s\",\n"
+>>>>>>> 939dce21892 (yb changes)
 					  "  ",
 					  gettext_noop("Owner"),
 					  gettext_noop("Schema"),
@@ -1239,8 +1249,13 @@ listDefaultACLs(const char *pattern)
 					  gettext_noop("type"),
 					  DEFACLOBJ_NAMESPACE,
 					  gettext_noop("schema"),
+<<<<<<< HEAD
 					  DEFACLOBJ_LARGEOBJECT,
 					  gettext_noop("large object"),
+=======
+					  DEFACLOBJ_TABLEGROUP,
+					  gettext_noop("tablegroup"),
+>>>>>>> 939dce21892 (yb changes)
 					  gettext_noop("Type"));
 
 	printACLColumn(&buf, "d.defaclacl");
@@ -1617,8 +1632,15 @@ describeOneTableDetails(const char *schemaname,
 		char		relpersistence;
 		char		relreplident;
 		char	   *relam;
+
+		char	   *yb_grpname;
+		bool		colocation;
 	}			tableinfo;
 	bool		show_column_details = false;
+
+	PGresult   *tgres = NULL;
+	PQExpBufferData tablegroupbuf;
+	bool		database_colocated = false;
 
 	myopt.default_footer = false;
 	/* This output looks confusing in expanded mode. */
@@ -1627,6 +1649,7 @@ describeOneTableDetails(const char *schemaname,
 	initPQExpBuffer(&buf);
 	initPQExpBuffer(&title);
 	initPQExpBuffer(&tmpbuf);
+	initPQExpBuffer(&tablegroupbuf);
 
 	/* Get general table info */
 	if (pset.sversion >= 120000)
@@ -1749,6 +1772,48 @@ describeOneTableDetails(const char *schemaname,
 			NULL : pg_strdup(PQgetvalue(res, 0, 14));
 	else
 		tableinfo.relam = NULL;
+	PQclear(res);
+	res = NULL;
+
+
+	/*
+	 * YB: Get information about tablegroup (if any)
+	 * and whether a table/index is colocated or not.
+	 */
+	printfPQExpBuffer(&tablegroupbuf,
+					  "SELECT grpname, is_colocated\n"
+					  "FROM pg_catalog.yb_table_properties(%s) p\n"
+					  "LEFT JOIN pg_catalog.pg_yb_tablegroup gr\n"
+					  "  ON gr.oid = p.tablegroup_oid;",
+					  oid);
+
+	tgres = PSQLexec(tablegroupbuf.data);
+
+	if (tgres && PQntuples(tgres) > 0)
+	{
+		if (strcmp(PQgetvalue(tgres, 0, 0), "") != 0)
+			tableinfo.yb_grpname = pg_strdup(PQgetvalue(tgres, 0, 0));
+		else
+			tableinfo.yb_grpname = NULL;
+
+		tableinfo.colocation = (strcmp(PQgetvalue(tgres, 0, 1), "t") == 0);
+	}
+	else
+	{
+		tableinfo.yb_grpname = NULL;
+		tableinfo.colocation = false;
+	}
+
+	PQclear(tgres);
+	tgres = NULL;
+
+	/* YB: Current database is colocated or not. */
+	printfPQExpBuffer(&buf, "SELECT yb_is_database_colocated();");
+	res = PSQLexec(buf.data);
+	if (res && PQntuples(res) > 0)
+	{
+		database_colocated = (strcmp(PQgetvalue(res, 0, 0), "t") == 0);
+	}
 	PQclear(res);
 	res = NULL;
 
@@ -2436,6 +2501,17 @@ describeOneTableDetails(const char *schemaname,
 			if (tableinfo.relkind == RELKIND_INDEX)
 				add_tablespace_footer(&cont, tableinfo.relkind,
 									  tableinfo.tablespace, true);
+
+			if (database_colocated)
+			{
+				add_colocation_footer(&cont, tableinfo.relkind,
+									  tableinfo.colocation, true);
+			}
+			else
+			{
+				add_tablegroup_footer(&cont, tableinfo.relkind,
+									  tableinfo.yb_grpname, true);
+			}
 		}
 
 		PQclear(result);
@@ -2465,11 +2541,16 @@ describeOneTableDetails(const char *schemaname,
 				appendPQExpBufferStr(&buf, ", i.indisreplident");
 			else
 				appendPQExpBufferStr(&buf, ", false AS indisreplident");
+<<<<<<< HEAD
 			appendPQExpBufferStr(&buf, ", c2.reltablespace");
 			if (pset.sversion >= 180000)
 				appendPQExpBufferStr(&buf, ", con.conperiod");
 			else
 				appendPQExpBufferStr(&buf, ", false AS conperiod");
+=======
+			/* YB: i.indexrelid for yb_table_properties below */
+			appendPQExpBufferStr(&buf, ", c2.reltablespace, i.indexrelid");
+>>>>>>> 939dce21892 (yb changes)
 			appendPQExpBuffer(&buf,
 							  "\nFROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i\n"
 							  "  LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ("
@@ -2551,6 +2632,41 @@ describeOneTableDetails(const char *schemaname,
 					add_tablespace_footer(&cont, RELKIND_INDEX,
 										  atooid(PQgetvalue(result, i, 11)),
 										  false);
+					/* YB: Get information about tablegroup (if any) */
+					printfPQExpBuffer(&tablegroupbuf,
+									  "SELECT tg.grpname\n"
+									  "FROM yb_table_properties(%s) props,\n"
+									  "   pg_yb_tablegroup tg\n"
+									  "WHERE tg.oid = props.tablegroup_oid;",
+									  PQgetvalue(result, i, 12));
+
+					tgres = PSQLexec(tablegroupbuf.data);
+					char	   *idx_grpname;
+
+					if (tgres && PQntuples(tgres) > 0 &&
+						strcmp(PQgetvalue(tgres, 0, 0), "") != 0)
+					{
+						idx_grpname = pg_strdup(PQgetvalue(tgres, 0, 0));
+					}
+					else
+						idx_grpname = NULL;
+
+					PQclear(tgres);
+					tgres = NULL;
+
+					if (database_colocated)
+					{
+						/*
+						 * Table and its indexes are always part of the same
+						 * colocation
+						 */
+						add_colocation_footer(&cont, RELKIND_INDEX, tableinfo.colocation, false);
+					}
+					else
+					{
+						/* Print tablegroup of the index on the same line */
+						add_tablegroup_footer(&cont, RELKIND_INDEX, idx_grpname, false);
+					}
 				}
 			}
 			PQclear(result);
@@ -3608,19 +3724,34 @@ describeOneTableDetails(const char *schemaname,
 		/*
 		 * No need to display default values; we already display a REPLICA
 		 * IDENTITY marker on indexes.
+		 * YB NOTE: The default replica identity of user defined tables is "CHANGE" in YB. In all
+		 * other cases the default behaviour of PG is followed.
 		 */
+<<<<<<< HEAD
 			tableinfo.relreplident != REPLICA_IDENTITY_INDEX &&
 			((strcmp(schemaname, "pg_catalog") != 0 &&
 			  tableinfo.relreplident != REPLICA_IDENTITY_DEFAULT) ||
 			 (strcmp(schemaname, "pg_catalog") == 0 &&
 			  tableinfo.relreplident != REPLICA_IDENTITY_NOTHING)))
+=======
+			tableinfo.relreplident != 'i' &&
+			((strcmp(schemaname, "information_schema") == 0 && tableinfo.relreplident != 'd') ||
+			 (strcmp(schemaname, "pg_catalog") != 0 && strcmp(schemaname, "information_schema") != 0 && tableinfo.relreplident != 'c') ||
+			 (strcmp(schemaname, "pg_catalog") == 0 && tableinfo.relreplident != 'n')))
+>>>>>>> 939dce21892 (yb changes)
 		{
 			const char *s = _("Replica Identity");
 
 			printfPQExpBuffer(&buf, "%s: %s",
 							  s,
+<<<<<<< HEAD
 							  tableinfo.relreplident == REPLICA_IDENTITY_FULL ? "FULL" :
 							  tableinfo.relreplident == REPLICA_IDENTITY_DEFAULT ? "NOTHING" :
+=======
+							  tableinfo.relreplident == 'f' ? "FULL" :
+							  tableinfo.relreplident == 'n' ? "NOTHING" :
+							  tableinfo.relreplident == 'd' ? "DEFAULT" :
+>>>>>>> 939dce21892 (yb changes)
 							  "???");
 
 			printTableAddFooter(&cont, buf.data);
@@ -3639,6 +3770,19 @@ describeOneTableDetails(const char *schemaname,
 		{
 			printfPQExpBuffer(&buf, _("Access method: %s"), tableinfo.relam);
 			printTableAddFooter(&cont, buf.data);
+		}
+
+		if (database_colocated)
+		{
+			/* Colocation info */
+			add_colocation_footer(&cont, tableinfo.relkind,
+								  tableinfo.colocation, true);
+		}
+		else
+		{
+			/* Tablegroup info */
+			add_tablegroup_footer(&cont, tableinfo.relkind,
+								  tableinfo.yb_grpname, true);
 		}
 	}
 
@@ -3664,6 +3808,7 @@ error_return:
 	termPQExpBuffer(&buf);
 	termPQExpBuffer(&title);
 	termPQExpBuffer(&tmpbuf);
+	termPQExpBuffer(&tablegroupbuf);
 
 	free(view_def);
 
@@ -3734,6 +3879,91 @@ add_tablespace_footer(printTableContent *const cont, char relkind,
 			PQclear(result);
 			termPQExpBuffer(&buf);
 		}
+	}
+}
+
+/*
+ * Add a tablegroup description to a footer.  If 'newline' is true, it is added
+ * in a new line; otherwise it's appended to the current value of the last
+ * footer.
+ */
+static void
+add_tablegroup_footer(printTableContent *const cont, char relkind,
+					  const char *grpname, const bool newline)
+{
+	/* relkinds for which we support tablegroups */
+	if ((relkind == RELKIND_RELATION ||
+		 relkind == RELKIND_INDEX ||
+		 relkind == RELKIND_PARTITIONED_TABLE ||
+		 relkind == RELKIND_PARTITIONED_INDEX) &&
+		grpname)
+	{
+		PQExpBufferData buf;
+
+		initPQExpBuffer(&buf);
+		if (newline)
+		{
+			/* Add the tablegroup as a new footer */
+			printfPQExpBuffer(&buf, _("Tablegroup: \"%s\""),
+							  grpname);
+			printTableAddFooter(cont, buf.data);
+		}
+		else
+		{
+			/* Append the tablegroup to the latest footer */
+			printfPQExpBuffer(&buf, "%s", cont->footer->data);
+
+			/*
+			 translator: before this string there's an index description like
+			 '"foo_pkey" PRIMARY KEY, btree (a)'
+			 */
+			appendPQExpBuffer(&buf, _(", tablegroup \"%s\""),
+							  grpname);
+			printTableSetFooter(cont, buf.data);
+		}
+		termPQExpBuffer(&buf);
+	}
+}
+
+/*
+ * Add a colocation description to a footer.  If 'newline' is true, it is added
+ * in a new line; otherwise it's appended to the current value of the last
+ * footer.
+ */
+static void
+add_colocation_footer(printTableContent *const cont, char relkind,
+					  bool colocation, const bool newline)
+{
+	/* relkinds for which we support colocation */
+	if ((relkind == RELKIND_RELATION ||
+		 relkind == RELKIND_INDEX ||
+		 relkind == RELKIND_PARTITIONED_TABLE ||
+		 relkind == RELKIND_PARTITIONED_INDEX ||
+		 relkind == RELKIND_MATVIEW) &&
+		colocation)
+	{
+		PQExpBufferData buf;
+
+		initPQExpBuffer(&buf);
+		if (newline)
+		{
+			/* Add the colocation as a new footer */
+			printfPQExpBuffer(&buf, _("Colocation: true"));
+			printTableAddFooter(cont, buf.data);
+		}
+		else
+		{
+			/* Append the colocation to the latest footer */
+			printfPQExpBuffer(&buf, "%s", cont->footer->data);
+
+			/*
+			 translator: before this string there's an index description like
+			 '"foo_pkey" PRIMARY KEY, btree (a)'
+			 */
+			appendPQExpBuffer(&buf, _(", colocation: true"));
+			printTableSetFooter(cont, buf.data);
+		}
+		termPQExpBuffer(&buf);
 	}
 }
 
@@ -5348,6 +5578,166 @@ error_return:
 	return false;
 }
 
+/*
+ * \dgr and \dgrt
+ *
+ * These describe tablegroups. Usage is \dgr[t][+] [tablegroup_name] where the inclusion of 't' additionally describes
+ * the tables within each tablegroup and the usage of '+' acts as a toggle for verbosity.
+ * Explicit specification of a tablegroup name restricts the output to the contents of that tablegroup.
+ *
+ * \dgr displays the name and owner for each tablegroup.
+ * \dgr+ displays the access privilegs, object description, and group options.
+ *
+ * \dgrt outputs a row for each relation that is in a tablegroup. In addition to the info about the relations's
+ * tablegroup, it also includes the name, relkind, and owner of the table.
+ * \dgrt+ also includes the relation's object description and size.
+
+ */
+bool
+listTablegroups(const char *pattern, bool verbose, bool showRelations)
+{
+	PQExpBufferData buf;
+	PGresult   *res;
+	printQueryOpt myopt = pset.popt;
+
+	initPQExpBuffer(&buf);
+
+	/* Show relations is true when '\dgrt' or '\dgrt+' is used. */
+	if (showRelations)
+	{
+		printfPQExpBuffer(&buf,
+						  "SELECT grpname AS \"%s\",\n"
+						  "  pg_catalog.pg_get_userbyid(grpowner) AS \"%s\", \n",
+						  gettext_noop("Group Name"),
+						  gettext_noop("Group Owner"));
+
+		/* If '+' is included, add the tablegroup's description and options */
+		if (verbose)
+		{
+			printACLColumn(&buf, "g.grpacl");
+			appendPQExpBuffer(&buf,
+							  ",\n  pg_catalog.obj_description(g.oid, 'pg_yb_tablegroup') AS \"%s\"",
+							  gettext_noop("Group Description"));
+			appendPQExpBuffer(&buf,
+							  ",\n  ts.spcname AS \"%s\"",
+							  gettext_noop("Group Tablespace"));
+			appendPQExpBuffer(&buf,
+							  ",\n  g.grpoptions AS \"%s\",\n",
+							  gettext_noop("Group Options"));
+		}
+
+		/* Get info about the table from pg_class */
+		appendPQExpBuffer(&buf,
+						  "  c.relname AS \"%s\", \n"
+						  "  CASE c.relkind"
+						  " WHEN " CppAsString2(RELKIND_RELATION) " THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_VIEW) " THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_MATVIEW) " THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_INDEX) " THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_SEQUENCE) " THEN '%s'"
+						  " WHEN 's' THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_FOREIGN_TABLE) " THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_PARTITIONED_TABLE) " THEN '%s'"
+						  " WHEN " CppAsString2(RELKIND_PARTITIONED_INDEX) " THEN '%s'"
+						  " END as \"%s\",\n"
+						  "  pg_catalog.pg_get_userbyid(c.relowner) AS \"%s\"",
+						  gettext_noop("Name"),
+						  gettext_noop("table"),
+						  gettext_noop("view"),
+						  gettext_noop("materialized view"),
+						  gettext_noop("index"),
+						  gettext_noop("sequence"),
+						  gettext_noop("special"),
+						  gettext_noop("foreign table"),
+						  gettext_noop("table"),	/* partitioned table */
+						  gettext_noop("index"),	/* partitioned index */
+						  gettext_noop("Type"),
+						  gettext_noop("Owner"));
+
+		/* If '+' is included, add the table's size and description */
+		if (verbose)
+		{
+			appendPQExpBuffer(&buf,
+							  ",\n  pg_catalog.obj_description(c.oid, 'pg_class') AS \"%s\",",
+							  gettext_noop("Rel Description"));
+			appendPQExpBuffer(&buf,
+							  "\n  pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"%s\"",
+							  gettext_noop("Size"));
+		}
+	}
+	else
+	{
+		printfPQExpBuffer(&buf,
+						  "SELECT g.grpname AS \"%s\",\n"
+						  "  pg_catalog.pg_get_userbyid(g.grpowner) AS \"%s\"",
+						  gettext_noop("Name"),
+						  gettext_noop("Owner"));
+
+		/* If '+' is included, add the tablegroup's description and options */
+		if (verbose)
+		{
+			appendPQExpBufferStr(&buf, ",\n  ");
+			printACLColumn(&buf, "g.grpacl");
+			appendPQExpBuffer(&buf,
+							  ",\n  pg_catalog.obj_description(g.oid, 'pg_yb_tablegroup') AS \"%s\"",
+							  gettext_noop("Description"));
+			appendPQExpBuffer(&buf,
+							  ",\n  ts.spcname AS \"%s\"",
+							  gettext_noop("Tablespace"));
+			appendPQExpBuffer(&buf,
+							  ",\n  g.grpoptions AS \"%s\"",
+							  gettext_noop("Options"));
+		}
+	}
+
+	appendPQExpBufferStr(&buf,
+						 "\nFROM pg_catalog.pg_yb_tablegroup g\n");
+
+	if (verbose)
+		appendPQExpBufferStr(&buf,
+							 "\nLEFT JOIN pg_catalog.pg_tablespace ts ON ts.oid = g.grptablespace\n");
+
+	/* If 't' is included, need to do the join based on pg_class reloptions */
+	if (showRelations)
+	{
+		appendPQExpBufferStr(&buf,
+							 "INNER JOIN (\n"
+							 "  SELECT cl.oid, cl.relname, cl.relkind, cl.relowner,\n"
+							 "         props.tablegroup_oid\n"
+							 "  FROM pg_catalog.pg_class cl, yb_table_properties(cl.oid) props\n"
+							 ") c\n"
+							 "ON c.tablegroup_oid = g.oid\n");
+	}
+
+	processSQLNamePattern(pset.db, &buf, pattern,
+						  false, false,
+						  NULL, "grpname", NULL,
+						  NULL, NULL, NULL);
+
+	appendPQExpBufferStr(&buf, "ORDER BY 1;");
+
+	res = PSQLexec(buf.data);
+	termPQExpBuffer(&buf);
+	if (!res)
+		return false;
+
+	myopt.nullPrint = NULL;
+	if (showRelations)
+	{
+		myopt.title = _("List of tablegroup tables");
+	}
+	else
+	{
+		myopt.title = _("List of tablegroups");
+	}
+
+	myopt.translate_header = true;
+
+	printQuery(res, &myopt, pset.queryFout, false, pset.logfile);
+
+	PQclear(res);
+	return true;
+}
 
 /*
  * \dFp

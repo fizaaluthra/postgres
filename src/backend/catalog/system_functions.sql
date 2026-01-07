@@ -479,7 +479,12 @@ CREATE OR REPLACE FUNCTION pg_create_logical_replication_slot(
     IN slot_name name, IN plugin name,
     IN temporary boolean DEFAULT false,
     IN twophase boolean DEFAULT false,
+<<<<<<< HEAD
     IN failover boolean DEFAULT false,
+=======
+    IN yb_lsn_type name DEFAULT 'SEQUENCE',
+    IN yb_ordering_mode name DEFAULT 'TRANSACTION',
+>>>>>>> 939dce21892 (yb changes)
     OUT slot_name name, OUT lsn pg_lsn)
 RETURNS RECORD
 LANGUAGE INTERNAL

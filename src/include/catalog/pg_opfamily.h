@@ -58,9 +58,14 @@ MAKE_SYSCACHE(OPFAMILYOID, pg_opfamily_oid_index, 8);
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
+<<<<<<< HEAD
 /* This does not account for non-core opfamilies that might accept boolean */
 #define IsBuiltinBooleanOpfamily(opfamily) \
 	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID)
+=======
+#define IsBooleanOpfamily(opfamily) \
+	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID || (opfamily) == BOOL_LSM_FAM_OID)
+>>>>>>> 939dce21892 (yb changes)
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

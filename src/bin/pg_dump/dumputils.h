@@ -36,16 +36,24 @@
 #define PGDUMP_STRFTIME_FMT  "%Y-%m-%d %H:%M:%S"
 #endif
 
+#define YB_SUPERUSER "yb_superuser"
 
+<<<<<<< HEAD
 extern char *sanitize_line(const char *str, bool want_hyphen);
 extern bool buildACLCommands(const char *name, const char *subname, const char *nspname,
+=======
+extern bool buildACLCommands(PGconn *yb_conn,
+							 const char *name, const char *subname, const char *nspname,
+>>>>>>> 939dce21892 (yb changes)
 							 const char *type, const char *acls, const char *baseacls,
 							 const char *owner, const char *prefix, int remoteVersion,
-							 PQExpBuffer sql);
-extern bool buildDefaultACLCommands(const char *type, const char *nspname,
+							 bool yb_dump_role_checks, PQExpBuffer sql);
+extern bool buildDefaultACLCommands(PGconn *yb_conn,
+									const char *type, const char *nspname,
 									const char *acls, const char *acldefault,
 									const char *owner,
 									int remoteVersion,
+									bool yb_dump_role_checks,
 									PQExpBuffer sql);
 
 extern void quoteAclUserName(PQExpBuffer output, const char *input);
@@ -53,7 +61,8 @@ extern void quoteAclUserName(PQExpBuffer output, const char *input);
 extern void buildShSecLabelQuery(const char *catalog_name,
 								 Oid objectId, PQExpBuffer sql);
 extern void emitShSecLabels(PGconn *conn, PGresult *res,
-							PQExpBuffer buffer, const char *objtype, const char *objname);
+							PQExpBuffer buffer, const char *objtype, const char *objname,
+							const char *yb_indent);
 
 extern bool variable_is_guc_list_quote(const char *name);
 
@@ -63,10 +72,19 @@ extern bool SplitGUCList(char *rawstring, char separator,
 extern void makeAlterConfigCommand(PGconn *conn, const char *configitem,
 								   const char *type, const char *name,
 								   const char *type2, const char *name2,
+<<<<<<< HEAD
 								   PQExpBuffer buf);
 extern void create_or_open_dir(const char *dirname);
 
 extern char *generate_restrict_key(void);
 extern bool valid_restrict_key(const char *restrict_key);
+=======
+								   bool yb_dump_role_checks, PQExpBuffer buf);
+
+extern void YBWwrapInRoleChecks(PGconn *conn,
+								PQExpBuffer sql, const char *op_name,
+								const char *role_name1, const char *role_name2,
+								const char *role_name3, PQExpBuffer result);
+>>>>>>> 939dce21892 (yb changes)
 
 #endif							/* DUMPUTILS_H */

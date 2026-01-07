@@ -23,6 +23,10 @@
 #include "utils/guc.h"			/* for application_name */
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/syscache.h"
+
 
 /* ----------
  * Total number of backends including auxiliary
@@ -73,6 +77,8 @@ static void pgstat_beshutdown_hook(int code, Datum arg);
 static void pgstat_read_current_status(void);
 static void pgstat_setup_backend_status_context(void);
 
+static char *DatabaseNameBuffer = NULL;
+
 
 /*
  * Report shared-memory space needed by BackendStatusShmemInit.
@@ -103,6 +109,11 @@ BackendStatusShmemSize(void)
 	size = add_size(size,
 					mul_size(sizeof(PgBackendGSSStatus), NumBackendStatSlots));
 #endif
+	size = add_size(size, mul_size(NAMEDATALEN, NumBackendStatSlots));
+
+	/* yb_new_conn metric */
+	size = add_size(size, sizeof(uint64_t));
+
 	return size;
 }
 
@@ -188,6 +199,28 @@ BackendStatusShmemInit(void)
 		}
 	}
 
+	if (YBIsEnabledInPostgresEnvVar())
+	{
+		Size		DatabaseNameBufferSize;
+
+		DatabaseNameBufferSize = mul_size(NAMEDATALEN, NumBackendStatSlots);
+		DatabaseNameBuffer = (char *)
+			ShmemInitStruct("Database Name Buffer", DatabaseNameBufferSize, &found);
+
+		if (!found)
+		{
+			MemSet(DatabaseNameBuffer, 0, DatabaseNameBufferSize);
+
+			/* Initialize st_databasename pointers. */
+			buffer = DatabaseNameBuffer;
+			for (i = 0; i < NumBackendStatSlots; i++)
+			{
+				BackendStatusArray[i].st_databasename = buffer;
+				buffer += NAMEDATALEN;
+			}
+		}
+	}
+
 #ifdef USE_SSL
 	/* Create or attach to the shared SSL status buffer */
 	size = mul_size(sizeof(PgBackendSSLStatus), NumBackendStatSlots);
@@ -231,6 +264,9 @@ BackendStatusShmemInit(void)
 		}
 	}
 #endif
+
+	yb_new_conn = (uint64_t *) ShmemAlloc(sizeof(uint64_t));
+	(*yb_new_conn) = 0;
 }
 
 /*
@@ -300,8 +336,45 @@ pgstat_bestart_initial(void)
 	lbeentry.st_activity_start_timestamp = 0;
 	lbeentry.st_state_start_timestamp = 0;
 	lbeentry.st_xact_start_timestamp = 0;
+<<<<<<< HEAD
 	lbeentry.st_databaseid = InvalidOid;
 	lbeentry.st_userid = InvalidOid;
+=======
+	lbeentry.st_databaseid = MyDatabaseId;
+
+	/* YB: Increment the total connections counter */
+	if (lbeentry.st_procpid > 0 &&
+		(lbeentry.st_backendType == B_BACKEND ||
+		 lbeentry.st_backendType == YB_AUTO_ANALYZE_BACKEND ||
+		 lbeentry.st_backendType == YB_YSQL_CONN_MGR))
+		(*yb_new_conn)++;
+
+	if (YBIsEnabledInPostgresEnvVar() && lbeentry.st_databaseid > 0)
+	{
+		HeapTuple	tuple;
+
+		tuple = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(lbeentry.st_databaseid));
+		Form_pg_database dbForm;
+
+		dbForm = (Form_pg_database) GETSTRUCT(tuple);
+		strcpy(lbeentry.st_databasename, dbForm->datname.data);
+		ReleaseSysCache(tuple);
+
+		/* Initialization of allocated memory measurement value */
+		lbeentry.yb_st_allocated_mem_bytes = PgMemTracker.backend_cur_allocated_mem_bytes;
+	}
+
+	/* We have userid for client-backends, wal-sender and bgworker processes */
+	if (lbeentry.st_backendType == B_BACKEND
+		|| lbeentry.st_backendType == B_WAL_SENDER
+		|| lbeentry.st_backendType == B_BG_WORKER
+		|| lbeentry.st_backendType == YB_AUTO_ANALYZE_BACKEND
+		|| lbeentry.st_backendType == YB_YSQL_CONN_MGR
+		|| lbeentry.st_backendType == YB_YSQL_CONN_MGR_WAL_SENDER)
+		lbeentry.st_userid = GetSessionUserId();
+	else
+		lbeentry.st_userid = InvalidOid;
+>>>>>>> 939dce21892 (yb changes)
 
 	/*
 	 * We may not have a MyProcPort (eg, if this is the autovacuum process).
@@ -518,6 +591,7 @@ pgstat_beshutdown_hook(int code, Datum arg)
 	PGSTAT_BEGIN_WRITE_ACTIVITY(beentry);
 
 	beentry->st_procpid = 0;	/* mark invalid */
+	beentry->yb_session_id = 0;
 
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
 
@@ -883,7 +957,9 @@ pgstat_read_current_status(void)
 		 * the source backend is between increment steps.)	We use a volatile
 		 * pointer here to ensure the compiler doesn't try to get cute.
 		 */
-		for (;;)
+		int			attempt = 1;
+
+		while (yb_pgstat_log_read_activity(beentry, ++attempt))
 		{
 			int			before_changecount;
 			int			after_changecount;
@@ -952,6 +1028,12 @@ pgstat_read_current_status(void)
 										&localentry->backend_subxact_count,
 										&localentry->backend_subxact_overflowed);
 
+			if (YBIsEnabledInPostgresEnvVar())
+			{
+				YbPgGetCurRssPssMemUsage(localentry->backendStatus.st_procpid,
+										 &localentry->yb_backend_rss_mem_bytes,
+										 &localentry->yb_backend_pss_mem_bytes);
+			}
 			localentry++;
 			localappname += NAMEDATALEN;
 			localclienthostname += NAMEDATALEN;
@@ -1014,7 +1096,9 @@ pgstat_get_backend_current_activity(int pid, bool checkUser)
 		volatile PgBackendStatus *vbeentry = beentry;
 		bool		found;
 
-		for (;;)
+		int			attempt = 1;
+
+		while (yb_pgstat_log_read_activity(vbeentry, ++attempt))
 		{
 			int			before_changecount;
 			int			after_changecount;
@@ -1345,4 +1429,142 @@ pgstat_clip_activity(const char *raw_activity)
 	activity[cliplen] = '\0';
 
 	return activity;
+}
+
+/*
+ * When backends die due to abnormal termination, cleanup is required.
+ *
+ * This function performs all the operations done by pgstat_beshutdown_hook,
+ * which is executed during safe backend terminations. However, it does not
+ * report the remaining stats to the pgstat collector as the backend has
+ * already died.
+ */
+void
+yb_pgstat_clear_entry_pid(int pid)
+{
+	PgBackendStatus *beentry;
+	int			i;
+
+	beentry = BackendStatusArray;
+	for (i = 1; i <= MaxBackends; i++)
+	{
+		volatile PgBackendStatus *vbeentry = beentry;
+
+		if (pid == vbeentry->st_procpid)
+		{
+			PGSTAT_BEGIN_WRITE_ACTIVITY(beentry);
+			beentry->st_procpid = 0;	/* mark invalid */
+			beentry->yb_session_id = 0;
+			PGSTAT_END_WRITE_ACTIVITY(beentry);
+			return;
+		}
+		beentry++;
+	}
+}
+
+/* ----------
+ * yb_pgstat_report_allocated_mem_bytes() -
+ *
+ *	Called from utils/mmgr/mcxt.c to update our allocated memory measurement
+ *	value
+ * ----------
+ */
+void
+yb_pgstat_report_allocated_mem_bytes(void)
+{
+	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (!beentry)
+		return;
+
+	PGSTAT_BEGIN_WRITE_ACTIVITY(beentry);
+
+	beentry->yb_st_allocated_mem_bytes = PgMemTracker.backend_cur_allocated_mem_bytes;
+
+	PGSTAT_END_WRITE_ACTIVITY(beentry);
+}
+
+/* ----------
+ * yb_pgstat_set_catalog_version() -
+ *
+ *		Set yb_st_catalog_version.version for my backend
+ * ----------
+ */
+void
+yb_pgstat_set_catalog_version(uint64_t catalog_version)
+{
+	volatile PgBackendStatus *vbeentry = MyBEEntry;
+
+	PGSTAT_BEGIN_WRITE_ACTIVITY(vbeentry);
+
+	vbeentry->yb_st_catalog_version.version = catalog_version;
+
+	PGSTAT_END_WRITE_ACTIVITY(vbeentry);
+}
+
+/* ----------
+ * yb_pgstat_set_has_catalog_version() -
+ *
+ *		Set yb_st_catalog_version.has_version for my backend
+ * ----------
+ */
+void
+yb_pgstat_set_has_catalog_version(bool has_version)
+{
+	volatile PgBackendStatus *vbeentry = MyBEEntry;
+
+	PGSTAT_BEGIN_WRITE_ACTIVITY(vbeentry);
+
+	vbeentry->yb_st_catalog_version.has_version = has_version;
+
+	PGSTAT_END_WRITE_ACTIVITY(vbeentry);
+}
+
+void
+yb_pgstat_add_session_info(uint64_t session_id)
+{
+	volatile PgBackendStatus *vbeentry = NULL;
+
+	/*
+	 * This code could be invoked either in a regular backend or in an
+	 * auxiliary process. In case of the latter, skip initializing shared
+	 * memory context. See note in pgstat_initalize()
+	 */
+	if (MyBEEntry == NULL)
+	{
+		/* Must be an auxiliary process */
+		Assert(MyAuxProcType != NotAnAuxProcess);
+		return;
+	}
+
+	vbeentry = MyBEEntry;
+
+	PGSTAT_BEGIN_WRITE_ACTIVITY(vbeentry);
+
+	vbeentry->yb_session_id = session_id;
+
+	PGSTAT_END_WRITE_ACTIVITY(vbeentry);
+}
+
+bool
+yb_pgstat_log_read_activity(volatile PgBackendStatus *beentry, int attempt)
+{
+	if (attempt >= YB_MAX_BEENTRIES_ATTEMPTS)
+	{
+		elog(WARNING, "backend status entry for pid %d required %d "
+			 "attempts, using inconsistent results",
+			 (beentry)->st_procpid, attempt);
+		return false;
+	}
+	if (attempt % YB_BEENTRY_LOGGING_INTERVAL == 0)
+		elog(WARNING, "backend status entry for pid %d required %d "
+			 "attempts, continuing to retry",
+			 (beentry)->st_procpid, attempt);
+	return true;
+}
+
+PgBackendStatus *
+getBackendStatusArray(void)
+{
+	return BackendStatusArray;
 }

@@ -165,6 +165,43 @@ typedef struct Port
 	HbaLine    *hba;
 
 	/*
+<<<<<<< HEAD
+=======
+	 * Whether yb-tserver to postgres authentication is used.  This information
+	 * needs to be saved separately from hba because hba gets deallocated after
+	 * the authentication cycle.
+	 */
+	bool		yb_is_tserver_auth_method;
+
+	/*
+	 * YB: To be used during Authentication, identifies whether authentication
+	 * is invoked due to Auth Passthrough Request packet.
+	 */
+	bool		yb_is_auth_passthrough_req;
+
+	/*
+	 * YB: To be used for the authentication of logical connections from the
+	 * connection manager either via auth passthrough or the special
+	 * authentication backend.
+	 * It identifies whether the logical connection is encrypted.
+	 */
+	bool		yb_is_ssl_enabled_in_logical_conn;
+
+	/*
+	 * Authenticated identity.  The meaning of this identifier is dependent on
+	 * hba->auth_method; it is the identity (if any) that the user presented
+	 * during the authentication cycle, before they were assigned a database
+	 * role.  (It is effectively the "SYSTEM-USERNAME" of a pg_ident usermap
+	 * -- though the exact string in use may be different, depending on pg_hba
+	 * options.)
+	 *
+	 * authn_id is NULL if the user has not actually been authenticated, for
+	 * example if the "trust" auth method is in use.
+	 */
+	const char *authn_id;
+
+	/*
+>>>>>>> 939dce21892 (yb changes)
 	 * TCP keepalive and user timeout settings.
 	 *
 	 * default values are 0 if AF_UNIX or not yet known; current values are 0

@@ -53,6 +53,12 @@
 #include "utils/guc.h"
 #include "utils/injection_point.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+#include "yb_ash.h"
+#include "yb_query_diagnostics.h"
+#include "yb_terminated_queries.h"
+
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
 
@@ -141,6 +147,15 @@ CalculateShmemSize(void)
 	size = add_size(size, AioShmemSize());
 	size = add_size(size, WaitLSNShmemSize());
 	size = add_size(size, LogicalDecodingCtlShmemSize());
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_ash)
+		size = add_size(size, YbAshShmemSize());
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
+		size = add_size(size, YbQueryDiagnosticsShmemSize());
+
+	/* include additional shmem for yb_terminated_queries */
+	size = add_size(size, YbTerminatedQueriesShmemSize());
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
@@ -325,11 +340,42 @@ CreateOrAttachShmemStructs(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+<<<<<<< HEAD
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
 	AioShmemInit();
 	WaitLSNShmemInit();
 	LogicalDecodingCtlShmemInit();
+=======
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_ash)
+		YbAshShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
+		YbQueryDiagnosticsShmemInit();
+
+	/* Setting up yb_terminated_queries shared memory space. */
+	YbTerminatedQueriesShmemInit();
+
+#ifdef EXEC_BACKEND
+
+	/*
+	 * Alloc the win32 shared backend array
+	 */
+	if (!IsUnderPostmaster)
+		ShmemBackendArrayAllocation();
+#endif
+
+	/* Initialize dynamic shared memory facilities. */
+	if (!IsUnderPostmaster)
+		dsm_postmaster_startup(shim);
+
+	/*
+	 * Now give loadable modules a chance to set up their shmem allocations
+	 */
+	if (shmem_startup_hook)
+		shmem_startup_hook();
+>>>>>>> 939dce21892 (yb changes)
 }
 
 /*

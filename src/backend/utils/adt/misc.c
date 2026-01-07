@@ -47,6 +47,7 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+<<<<<<< HEAD
 
 /*
  * structure to cache metadata needed in pg_input_is_valid_common
@@ -65,6 +66,10 @@ static bool pg_input_is_valid_common(FunctionCallInfo fcinfo,
 									 text *txt, text *typname,
 									 ErrorSaveContext *escontext);
 
+=======
+/* YB includes */
+#include "pg_yb_utils.h"
+>>>>>>> 939dce21892 (yb changes)
 
 /*
  * Common subroutine for num_nulls() and num_nonnulls().
@@ -314,6 +319,12 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 Datum
 pg_tablespace_location(PG_FUNCTION_ARGS)
 {
+	/* Not applicable for YB clusters. */
+	if (IsYugaByteEnabled())
+	{
+		PG_RETURN_TEXT_P(cstring_to_text(""));
+	}
+
 	Oid			tablespaceOid = PG_GETARG_OID(0);
 	char	   *tablespaceLoc;
 

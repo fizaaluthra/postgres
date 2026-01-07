@@ -31,6 +31,7 @@ typedef enum UserAuth
 	uaPassword,
 	uaMD5,
 	uaSCRAM,
+	uaYbTserverKey,				/* For internal tserver-postgres connection */
 	uaGSS,
 	uaSSPI,
 	uaPAM,
@@ -39,8 +40,13 @@ typedef enum UserAuth
 	uaCert,
 	uaRADIUS,
 	uaPeer,
+<<<<<<< HEAD
 	uaOAuth,
 #define USER_AUTH_LAST uaOAuth	/* Must be last value of this enum */
+=======
+	uaYbJWT,
+#define USER_AUTH_LAST uaYbJWT	/* Must be last value of this enum */
+>>>>>>> 939dce21892 (yb changes)
 } UserAuth;
 
 /*
@@ -136,10 +142,23 @@ typedef struct HbaLine
 	char	   *radiusidentifiers_s;
 	List	   *radiusports;
 	char	   *radiusports_s;
+<<<<<<< HEAD
 	char	   *oauth_issuer;
 	char	   *oauth_scope;
 	char	   *oauth_validator;
 	bool		oauth_skip_usermap;
+=======
+
+	/* YB */
+	char	   *maskedline;
+	char	   *yb_jwt_jwks_path;
+	char	   *yb_jwt_jwks_url;
+	List	   *yb_jwt_audiences;
+	char	   *yb_jwt_audiences_s;
+	List	   *yb_jwt_issuers;
+	char	   *yb_jwt_issuers_s;
+	char	   *yb_jwt_matching_claim_key;
+>>>>>>> 939dce21892 (yb changes)
 } HbaLine;
 
 typedef struct IdentLine

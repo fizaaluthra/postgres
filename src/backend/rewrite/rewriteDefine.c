@@ -410,6 +410,108 @@ DefineQueryRewrite(const char *rulename,
 								ViewSelectRuleName)));
 			rulename = pstrdup(ViewSelectRuleName);
 		}
+<<<<<<< HEAD
+=======
+
+		/*
+		 * Are we converting a relation to a view?
+		 *
+		 * If so, check that the relation is empty because the storage for the
+		 * relation is going to be deleted.  Also insist that the rel not be
+		 * involved in partitioning, nor have any triggers, indexes, child or
+		 * parent tables, RLS policies, or RLS enabled.  (Note: some of these
+		 * tests are too strict, because they will reject relations that once
+		 * had such but don't anymore.  But we don't really care, because this
+		 * whole business of converting relations to views is just an obsolete
+		 * kluge to allow dump/reload of views that participate in circular
+		 * dependencies.)
+		 *
+		 * Also ensure the relation isn't being manipulated in any outer SQL
+		 * command of our own session.
+		 */
+		if (event_relation->rd_rel->relkind != RELKIND_VIEW &&
+			event_relation->rd_rel->relkind != RELKIND_MATVIEW)
+		{
+			TableScanDesc scanDesc;
+			Snapshot	snapshot;
+			TupleTableSlot *slot;
+
+			CheckTableNotInUse(event_relation, "CREATE RULE");
+
+			if (event_relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("cannot convert partitioned table \"%s\" to a view",
+								RelationGetRelationName(event_relation))));
+
+			/* only case left: */
+			Assert(event_relation->rd_rel->relkind == RELKIND_RELATION);
+
+			if (event_relation->rd_rel->relispartition)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("cannot convert partition \"%s\" to a view",
+								RelationGetRelationName(event_relation))));
+
+			snapshot = RegisterSnapshot(GetLatestSnapshot());
+			scanDesc = table_beginscan(event_relation, snapshot, 0, NULL);
+			slot = table_slot_create(event_relation, NULL);
+			if (table_scan_getnextslot(scanDesc, ForwardScanDirection, slot))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it is not empty",
+								RelationGetRelationName(event_relation))));
+			ExecDropSingleTupleTableSlot(slot);
+			table_endscan(scanDesc);
+			UnregisterSnapshot(snapshot);
+
+			if (event_relation->rd_rel->relhastriggers)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it has triggers",
+								RelationGetRelationName(event_relation)),
+						 errhint("In particular, the table cannot be involved in any foreign key relationships.")));
+
+			if (event_relation->rd_rel->relhasindex)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it has indexes",
+								RelationGetRelationName(event_relation))));
+
+			if (event_relation->rd_rel->relhassubclass)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it has child tables",
+								RelationGetRelationName(event_relation))));
+
+			if (has_superclass(RelationGetRelid(event_relation)))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it has parent tables",
+								RelationGetRelationName(event_relation))));
+
+			if (event_relation->rd_rel->relrowsecurity)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it has row security enabled",
+								RelationGetRelationName(event_relation))));
+
+			if (relation_has_policies(event_relation))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it has row security policies",
+								RelationGetRelationName(event_relation))));
+
+			/* YB */
+			if (IsCatalogNamespace(event_relation->rd_rel->relnamespace))
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not convert table \"%s\" to a view because it's a system table",
+								RelationGetRelationName(event_relation))));
+
+			RelisBecomingView = true;
+		}
+>>>>>>> 939dce21892 (yb changes)
 	}
 	else
 	{

@@ -124,6 +124,10 @@ typedef enum
 	PGC_S_INTERACTIVE,			/* dividing line for error reporting */
 	PGC_S_TEST,					/* test per-database or per-user setting */
 	PGC_S_SESSION,				/* SET command */
+<<<<<<< HEAD
+=======
+	YSQL_CONN_MGR				/* SET SESSION PARAMETER packet */
+>>>>>>> 939dce21892 (yb changes)
 } GucSource;
 
 /*
@@ -194,6 +198,9 @@ typedef void (*GucEnumAssignHook) (int newval, void *extra);
 
 typedef const char *(*GucShowHook) (void);
 
+typedef bool (*YbGucOidCheckHook) (Oid *newval, void **extra, GucSource source);
+typedef void (*YbGucOidAssignHook) (Oid newval, void *extra);
+
 /*
  * Miscellaneous
  */
@@ -242,6 +249,9 @@ typedef enum
 #define GUC_UNIT_TIME		 0x70000000 /* mask for time-related units */
 
 #define GUC_UNIT			 (GUC_UNIT_MEMORY | GUC_UNIT_TIME)
+
+#define GUC_YB_CUSTOM_STICKY	0x40000000	/* YB: stickiness for custom
+											 * string variables */
 
 
 /* GUC vars that are actually defined in guc_tables.c, rather than elsewhere */
@@ -329,6 +339,23 @@ extern PGDLLIMPORT bool trace_sort;
 extern PGDLLIMPORT bool optimize_bounded_sort;
 #endif
 
+/* YB */
+extern PGDLLIMPORT bool yb_enable_memory_tracking;
+extern PGDLLIMPORT int yb_bnl_batch_size;
+extern PGDLLIMPORT bool yb_bnl_optimize_first_batch;
+extern PGDLLIMPORT bool yb_bnl_enable_hashing;
+extern PGDLLIMPORT int yb_explicit_row_locking_batch_size;
+extern PGDLLIMPORT bool yb_lock_pk_single_rpc;
+extern PGDLLIMPORT int yb_toast_catcache_threshold;
+extern PGDLLIMPORT bool yb_enable_fkey_catcache;
+extern PGDLLIMPORT bool yb_index_checker;
+extern PGDLLIMPORT bool yb_test_slowdown_index_check;
+extern PGDLLIMPORT int yb_test_index_check_num_batches_per_snapshot;
+
+extern PGDLLIMPORT bool yb_enable_planner_trace;
+extern PGDLLIMPORT char *yb_hinted_uids;
+extern PGDLLIMPORT bool yb_enable_derived_equalities;
+
 /*
  * Declarations for options for enum values
  *
@@ -376,6 +403,19 @@ extern void DefineCustomIntVariable(const char *name,
 									GucIntCheckHook check_hook,
 									GucIntAssignHook assign_hook,
 									GucShowHook show_hook) pg_attribute_nonnull(1, 4);
+
+extern void DefineCustomOidVariable(const char *name,
+									const char *short_desc,
+									const char *long_desc,
+									Oid *valueAddr,
+									Oid bootValue,
+									Oid minValue,
+									Oid maxValue,
+									GucContext context,
+									int flags,
+									YbGucOidCheckHook check_hook,
+									YbGucOidAssignHook assign_hook,
+									GucShowHook show_hook);
 
 extern void DefineCustomRealVariable(const char *name,
 									 const char *short_desc,
@@ -438,6 +478,7 @@ extern void ParseLongOption(const char *string, char **name, char **value);
 extern const char *get_config_unit_name(int flags);
 extern bool parse_int(const char *value, int *result, int flags,
 					  const char **hintmsg);
+extern bool parse_oid(const char *value, Oid *result, const char **hintmsg);
 extern bool parse_real(const char *value, double *result, int flags,
 					   const char **hintmsg);
 extern int	set_config_option(const char *name, const char *value,
@@ -477,6 +518,8 @@ extern void guc_free(void *ptr);
 extern void write_nondefault_variables(GucContext context);
 extern void read_nondefault_variables(void);
 #endif
+
+extern void YbSetParallelWorker();
 
 /* GUC serialization */
 extern Size EstimateGUCStateSpace(void);

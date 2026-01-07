@@ -249,7 +249,14 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 	switch (cstate->copy_src)
 	{
 		case COPY_FILE:
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_start(WAIT_EVENT_YB_COPY_COMMAND_STREAM_READ);
+
 			bytesread = fread(databuf, 1, maxread, cstate->copy_file);
+
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_end();
+
 			if (ferror(cstate->copy_file))
 				ereport(ERROR,
 						(errcode_for_file_access(),
@@ -631,7 +638,6 @@ CopyLoadRawBuf(CopyFromState cstate)
 	cstate->raw_buf_len = nbytes;
 
 	cstate->bytes_processed += inbytes;
-	pgstat_progress_update_param(PROGRESS_COPY_BYTES_PROCESSED, cstate->bytes_processed);
 
 	if (inbytes == 0)
 		cstate->raw_reached_eof = true;
@@ -875,10 +881,14 @@ NextCopyFromRawFieldsInternal(CopyFromState cstate, char ***fields, int *nfields
  *
  * 'values' and 'nulls' arrays must be the same length as columns of the
  * relation passed to BeginCopyFrom. This function fills the arrays.
+ *
+ * 'skip_row' is used to specify whether we should skip format checking for
+ * this row. In particular, if 'skip_row' is true, we will not raise error
+ * upon reading an invalid row.
  */
 bool
 NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
-			 Datum *values, bool *nulls)
+			 Datum *values, bool *nulls, bool skip_row)
 {
 	TupleDesc	tupDesc;
 	AttrNumber	num_phys_attrs,
@@ -891,6 +901,7 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 	num_phys_attrs = tupDesc->natts;
 
 	/* Initialize all values for row to NULL */
+<<<<<<< HEAD
 	MemSet(values, 0, num_phys_attrs * sizeof(Datum));
 	MemSet(nulls, true, num_phys_attrs * sizeof(bool));
 	MemSet(cstate->defaults, false, num_phys_attrs * sizeof(bool));
@@ -898,6 +909,151 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 	/* Get one row from source */
 	if (!cstate->routine->CopyFromOneRow(cstate, econtext, values, nulls))
 		return false;
+=======
+	if (!skip_row)
+	{
+		MemSet(values, 0, num_phys_attrs * sizeof(Datum));
+		MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+	}
+
+	if (!cstate->opts.binary)
+	{
+		char	  **field_strings;
+		ListCell   *cur;
+		int			fldct;
+		int			fieldno;
+		char	   *string;
+
+		/* read raw fields in the next line */
+		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
+			return false;
+
+		/* YB: if the row is skipped, ignore all the format checking */
+		if (skip_row)
+			return true;
+
+		/* check for overflowing fields */
+		if (attr_count > 0 && fldct > attr_count)
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("extra data after last expected column")));
+
+		fieldno = 0;
+
+		/* Loop to read the user attributes on the line. */
+		foreach(cur, cstate->attnumlist)
+		{
+			int			attnum = lfirst_int(cur);
+			int			m = attnum - 1;
+			Form_pg_attribute att = TupleDescAttr(tupDesc, m);
+
+			if (fieldno >= fldct)
+				ereport(ERROR,
+						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+						 errmsg("missing data for column \"%s\"",
+								NameStr(att->attname))));
+			string = field_strings[fieldno++];
+
+			if (cstate->convert_select_flags &&
+				!cstate->convert_select_flags[m])
+			{
+				/* ignore input field, leaving column as NULL */
+				continue;
+			}
+
+			if (cstate->opts.csv_mode)
+			{
+				if (string == NULL &&
+					cstate->opts.force_notnull_flags[m])
+				{
+					/*
+					 * FORCE_NOT_NULL option is set and column is NULL -
+					 * convert it to the NULL string.
+					 */
+					string = cstate->opts.null_print;
+				}
+				else if (string != NULL && cstate->opts.force_null_flags[m]
+						 && strcmp(string, cstate->opts.null_print) == 0)
+				{
+					/*
+					 * FORCE_NULL option is set and column matches the NULL
+					 * string. It must have been quoted, or otherwise the
+					 * string would already have been set to NULL. Convert it
+					 * to NULL as specified.
+					 */
+					string = NULL;
+				}
+			}
+
+			cstate->cur_attname = NameStr(att->attname);
+			cstate->cur_attval = string;
+			values[m] = InputFunctionCall(&in_functions[m],
+										  string,
+										  typioparams[m],
+										  att->atttypmod);
+			if (string != NULL)
+				nulls[m] = false;
+			cstate->cur_attname = NULL;
+			cstate->cur_attval = NULL;
+		}
+
+		Assert(fieldno == attr_count);
+	}
+	else
+	{
+		/* binary */
+		int16		fld_count;
+		ListCell   *cur;
+
+		cstate->cur_lineno++;
+
+		if (!CopyGetInt16(cstate, &fld_count))
+		{
+			/* EOF detected (end of file, or protocol-level EOF) */
+			return false;
+		}
+
+		if (fld_count == -1)
+		{
+			/*
+			 * Received EOF marker.  Wait for the protocol-level EOF, and
+			 * complain if it doesn't come immediately.  In COPY FROM STDIN,
+			 * this ensures that we correctly handle CopyFail, if client
+			 * chooses to send that now.  When copying from file, we could
+			 * ignore the rest of the file like in text mode, but we choose to
+			 * be consistent with the COPY FROM STDIN case.
+			 */
+			char		dummy;
+
+			if (CopyReadBinaryData(cstate, &dummy, 1) > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+						 errmsg("received copy data after EOF marker")));
+			return false;
+		}
+
+		if (fld_count != attr_count)
+			ereport(ERROR,
+					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
+					 errmsg("row field count is %d, expected %d",
+							(int) fld_count, attr_count)));
+
+		foreach(cur, cstate->attnumlist)
+		{
+			int			attnum = lfirst_int(cur);
+			int			m = attnum - 1;
+			Form_pg_attribute att = TupleDescAttr(tupDesc, m);
+
+			cstate->cur_attname = NameStr(att->attname);
+			values[m] = CopyReadBinaryAttribute(cstate,
+												&in_functions[m],
+												typioparams[m],
+												att->atttypmod,
+												&nulls[m]);
+			cstate->cur_attname = NULL;
+		}
+	}
+>>>>>>> 939dce21892 (yb changes)
 
 	/*
 	 * Now compute and insert any defaults available for the columns not

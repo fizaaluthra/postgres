@@ -81,6 +81,12 @@
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "access/xact.h"
+#include "common/pg_yb_common.h"
+#include "libpq/yb_pqcomm_extensions.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 /*
  * Cope with the various platform-specific ways to spell TCP keepalive socket
  * options.  This doesn't cover Windows, which as usual does its own thing.
@@ -114,15 +120,27 @@ static List *sock_paths = NIL;
  *
  * The receive buffer is fixed size. Send buffer is usually 8k, but can be
  * enlarged by pq_putmessage_noblock() if the message doesn't fit otherwise.
+ *
+ * YB: Send buffer is controlled by ysql_output_buffer_size pggate gflag.
  */
 
-#define PQ_SEND_BUFFER_SIZE 8192
 #define PQ_RECV_BUFFER_SIZE 8192
 
 static char *PqSendBuffer;
 static int	PqSendBufferSize;	/* Size send buffer */
+<<<<<<< HEAD
 static size_t PqSendPointer;	/* Next index to store a byte in PqSendBuffer */
 static size_t PqSendStart;		/* Next index to send a byte in PqSendBuffer */
+=======
+static int	PqSendPointer;		/* Next index to store a byte in PqSendBuffer */
+static int	PqSendStart;		/* Next index to send a byte in PqSendBuffer */
+static int	PqSendYbSavedBufPos;	/* Value of PqSendPointer to restore
+									 * during statement restart */
+static bool PqSendYbNonRestartableData; /* Indicates whether data sent to user
+										 * should be treated as preventing
+										 * transparent restarts. This should
+										 * be false e.g. for BEGIN statement. */
+>>>>>>> 939dce21892 (yb changes)
 
 static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
 static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
@@ -276,9 +294,11 @@ pq_init(ClientSocket *client_sock)
 	}
 
 	/* initialize state variables */
-	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
+	PqSendBufferSize = YBGetYsqlOutputBufferSize();
 	PqSendBuffer = MemoryContextAlloc(TopMemoryContext, PqSendBufferSize);
 	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
+	PqSendYbSavedBufPos = 0;
+	PqSendYbNonRestartableData = true;
 	PqCommBusy = false;
 	PqCommReadingMsg = false;
 
@@ -394,9 +414,46 @@ socket_close(int code, Datum arg)
 
 
 
+<<<<<<< HEAD
 /* --------------------------------
  * Postmaster functions to handle sockets.
  * --------------------------------
+=======
+/*
+ * yb_pqcomm_extensions.h
+ */
+
+/*
+ * Save current output buffer position, allowing for rollback if needed.
+ *
+ * sending_non_restartable_data controls whether internal_flush should mark data as sent.
+ * Disabling this is used specifically for BEGIN statement to not prevent transaction restart.
+ */
+void
+YBSaveOutputBufferPosition(bool sending_non_restartable_data)
+{
+	PqSendYbSavedBufPos = PqSendPointer;
+	PqSendYbNonRestartableData = sending_non_restartable_data;
+}
+
+/*
+ * Rollback output buffer to a previously saved position, discarding everything added after it.
+ * Should ONLY be called after YBSaveOutputBufferPosition.
+ */
+void
+YBRestoreOutputBufferPosition(void)
+{
+	PqSendPointer = PqSendYbSavedBufPos;
+}
+
+
+
+/*
+ * Streams -- wrapper around Unix socket system calls
+ *
+ *
+ *		Stream functions are used for vanilla TCP connection protocol.
+>>>>>>> 939dce21892 (yb changes)
  */
 
 /*
@@ -814,6 +871,108 @@ AcceptConnection(pgsocket server_fd, ClientSocket *client_sock)
 		return STATUS_ERROR;
 	}
 
+<<<<<<< HEAD
+=======
+	/* fill in the server (local) address */
+	port->laddr.salen = sizeof(port->laddr.addr);
+	if (getsockname(port->sock,
+					(struct sockaddr *) &port->laddr.addr,
+					&port->laddr.salen) < 0)
+	{
+		ereport(LOG,
+				(errmsg("%s() failed: %m", "getsockname")));
+		return STATUS_ERROR;
+	}
+
+	/* select NODELAY and KEEPALIVE options if it's a TCP connection */
+	if (port->laddr.addr.ss_family != AF_UNIX)
+	{
+		int			on;
+#ifdef WIN32
+		int			oldopt;
+		int			optlen;
+		int			newopt;
+#endif
+
+#ifdef	TCP_NODELAY
+		on = 1;
+		if (setsockopt(port->sock, IPPROTO_TCP, TCP_NODELAY,
+					   (char *) &on, sizeof(on)) < 0)
+		{
+			ereport(LOG,
+					(errmsg("%s(%s) failed: %m", "setsockopt", "TCP_NODELAY")));
+			return STATUS_ERROR;
+		}
+#endif
+		on = 1;
+		if (setsockopt(port->sock, SOL_SOCKET, SO_KEEPALIVE,
+					   (char *) &on, sizeof(on)) < 0)
+		{
+			ereport(LOG,
+					(errmsg("%s(%s) failed: %m", "setsockopt", "SO_KEEPALIVE")));
+			return STATUS_ERROR;
+		}
+
+#ifdef WIN32
+
+#define PQ_SEND_BUFFER_SIZE 8192
+
+		/*
+		 * This is a Win32 socket optimization.  The OS send buffer should be
+		 * large enough to send the whole Postgres send buffer in one go, or
+		 * performance suffers.  The Postgres send buffer can be enlarged if a
+		 * very large message needs to be sent, but we won't attempt to
+		 * enlarge the OS buffer if that happens, so somewhat arbitrarily
+		 * ensure that the OS buffer is at least PQ_SEND_BUFFER_SIZE * 4.
+		 * (That's 32kB with the current default).
+		 *
+		 * The default OS buffer size used to be 8kB in earlier Windows
+		 * versions, but was raised to 64kB in Windows 2012.  So it shouldn't
+		 * be necessary to change it in later versions anymore.  Changing it
+		 * unnecessarily can even reduce performance, because setting
+		 * SO_SNDBUF in the application disables the "dynamic send buffering"
+		 * feature that was introduced in Windows 7.  So before fiddling with
+		 * SO_SNDBUF, check if the current buffer size is already large enough
+		 * and only increase it if necessary.
+		 *
+		 * See https://support.microsoft.com/kb/823764/EN-US/ and
+		 * https://msdn.microsoft.com/en-us/library/bb736549%28v=vs.85%29.aspx
+		 */
+		optlen = sizeof(oldopt);
+		if (getsockopt(port->sock, SOL_SOCKET, SO_SNDBUF, (char *) &oldopt,
+					   &optlen) < 0)
+		{
+			ereport(LOG,
+					(errmsg("%s(%s) failed: %m", "getsockopt", "SO_SNDBUF")));
+			return STATUS_ERROR;
+		}
+		newopt = PQ_SEND_BUFFER_SIZE * 4;
+		if (oldopt < newopt)
+		{
+			if (setsockopt(port->sock, SOL_SOCKET, SO_SNDBUF, (char *) &newopt,
+						   sizeof(newopt)) < 0)
+			{
+				ereport(LOG,
+						(errmsg("%s(%s) failed: %m", "setsockopt", "SO_SNDBUF")));
+				return STATUS_ERROR;
+			}
+		}
+#endif
+
+		/*
+		 * Also apply the current keepalive parameters.  If we fail to set a
+		 * parameter, don't error out, because these aren't universally
+		 * supported.  (Note: you might think we need to reset the GUC
+		 * variables to 0 in such a case, but it's not necessary because the
+		 * show hooks for these variables report the truth anyway.)
+		 */
+		(void) pq_setkeepalivesidle(tcp_keepalives_idle, port);
+		(void) pq_setkeepalivesinterval(tcp_keepalives_interval, port);
+		(void) pq_setkeepalivescount(tcp_keepalives_count, port);
+		(void) pq_settcpusertimeout(tcp_user_timeout, port);
+	}
+
+>>>>>>> 939dce21892 (yb changes)
 	return STATUS_OK;
 }
 
@@ -978,17 +1137,29 @@ pq_getbyte(void)
  *	 Same as pq_getbyte() except we don't advance the pointer.
  * --------------------------------
  */
-int
-pq_peekbyte(void)
+static int
+pq_peekbyte_impl(void)
 {
-	Assert(PqCommReadingMsg);
-
 	while (PqRecvPointer >= PqRecvLength)
 	{
 		if (pq_recvbuf())		/* If nothing in buffer, then recv some */
 			return EOF;			/* Failed to recv data */
 	}
 	return (unsigned char) PqRecvBuffer[PqRecvPointer];
+}
+
+int
+pq_peekbyte(void)
+{
+	Assert(PqCommReadingMsg);
+
+	return pq_peekbyte_impl();
+}
+
+int
+yb_pq_peekbyte_no_msg_reading_status_check(void)
+{
+	return pq_peekbyte_impl();
 }
 
 /* --------------------------------
@@ -1348,6 +1519,7 @@ socket_flush(void)
 static inline int
 internal_flush(void)
 {
+<<<<<<< HEAD
 	return internal_flush_buffer(PqSendBuffer, &PqSendStart, &PqSendPointer);
 }
 
@@ -1361,6 +1533,13 @@ internal_flush(void)
 static pg_noinline int
 internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 {
+=======
+	if (PqSendYbNonRestartableData)
+	{
+		YBMarkDataSent();
+	}
+
+>>>>>>> 939dce21892 (yb changes)
 	static int	last_reported_send_errno = 0;
 
 	const char *bufptr = buf + *start;
@@ -1370,7 +1549,11 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 	{
 		int			r;
 
-		r = secure_write(MyProcPort, bufptr, bufend - bufptr);
+		/* YB: For compatibility reasons, cap at ysql_output_flush_size. */
+		int			yb_send_len = Min(bufend - bufptr,
+									  *YBCGetGFlags()->ysql_output_flush_size);
+
+		r = secure_write(MyProcPort, bufptr, yb_send_len);
 
 		if (r <= 0)
 		{
@@ -1410,7 +1593,12 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 			 * flag that'll cause the next CHECK_FOR_INTERRUPTS to terminate
 			 * the connection.
 			 */
+<<<<<<< HEAD
 			*start = *end = 0;
+=======
+			PqSendStart = PqSendPointer = 0;
+			PqSendYbSavedBufPos = 0;
+>>>>>>> 939dce21892 (yb changes)
 			ClientConnectionLost = 1;
 			InterruptPending = 1;
 			return EOF;
@@ -1421,7 +1609,12 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 		*start += r;
 	}
 
+<<<<<<< HEAD
 	*start = *end = 0;
+=======
+	PqSendStart = PqSendPointer = 0;
+	PqSendYbSavedBufPos = 0;
+>>>>>>> 939dce21892 (yb changes)
 	return 0;
 }
 

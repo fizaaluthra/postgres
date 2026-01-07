@@ -68,7 +68,11 @@ MAKE_SYSCACHE(DEFACLROLENSPOBJ, pg_default_acl_role_nsp_obj_index, 8);
 #define DEFACLOBJ_FUNCTION		'f' /* function */
 #define DEFACLOBJ_TYPE			'T' /* type */
 #define DEFACLOBJ_NAMESPACE		'n' /* namespace */
+<<<<<<< HEAD
 #define DEFACLOBJ_LARGEOBJECT	'L' /* large object */
+=======
+#define DEFACLOBJ_TABLEGROUP	'g' /* tablegroup */
+>>>>>>> 939dce21892 (yb changes)
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

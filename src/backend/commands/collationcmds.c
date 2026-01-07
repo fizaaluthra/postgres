@@ -37,6 +37,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 typedef struct
 {
@@ -347,6 +350,11 @@ DefineCollation(ParseState *pstate, List *names, List *parameters, bool if_not_e
 			check_encoding_locale_matches(collencoding, collcollate, collctype);
 		}
 	}
+
+	if (IsYugaByteEnabled() && !collisdeterministic)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("nondeterministic collation is not supported")));
 
 	if (!collversion)
 	{
@@ -887,7 +895,30 @@ pg_import_system_collations(PG_FUNCTION_ARGS)
 			}
 			localebuf[len - 1] = '\0';
 
+<<<<<<< HEAD
 			enc = create_collation_from_locale(localebuf, nspid, &nvalid, &ncreated);
+=======
+			/*
+			 * Some systems have locale names that don't consist entirely of
+			 * ASCII letters (such as "bokm&aring;l" or "fran&ccedil;ais").
+			 * This is pretty silly, since we need the locale itself to
+			 * interpret the non-ASCII characters. We can't do much with
+			 * those, so we filter them out.
+			 */
+			if (!pg_is_ascii(localebuf))
+			{
+				elog(DEBUG1, "skipping locale with non-ASCII name: \"%s\"", localebuf);
+				continue;
+			}
+
+			/*
+			 * For libc, Yugabyte only supports the basic locales.
+			 */
+			if (IsYugaByteEnabled() && !YBIsSupportedLibcLocale(localebuf))
+				continue;
+
+			enc = pg_get_encoding_from_locale(localebuf, false);
+>>>>>>> 939dce21892 (yb changes)
 			if (enc < 0)
 				continue;
 

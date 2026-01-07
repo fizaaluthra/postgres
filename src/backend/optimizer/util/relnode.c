@@ -40,6 +40,10 @@
 #include "utils/selfuncs.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "partitioning/partbounds.h"
+#include "pg_yb_utils.h"
+
 
 typedef struct JoinHashEntry
 {
@@ -110,6 +114,14 @@ setup_simple_rel_arrays(PlannerInfo *root)
 	int			size;
 	Index		rti;
 	ListCell   *lc;
+
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * In a new block so bump the block count.
+		 */
+		root->ybBlockId = ++(root->glob->ybBlockCnt);
+	}
 
 	/* Arrays are accessed using RT indexes (1..N) */
 	size = list_length(root->parse->rtable) + 1;
@@ -196,6 +208,29 @@ expand_planner_arrays(PlannerInfo *root, int add_size)
 			palloc0_array(AppendRelInfo *, new_size);
 
 	root->simple_rel_array_size = new_size;
+}
+
+/*
+ * See if the name pointed to by 'hintAlias' appears in the list.
+ */
+bool
+ybFindHintAlias(List *ybPlanHintsAliasMapping, char *hintAlias)
+{
+	ListCell   *lc;
+	bool		found = false;
+
+	foreach(lc, ybPlanHintsAliasMapping)
+	{
+		char	   *existingAlias = (char *) lfirst(lc);
+
+		if (existingAlias != NULL && strcmp(hintAlias, existingAlias) == 0)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	return found;
 }
 
 /*
@@ -304,6 +339,10 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->all_partrels = NULL;
 	rel->partexprs = NULL;
 	rel->nullable_partexprs = NULL;
+	rel->ybUniqueBaseId = 0;
+	rel->ybHintAlias = NULL;
+	rel->ybBlockId = 0;
+	rel->ybRoot = root;
 
 	/*
 	 * Pass assorted information down the inheritance hierarchy.
@@ -421,6 +460,109 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 		}
 	}
 
+<<<<<<< HEAD
+=======
+	/* Save the finished struct in the query's simple_rel_array */
+	root->simple_rel_array[relid] = rel;
+
+	if (IsYugaByteEnabled())
+	{
+		if (rte->ybHintAlias != NULL)
+		{
+			/*
+			 * This code path is taken when we have an INSERT, UPDATE, DELETE, or MERGE statement
+			 * and have already processed the target RTE (when PlannerGlobal instance was allocated
+			 * standard_planner()). Just place the information on 'rel'.
+			 */
+			rel->ybHintAlias = rte->ybHintAlias;
+			rel->ybBlockId = root->ybBlockId;
+			rel->ybUniqueBaseId = rte->ybUniqueBaseId;
+
+			if (yb_enable_planner_trace)
+			{
+				ereport(DEBUG1,
+						(errmsg("\nblock %d : table %s (unique base id = %d, relid = %d) -> Hint alias %s",
+								rel->ybBlockId, rte->eref->aliasname, rel->ybUniqueBaseId, relid, rel->ybHintAlias)));
+			}
+		}
+		else if (rte->eref != NULL && rte->eref->aliasname != NULL)
+		{
+			PlannerGlobal *glob = root->glob;
+
+			/*
+			 * Assign a unique id to the rel.
+			 */
+			rel->ybUniqueBaseId = ++(glob->ybBaseRelCnt);
+
+			/*
+			 * Start with the existing rel alias.
+			 */
+			char	   *hintAlias = rte->eref->aliasname;
+
+			int			aliasSuffix = 1;
+			StringInfo	buf = NULL;
+
+			/*
+			 * Loop as long as the alias is found in the global list (across all blocks).
+			 */
+			while (ybFindHintAlias(glob->ybPlanHintsAliasMapping, hintAlias))
+			{
+				if (buf == NULL)
+				{
+					buf = makeStringInfo();
+				}
+				else
+				{
+					resetStringInfo(buf);
+				}
+
+				/*
+				 * Append the next numeric suffix.
+				 */
+				appendStringInfoString(buf, rte->eref->aliasname);
+				appendStringInfoString(buf, "_");
+				appendStringInfo(buf, "%d", aliasSuffix);
+				hintAlias = pstrdup(buf->data);
+				++aliasSuffix;
+			}
+
+			if (buf != NULL)
+			{
+				pfree(buf->data);
+				pfree(buf);
+			}
+
+			if (glob->ybPlanHintsAliasMapping == NIL)
+			{
+				/*
+				 * Insert a NULL at position 0 since we start in position 1 for convenience and numbering/indexing
+				 * begins at 1 for relations when planning.
+				 */
+				glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, 0, NULL);
+			}
+
+			/*
+			 * Insert the alias we decided upon into the global list at position corresponding to rel's unique base relation id.
+			 */
+			glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, rel->ybUniqueBaseId, hintAlias);
+
+			/*
+			 * Store the info on the RTE and RelOptInfo.
+			 */
+			rte->ybHintAlias = hintAlias;
+			rel->ybHintAlias = hintAlias;
+			rel->ybBlockId = root->ybBlockId;
+
+			if (yb_enable_planner_trace)
+			{
+				ereport(DEBUG1,
+						(errmsg("\nblock %d : table %s (unique base id = %d, relid = %d) -> Hint alias %s",
+								rel->ybBlockId, rte->eref->aliasname, rel->ybUniqueBaseId, relid, rel->ybHintAlias)));
+			}
+		}
+	}
+
+>>>>>>> 939dce21892 (yb changes)
 	return rel;
 }
 
@@ -887,6 +1029,10 @@ build_join_rel(PlannerInfo *root,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
+	joinrel->ybUniqueBaseId = 0;
+	joinrel->ybHintAlias = NULL;
+	joinrel->ybBlockId = 0;
+	joinrel->ybRoot = root;
 
 	/* Compute information relevant to the foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -1075,6 +1221,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
+	joinrel->ybRoot = root;
 
 	/* Compute information relevant to foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -1612,6 +1759,10 @@ fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
 	upperrel->cheapest_startup_path = NULL;
 	upperrel->cheapest_total_path = NULL;
 	upperrel->cheapest_parameterized_paths = NIL;
+	upperrel->ybUniqueBaseId = 0;
+	upperrel->ybHintAlias = NULL;
+	upperrel->ybBlockId = 0;
+	upperrel->ybRoot = root;
 
 	root->upper_rels[kind] = lappend(root->upper_rels[kind], upperrel);
 
@@ -1674,6 +1825,7 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	Bitmapset  *pserials;
 	double		rows;
 	ListCell   *lc;
+	Relids		batchedrelids = root->yb_cur_batched_relids;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
 	Assert(bms_is_subset(baserel->lateral_relids, required_outer));
@@ -1684,9 +1836,22 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 
 	Assert(!bms_overlap(baserel->relids, required_outer));
 
-	/* If we already have a PPI for this parameterization, just return it */
-	if ((ppi = find_param_path_info(baserel, required_outer)))
-		return ppi;
+	if (IsYugaByteEnabled())
+	{
+		if ((ppi =
+			 yb_find_batched_param_path_info(baserel,
+											 required_outer,
+											 batchedrelids)))
+			return ppi;
+	}
+	else
+	{
+		/*
+		 * If we already have a PPI for this parameterization, just return it
+		 */
+		if ((ppi = find_param_path_info(baserel, required_outer)))
+			return ppi;
+	}
 
 	/*
 	 * Identify all joinclauses that are movable to this base rel given this
@@ -1735,15 +1900,40 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 		pserials = bms_add_member(pserials, rinfo->rinfo_serial);
 	}
 
-	/* Estimate the number of rows returned by the parameterized scan */
-	rows = get_parameterized_baserel_size(root, baserel, pclauses);
+	List	   *sel_clauses = pclauses;
 
+	if (!bms_is_empty(batchedrelids) && yb_enable_base_scans_cost_model)
+	{
+		List	   *new_pclauses = NIL;
+
+		foreach(lc, pclauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+			RestrictInfo *batched = yb_get_batched_restrictinfo(rinfo,
+																batchedrelids,
+																baserel->relids);
+
+			if (batched)
+				rinfo = batched;
+
+			new_pclauses = lappend(new_pclauses, rinfo);
+		}
+		sel_clauses = new_pclauses;
+	}
+
+	/* Estimate the number of rows returned by the parameterized scan */
+	rows = get_parameterized_baserel_size(root, baserel, sel_clauses);
 	/* And now we can build the ParamPathInfo */
 	ppi = makeNode(ParamPathInfo);
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
 	ppi->ppi_clauses = pclauses;
+<<<<<<< HEAD
 	ppi->ppi_serials = pserials;
+=======
+	ppi->yb_ppi_req_outer_batched = batchedrelids;
+
+>>>>>>> 939dce21892 (yb changes)
 	baserel->ppilist = lappend(baserel->ppilist, ppi);
 
 	return ppi;
@@ -1803,6 +1993,17 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 		return NULL;
 
 	Assert(!bms_overlap(joinrel->relids, required_outer));
+
+	/* YB: Compute batched and unbatched relids. */
+	Relids		req_batchedids = bms_union(YB_PATH_REQ_OUTER_BATCHED(outer_path),
+										   YB_PATH_REQ_OUTER_BATCHED(inner_path));
+
+	Relids		req_unbatchedids = bms_union(YB_PATH_REQ_OUTER_UNBATCHED(outer_path),
+											 YB_PATH_REQ_OUTER_UNBATCHED(inner_path));
+
+	req_batchedids = bms_difference(req_batchedids,
+									req_unbatchedids);
+	req_batchedids = bms_difference(req_batchedids, outer_path->parent->relids);
 
 	/*
 	 * Identify all joinclauses that are movable to this join rel given this
@@ -1929,6 +2130,42 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 		}
 	}
 
+	if (IsYugaByteEnabled() && !bms_is_empty(req_batchedids))
+	{
+		/*
+		 * YB: TODO: This can be omitted if we allow join filters to be batched
+		 * IN clauses. Consider a join for (X (Y Z)) with a filter Fxy between
+		 * X and Y. If this filter is applied at the lower join then batching
+		 * X becomes impossible if Fxy is not converted into an IN clause.
+		 * This same logic can be applied to any mergejoinable qpqual within
+		 * a batched join context.
+		 */
+		foreach(lc, pclauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			/*
+			 * YB: If outer/inner path has a relevant pclause that requires
+			 * external relids that are not in
+			 * outer/inner_batchedrelids
+			 * then those external relids need to be unbatched.
+			 */
+			if (bms_is_subset(rinfo->clause_relids, joinrel->relids))
+				continue;
+
+			if (bms_overlap(rinfo->clause_relids, req_batchedids))
+			{
+				Relids		unbatched_ext_rels = bms_difference(rinfo->clause_relids,
+																joinrel->relids);
+
+				req_unbatchedids =
+					bms_union(req_unbatchedids, unbatched_ext_rels);
+			}
+		}
+	}
+
+	req_batchedids = bms_difference(req_batchedids, req_unbatchedids);
+
 	/*
 	 * Now, attach the identified moved-down clauses to the caller's
 	 * restrict_clauses list.  By using list_concat in this order, we leave
@@ -1937,7 +2174,9 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	*restrict_clauses = list_concat(pclauses, *restrict_clauses);
 
 	/* If we already have a PPI for this parameterization, just return it */
-	if ((ppi = find_param_path_info(joinrel, required_outer)))
+	if ((ppi = yb_find_batched_param_path_info(joinrel,
+											   required_outer,
+											   req_batchedids)))
 		return ppi;
 
 	/* Estimate the number of rows returned by the parameterized join */
@@ -1958,10 +2197,38 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	ppi->ppi_req_outer = required_outer;
 	ppi->ppi_rows = rows;
 	ppi->ppi_clauses = NIL;
+<<<<<<< HEAD
 	ppi->ppi_serials = NULL;
+=======
+
+	ppi->yb_ppi_req_outer_batched = req_batchedids;
+
+>>>>>>> 939dce21892 (yb changes)
 	joinrel->ppilist = lappend(joinrel->ppilist, ppi);
 
 	return ppi;
+}
+
+bool
+yb_has_same_batching_reqs(List *paths)
+{
+	Path	   *first_path = (Path *) linitial(paths);
+	Relids		first_req_outer_batch = YB_PATH_REQ_OUTER_BATCHED(first_path);
+	Relids		first_req_outer = PATH_REQ_OUTER(first_path);
+	ListCell   *lc;
+
+	foreach(lc, paths)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (!bms_equal(first_req_outer_batch, YB_PATH_REQ_OUTER_BATCHED(path)))
+			return false;
+
+		if (!bms_equal(first_req_outer, PATH_REQ_OUTER(path)))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -2001,6 +2268,25 @@ get_appendrel_parampathinfo(RelOptInfo *appendrel, Relids required_outer)
 	appendrel->ppilist = lappend(appendrel->ppilist, ppi);
 
 	return ppi;
+}
+
+ParamPathInfo *
+yb_find_batched_param_path_info(RelOptInfo *rel, Relids required_outer,
+								Relids yb_required_batched_outer)
+{
+	ListCell   *lc;
+
+	foreach(lc, rel->ppilist)
+	{
+		ParamPathInfo *ppi = (ParamPathInfo *) lfirst(lc);
+
+		if (bms_equal(ppi->ppi_req_outer, required_outer) &&
+			bms_equal(ppi->yb_ppi_req_outer_batched,
+					  yb_required_batched_outer))
+			return ppi;
+	}
+
+	return NULL;
 }
 
 /*

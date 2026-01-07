@@ -66,6 +66,10 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "commands/yb_tablegroup.h"
+#include "pg_yb_utils.h"
+
 static Oid	AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid);
 
 /*
@@ -372,6 +376,10 @@ AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
 ObjectAddress
 ExecRenameStmt(RenameStmt *stmt)
 {
+	if (IsYugaByteEnabled() && stmt->relation &&
+		YbIsRangeVarTempRelation(stmt->relation))
+		YBCRecordTempRelationDDL();
+
 	switch (stmt->renameType)
 	{
 		case OBJECT_TABCONSTRAINT:
@@ -387,6 +395,9 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_SCHEMA:
 			return RenameSchema(stmt->subname, stmt->newname);
 
+		case OBJECT_YBTABLEGROUP:
+			return RenameTablegroup(stmt->subname, stmt->newname);
+
 		case OBJECT_TABLESPACE:
 			return RenameTableSpace(stmt->subname, stmt->newname);
 
@@ -396,7 +407,7 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_MATVIEW:
 		case OBJECT_INDEX:
 		case OBJECT_FOREIGN_TABLE:
-			return RenameRelation(stmt);
+			return RenameRelation(stmt, false /* yb_is_internal_clone_rename */ );
 
 		case OBJECT_COLUMN:
 		case OBJECT_ATTRIBUTE:
@@ -416,13 +427,15 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_TYPE:
 			return RenameType(stmt);
 
+		case OBJECT_FUNCTION:
+			return RenameFunction(stmt, stmt->newname);
+
 		case OBJECT_AGGREGATE:
 		case OBJECT_COLLATION:
 		case OBJECT_CONVERSION:
 		case OBJECT_EVENT_TRIGGER:
 		case OBJECT_FDW:
 		case OBJECT_FOREIGN_SERVER:
-		case OBJECT_FUNCTION:
 		case OBJECT_OPCLASS:
 		case OBJECT_OPFAMILY:
 		case OBJECT_LANGUAGE:
@@ -669,7 +682,40 @@ AlterObjectNamespace_oid(Oid classId, Oid objid, Oid nspOid,
 			}
 			break;
 
+<<<<<<< HEAD
 		default:
+=======
+		case OCLASS_CAST:
+		case OCLASS_CONSTRAINT:
+		case OCLASS_DEFAULT:
+		case OCLASS_LANGUAGE:
+		case OCLASS_LARGEOBJECT:
+		case OCLASS_AM:
+		case OCLASS_AMOP:
+		case OCLASS_AMPROC:
+		case OCLASS_REWRITE:
+		case OCLASS_TRIGGER:
+		case OCLASS_SCHEMA:
+		case OCLASS_ROLE:
+		case OCLASS_DATABASE:
+		case OCLASS_YBTBLGROUP:
+		case OCLASS_TBLSPACE:
+		case OCLASS_FDW:
+		case OCLASS_FOREIGN_SERVER:
+		case OCLASS_USER_MAPPING:
+		case OCLASS_DEFACL:
+		case OCLASS_EXTENSION:
+		case OCLASS_EVENT_TRIGGER:
+		case OCLASS_PARAMETER_ACL:
+		case OCLASS_POLICY:
+		case OCLASS_PUBLICATION:
+		case OCLASS_PUBLICATION_NAMESPACE:
+		case OCLASS_PUBLICATION_REL:
+		case OCLASS_SUBSCRIPTION:
+		case OCLASS_TRANSFORM:
+		case OCLASS_YBPROFILE:
+		case OCLASS_YBROLE_PROFILE:
+>>>>>>> 939dce21892 (yb changes)
 			/* ignore object types that don't have schema-qualified names */
 			Assert(get_object_attnum_namespace(classId) == InvalidAttrNumber);
 	}
@@ -871,11 +917,17 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			return AlterSubscriptionOwner(strVal(stmt->object),
 										  newowner);
 
+		case OBJECT_YBTABLEGROUP:
+			return AlterTablegroupOwner(strVal(stmt->object),
+										newowner);
+
+		case OBJECT_FUNCTION:
+			return AlterFunctionOwner(stmt, newowner);
+
 			/* Generic cases */
 		case OBJECT_AGGREGATE:
 		case OBJECT_COLLATION:
 		case OBJECT_CONVERSION:
-		case OBJECT_FUNCTION:
 		case OBJECT_LANGUAGE:
 		case OBJECT_LARGEOBJECT:
 		case OBJECT_OPERATOR:
