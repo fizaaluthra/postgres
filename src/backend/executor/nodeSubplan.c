@@ -64,6 +64,7 @@ ExecSubPlan(SubPlanState *node,
 	EState	   *estate = node->planstate->state;
 	ScanDirection dir = estate->es_direction;
 	Datum		retval;
+	YbcPgExecParameters yb_params = estate->yb_exec_params;
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -87,6 +88,9 @@ ExecSubPlan(SubPlanState *node,
 
 	/* restore scan direction */
 	estate->es_direction = dir;
+
+	/* YB: Restore yb exec params */
+	estate->yb_exec_params = yb_params;
 
 	return retval;
 }
@@ -150,10 +154,23 @@ ExecHashSubPlan(SubPlanState *node,
 			FindTupleHashEntry(node->hashtable,
 							   slot,
 							   node->cur_eq_comp,
+<<<<<<< HEAD
 							   node->lhs_hash_expr) != NULL)
 			result = true;
 		else if (node->havenullrows &&
 				 findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
+=======
+							   node->lhs_hash_funcs,
+							   node->hashtable->keyColIdx) != NULL)
+		{
+			ExecClearTuple(slot);
+			return BoolGetDatum(true);
+		}
+		if (node->havenullrows &&
+			findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
+		{
+			ExecClearTuple(slot);
+>>>>>>> bc662ba7050
 			*isNull = true;
 	}
 
@@ -1140,6 +1157,8 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	 * Enforce forward scan direction regardless of caller. It's hard but not
 	 * impossible to get here in backward scan, so make it work anyway.
 	 */
+	YbcPgExecParameters yb_params = estate->yb_exec_params;
+
 	estate->es_direction = ForwardScanDirection;
 
 	/* Initialize ArrayBuildStateAny in caller's context, if needed */
@@ -1277,6 +1296,9 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 
 	/* restore scan direction */
 	estate->es_direction = dir;
+
+	/* YB: Restore yb exec params */
+	estate->yb_exec_params = yb_params;
 }
 
 /*

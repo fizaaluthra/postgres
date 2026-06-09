@@ -48,6 +48,10 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+
 typedef struct
 {
 	DestReceiver pub;			/* publicly-known function pointers */
@@ -113,23 +117,27 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	 */
 	intoRelationAddr = DefineRelation(create, relkind, InvalidOid, NULL, NULL);
 
-	/*
-	 * If necessary, create a TOAST table for the target table.  Note that
-	 * NewRelationCreateToastTable ends with CommandCounterIncrement(), so
-	 * that the TOAST table will be visible for insertion.
-	 */
-	CommandCounterIncrement();
+	/* TOAST tables are not needed in YugaByte database */
+	if (!IsYugaByteEnabled())
+	{
+		/*
+		 * If necessary, create a TOAST table for the target table.  Note that
+		 * NewRelationCreateToastTable ends with CommandCounterIncrement(), so
+		 * that the TOAST table will be visible for insertion.
+		 */
+		CommandCounterIncrement();
 
-	/* parse and validate reloptions for the toast table */
-	toast_options = transformRelOptions((Datum) 0,
-										create->options,
-										"toast",
-										validnsps,
-										true, false);
+		/* parse and validate reloptions for the toast table */
+		toast_options = transformRelOptions((Datum) 0,
+											create->options,
+											"toast",
+											validnsps,
+											true, false);
 
-	(void) heap_reloptions(RELKIND_TOASTVALUE, toast_options, true);
+		(void) heap_reloptions(RELKIND_TOASTVALUE, toast_options, true);
 
-	NewRelationCreateToastTable(intoRelationAddr.objectId, toast_options);
+		NewRelationCreateToastTable(intoRelationAddr.objectId, toast_options);
+	}
 
 	/* Create the "view" part of a materialized view. */
 	if (is_matview)
@@ -277,7 +285,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		into->skipData = true;
 	}
 
-	if (into->skipData)
+	if (into->skipData || yb_xcluster_automatic_mode_target_ddl)
 	{
 		/*
 		 * If WITH NO DATA was specified, do not go through the rewriter,
@@ -286,6 +294,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		 * from running the planner before all dependencies are set up.
 		 */
 		address = create_ctas_nodata(query->targetList, into);
+<<<<<<< HEAD
 
 		/*
 		 * For materialized views, reuse the REFRESH logic, which locks down
@@ -296,6 +305,20 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 			RefreshMatViewByOid(address.objectId, true, false, false,
 								pstate->p_sourcetext, qc);
 
+=======
+		if (is_matview && yb_xcluster_automatic_mode_target_ddl)
+		{
+			/*
+			 * For automatic mode xCluster the data is replicated to the
+			 * target, so we need to mark the relation as populated.
+			 */
+			Relation intoRelationDesc =
+				table_open(address.objectId, AccessExclusiveLock);
+			SetMatViewPopulatedState(intoRelationDesc, true,
+									 /* yb_in_place_refresh= */ false);
+			table_close(intoRelationDesc, AccessExclusiveLock);
+		}
+>>>>>>> bc662ba7050
 	}
 	else
 	{
@@ -550,7 +573,8 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 * going to fill it; otherwise, no change needed.
 	 */
 	if (is_matview && !into->skipData)
-		SetMatViewPopulatedState(intoRelationDesc, true);
+		SetMatViewPopulatedState(intoRelationDesc, true,
+								 false /* yb_in_place_refresh */ );
 
 	/*
 	 * Fill private fields of myState for use by later routines
@@ -588,18 +612,36 @@ intorel_receive(TupleTableSlot *slot, DestReceiver *self)
 	if (!myState->into->skipData)
 	{
 		/*
-		 * Note that the input slot might not be of the type of the target
-		 * relation. That's supported by table_tuple_insert(), but slightly
-		 * less efficient than inserting with the right slot - but the
-		 * alternative would be to copy into a slot of the right type, which
-		 * would not be cheap either. This also doesn't allow accessing per-AM
-		 * data (say a tuple's xmin), but since we don't do that here...
+		 * YB: if we are creating and inserting into a temporary table,
+		 * we must use PG transaction codepaths as well
 		 */
-		table_tuple_insert(myState->rel,
-						   slot,
-						   myState->output_cid,
-						   myState->ti_options,
-						   myState->bistate);
+		if (myState->rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+			IsYugaByteEnabled())
+			YbSetTxnUsesTempRel();
+
+		if (IsYBRelation(myState->rel))
+		{
+			/* Update the tuple with table oid */
+			slot->tts_tableOid = RelationGetRelid(myState->rel);
+
+			YBCExecuteInsert(myState->rel,
+							 slot,
+							 ONCONFLICT_NONE);
+		}
+		else
+			/*
+			 * Note that the input slot might not be of the type of the target
+			 * relation. That's supported by table_tuple_insert(), but slightly
+			 * less efficient than inserting with the right slot - but the
+			 * alternative would be to copy into a slot of the right type, which
+			 * would not be cheap either. This also doesn't allow accessing per-AM
+			 * data (say a tuple's xmin), but since we don't do that here...
+			 */
+			table_tuple_insert(myState->rel,
+							   slot,
+							   myState->output_cid,
+							   myState->ti_options,
+							   myState->bistate);
 	}
 
 	/* We know this is a newly created relation, so there are no indexes */

@@ -1395,12 +1395,18 @@ gethms(char const *string, char const *errstring)
 			break;
 		case 8:
 			ok = '0' <= xr && xr <= '9';
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* fallthrough */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case 7:
 			ok &= ssx == '.';
 			if (ok && noise)
 				warning(_("fractional seconds rejected by"
 						  " pre-2018 versions of zic"));
+<<<<<<< HEAD
 			pg_fallthrough;
 		case 5:
 			ok &= mmx == ':';
@@ -1408,6 +1414,18 @@ gethms(char const *string, char const *errstring)
 		case 3:
 			ok &= hhx == ':';
 			pg_fallthrough;
+=======
+			/* fallthrough */
+			yb_switch_fallthrough();
+		case 5:
+			ok &= mmx == ':';
+			/* fallthrough */
+			yb_switch_fallthrough();
+		case 3:
+			ok &= hhx == ':';
+			/* fallthrough */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case 1:
 			break;
 	}

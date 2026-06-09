@@ -23,7 +23,11 @@
 #include "varatt.h"
 
 /* GUC */
+<<<<<<< HEAD
 int			default_toast_compression = DEFAULT_TOAST_COMPRESSION;
+=======
+int			default_toast_compression = TOAST_LZ4_COMPRESSION;
+>>>>>>> bc662ba7050
 
 #define NO_COMPRESSION_SUPPORT(method) \
 	ereport(ERROR, \
@@ -43,7 +47,7 @@ pglz_compress_datum(const varlena *value)
 				len;
 	varlena    *tmp = NULL;
 
-	valsize = VARSIZE_ANY_EXHDR(value);
+	valsize = VARSIZE_ANY_EXHDR(DatumGetPointer(value));
 
 	/*
 	 * No point in wasting a palloc cycle if value size is outside the allowed

@@ -29,6 +29,9 @@
 #include "utils/relcache.h"
 #include "utils/reltrigger.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 /*
  * LockRelId and LockInfo really belong to lmgr.h, but it's more convenient
@@ -253,6 +256,23 @@ typedef struct RelationData
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
 	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
+
+	/* YB */
+	YbcTableProperties yb_table_properties; /* NULL if not loaded */
+	/* contains all except yb system primary keys of the relation. */
+	Bitmapset  *primary_key_bms;	/* NULL if not initialized */
+	/* contains all primary keys of the relation, including yb system columns. */
+	Bitmapset  *full_primary_key_bms;	/* NULL if not initialized */
+	bool belongs_to_yb_system_db;		/* true for relations in the yb_system
+										 * db which are accessible by all databases.
+										 * When this relation is accessed by a db
+										 * other than yb_system, the Relation object
+										 * needs to be manually created (it is not
+										 * part of relcache). While doing so, this
+										 * field should be set to true (for example,
+										 * see ybNotificationsRel()). For all other
+										 * cases, this field should be false.
+										 */
 } RelationData;
 
 
@@ -275,6 +295,7 @@ typedef struct ForeignKeyCacheInfo
 	pg_node_attr(no_equal, no_read, no_query_jumble)
 
 	NodeTag		type;
+<<<<<<< HEAD
 	/* oid of the constraint itself */
 	Oid			conoid;
 	/* relation constrained by the foreign key */
@@ -296,6 +317,17 @@ typedef struct ForeignKeyCacheInfo
 	AttrNumber	confkey[INDEX_MAX_KEYS] pg_node_attr(array_size(nkeys));
 	/* PK = FK operator OIDs */
 	Oid			conpfeqop[INDEX_MAX_KEYS] pg_node_attr(array_size(nkeys));
+=======
+	Oid			conoid;			/* oid of the constraint itself */
+	Oid			conrelid;		/* relation constrained by the foreign key */
+	Oid			confrelid;		/* relation referenced by the foreign key */
+	int			nkeys;			/* number of columns in the foreign key */
+	Oid			ybconindid;		/* oid of index supporting the FK constraint */
+	/* these arrays each have nkeys valid entries: */
+	AttrNumber	conkey[INDEX_MAX_KEYS]; /* cols in referencing table */
+	AttrNumber	confkey[INDEX_MAX_KEYS];	/* cols in referenced table */
+	Oid			conpfeqop[INDEX_MAX_KEYS];	/* PK = FK operator OIDs */
+>>>>>>> bc662ba7050
 } ForeignKeyCacheInfo;
 
 
@@ -349,6 +381,7 @@ typedef struct StdRdOptions
 	bool		user_catalog_table; /* use as an additional catalog relation */
 	int			parallel_workers;	/* max number of parallel workers */
 	StdRdOptIndexCleanup vacuum_index_cleanup;	/* controls index vacuuming */
+<<<<<<< HEAD
 	pg_ternary	vacuum_truncate;	/* enables vacuum to truncate a relation */
 
 	/*
@@ -356,6 +389,16 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+=======
+	bool		vacuum_truncate;	/* enables vacuum to truncate a relation */
+
+	/* YB additions. */
+	bool		colocated;
+	Oid			tablegroup_oid;
+	Oid			colocation_id;
+	Oid			table_oid;
+	Oid			row_type_oid;
+>>>>>>> bc662ba7050
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -420,6 +463,25 @@ typedef enum ViewOptCheckOption
 } ViewOptCheckOption;
 
 /*
+ * RelationGetColocated
+ *		Returns the relation's colocated reloption setting.
+ *		Note multiple eval of argument!
+ */
+#define RelationGetColocated(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->colocated : false)
+
+/*
+ * RelationGetTableOid
+ *		Returns the relation's table_oid reloption setting.
+ *		Note multiple eval of argument!
+ */
+#define RelationGetTableOid(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->table_oid : 0)
+
+
+/*
  * ViewOptions
  *		Contents of rd_options for views
  */
@@ -429,6 +491,9 @@ typedef struct ViewOptions
 	bool		security_barrier;
 	bool		security_invoker;
 	ViewOptCheckOption check_option;
+
+	bool		yb_use_initdb_acl;	/* initialize with default initdb-like
+									 * permissions */
 } ViewOptions;
 
 /*
@@ -718,5 +783,18 @@ RelationCloseSmgr(Relation relation)
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
+
+/*
+ * YbParitionedTableOptions
+ *		Contents of rd_options for partitioned tables.
+ */
+typedef struct YbParitionedTableOptions
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+
+	/* YB additions. */
+	Oid			colocation_id;
+	bool		colocation;
+} YbParitionedTableOptions;
 
 #endif							/* REL_H */

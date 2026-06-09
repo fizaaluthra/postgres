@@ -37,6 +37,9 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "catalog/pg_yb_catalog_version_d.h"
+
 
 static bool tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
 						 TypeCacheEntry **eq, Bitmapset *columns);
@@ -840,7 +843,7 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 
 		/* Check the constraints of the tuple */
 		if (rel->rd_att->constr)
-			ExecConstraints(resultRelInfo, slot, estate);
+			ExecConstraints(resultRelInfo, slot, estate, NULL /* mtstate */ );
 		if (rel->rd_rel->relispartition)
 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
 
@@ -944,7 +947,7 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 
 		/* Check the constraints of the tuple */
 		if (rel->rd_att->constr)
-			ExecConstraints(resultRelInfo, slot, estate);
+			ExecConstraints(resultRelInfo, slot, estate, NULL /* mtstate */ );
 		if (rel->rd_rel->relispartition)
 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
 
@@ -1108,6 +1111,27 @@ CheckCmdReplicaIdentity(Relation rel, CmdType cmd)
 
 	/* REPLICA IDENTITY FULL is also good for UPDATE/DELETE. */
 	if (rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+		return;
+
+	/* YB: YB_REPLICA_IDENTITY_CHANGE is also good. */
+	if (IsYugaByteEnabled() && rel->rd_rel->relreplident == YB_REPLICA_IDENTITY_CHANGE)
+		return;
+
+	/*
+	 * YB: In per-database catalog version mode at the end of a global-impact
+	 * DDL statement, we internally call yb_increment_all_db_catalog_versions
+	 * which sets yb_non_ddl_txn_for_sys_tables_allowed to true in order to
+	 * update pg_yb_catalog_version table. More generally, a user may want
+	 * to manually set yb_non_ddl_txn_for_sys_tables_allowed to true and then
+	 * perform an update on pg_yb_catalog_version table to force catalog cache
+	 * refresh.
+	 * NOTE: we may need to allow more system tables in YB context.
+	 *
+	 * TODO(#20143): Revisit if and when we introduce support for replica
+	 * identity, to identify how REPLICA_IDENTITY_NOTHING is handled here.
+	 */
+	if (IsYugaByteEnabled() &&
+		yb_non_ddl_txn_for_sys_tables_allowed)
 		return;
 
 	/*

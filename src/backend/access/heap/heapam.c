@@ -56,6 +56,12 @@
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+#include "utils/builtins.h"
+
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, uint32 options);
@@ -111,7 +117,6 @@ static int	bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
 static HeapTuple ExtractReplicaIdentity(Relation relation, HeapTuple tp, bool key_required,
 										bool *copy);
-
 
 /*
  * This table lists the heavyweight lock mode that corresponds to each tuple
@@ -378,6 +383,8 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 		bpscan = (ParallelBlockTableScanDesc) scan->rs_base.rs_parallel;
 		scan->rs_nblocks = bpscan->phs_nblocks;
 	}
+	else if (RelationGetForm(scan->rs_base.rs_rd)->relkind == RELKIND_SEQUENCE)
+		scan->rs_nblocks = 1;
 	else
 		scan->rs_nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
 
@@ -463,6 +470,7 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	scan->rs_inited = false;
 	scan->rs_ctup.t_data = NULL;
 	ItemPointerSetInvalid(&scan->rs_ctup.t_self);
+	HEAPTUPLE_YBCTID(&scan->rs_ctup) = (Datum) 0;
 	scan->rs_cbuf = InvalidBuffer;
 	scan->rs_cblock = InvalidBlockNumber;
 	scan->rs_ntuples = 0;
@@ -1172,6 +1180,15 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	HeapScanDesc scan;
 
 	/*
+	 * YB scan methods should only be used for tables that are handled by
+	 * YugaByte.
+	 */
+	if (IsYBRelation(relation))
+	{
+		return ybc_heap_beginscan(relation, snapshot, nkeys, key, flags);
+	}
+
+	/*
 	 * increment relation ref count while scanning relation
 	 *
 	 * This is just to make really sure the relcache entry won't go away while
@@ -1389,6 +1406,11 @@ heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 void
 heap_endscan(TableScanDesc sscan)
 {
+	if (IsYBRelation(sscan->rs_rd))
+	{
+		return ybc_heap_endscan(sscan);
+	}
+
 	HeapScanDesc scan = (HeapScanDesc) sscan;
 
 	/* Note: no locking manipulations needed */
@@ -1434,6 +1456,11 @@ heap_endscan(TableScanDesc sscan)
 HeapTuple
 heap_getnext(TableScanDesc sscan, ScanDirection direction)
 {
+	if (IsYBRelation(sscan->rs_rd))
+	{
+		return ybc_heap_getnext(sscan);
+	}
+
 	HeapScanDesc scan = (HeapScanDesc) sscan;
 
 	/*
@@ -1473,6 +1500,19 @@ heap_getnext(TableScanDesc sscan, ScanDirection direction)
 bool
 heap_getnextslot(TableScanDesc sscan, ScanDirection direction, TupleTableSlot *slot)
 {
+	if (IsYBRelation(sscan->rs_rd))
+	{
+		HeapTuple	tuple = ybc_heap_getnext(sscan);
+
+		if (!tuple)
+		{
+			ExecClearTuple(slot);
+			return false;
+		}
+		ExecStoreHeapTuple(tuple, slot, false /* shouldFree */ );
+		return true;
+	}
+
 	HeapScanDesc scan = (HeapScanDesc) sscan;
 
 	/* Note: no locking manipulations needed */
@@ -2011,6 +2051,12 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		all_visible_cleared = false;
 
+	if (IsYBRelation(relation))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("operation not allowed in Yugabyte mode %s",
+						__func__)));
+
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
 		   RelationGetNumberOfAttributes(relation));
@@ -2296,6 +2342,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		starting_with_empty_page = false;
 	int			npages = 0;
 	int			npages_used = 0;
+
+	if (IsYBRelation(relation))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("operation not allowed in Yugabyte mode")));
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -2736,6 +2787,13 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	bool		all_visible_cleared = false;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
+
+	if (IsYBRelation(relation))
+	{
+		YBC_LOG_WARNING("Ignoring unsupported tuple delete for rel %s",
+						RelationGetRelationName(relation));
+		return TM_Ok;			/* HeapTupleMayBeUpdated; */
+	}
 
 	Assert(ItemPointerIsValid(tid));
 
@@ -4578,6 +4636,12 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	tuple->t_len = ItemIdGetLength(lp);
 	tuple->t_tableOid = RelationGetRelid(relation);
+
+	/*
+	 * This will only be used for non-YB tuples (e.g. Temp tables) so we just
+	 * need to set the ybctid to 0 (NULL) here.
+	 */
+	HEAPTUPLE_YBCTID(tuple) = (Datum) 0;
 
 l3:
 	result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
@@ -6612,7 +6676,129 @@ heap_inplace_unlock(Relation relation,
 {
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	UnlockTuple(relation, &oldtup->t_self, InplaceUpdateTupleLock);
+<<<<<<< HEAD
 	ForgetInplace_Inval();
+=======
+}
+
+/*
+ * heap_inplace_update - deprecated
+ *
+ * This exists only to keep modules working in back branches.  Affected
+ * modules should migrate to systable_inplace_update_begin().
+ *
+ * If yb_shared_update is specified, this update will be done in every
+ * database (including template0 and template1). Such operation will assume
+ * the tuple is exactly the same in all databases.
+ * This is needed when creating shared relations.
+ * This flag should not be used during initdb bootstrap.
+ */
+void
+heap_inplace_update(Relation relation, HeapTuple tuple, bool yb_shared_update)
+{
+	Buffer		buffer;
+	Page		page;
+	OffsetNumber offnum;
+	ItemId		lp = NULL;
+	HeapTupleHeader htup;
+	uint32		oldlen;
+	uint32		newlen;
+
+	if (IsYBRelation(relation))
+	{
+		if (yb_shared_update)
+		{
+			if (!IsYsqlUpgrade)
+				elog(ERROR, "shared update cannot be done outside of YSQL upgrade");
+
+			YB_FOR_EACH_DB(pg_db_tuple)
+			{
+				Oid			dboid = ((Form_pg_database) GETSTRUCT(pg_db_tuple))->oid;
+
+				/* YB doesn't use PG locks so it's okay not to take them. */
+				YBCUpdateSysCatalogTupleForDb(dboid, relation, NULL /* oldtuple */ , tuple);
+			}
+			YB_FOR_EACH_DB_END;
+		}
+		else
+		{
+			YBCUpdateSysCatalogTuple(relation, NULL /* oldtuple */ , tuple);
+		}
+		return;
+	}
+
+	/*
+	 * For now, we don't allow parallel updates.  Unlike a regular update,
+	 * this should never create a combo CID, so it might be possible to relax
+	 * this restriction, but not without more thought and testing.  It's not
+	 * clear that it would be useful, anyway.
+	 */
+	if (IsInParallelMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot update tuples during a parallel operation")));
+
+	buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(&(tuple->t_self)));
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = (Page) BufferGetPage(buffer);
+
+	offnum = ItemPointerGetOffsetNumber(&(tuple->t_self));
+	if (PageGetMaxOffsetNumber(page) >= offnum)
+		lp = PageGetItemId(page, offnum);
+
+	if (PageGetMaxOffsetNumber(page) < offnum || !ItemIdIsNormal(lp))
+		elog(ERROR, "invalid lp");
+
+	htup = (HeapTupleHeader) PageGetItem(page, lp);
+
+	oldlen = ItemIdGetLength(lp) - htup->t_hoff;
+	newlen = tuple->t_len - tuple->t_data->t_hoff;
+	if (oldlen != newlen || htup->t_hoff != tuple->t_data->t_hoff)
+		elog(ERROR, "wrong tuple length");
+
+	/* NO EREPORT(ERROR) from here till changes are logged */
+	START_CRIT_SECTION();
+
+	memcpy((char *) htup + htup->t_hoff,
+		   (char *) tuple->t_data + tuple->t_data->t_hoff,
+		   newlen);
+
+	MarkBufferDirty(buffer);
+
+	/* XLOG stuff */
+	if (RelationNeedsWAL(relation))
+	{
+		xl_heap_inplace xlrec;
+		XLogRecPtr	recptr;
+
+		xlrec.offnum = ItemPointerGetOffsetNumber(&tuple->t_self);
+
+		XLogBeginInsert();
+		XLogRegisterData((char *) &xlrec, SizeOfHeapInplace);
+
+		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+		XLogRegisterBufData(0, (char *) htup + htup->t_hoff, newlen);
+
+		/* inplace updates aren't decoded atm, don't log the origin */
+
+		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_INPLACE);
+
+		PageSetLSN(page, recptr);
+	}
+
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buffer);
+
+	/*
+	 * Send out shared cache inval if necessary.  Note that because we only
+	 * pass the new version of the tuple, this mustn't be used for any
+	 * operations that could change catcache lookup keys.  But we aren't
+	 * bothering with index updates either, so that's true a fortiori.
+	 */
+	if (!IsBootstrapProcessingMode())
+		CacheInvalidateHeapTuple(relation, tuple, NULL);
+>>>>>>> bc662ba7050
 }
 
 #define		FRM_NOOP				0x0001

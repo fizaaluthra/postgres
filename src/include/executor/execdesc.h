@@ -53,8 +53,20 @@ typedef struct QueryDesc
 	/* This field is set by ExecutePlan */
 	bool		already_executed;	/* true if previously executed */
 
+<<<<<<< HEAD
 	/* This field is allocated by ExecutorStart if needed */
 	struct Instrumentation *query_instr;	/* query level instrumentation */
+=======
+	/* This is always set NULL by the core system, but plugins can change it */
+	struct Instrumentation *totaltime;	/* total time spent in ExecutorRun */
+
+	/*
+	 * YB: An additional instrumentation field to collect async RPC stats. This
+	 * needs to be a separate field because its life cycle is distinct from
+	 * that of 'totaltime'.
+	 */
+	struct Instrumentation *yb_query_stats;
+>>>>>>> bc662ba7050
 } QueryDesc;
 
 /* in pquery.c */

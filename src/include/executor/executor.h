@@ -22,6 +22,9 @@
 #include "nodes/parsenodes.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "executor/execPartition.h"
+
 
 /*
  * The "eflags" argument to ExecutorStart and the various ExecInitNode
@@ -60,9 +63,16 @@
  * mean that the plan can't queue any AFTER triggers; just that the caller
  * is responsible for there being a trigger context for them to be queued in.
  *
+<<<<<<< HEAD
  * WITH_NO_DATA indicates that we are performing REFRESH MATERIALIZED VIEW
  * ... WITH NO DATA.  Currently, the only effect is to suppress errors about
  * scanning unpopulated materialized views.
+=======
+ * YB_AGG_PARENT tells the plan node that the parent node is an Agg node.  This
+ * context is used to signal the plan node to make an extra effort to determine
+ * whether aggregates can be pushed down.  It should only be set for plan nodes
+ * that have no children, such as IndexOnlyScan.
+>>>>>>> bc662ba7050
  */
 #define EXEC_FLAG_EXPLAIN_ONLY		0x0001	/* EXPLAIN, no ANALYZE */
 #define EXEC_FLAG_EXPLAIN_GENERIC	0x0002	/* EXPLAIN (GENERIC_PLAN) */
@@ -71,6 +81,8 @@
 #define EXEC_FLAG_MARK				0x0010	/* need mark/restore */
 #define EXEC_FLAG_SKIP_TRIGGERS		0x0020	/* skip AfterTrigger setup */
 #define EXEC_FLAG_WITH_NO_DATA		0x0040	/* REFRESH ... WITH NO DATA */
+
+#define EXEC_FLAG_YB_AGG_PARENT	0x8000	/* parent node is Agg */
 
 
 /* Hook for plugins to get control in ExecutorStart() */
@@ -130,7 +142,8 @@ extern ExprState *execTuplesMatchPrepare(TupleDesc desc,
 extern void execTuplesHashPrepare(int numCols,
 								  const Oid *eqOperators,
 								  Oid **eqFuncOids,
-								  FmgrInfo **hashFunctions);
+								  FmgrInfo **leftHashFunctions,
+								  FmgrInfo **rightHashFunctions);
 extern TupleHashTable BuildTupleHashTable(PlanState *parent,
 										  TupleDesc inputDesc,
 										  const TupleTableSlotOps *inputOps,
@@ -156,7 +169,12 @@ extern TupleHashEntry LookupTupleHashEntryHash(TupleHashTable hashtable,
 extern TupleHashEntry FindTupleHashEntry(TupleHashTable hashtable,
 										 TupleTableSlot *slot,
 										 ExprState *eqcomp,
+<<<<<<< HEAD
 										 ExprState *hashexpr);
+=======
+										 FmgrInfo *hashfunctions,
+										 AttrNumber *keyColIdx);
+>>>>>>> bc662ba7050
 extern void ResetTupleHashTable(TupleHashTable hashtable);
 extern Size EstimateTupleHashTableSpace(double nentries,
 										Size tupleWidth,
@@ -259,11 +277,16 @@ extern ResultRelInfo *ExecGetTriggerResultRel(EState *estate, Oid relid,
 											  ResultRelInfo *rootRelInfo);
 extern List *ExecGetAncestorResultRels(EState *estate, ResultRelInfo *resultRelInfo);
 extern void ExecConstraints(ResultRelInfo *resultRelInfo,
+<<<<<<< HEAD
 							TupleTableSlot *slot, EState *estate);
 extern AttrNumber ExecRelGenVirtualNotNull(ResultRelInfo *resultRelInfo,
 										   TupleTableSlot *slot,
 										   EState *estate,
 										   List *notnull_virtual_attrs);
+=======
+							TupleTableSlot *slot, EState *estate,
+							ModifyTableState *mstate);
+>>>>>>> bc662ba7050
 extern bool ExecPartitionCheck(ResultRelInfo *resultRelInfo,
 							   TupleTableSlot *slot, EState *estate, bool emitError);
 extern void ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
@@ -292,6 +315,7 @@ extern bool EvalPlanQualFetchRowMark(EPQState *epqstate, Index rti, TupleTableSl
 extern TupleTableSlot *EvalPlanQualNext(EPQState *epqstate);
 extern void EvalPlanQualBegin(EPQState *epqstate);
 extern void EvalPlanQualEnd(EPQState *epqstate);
+extern bool yb_refresh_stats_before_exec;
 
 /*
  * functions in execProcnode.c
@@ -764,8 +788,13 @@ extern List *ExecInsertIndexTuples(ResultRelInfo *resultRelInfo, EState *estate,
 extern bool ExecCheckIndexConstraints(ResultRelInfo *resultRelInfo,
 									  TupleTableSlot *slot,
 									  EState *estate, ItemPointer conflictTid,
+<<<<<<< HEAD
 									  const ItemPointerData *tupleid,
 									  List *arbiterIndexes);
+=======
+									  List *arbiterIndexes,
+									  TupleTableSlot **ybConflictSlot);
+>>>>>>> bc662ba7050
 extern void check_exclusion_constraint(Relation heap, Relation index,
 									   IndexInfo *indexInfo,
 									   const ItemPointerData *tupleid,
@@ -816,5 +845,42 @@ extern ResultRelInfo *ExecLookupResultRelByOid(ModifyTableState *node,
 											   Oid resultoid,
 											   bool missing_ok,
 											   bool update_cache);
+
+/* YB */
+extern ExprState *ybPrepareOuterExprsEqualFn(List *outer_exprs,
+											 Oid *eqOps, PlanState *parent);
+extern TupleHashTable YbBuildTupleHashTableExt(PlanState *parent,
+											   TupleDesc inputDesc,
+											   int numCols, ExprState **keyColExprs,
+											   ExprState *eqExpr,
+											   Oid *eqfuncoids,
+											   FmgrInfo *hashfunctions,
+											   long nbuckets, Size additionalsize,
+											   MemoryContext metacxt,
+											   MemoryContext tablecxt,
+											   MemoryContext tempcxt,
+											   ExprContext *expr_cxt,
+											   bool use_variable_hash_iv);
+extern void ExecDeleteIndexTuples(ResultRelInfo *resultRelInfo, Datum ybctid, HeapTuple tuple,
+								  EState *estate);
+extern List *YbExecUpdateIndexTuples(ResultRelInfo *resultRelInfo,
+									 TupleTableSlot *slot,
+									 Datum ybctid,
+									 HeapTuple oldtuple,
+									 ItemPointer tupleid,
+									 EState *estate,
+									 Bitmapset *updatedCols,
+									 bool is_pk_updated,
+									 bool is_inplace_update_enabled);
+extern void YbBatchFetchConflictingRows(ResultRelInfo *resultRelInfo,
+										YbInsertOnConflictBatchState *yb_ioc_state,
+										EState *estate,
+										List *arbiterIndexes);
+extern bool YbShouldCheckUniqueOrExclusionIndex(IndexInfo *indexInfo,
+												Relation indexRelation,
+												Relation heapRelation,
+												List *arbiterIndexes);
+extern bool YbIsAnyIndexKeyColumnNull(IndexInfo *indexInfo,
+									  bool isnull[INDEX_MAX_KEYS]);
 
 #endif							/* EXECUTOR_H  */

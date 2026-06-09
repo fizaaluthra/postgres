@@ -57,6 +57,10 @@
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "yb_ysql_conn_mgr_helper.h"
+#include <pg_yb_utils.h>
+
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
 
@@ -267,10 +271,67 @@ GetBackendTypeDesc(BackendType backendType)
 
 	switch (backendType)
 	{
+<<<<<<< HEAD
 #define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach)	\
 		case bktype: backendDesc = description; break;
 #include "postmaster/proctypelist.h"
 #undef PG_PROCTYPE
+=======
+		case B_INVALID:
+			backendDesc = "not initialized";
+			break;
+		case B_AUTOVAC_LAUNCHER:
+			backendDesc = "autovacuum launcher";
+			break;
+		case B_AUTOVAC_WORKER:
+			backendDesc = "autovacuum worker";
+			break;
+		case B_BACKEND:
+			backendDesc = "client backend";
+			break;
+		case B_BG_WORKER:
+			backendDesc = "background worker";
+			break;
+		case B_BG_WRITER:
+			backendDesc = "background writer";
+			break;
+		case B_CHECKPOINTER:
+			backendDesc = "checkpointer";
+			break;
+		case B_STARTUP:
+			backendDesc = "startup";
+			break;
+		case B_WAL_RECEIVER:
+			backendDesc = "walreceiver";
+			break;
+		case B_WAL_SENDER:
+			backendDesc = "walsender";
+			break;
+		case B_WAL_WRITER:
+			backendDesc = "walwriter";
+			break;
+		case B_ARCHIVER:
+			backendDesc = "archiver";
+			break;
+		case B_LOGGER:
+			backendDesc = "logger";
+			break;
+		case YB_YSQL_CONN_MGR:
+			backendDesc = "yb-conn-mgr worker connection";
+			break;
+		case YB_YSQL_CONN_MGR_WAL_SENDER:
+			backendDesc = "yb-conn-mgr walsender";
+			break;
+		case YB_AUTO_ANALYZE_BACKEND:
+			backendDesc = "yb auto analyze backend";
+			break;
+		case YB_INDEX_BACKFILL_DDL:
+			backendDesc = "yb index backfill";
+			break;
+		case YB_MATVIEW_REFRESH_DDL:
+			backendDesc = "yb matview refresh";
+			break;
+>>>>>>> bc662ba7050
 	}
 	return backendDesc;
 }
@@ -352,7 +413,7 @@ checkDataDir(void)
 	 */
 #if !defined(WIN32) && !defined(__CYGWIN__)
 	if (stat_buf.st_mode & PG_MODE_MASK_GROUP)
-		ereport(FATAL,
+		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("data directory \"%s\" has invalid permissions",
 						DataDir),
@@ -1899,4 +1960,20 @@ pg_bindtextdomain(const char *domain)
 		pg_bind_textdomain_codeset(domain);
 	}
 #endif
+}
+
+void
+YbSetUserContext(const Oid roleid, const bool is_superuser, const char *rname)
+{
+	/* change the auth user */
+	AuthenticatedUserId = roleid;
+	AuthenticatedUserIsSuperuser = is_superuser;
+
+	SetSessionUserId(roleid, is_superuser);
+
+	SetConfigOption("session_authorization", rname,
+					PGC_INTERNAL, PGC_S_OVERRIDE);
+	SetConfigOption("is_superuser",
+					is_superuser ? "on" : "off",
+					PGC_INTERNAL, PGC_S_OVERRIDE);
 }

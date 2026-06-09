@@ -50,6 +50,8 @@
 
 #define Generation_CHUNK_FRACTION	8
 
+#define Generation_CONTEXTSZ	MAXALIGN(sizeof(GenerationContext))
+
 typedef struct GenerationBlock GenerationBlock; /* forward reference */
 
 typedef void *GenerationPointer;
@@ -219,6 +221,8 @@ GenerationContextCreate(MemoryContext parent,
 						   name)));
 	}
 
+	YbPgMemAddConsumption(allocSize);
+
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
 	 * we'd leak the header if we ereport in this stretch.
@@ -350,7 +354,10 @@ GenerationDelete(MemoryContext context)
 	VALGRIND_DESTROY_MEMPOOL(context);
 
 	/* And free the context header and keeper block */
+	size_t		freed_sz = context->mem_allocated + Generation_CONTEXTSZ;
+
 	free(context);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -369,8 +376,36 @@ GenerationAllocLarge(MemoryContext context, Size size, int flags)
 	Size		required_size;
 	Size		blksize;
 
+<<<<<<< HEAD
 	/* validate 'size' is within the limits for the given 'flags' */
 	MemoryContextCheckSize(context, size, flags);
+=======
+	/* is it an over-sized chunk? if yes, allocate special block */
+	if (chunk_size > set->allocChunkLimit)
+	{
+		Size		blksize = required_size + Generation_BLOCKHDRSZ;
+
+		block = (GenerationBlock *) malloc(blksize);
+		if (block == NULL)
+			return NULL;
+
+		YbPgMemAddConsumption(blksize);
+
+		context->mem_allocated += blksize;
+
+		/* block with a single (used) chunk */
+		block->blksize = blksize;
+		block->nchunks = 1;
+		block->nfree = 0;
+
+		/* the block is completely full */
+		block->freeptr = block->endptr = ((char *) block) + blksize;
+
+		chunk = (GenerationChunk *) (((char *) block) + Generation_BLOCKHDRSZ);
+		chunk->block = block;
+		chunk->context = set;
+		chunk->size = chunk_size;
+>>>>>>> bc662ba7050
 
 #ifdef MEMORY_CONTEXT_CHECKING
 	/* ensure there's always space for the sentinel byte */
@@ -438,7 +473,75 @@ GenerationAllocChunkFromBlock(MemoryContext context, GenerationBlock *block,
 {
 	MemoryChunk *chunk = (MemoryChunk *) (block->freeptr);
 
+<<<<<<< HEAD
 	/* validate we've been given a block with enough free space */
+=======
+	if (block == NULL ||
+		GenerationBlockFreeBytes(block) < required_size)
+	{
+		Size		blksize;
+		GenerationBlock *freeblock = set->freeblock;
+
+		if (freeblock != NULL &&
+			GenerationBlockIsEmpty(freeblock) &&
+			GenerationBlockFreeBytes(freeblock) >= required_size)
+		{
+			block = freeblock;
+
+			/*
+			 * Zero out the freeblock as we'll set this to the current block
+			 * below
+			 */
+			set->freeblock = NULL;
+		}
+		else if (GenerationBlockIsEmpty(set->keeper) &&
+				 GenerationBlockFreeBytes(set->keeper) >= required_size)
+		{
+			block = set->keeper;
+		}
+		else
+		{
+			/*
+			 * The first such block has size initBlockSize, and we double the
+			 * space in each succeeding block, but not more than maxBlockSize.
+			 */
+			blksize = set->nextBlockSize;
+			set->nextBlockSize <<= 1;
+			if (set->nextBlockSize > set->maxBlockSize)
+				set->nextBlockSize = set->maxBlockSize;
+
+			/* we'll need a block hdr too, so add that to the required size */
+			required_size += Generation_BLOCKHDRSZ;
+
+			/* round the size up to the next power of 2 */
+			if (blksize < required_size)
+				blksize = pg_nextpower2_size_t(required_size);
+
+			block = (GenerationBlock *) malloc(blksize);
+
+			if (block == NULL)
+				return NULL;
+
+			YbPgMemAddConsumption(blksize);
+
+			context->mem_allocated += blksize;
+
+			/* initialize the new block */
+			GenerationBlockInit(block, blksize);
+
+			/* add it to the doubly-linked list of blocks */
+			dlist_push_head(&set->blocks, &block->node);
+
+			/* Zero out the freeblock in case it's become full */
+			set->freeblock = NULL;
+		}
+
+		/* and also use it as the current allocation block */
+		set->block = block;
+	}
+
+	/* we're supposed to have a block with enough free space now */
+>>>>>>> bc662ba7050
 	Assert(block != NULL);
 	Assert((block->endptr - block->freeptr) >=
 		   Generation_CHUNKHDRSZ + chunk_size);
@@ -698,6 +801,7 @@ GenerationBlockFree(GenerationContext *set, GenerationBlock *block)
 	dlist_delete(&block->node);
 
 	((MemoryContext) set)->mem_allocated -= block->blksize;
+	size_t		freed_sz = block->blksize;
 
 #ifdef CLOBBER_FREED_MEMORY
 	wipe_mem(block, block->blksize);
@@ -707,6 +811,7 @@ GenerationBlockFree(GenerationContext *set, GenerationBlock *block)
 	VALGRIND_MEMPOOL_FREE(set, block);
 
 	free(block);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -820,8 +925,27 @@ GenerationFree(void *pointer)
 		GenerationBlockMarkEmpty(block);
 		set->freeblock = block;
 	}
+<<<<<<< HEAD
 	else
 		GenerationBlockFree(set, block);	/* Otherwise, free it */
+=======
+
+	/* Also make sure the block is not marked as the current block. */
+	if (set->block == block)
+		set->block = NULL;
+
+	/*
+	 * The block is empty, so let's get rid of it. First remove it from the
+	 * list of blocks, then return it to malloc().
+	 */
+	dlist_delete(&block->node);
+
+	size_t		freed_sz = block->blksize;
+
+	context->mem_allocated -= block->blksize;
+	free(block);
+	YbPgMemSubConsumption(freed_sz);
+>>>>>>> bc662ba7050
 }
 
 /*

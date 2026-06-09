@@ -20,6 +20,15 @@
 #include "nodes/pathnodes.h"
 #include "utils/relcache.h"
 
+
+typedef enum YbPgFdwServerType
+{
+	PG_FDW_SERVER_UNKNOWN = 0,
+	PG_FDW_SERVER_POSTGRES,
+	PG_FDW_SERVER_YUGABYTEDB,
+  PG_FDW_SERVER_FEDERATED_YUGABYTEDB
+} YbPgFdwServerType;
+
 /*
  * FDW-specific planner information kept in RelOptInfo.fdw_private for a
  * postgres_fdw foreign table.  For a baserel, this struct is created by
@@ -129,6 +138,10 @@ typedef struct PgFdwRelationInfo
 	 * representing the relation.
 	 */
 	int			relation_index;
+
+	/* The underlying server that is hosting the relation. */
+	YbPgFdwServerType yb_server_type;
+	AttrNumber	yb_min_attr;
 } PgFdwRelationInfo;
 
 /*
@@ -155,6 +168,10 @@ typedef enum PgFdwSamplingMethod
 extern int	set_transmission_modes(void);
 extern void reset_transmission_modes(int nestlevel);
 extern void process_pending_request(AsyncRequest *areq);
+
+/* YB functions in postgres_fdw.c */
+extern bool yb_is_valid_server_type(const char *server_type);
+extern AttrNumber yb_get_min_attr_from_ftrelid(Oid relid);
 
 /* in connection.c */
 extern PGconn *GetConnection(UserMapping *user, bool will_prep_stmt,

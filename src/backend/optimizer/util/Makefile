@@ -13,6 +13,9 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	yb_merge_scan.o \
+	ybplan.o \
+	\
 	appendinfo.o \
 	clauses.o \
 	extendplan.o \

@@ -447,6 +447,8 @@ struct pg_conn
 	char	   *oauth_ca_file;	/* CA file path */
 	bool		oauth_want_retry;	/* should we retry on failure? */
 
+	char	   *yb_auto_analyze; /* use the connection for auto analyze? */
+
 	/* Optional file to write trace info to */
 	FILE	   *Pfdebug;
 	int			traceFlags;
@@ -698,14 +700,14 @@ extern char *const pgresStatus[];
 #ifdef USE_SSL
 
 #ifndef WIN32
-#define USER_CERT_FILE		".postgresql/postgresql.crt"
-#define USER_KEY_FILE		".postgresql/postgresql.key"
-#define ROOT_CERT_FILE		".postgresql/root.crt"
-#define ROOT_CRL_FILE		".postgresql/root.crl"
+#define USER_CERT_FILE		".yugabytedb/yugabytedb.crt"
+#define USER_KEY_FILE		".yugabytedb/yugabytedb.key"
+#define ROOT_CERT_FILE		".yugabytedb/root.crt"
+#define ROOT_CRL_FILE		".yugabytedb/root.crl"
 #else
 /* On Windows, the "home" directory is already PostgreSQL-specific */
-#define USER_CERT_FILE		"postgresql.crt"
-#define USER_KEY_FILE		"postgresql.key"
+#define USER_CERT_FILE		"yugabytedb.crt"
+#define USER_KEY_FILE		"yugabytedb.key"
 #define ROOT_CERT_FILE		"root.crt"
 #define ROOT_CRL_FILE		"root.crl"
 #endif

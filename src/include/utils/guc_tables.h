@@ -24,6 +24,7 @@ enum config_type
 {
 	PGC_BOOL,
 	PGC_INT,
+	PGC_OID,
 	PGC_REAL,
 	PGC_STRING,
 	PGC_ENUM,
@@ -33,6 +34,7 @@ union config_var_val
 {
 	bool		boolval;
 	int			intval;
+	Oid			oidval;
 	double		realval;
 	char	   *stringval;
 	int			enumval;
@@ -133,6 +135,69 @@ typedef struct guc_stack
 	config_var_value masked;	/* SET value in a GUC_SET_LOCAL entry */
 } GucStack;
 
+<<<<<<< HEAD
+=======
+/*
+ * Generic fields applicable to all types of variables
+ *
+ * The short description should be less than 80 chars in length. Some
+ * applications may use the long description as well, and will append
+ * it to the short description. (separated by a newline or '. ')
+ *
+ * srole is the role that set the current value, or BOOTSTRAP_SUPERUSERID
+ * if the value came from an internal source or the config file.  Similarly
+ * for reset_srole (which is usually BOOTSTRAP_SUPERUSERID, but not always).
+ *
+ * Note that sourcefile/sourceline are kept here, and not pushed into stacked
+ * values, although in principle they belong with some stacked value if the
+ * active value is session- or transaction-local.  This is to avoid bloating
+ * stack entries.  We know they are only relevant when source == PGC_S_FILE.
+ */
+struct config_generic
+{
+	/* constant fields, must be set correctly in initial value: */
+	const char *name;			/* name of variable - MUST BE FIRST */
+	GucContext	context;		/* context required to set the variable */
+	enum config_group group;	/* to help organize variables by function */
+	const char *short_desc;		/* short desc. of this variable's purpose */
+	const char *long_desc;		/* long desc. of this variable's purpose */
+	int			flags;			/* flag bits, see guc.h */
+	/* variable fields, initialized at runtime: */
+	enum config_type vartype;	/* type of variable (set only at startup) */
+	int			status;			/* status bits, see below */
+	GucSource	source;			/* source of the current actual value */
+	GucSource	reset_source;	/* source of the reset_value */
+	GucContext	scontext;		/* context that set the current value */
+	GucContext	reset_scontext; /* context that set the reset value */
+	Oid			srole;			/* role that set the current value */
+	Oid			reset_srole;	/* role that set the reset value */
+	GucStack   *stack;			/* stacked prior values */
+	void	   *extra;			/* "extra" pointer for current actual value */
+	char	   *last_reported;	/* if variable is GUC_REPORT, value last sent
+								 * to client (NULL if not yet sent) */
+	char	   *sourcefile;		/* file current setting is from (NULL if not
+								 * set in config file) */
+	int			sourceline;		/* line in source file */
+	/* YB: Saved default value in case conn mgr overrides the default */
+	GucStack   *ysql_conn_mgr_saved_default;
+};
+
+/* bit values in status field */
+#define GUC_IS_IN_FILE		0x0001	/* found it in config file */
+/*
+ * Caution: the GUC_IS_IN_FILE bit is transient state for ProcessConfigFile.
+ * Do not assume that its value represents useful information elsewhere.
+ */
+#define GUC_PENDING_RESTART 0x0002	/* changed value cannot be applied yet */
+#define GUC_NEEDS_REPORT	0x0004	/* new value must be reported to client */
+/* YB: GUC value was reset to the currently saved default */
+#define YB_GUC_VALUE_RESET 0x0008
+/*
+ * YB: GUC default value, which was overriden by ConnMgr, was reset to the
+ * default value of the txn backend
+ */
+#define YB_GUC_DEFAULT_RESET 0x0010
+>>>>>>> bc662ba7050
 
 /* GUC records for specific variable types */
 
@@ -160,6 +225,22 @@ struct config_int
 	GucShowHook show_hook;
 	/* variable fields, initialized at runtime: */
 	int			reset_val;
+};
+
+struct yb_config_oid
+{
+	struct config_generic gen;
+	/* constant fields, must be set correctly in initial value: */
+	Oid		   *variable;
+	Oid			boot_val;
+	Oid			min;
+	Oid			max;
+	YbGucOidCheckHook check_hook;
+	YbGucOidAssignHook assign_hook;
+	GucShowHook show_hook;
+	/* variable fields, initialized at runtime: */
+	Oid			reset_val;
+	void	   *reset_extra;
 };
 
 struct config_real

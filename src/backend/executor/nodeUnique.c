@@ -37,6 +37,9 @@
 #include "executor/nodeUnique.h"
 #include "miscadmin.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /* ----------------------------------------------------------------
  *		ExecUnique

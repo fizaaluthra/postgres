@@ -102,7 +102,10 @@ The remaining code is authored by Andrew Dunstan <amdunstan@ncshp.org> and
 #include "utils/formatting.h"
 
 /* turn off assertions for embedded function */
+#if 0							/* Commented out by Yugabyte: NDEBUG should
+								 * not be redefined! */
 #define NDEBUG
+#endif							/* YB */
 
 #else							/* DMETAPHONE_MAIN */
 

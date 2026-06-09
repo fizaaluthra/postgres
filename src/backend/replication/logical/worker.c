@@ -3757,7 +3757,11 @@ apply_handle_truncate(StringInfo s)
 						relids_logged,
 						DROP_RESTRICT,
 						restart_seqs,
+<<<<<<< HEAD
 						!MySubscription->runasowner);
+=======
+						false /* yb_is_top_level */ );
+>>>>>>> bc662ba7050
 	foreach(lc, remote_rels)
 	{
 		LogicalRepRelMapEntry *rel = lfirst(lc);

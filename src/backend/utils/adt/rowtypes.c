@@ -27,6 +27,9 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "yb/yql/pggate/util/ybc_util.h"
+
 
 /*
  * structure to cache metadata needed for record I/O
@@ -323,12 +326,15 @@ fail:
 }
 
 /*
- * record_out		- output routine for any composite type.
+ * record_out_internal - a helper function for record_out. The
+ * portion of record_out that doesn't depend on sys/rel cache has been extracted
+ * into this function. This has been done so that it can be used by YB CDC for
+ * decoding composite types.
  */
 Datum
-record_out(PG_FUNCTION_ARGS)
+record_out_internal(HeapTupleHeader rec, TupleDesc *tupdesc_ptr,
+					FmgrInfo *flinfo)
 {
-	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
 	Oid			tupType;
 	int32		tupTypmod;
 	TupleDesc	tupdesc;
@@ -346,7 +352,7 @@ record_out(PG_FUNCTION_ARGS)
 	/* Extract type info from the tuple itself */
 	tupType = HeapTupleHeaderGetTypeId(rec);
 	tupTypmod = HeapTupleHeaderGetTypMod(rec);
-	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+	tupdesc = *tupdesc_ptr;
 	ncolumns = tupdesc->natts;
 
 	/* Build a temporary HeapTuple control structure */
@@ -359,15 +365,15 @@ record_out(PG_FUNCTION_ARGS)
 	 * We arrange to look up the needed I/O info just once per series of
 	 * calls, assuming the record type doesn't change underneath us.
 	 */
-	my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
+	my_extra = (RecordIOData *) flinfo->fn_extra;
 	if (my_extra == NULL ||
 		my_extra->ncolumns != ncolumns)
 	{
-		fcinfo->flinfo->fn_extra =
-			MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+		flinfo->fn_extra =
+			MemoryContextAlloc(flinfo->fn_mcxt,
 							   offsetof(RecordIOData, columns) +
 							   ncolumns * sizeof(ColumnIOData));
-		my_extra = (RecordIOData *) fcinfo->flinfo->fn_extra;
+		my_extra = (RecordIOData *) flinfo->fn_extra;
 		my_extra->record_type = InvalidOid;
 		my_extra->record_typmod = 0;
 	}
@@ -427,7 +433,7 @@ record_out(PG_FUNCTION_ARGS)
 							  &column_info->typiofunc,
 							  &column_info->typisvarlena);
 			fmgr_info_cxt(column_info->typiofunc, &column_info->proc,
-						  fcinfo->flinfo->fn_mcxt);
+						  flinfo->fn_mcxt);
 			column_info->column_type = column_type;
 		}
 
@@ -471,6 +477,30 @@ record_out(PG_FUNCTION_ARGS)
 	ReleaseTupleDesc(tupdesc);
 
 	PG_RETURN_CSTRING(buf.data);
+}
+
+/*
+ * record_out		- output routine for any composite type.
+ * Note: The portion of this function that is independent of sys/rel cache has
+ * been extracted as record_out_internal. Any upstream changes to that portion
+ * should go there.
+ */
+Datum
+record_out(PG_FUNCTION_ARGS)
+{
+	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc;
+
+	check_stack_depth();		/* recurses for record-type columns */
+
+	/* Extract type info from the tuple itself */
+	tupType = HeapTupleHeaderGetTypeId(rec);
+	tupTypmod = HeapTupleHeaderGetTypMod(rec);
+	tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+	return record_out_internal(rec, &tupdesc, fcinfo->flinfo);
 }
 
 /*
@@ -764,8 +794,6 @@ record_send(PG_FUNCTION_ARGS)
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		ColumnIOData *column_info = &my_extra->columns[i];
 		Oid			column_type = att->atttypid;
-		Datum		attr;
-		bytea	   *outputbytes;
 
 		/* Ignore dropped columns in datatype */
 		if (att->attisdropped)
@@ -793,11 +821,7 @@ record_send(PG_FUNCTION_ARGS)
 			column_info->column_type = column_type;
 		}
 
-		attr = values[i];
-		outputbytes = SendFunctionCall(&column_info->proc, attr);
-		pq_sendint32(&buf, VARSIZE(outputbytes) - VARHDRSZ);
-		pq_sendbytes(&buf, VARDATA(outputbytes),
-					 VARSIZE(outputbytes) - VARHDRSZ);
+		StringInfoSendFunctionCall(&buf, &column_info->proc, values[i]);
 	}
 
 	pfree(values);
@@ -2049,4 +2073,31 @@ hash_record_extended(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(record, 0);
 
 	PG_RETURN_UINT64(result);
+}
+
+Datum
+YbRecordOut(HeapTupleHeader rec, TupleDesc tupdesc)
+{
+	FmgrInfo   *flinfo = palloc0(sizeof(FmgrInfo));
+	RecordIOData *my_extra;
+	size_t		natts = tupdesc->natts;
+
+	flinfo->fn_extra = MemoryContextAlloc(CurrentMemoryContext,
+										  offsetof(RecordIOData, columns) +
+										  natts * sizeof(ColumnIOData));
+	my_extra = (RecordIOData *) flinfo->fn_extra;
+	my_extra->record_type = HeapTupleHeaderGetTypeId(rec);
+	my_extra->record_typmod = HeapTupleHeaderGetTypMod(rec);
+	my_extra->ncolumns = natts;
+	for (size_t i = 0; i < natts; i++)
+	{
+		ColumnIOData *column_info = &my_extra->columns[i];
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+		column_info->typiofunc =
+			fmgr_internal_function(YBCGetOutFuncName(att->atttypid));
+		fmgr_info(column_info->typiofunc, &column_info->proc);
+		column_info->column_type = att->atttypid;
+	}
+	return record_out_internal(rec, &tupdesc, flinfo);
 }

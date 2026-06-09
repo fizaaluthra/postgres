@@ -27,6 +27,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * Store a default expression for column attnum of relation rel.
@@ -240,7 +243,7 @@ RemoveAttrDefaultById(Oid attrdefId)
 	myrel = relation_open(myrelid, AccessExclusiveLock);
 
 	/* Now we can delete the pg_attrdef row */
-	CatalogTupleDelete(attrdef_rel, &tuple->t_self);
+	CatalogTupleDelete(attrdef_rel, tuple);
 
 	systable_endscan(scan);
 	table_close(attrdef_rel, RowExclusiveLock);

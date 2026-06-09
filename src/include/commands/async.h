@@ -15,6 +15,17 @@
 
 #include <signal.h>
 
+<<<<<<< HEAD
+=======
+/* YB includes */
+#include "storage/proc.h"
+
+/*
+ * The number of SLRU page buffers we use for the notification queue.
+ */
+#define NUM_NOTIFY_BUFFERS	8
+
+>>>>>>> bc662ba7050
 extern PGDLLIMPORT bool Trace_notify;
 extern PGDLLIMPORT int max_notify_queue_pages;
 extern PGDLLIMPORT volatile sig_atomic_t notifyInterruptPending;
@@ -43,7 +54,15 @@ extern void HandleNotifyInterrupt(void);
 /* process interrupts */
 extern void ProcessNotifyInterrupt(bool flush);
 
+<<<<<<< HEAD
 /* freeze old transaction IDs in notify queue (called by VACUUM) */
 extern void AsyncNotifyFreezeXids(TransactionId newFrozenXid);
+=======
+/* entry point for notifications poller background process */
+extern void YbNotifsPollerMain(Datum main_arg);
+
+/* cleans up state when a listening backend crashes, called by postmaster.  */
+extern void YbCleanupListenStateForProc(PGPROC *proc);
+>>>>>>> bc662ba7050
 
 #endif							/* ASYNC_H */

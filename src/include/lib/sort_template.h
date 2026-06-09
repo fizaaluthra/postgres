@@ -309,6 +309,15 @@ ST_SORT(ST_ELEMENT_TYPE * data, size_t n
 
 loop:
 	DO_CHECK_FOR_INTERRUPTS();
+	/*
+	 * YB: avoid ASAN undefined-behavior issue by returning early before
+	 * pointer arithmetic on NULL.
+	 */
+	if (a == NULL)
+	{
+		Assert(n == 0);
+		return;
+	}
 	if (n < 7)
 	{
 		/*

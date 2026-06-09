@@ -36,10 +36,19 @@
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
+<<<<<<< HEAD
 PG_MODULE_MAGIC_EXT(
 					.name = "pgoutput",
 					.version = PG_VERSION
 );
+=======
+/* YB includes */
+#include "pg_yb_utils.h"
+
+PG_MODULE_MAGIC;
+
+extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
+>>>>>>> bc662ba7050
 
 static void pgoutput_startup(LogicalDecodingContext *ctx,
 							 OutputPluginOptions *opt, bool is_init);
@@ -83,6 +92,8 @@ static void pgoutput_stream_commit(struct LogicalDecodingContext *ctx,
 static void pgoutput_stream_prepare_txn(LogicalDecodingContext *ctx,
 										ReorderBufferTXN *txn, XLogRecPtr prepare_lsn);
 
+static void yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid);
+
 static bool publications_valid;
 
 static List *LoadPublications(List *pubnames);
@@ -91,6 +102,15 @@ static void publication_invalidation_cb(Datum arg, SysCacheIdentifier cacheid,
 static void send_repl_origin(LogicalDecodingContext *ctx,
 							 ReplOriginId origin_id, XLogRecPtr origin_lsn,
 							 bool send_origin);
+
+/*
+ * This indicates whether the plugin being used is yboutput or pgoutput. In
+ * yboutput mode, we also support yb-specific replica identity
+ * (CHANGE for now).
+ */
+static bool yb_is_yboutput_mode;
+
+static void yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity);
 
 /*
  * Only 3 publication actions are used for row filtering ("insert", "update",
@@ -284,6 +304,12 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->stream_truncate_cb = pgoutput_truncate;
 	/* transaction streaming - two-phase commit */
 	cb->stream_prepare_cb = pgoutput_stream_prepare_txn;
+
+	if (IsYugaByteEnabled())
+	{
+		cb->yb_schema_change_cb = yb_pgoutput_schema_change;
+		cb->yb_support_yb_specifc_replica_identity_cb = yb_support_yb_specific_replica_identity;
+	}
 }
 
 static void
@@ -550,6 +576,9 @@ pgoutput_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
 		else
 			ctx->twophase_opt_given = true;
 
+		if (IsYugaByteEnabled())
+			opt->yb_publication_names = data->publication_names;
+
 		/* Init publication state. */
 		data->publications = NIL;
 		publications_valid = false;
@@ -789,6 +818,10 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 		set_schema_sent_in_streamed_txn(relentry, topxid);
 	else
 		relentry->schema_sent = true;
+
+	if (IsYugaByteEnabled())
+		elog(DEBUG1, "Sent the RELATION message for table_id: %d",
+			 RelationGetRelid(relation));
 }
 
 /*
@@ -1616,9 +1649,99 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 									relentry->include_gencols_type);
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
+<<<<<<< HEAD
 			logicalrep_write_update(ctx->out, xid, targetrel, old_slot,
 									new_slot, data->binary, relentry->columns,
 									relentry->include_gencols_type);
+=======
+			if (change->data.tp.oldtuple)
+			{
+				old_slot = relentry->old_slot;
+				ExecStoreHeapTuple(&change->data.tp.oldtuple->tuple,
+								   old_slot, false);
+			}
+
+			new_slot = relentry->new_slot;
+			ExecStoreHeapTuple(&change->data.tp.newtuple->tuple,
+							   new_slot, false);
+
+			/* Switch relation if publishing via root. */
+			if (relentry->publish_as_relid != RelationGetRelid(relation))
+			{
+				Assert(relation->rd_rel->relispartition);
+				ancestor = RelationIdGetRelation(relentry->publish_as_relid);
+				targetrel = ancestor;
+				/* Convert tuples if needed. */
+				if (relentry->attrmap)
+				{
+					TupleDesc	tupdesc = RelationGetDescr(targetrel);
+
+					if (old_slot)
+						old_slot = execute_attr_map_slot(relentry->attrmap,
+														 old_slot,
+														 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+
+					new_slot = execute_attr_map_slot(relentry->attrmap,
+													 new_slot,
+													 MakeTupleTableSlot(tupdesc, &TTSOpsVirtual));
+				}
+			}
+
+			/* Check row filter */
+			if (!pgoutput_row_filter(targetrel, old_slot, &new_slot,
+									 relentry, &action))
+				break;
+
+			/* Send BEGIN if we haven't yet */
+			if (txndata && !txndata->sent_begin_txn)
+				pgoutput_send_begin(ctx, txn);
+
+			maybe_send_schema(ctx, change, relation, relentry);
+
+			bool	   *yb_old_is_omitted = NULL;
+			bool	   *yb_new_is_omitted = NULL;
+
+			if (IsYugaByteEnabled() && yb_is_yboutput_mode)
+			{
+				yb_old_is_omitted =
+					change->data.tp.oldtuple ?
+					change->data.tp.oldtuple->yb_is_omitted :
+					NULL;
+
+				yb_new_is_omitted = change->data.tp.newtuple->yb_is_omitted;
+			}
+
+			OutputPluginPrepareWrite(ctx, true);
+
+			/*
+			 * Updates could be transformed to inserts or deletes based on the
+			 * results of the row filter for old and new tuple.
+			 */
+			switch (action)
+			{
+				case REORDER_BUFFER_CHANGE_INSERT:
+					logicalrep_write_insert(ctx->out, xid, targetrel,
+											new_slot, data->binary,
+											relentry->columns);
+					break;
+				case REORDER_BUFFER_CHANGE_UPDATE:
+					logicalrep_write_update(ctx->out, xid, targetrel,
+											old_slot, new_slot, data->binary,
+											relentry->columns,
+											yb_old_is_omitted,
+											yb_new_is_omitted);
+					break;
+				case REORDER_BUFFER_CHANGE_DELETE:
+					logicalrep_write_delete(ctx->out, xid, targetrel,
+											old_slot, data->binary,
+											relentry->columns);
+					break;
+				default:
+					Assert(false);
+			}
+
+			OutputPluginWrite(ctx, true);
+>>>>>>> bc662ba7050
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			logicalrep_write_delete(ctx->out, xid, targetrel, old_slot,
@@ -1788,6 +1911,14 @@ static void
 pgoutput_shutdown(LogicalDecodingContext *ctx)
 {
 	pgoutput_memory_context_reset(NULL);
+}
+
+static void
+yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid)
+{
+	elog(DEBUG1, "yb_pgoutput_schema_change for relid: %d", relid);
+
+	rel_sync_cache_relation_cb(0 /* unused */ , relid);
 }
 
 /*
@@ -2519,3 +2650,46 @@ send_repl_origin(LogicalDecodingContext *ctx, ReplOriginId origin_id,
 		}
 	}
 }
+<<<<<<< HEAD
+=======
+
+/*
+ * Try to update progress and send a keepalive message if too many changes were
+ * processed.
+ *
+ * For a large transaction, if we don't send any change to the downstream for a
+ * long time (exceeds the wal_receiver_timeout of standby) then it can timeout.
+ * This can happen when all or most of the changes are either not published or
+ * got filtered out.
+ */
+static void
+update_replication_progress(LogicalDecodingContext *ctx, bool skipped_xact)
+{
+	static int	changes_count = 0;
+
+	/*
+	 * We don't want to try sending a keepalive message after processing each
+	 * change as that can have overhead. Tests revealed that there is no
+	 * noticeable overhead in doing it after continuously processing 100 or so
+	 * changes.
+	 */
+#define CHANGES_THRESHOLD 100
+
+	/*
+	 * If we are at the end of transaction LSN, update progress tracking.
+	 * Otherwise, after continuously processing CHANGES_THRESHOLD changes, we
+	 * try to send a keepalive message if required.
+	 */
+	if (ctx->end_xact || ++changes_count >= CHANGES_THRESHOLD)
+	{
+		OutputPluginUpdateProgress(ctx, skipped_xact);
+		changes_count = 0;
+	}
+}
+
+static void
+yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity)
+{
+	yb_is_yboutput_mode = support_yb_specific_replica_identity;
+}
+>>>>>>> bc662ba7050

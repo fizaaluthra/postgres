@@ -23,6 +23,10 @@
 #include "catalog/pg_type_d.h"	/* IWYU pragma: export */
 #include "nodes/nodes.h"
 
+#define BSONOID				8095
+#define VECTOROID			8078
+#define GRAPHIDOID			8113
+
 /* ----------------
  *		pg_type definition.  cpp turns this into
  *		typedef struct FormData_pg_type
@@ -384,7 +388,8 @@ extern ObjectAddress TypeCreate(Oid newTypeOid,
 								int32 typeMod,
 								int32 typNDims,
 								bool typeNotNull,
-								Oid typeCollation);
+								Oid typeCollation,
+								bool ybRelationIsShared);
 
 extern void GenerateTypeDependencies(HeapTuple typeTuple,
 									 Relation typeCatalog,
@@ -395,7 +400,9 @@ extern void GenerateTypeDependencies(HeapTuple typeTuple,
 									 bool isImplicitArray,
 									 bool isDependentType,
 									 bool makeExtensionDep,
-									 bool rebuild);
+									 bool rebuild,
+									 bool ybRelationIsSystem,
+									 bool ybRelationIsShared);
 
 extern void RenameTypeInternal(Oid typeOid, const char *newTypeName,
 							   Oid typeNamespace);

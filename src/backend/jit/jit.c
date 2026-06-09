@@ -30,7 +30,11 @@
 #include "utils/fmgrprotos.h"
 
 /* GUCs */
+<<<<<<< HEAD
 bool		jit_enabled = false;
+=======
+bool		jit_enabled = false;	/* YB: changed to false */
+>>>>>>> bc662ba7050
 char	   *jit_provider = NULL;
 bool		jit_debugging_support = false;
 bool		jit_dump_bitcode = false;

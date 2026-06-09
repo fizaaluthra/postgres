@@ -180,7 +180,12 @@ DecodeISO8601Interval(char *str,
 						continue;
 					}
 					/* Else fall through to extended alternative format */
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* FALLTHROUGH */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -259,7 +264,12 @@ DecodeISO8601Interval(char *str,
 						return 0;
 					}
 					/* Else fall through to extended alternative format */
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* FALLTHROUGH */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -387,7 +397,12 @@ DecodeInterval(char **field, int *ftype, int nf,	/* int range, */
 					tmask = DTK_M(TZ);
 					break;
 				}
+<<<<<<< HEAD
 				pg_fallthrough;
+=======
+				/* FALL THROUGH */
+				yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 			case DTK_DATE:
 			case DTK_NUMBER:

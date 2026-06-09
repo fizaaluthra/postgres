@@ -41,14 +41,28 @@
 #include "tcop/backend_startup.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "access/htup_details.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "commands/yb_profile.h"
+#include "pg_yb_utils.h"
+#include "utils/builtins.h"		/* TODO: may not be needed */
+#include "utils/syscache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 /*----------------------------------------------------------------
  * Global authentication functions
  *----------------------------------------------------------------
  */
+<<<<<<< HEAD
 static void auth_failed(Port *port, int elevel, int status,
 						const char *logdetail);
+=======
+static void auth_failed(Port *port, int status, const char *logdetail,
+						bool yb_role_is_locked_out);
+>>>>>>> bc662ba7050
 static char *recv_password_packet(Port *port);
-
 
 /*----------------------------------------------------------------
  * Password-based authentication methods (password, md5, and scram-sha-256)
@@ -60,6 +74,7 @@ static int	CheckPWChallengeAuth(Port *port, const char **logdetail);
 static int	CheckMD5Auth(Port *port, char *shadow_pass,
 						 const char **logdetail);
 
+static int	CheckYbTserverKeyAuth(Port *port, const char **logdetail);
 
 /*----------------------------------------------------------------
  * Ident authentication
@@ -147,6 +162,8 @@ static int	CheckBSDAuth(Port *port, char *user);
 
 static int	CheckLDAPAuth(Port *port);
 
+static char *get_ldap_password(char *ldapbindpasswd);
+
 /* LDAP_OPT_DIAGNOSTIC_MESSAGE is the newer spelling */
 #ifndef LDAP_OPT_DIAGNOSTIC_MESSAGE
 #define LDAP_OPT_DIAGNOSTIC_MESSAGE LDAP_OPT_ERROR_STRING
@@ -203,6 +220,37 @@ static int	pg_SSPI_make_upn(char *accountname,
 							 bool update_accountname);
 #endif
 
+<<<<<<< HEAD
+=======
+/*----------------------------------------------------------------
+ * RADIUS Authentication
+ *----------------------------------------------------------------
+ */
+static int	CheckRADIUSAuth(Port *port);
+static int	PerformRadiusTransaction(const char *server, const char *secret, const char *portstr, const char *identifier, const char *user_name, const char *passwd);
+
+/*----------------------------------------------------------------
+ * JWT Authentication
+ *----------------------------------------------------------------
+ */
+static int	YbCheckJwtAuth(Port *port);
+
+/*
+ * Maximum accepted size of GSS and SSPI authentication tokens.
+ * We also use this as a limit on ordinary password packet lengths.
+ *
+ * Kerberos tickets are usually quite small, but the TGTs issued by Windows
+ * domain controllers include an authorization field known as the Privilege
+ * Attribute Certificate (PAC), which contains the user's Windows permissions
+ * (group memberships etc.). The PAC is copied into all tickets obtained on
+ * the basis of this TGT (even those issued by Unix realms which the Windows
+ * realm trusts), and can be several kB in size. The maximum token size
+ * accepted by Windows systems is determined by the MaxAuthToken Windows
+ * registry setting. Microsoft recommends that it is not set higher than
+ * 65535 bytes, so that seems like a reasonable limit for us as well.
+ */
+#define PG_MAX_AUTH_TOKEN_LENGTH	65535
+>>>>>>> bc662ba7050
 
 /*----------------------------------------------------------------
  * Global authentication functions
@@ -231,13 +279,31 @@ ClientAuthentication_hook_type ClientAuthentication_hook = NULL;
  * when the elevel allows.
  */
 static void
+<<<<<<< HEAD
 auth_failed(Port *port, int elevel, int status, const char *logdetail)
+=======
+auth_failed(Port *port, int status, const char *logdetail, bool yb_role_is_locked_out)
+>>>>>>> bc662ba7050
 {
 	const char *errstr;
 	char	   *cdetail;
 	int			errcode_return = ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION;
 
+<<<<<<< HEAD
 	Assert(elevel >= FATAL);	/* we must exit here */
+=======
+	bool		yb_is_auth_passthrough = YbIsAuthPassthroughInProgress(port);
+
+	/*
+	 * YB: When using Auth Passthrough mode of connection manager, mark the
+	 * current auth attempt as failed so that the control backend knows to abort
+	 * auth and reset to its base state. The fact that we are in a call to
+	 * `auth_failed()` is sufficient to conclude that auth has failed.
+	 */
+
+	if (yb_is_auth_passthrough)
+		port->yb_has_auth_passthrough_failed = true;
+>>>>>>> bc662ba7050
 
 	/*
 	 * If we failed due to EOF from client, just quit; there's no point in
@@ -248,9 +314,22 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 	 * send.  We'll get a useless log entry for every psql connection under
 	 * password auth, even if it's perfectly successful, if we log STATUS_EOF
 	 * events.)
+	 *
+	 * YB: When conn mgr is enabled and in auth passthrough mode, avoid calling
+	 * proc_exit here, instead returning a failure result via
+	 * port->yb_has_auth_passthrough_failed.
 	 */
 	if (status == STATUS_EOF)
-		proc_exit(0);
+	{
+		if (yb_is_auth_passthrough)
+		{
+			return;
+		}
+		else
+		{
+			proc_exit(0);
+		}
+	}
 
 	switch (port->hba->auth_method)
 	{
@@ -274,6 +353,10 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 			/* We use it to indicate if a .pgpass password failed. */
 			errcode_return = ERRCODE_INVALID_PASSWORD;
 			break;
+		case uaYbTserverKey:
+			errstr = gettext_noop("tserver key authentication failed for user \"%s\"");
+			errcode_return = ERRCODE_INVALID_PASSWORD;
+			break;
 		case uaGSS:
 			errstr = gettext_noop("GSSAPI authentication failed for user \"%s\"");
 			break;
@@ -295,26 +378,59 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 		case uaOAuth:
 			errstr = gettext_noop("OAuth bearer authentication failed for user \"%s\"");
 			break;
+
+		case uaYbJWT:
+			errstr = gettext_noop("JWT authentication failed for user \"%s\"");
+			break;
+
 		default:
 			errstr = gettext_noop("authentication failed for user \"%s\": invalid authentication method");
 			break;
 	}
 
+<<<<<<< HEAD
 	cdetail = psprintf(_("Connection matched file \"%s\" line %d: \"%s\""),
 					   port->hba->sourcefile, port->hba->linenumber,
 					   port->hba->rawline);
+=======
+	char	   *line_to_print = port->hba->maskedline;
+
+	if (!line_to_print)
+		line_to_print = port->hba->rawline;
+
+	cdetail = psprintf(_("Connection matched pg_hba.conf line %d: \"%s\""),
+					   port->hba->linenumber, line_to_print);
+>>>>>>> bc662ba7050
 	if (logdetail)
 		logdetail = psprintf("%s\n%s", logdetail, cdetail);
 	else
 		logdetail = cdetail;
 
+<<<<<<< HEAD
 	ereport(elevel,
+=======
+	if (yb_is_auth_passthrough)
+		YbSendFatalForLogicalConnectionPacket();
+
+	ereport(YbAuthFailedErrorLevel(yb_is_auth_passthrough),
+>>>>>>> bc662ba7050
 			(errcode(errcode_return),
-			 errmsg(errstr, port->user_name),
-			 logdetail ? errdetail_log("%s", logdetail) : 0));
+			 (yb_role_is_locked_out ?
+			  errmsg("role \"%s\" is locked. Contact your database administrator.",
+					 port->user_name) :
+			  errmsg(errstr, port->user_name)),
+			 (logdetail ? errdetail_log("%s", logdetail) : 0)));
 
 	/* doesn't return */
+<<<<<<< HEAD
 	pg_unreachable();
+=======
+	/*
+	 * YB: This function does in fact return when the Auth Passthrough mode of
+	 * Connection Manager is enabled. The relevant codepath changes for this
+	 * change in behaviour are all under the `yb_ai_auth_passthrough` flag.
+	 */
+>>>>>>> bc662ba7050
 }
 
 
@@ -351,8 +467,23 @@ set_authn_id(Port *port, const char *id)
 							   MyClientConnectionInfo.authn_id, id)));
 	}
 
+<<<<<<< HEAD
 	MyClientConnectionInfo.authn_id = MemoryContextStrdup(TopMemoryContext, id);
 	MyClientConnectionInfo.auth_method = port->hba->auth_method;
+=======
+	/*
+	 * YB: When handling an incoming auth request in Auth Passthrough mode,
+	 * the authn_id of the incoming client is not required after auth finishes.
+	 * Thus there is no need to store it in TopMemoryContext; and allocating in
+	 * TopMemoryContext here leads to a memory leak in this scenario (requiring
+	 * an explicit pfree elsewhere). So, we continue allocating in the txn
+	 * MemoryContext spawned specifically for Auth Passthrough auth attempts.
+	 */
+	if (YbIsAuthPassthroughInProgress(port))
+		port->authn_id = pstrdup(id);
+	else
+		port->authn_id = MemoryContextStrdup(TopMemoryContext, id);
+>>>>>>> bc662ba7050
 
 	if (log_connections & LOG_CONNECTION_AUTHENTICATION)
 	{
@@ -369,12 +500,25 @@ set_authn_id(Port *port, const char *id)
 /*
  * Client authentication starts here.  If there is an error, this
  * function does not return and the backend process is terminated.
+ *
+ * YB: This function *does* return in case connection manager is active and this
+ * is a control backend being used for authentication with auth passthrough mode
+ * enabled.
+ * If auth fails, `port->yb_has_auth_passthrough_failed` is used to signal
+ * authentication failure. This is set in the call to `auth_failed()`. Else it
+ * must be set manually where auth_failed is not called before returning.
  */
 void
 ClientAuthentication(Port *port)
 {
 	int			status = STATUS_ERROR;
 	const char *logdetail = NULL;
+
+	bool		yb_auth_passthrough = YbIsAuthPassthroughInProgress(port);
+
+	/* Auth Passthrough can be enabled only for Ysql Connection Manager */
+	if (yb_auth_passthrough)
+		Assert(YbIsClientYsqlConnMgr());
 
 	/*
 	 * "Abandoned" is a SASL-specific state similar to STATUS_EOF, in that we
@@ -396,12 +540,40 @@ ClientAuthentication(Port *port)
 	CHECK_FOR_INTERRUPTS();
 
 	/*
+	 * Only tserver-owned backends using yb-tserver-key authentication are
+	 * allowed to run as yb_auto_analyze.
+	 */
+	if (IsYugaByteEnabled() && MyBackendType == YB_AUTO_ANALYZE_BACKEND &&
+		port->hba->auth_method != uaYbTserverKey &&
+		!YBCGetGFlags()->TEST_ysql_bypass_auto_analyze_auth_check)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("yb_auto_analyze can only be set if the authentication method "
+						"is yb-tserver-key")));
+
+	/*
 	 * This is the first point where we have access to the hba record for the
 	 * current connection, so perform any verifications based on the hba
 	 * options field that should be done *before* the authentication here.
 	 */
 	if (port->hba->clientcert != clientCertOff)
 	{
+		if (YbIsClientYsqlConnMgr() &&
+			(yb_auth_passthrough == true || yb_is_auth_backend == true))
+		{
+			/*
+			 * Ysql Connection Manager does not know what is the
+			 * authentication type of a client, if authentication type is cert,
+			 * a FATAL packet is sent back to the Ysql Connection Manager.
+			 */
+			auth_failed(port, status,
+						"cert authentication is not supported with connection "
+						"manager",
+						false);
+			return;
+		}
+
+
 		/* If we haven't loaded a root certificate store, fail */
 		if (!secure_loaded_verify_locations())
 			ereport(FATAL,
@@ -463,13 +635,22 @@ ClientAuthentication(Port *port)
 									hostinfo, port->user_name,
 									encryption_state)));
 				else
-					ereport(FATAL,
+				{
+					if (yb_auth_passthrough)
+					{
+						YbSendFatalForLogicalConnectionPacket();
+						port->yb_has_auth_passthrough_failed = true;
+					}
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					/* translator: last %s describes encryption state */
 							 errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
 									hostinfo, port->user_name,
 									port->database_name,
 									encryption_state)));
+					return;
+				}
 				break;
 			}
 
@@ -531,7 +712,14 @@ ClientAuthentication(Port *port)
 									encryption_state),
 							 HOSTNAME_LOOKUP_DETAIL(port)));
 				else
-					ereport(FATAL,
+				{
+					if (yb_auth_passthrough)
+					{
+						YbSendFatalForLogicalConnectionPacket();
+						port->yb_has_auth_passthrough_failed = true;
+					}
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					/* translator: last %s describes encryption state */
 							 errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\", %s",
@@ -539,6 +727,8 @@ ClientAuthentication(Port *port)
 									port->database_name,
 									encryption_state),
 							 HOSTNAME_LOOKUP_DETAIL(port)));
+					return;
+				}
 				break;
 			}
 
@@ -597,6 +787,25 @@ ClientAuthentication(Port *port)
 			status = CheckPasswordAuth(port, &logdetail);
 			break;
 
+		case uaYbTserverKey:
+#ifdef HAVE_UNIX_SOCKETS
+			Assert(IsYugaByteEnabled());
+
+			if (YbIsAuthPassthroughInProgress(port))
+			{
+				auth_failed(port, status,
+							"YbTserverKey authentication is not supported "
+							"in auth passthrough",
+							false);
+				return;
+			}
+
+			status = CheckYbTserverKeyAuth(port, &logdetail);
+#else
+			Assert(false);
+#endif
+			break;
+
 		case uaPAM:
 #ifdef USE_PAM
 			status = CheckPAMAuth(port, port->user_name, "");
@@ -625,9 +834,15 @@ ClientAuthentication(Port *port)
 		case uaTrust:
 			status = STATUS_OK;
 			break;
+<<<<<<< HEAD
 		case uaOAuth:
 			status = CheckSASLAuth(&pg_be_oauth_mech, port, NULL, &logdetail,
 								   &abandoned);
+=======
+
+		case uaYbJWT:
+			status = YbCheckJwtAuth(port);
+>>>>>>> bc662ba7050
 			break;
 	}
 
@@ -665,13 +880,64 @@ ClientAuthentication(Port *port)
 	if (ClientAuthentication_hook)
 		(*ClientAuthentication_hook) (port, status);
 
+	/*
+	 * YB: If conditions are met, update the role's profile entry.  Specific
+	 * authentication methods are isolated from profile handling.
+	 */
+	if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist &&
+		IsProfileHandlingRequired(port->hba->auth_method))
+	{
+		bool		profile_is_disabled = false;
+		HeapTuple	roleTuple,
+					profileTuple = NULL;
+		Oid			roleid = InvalidOid;
+
+		/* Get role info from pg_authid */
+		roleTuple = SearchSysCache1(AUTHNAME, PointerGetDatum(port->user_name));
+		if (HeapTupleIsValid(roleTuple))
+		{
+			roleid = ((Form_pg_authid) GETSTRUCT(roleTuple))->oid;
+			profileTuple = yb_get_role_profile_tuple_by_role_oid(roleid);
+			if (HeapTupleIsValid(profileTuple))
+			{
+				Form_pg_yb_role_profile rolprfform = (Form_pg_yb_role_profile) GETSTRUCT(profileTuple);
+
+				if (rolprfform->rolprfstatus != YB_ROLPRFSTATUS_OPEN)
+					profile_is_disabled = true;
+			}
+			ReleaseSysCache(roleTuple);
+		}
+
+		if (status == STATUS_OK && !profile_is_disabled)
+		{
+			if (roleid != InvalidOid)
+				YbResetFailedAttemptsIfAllowed(roleid);
+			sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
+		}
+		else
+		{
+			/* Do not increment login attempts if no password was supplied */
+			if (roleid != InvalidOid && status != STATUS_EOF)
+				profile_is_disabled =
+					YbMaybeIncFailedAttemptsAndDisableProfile(roleid);
+			auth_failed(port, status, logdetail, profile_is_disabled);
+		}
+		return;
+	}
+
 	if (status == STATUS_OK)
+	{
 		sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
+	}
 	else
+<<<<<<< HEAD
 		auth_failed(port,
 					abandoned ? FATAL_CLIENT_ONLY : FATAL,
 					status,
 					logdetail);
+=======
+		auth_failed(port, status, logdetail, false /* yb_role_is_locked_out */ );
+>>>>>>> bc662ba7050
 }
 
 
@@ -762,12 +1028,36 @@ recv_password_packet(Port *port)
 	 * We rely on that for MD5 and SCRAM authentication, but we still need
 	 * this check here, to prevent an empty password from being used with
 	 * authentication methods that check the password against an external
+<<<<<<< HEAD
 	 * system, like PAM and LDAP.
+=======
+	 * system, like PAM, LDAP and RADIUS.
+	 *
+	 * YB: In the case of auth passthrough mode of connection manager, we want
+	 * to avoid terminating the backend process if possible. In this case, we
+	 * forward a FATAL packet through conn mgr to the client and abort auth, but
+	 * do not push an ERROR level log and kill the backend (using WARNING
+	 * instead).
+>>>>>>> bc662ba7050
 	 */
 	if (buf.len == 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PASSWORD),
-				 errmsg("empty password returned by client")));
+	{
+		if (YbIsAuthPassthroughInProgress(port))
+		{
+			YbSendFatalForLogicalConnectionPacket();
+			ereport(YbAuthFailedErrorLevel(true /* auth_passthrough */ ),
+					(errcode(ERRCODE_INVALID_PASSWORD),
+					 errmsg("empty password returned by client")));
+
+			return NULL;		/* YB: Added return NULL as per above comment */
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PASSWORD),
+					 errmsg("empty password returned by client")));
+		}
+	}
 
 	/* Do not echo password to logs, for security. */
 	elog(DEBUG5, "received password packet");
@@ -914,6 +1204,41 @@ CheckMD5Auth(Port *port, char *shadow_pass, const char **logdetail)
 	pfree(passwd);
 
 	return result;
+}
+
+/*
+ * Yugabyte internal tserver to postgres key authentication.
+ */
+static int
+CheckYbTserverKeyAuth(Port *port, const char **logdetail)
+{
+	char	   *passwd;
+	uint64_t	client_key;
+
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	passwd = recv_password_packet(port);
+	if (passwd == NULL)
+		return STATUS_EOF;		/* client wouldn't send password */
+	else
+	{
+		/* Convert client-supplied password string to uint64 key */
+		char	   *end;
+
+		errno = 0;
+		client_key = strtou64(passwd, &end, 10);
+		if (!(*passwd != '\0' && *end == '\0') || errno == ERANGE)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("auth key must be uint64")));
+		pfree(passwd);
+	}
+
+	uint64_t	auth_key;
+
+	return yb_get_role_password(port->user_name, logdetail, &auth_key)
+		? yb_plain_key_verify(port->user_name, auth_key, client_key, logdetail)
+		: STATUS_ERROR;
 }
 
 
@@ -2007,7 +2332,12 @@ pam_passwd_conv_proc(int num_msg, PG_PAM_CONST struct pam_message **msg,
 				ereport(LOG,
 						(errmsg("error from underlying PAM layer: %s",
 								msg[i]->msg)));
+<<<<<<< HEAD
 				pg_fallthrough;
+=======
+				/* FALL THROUGH */
+				yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 			case PAM_TEXT_INFO:
 				/* we don't bother to log TEXT_INFO messages */
 				if ((reply[i].resp = strdup("")) == NULL)
@@ -2545,9 +2875,17 @@ CheckLDAPAuth(Port *port)
 		 * Bind with a pre-defined username/password (if available) for
 		 * searching. If none is specified, this turns into an anonymous bind.
 		 */
+		char	   *hba_password = get_ldap_password(port->hba->ldapbindpasswd);
+
 		r = ldap_simple_bind_s(ldap,
 							   port->hba->ldapbinddn ? port->hba->ldapbinddn : "",
+<<<<<<< HEAD
 							   port->hba->ldapbindpasswd ? ldap_password_hook(port->hba->ldapbindpasswd) : "");
+=======
+							   hba_password);
+		pfree(hba_password);
+
+>>>>>>> bc662ba7050
 		if (r != LDAP_SUCCESS)
 		{
 			ereport(LOG,
@@ -2689,6 +3027,24 @@ errdetail_for_ldap(LDAP *ldap)
 	return 0;
 }
 
+static char *
+get_ldap_password(char *ldapbindpasswd)
+{
+	/* Return password stored in YSQL_LDAP_BIND_PWD_ENV env var */
+	if (strncmp(ldapbindpasswd, "YSQL_LDAP_BIND_PWD_ENV", 22) == 0)
+	{
+		if (getenv("YSQL_LDAP_BIND_PWD_ENV") != NULL)
+		{
+			return pstrdup(getenv("YSQL_LDAP_BIND_PWD_ENV"));
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("expected env variable YSQL_LDAP_BIND_PWD_ENV to be defined, got NULL")));
+	}
+
+	/* Return password as defined in hba.conf */
+	return pstrdup(ldapbindpasswd);
+}
 #endif							/* USE_LDAP */
 
 
@@ -2777,3 +3133,703 @@ CheckCertAuth(Port *port)
 	return status_check_usermap;
 }
 #endif
+<<<<<<< HEAD
+=======
+
+
+/*----------------------------------------------------------------
+ * RADIUS authentication
+ *----------------------------------------------------------------
+ */
+
+/*
+ * RADIUS authentication is described in RFC2865 (and several others).
+ */
+
+#define RADIUS_VECTOR_LENGTH 16
+#define RADIUS_HEADER_LENGTH 20
+#define RADIUS_MAX_PASSWORD_LENGTH 128
+
+/* Maximum size of a RADIUS packet we will create or accept */
+#define RADIUS_BUFFER_SIZE 1024
+
+typedef struct
+{
+	uint8		attribute;
+	uint8		length;
+	uint8		data[FLEXIBLE_ARRAY_MEMBER];
+} radius_attribute;
+
+typedef struct
+{
+	uint8		code;
+	uint8		id;
+	uint16		length;
+	uint8		vector[RADIUS_VECTOR_LENGTH];
+	/* this is a bit longer than strictly necessary: */
+	char		pad[RADIUS_BUFFER_SIZE - RADIUS_VECTOR_LENGTH];
+} radius_packet;
+
+/* RADIUS packet types */
+#define RADIUS_ACCESS_REQUEST	1
+#define RADIUS_ACCESS_ACCEPT	2
+#define RADIUS_ACCESS_REJECT	3
+
+/* RADIUS attributes */
+#define RADIUS_USER_NAME		1
+#define RADIUS_PASSWORD			2
+#define RADIUS_SERVICE_TYPE		6
+#define RADIUS_NAS_IDENTIFIER	32
+
+/* RADIUS service types */
+#define RADIUS_AUTHENTICATE_ONLY	8
+
+/* Seconds to wait - XXX: should be in a config variable! */
+#define RADIUS_TIMEOUT 3
+
+static void
+radius_add_attribute(radius_packet *packet, uint8 type, const unsigned char *data, int len)
+{
+	radius_attribute *attr;
+
+	if (packet->length + len > RADIUS_BUFFER_SIZE)
+	{
+		/*
+		 * With remotely realistic data, this can never happen. But catch it
+		 * just to make sure we don't overrun a buffer. We'll just skip adding
+		 * the broken attribute, which will in the end cause authentication to
+		 * fail.
+		 */
+		elog(WARNING,
+			 "adding attribute code %d with length %d to radius packet would create oversize packet, ignoring",
+			 type, len);
+		return;
+	}
+
+	attr = (radius_attribute *) ((unsigned char *) packet + packet->length);
+	attr->attribute = type;
+	attr->length = len + 2;		/* total size includes type and length */
+	memcpy(attr->data, data, len);
+	packet->length += attr->length;
+}
+
+static int
+CheckRADIUSAuth(Port *port)
+{
+	char	   *passwd;
+	ListCell   *server,
+			   *secrets,
+			   *radiusports,
+			   *identifiers;
+
+	/* Make sure struct alignment is correct */
+	Assert(offsetof(radius_packet, vector) == 4);
+
+	/* Verify parameters */
+	if (list_length(port->hba->radiusservers) < 1)
+	{
+		ereport(LOG,
+				(errmsg("RADIUS server not specified")));
+		return STATUS_ERROR;
+	}
+
+	if (list_length(port->hba->radiussecrets) < 1)
+	{
+		ereport(LOG,
+				(errmsg("RADIUS secret not specified")));
+		return STATUS_ERROR;
+	}
+
+	/* Send regular password request to client, and get the response */
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	passwd = recv_password_packet(port);
+	if (passwd == NULL)
+		return STATUS_EOF;		/* client wouldn't send password */
+
+	if (strlen(passwd) > RADIUS_MAX_PASSWORD_LENGTH)
+	{
+		ereport(LOG,
+				(errmsg("RADIUS authentication does not support passwords longer than %d characters", RADIUS_MAX_PASSWORD_LENGTH)));
+		pfree(passwd);
+		return STATUS_ERROR;
+	}
+
+	/*
+	 * Loop over and try each server in order.
+	 */
+	secrets = list_head(port->hba->radiussecrets);
+	radiusports = list_head(port->hba->radiusports);
+	identifiers = list_head(port->hba->radiusidentifiers);
+	foreach(server, port->hba->radiusservers)
+	{
+		int			ret = PerformRadiusTransaction(lfirst(server),
+												   lfirst(secrets),
+												   radiusports ? lfirst(radiusports) : NULL,
+												   identifiers ? lfirst(identifiers) : NULL,
+												   port->user_name,
+												   passwd);
+
+		/*------
+		 * STATUS_OK = Login OK
+		 * STATUS_ERROR = Login not OK, but try next server
+		 * STATUS_EOF = Login not OK, and don't try next server
+		 *------
+		 */
+		if (ret == STATUS_OK)
+		{
+			set_authn_id(port, port->user_name);
+
+			pfree(passwd);
+			return STATUS_OK;
+		}
+		else if (ret == STATUS_EOF)
+		{
+			pfree(passwd);
+			return STATUS_ERROR;
+		}
+
+		/*
+		 * secret, port and identifiers either have length 0 (use default),
+		 * length 1 (use the same everywhere) or the same length as servers.
+		 * So if the length is >1, we advance one step. In other cases, we
+		 * don't and will then reuse the correct value.
+		 */
+		if (list_length(port->hba->radiussecrets) > 1)
+			secrets = lnext(port->hba->radiussecrets, secrets);
+		if (list_length(port->hba->radiusports) > 1)
+			radiusports = lnext(port->hba->radiusports, radiusports);
+		if (list_length(port->hba->radiusidentifiers) > 1)
+			identifiers = lnext(port->hba->radiusidentifiers, identifiers);
+	}
+
+	/* No servers left to try, so give up */
+	pfree(passwd);
+	return STATUS_ERROR;
+}
+
+static int
+PerformRadiusTransaction(const char *server, const char *secret, const char *portstr, const char *identifier, const char *user_name, const char *passwd)
+{
+	radius_packet radius_send_pack;
+	radius_packet radius_recv_pack;
+	radius_packet *packet = &radius_send_pack;
+	radius_packet *receivepacket = &radius_recv_pack;
+	char	   *radius_buffer = (char *) &radius_send_pack;
+	char	   *receive_buffer = (char *) &radius_recv_pack;
+	int32		service = pg_hton32(RADIUS_AUTHENTICATE_ONLY);
+	uint8	   *cryptvector;
+	int			encryptedpasswordlen;
+	uint8		encryptedpassword[RADIUS_MAX_PASSWORD_LENGTH];
+	uint8	   *md5trailer;
+	int			packetlength;
+	pgsocket	sock;
+
+#ifdef HAVE_IPV6
+	struct sockaddr_in6 localaddr;
+	struct sockaddr_in6 remoteaddr;
+#else
+	struct sockaddr_in localaddr;
+	struct sockaddr_in remoteaddr;
+#endif
+	struct addrinfo hint;
+	struct addrinfo *serveraddrs;
+	int			port;
+	socklen_t	addrsize;
+	fd_set		fdset;
+	struct timeval endtime;
+	int			i,
+				j,
+				r;
+
+	/* Assign default values */
+	if (portstr == NULL)
+		portstr = "1812";
+	if (identifier == NULL)
+		identifier = "postgresql";
+
+	MemSet(&hint, 0, sizeof(hint));
+	hint.ai_socktype = SOCK_DGRAM;
+	hint.ai_family = AF_UNSPEC;
+	port = atoi(portstr);
+
+	r = pg_getaddrinfo_all(server, portstr, &hint, &serveraddrs);
+	if (r || !serveraddrs)
+	{
+		ereport(LOG,
+				(errmsg("could not translate RADIUS server name \"%s\" to address: %s",
+						server, gai_strerror(r))));
+		if (serveraddrs)
+			pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+		return STATUS_ERROR;
+	}
+	/* XXX: add support for multiple returned addresses? */
+
+	/* Construct RADIUS packet */
+	packet->code = RADIUS_ACCESS_REQUEST;
+	packet->length = RADIUS_HEADER_LENGTH;
+	if (!pg_strong_random(packet->vector, RADIUS_VECTOR_LENGTH))
+	{
+		ereport(LOG,
+				(errmsg("could not generate random encryption vector")));
+		pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+		return STATUS_ERROR;
+	}
+	packet->id = packet->vector[0];
+	radius_add_attribute(packet, RADIUS_SERVICE_TYPE, (const unsigned char *) &service, sizeof(service));
+	radius_add_attribute(packet, RADIUS_USER_NAME, (const unsigned char *) user_name, strlen(user_name));
+	radius_add_attribute(packet, RADIUS_NAS_IDENTIFIER, (const unsigned char *) identifier, strlen(identifier));
+
+	/*
+	 * RADIUS password attributes are calculated as: e[0] = p[0] XOR
+	 * MD5(secret + Request Authenticator) for the first group of 16 octets,
+	 * and then: e[i] = p[i] XOR MD5(secret + e[i-1]) for the following ones
+	 * (if necessary)
+	 */
+	encryptedpasswordlen = ((strlen(passwd) + RADIUS_VECTOR_LENGTH - 1) / RADIUS_VECTOR_LENGTH) * RADIUS_VECTOR_LENGTH;
+	cryptvector = palloc(strlen(secret) + RADIUS_VECTOR_LENGTH);
+	memcpy(cryptvector, secret, strlen(secret));
+
+	/* for the first iteration, we use the Request Authenticator vector */
+	md5trailer = packet->vector;
+	for (i = 0; i < encryptedpasswordlen; i += RADIUS_VECTOR_LENGTH)
+	{
+		const char *errstr = NULL;
+
+		memcpy(cryptvector + strlen(secret), md5trailer, RADIUS_VECTOR_LENGTH);
+
+		/*
+		 * .. and for subsequent iterations the result of the previous XOR
+		 * (calculated below)
+		 */
+		md5trailer = encryptedpassword + i;
+
+		if (!pg_md5_binary(cryptvector, strlen(secret) + RADIUS_VECTOR_LENGTH,
+						   encryptedpassword + i, &errstr))
+		{
+			ereport(LOG,
+					(errmsg("could not perform MD5 encryption of password: %s",
+							errstr)));
+			pfree(cryptvector);
+			pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+			return STATUS_ERROR;
+		}
+
+		for (j = i; j < i + RADIUS_VECTOR_LENGTH; j++)
+		{
+			if (j < strlen(passwd))
+				encryptedpassword[j] = passwd[j] ^ encryptedpassword[j];
+			else
+				encryptedpassword[j] = '\0' ^ encryptedpassword[j];
+		}
+	}
+	pfree(cryptvector);
+
+	radius_add_attribute(packet, RADIUS_PASSWORD, encryptedpassword, encryptedpasswordlen);
+
+	/* Length needs to be in network order on the wire */
+	packetlength = packet->length;
+	packet->length = pg_hton16(packet->length);
+
+	sock = socket(serveraddrs[0].ai_family, SOCK_DGRAM, 0);
+	if (sock == PGINVALID_SOCKET)
+	{
+		ereport(LOG,
+				(errmsg("could not create RADIUS socket: %m")));
+		pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+		return STATUS_ERROR;
+	}
+
+	memset(&localaddr, 0, sizeof(localaddr));
+#ifdef HAVE_IPV6
+	localaddr.sin6_family = serveraddrs[0].ai_family;
+	localaddr.sin6_addr = in6addr_any;
+	if (localaddr.sin6_family == AF_INET6)
+		addrsize = sizeof(struct sockaddr_in6);
+	else
+		addrsize = sizeof(struct sockaddr_in);
+#else
+	localaddr.sin_family = serveraddrs[0].ai_family;
+	localaddr.sin_addr.s_addr = INADDR_ANY;
+	addrsize = sizeof(struct sockaddr_in);
+#endif
+
+	if (bind(sock, (struct sockaddr *) &localaddr, addrsize))
+	{
+		ereport(LOG,
+				(errmsg("could not bind local RADIUS socket: %m")));
+		closesocket(sock);
+		pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+		return STATUS_ERROR;
+	}
+
+	if (sendto(sock, radius_buffer, packetlength, 0,
+			   serveraddrs[0].ai_addr, serveraddrs[0].ai_addrlen) < 0)
+	{
+		ereport(LOG,
+				(errmsg("could not send RADIUS packet: %m")));
+		closesocket(sock);
+		pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+		return STATUS_ERROR;
+	}
+
+	/* Don't need the server address anymore */
+	pg_freeaddrinfo_all(hint.ai_family, serveraddrs);
+
+	/*
+	 * Figure out at what time we should time out. We can't just use a single
+	 * call to select() with a timeout, since somebody can be sending invalid
+	 * packets to our port thus causing us to retry in a loop and never time
+	 * out.
+	 *
+	 * XXX: Using WaitLatchOrSocket() and doing a CHECK_FOR_INTERRUPTS() if
+	 * the latch was set would improve the responsiveness to
+	 * timeouts/cancellations.
+	 */
+	gettimeofday(&endtime, NULL);
+	endtime.tv_sec += RADIUS_TIMEOUT;
+
+	while (true)
+	{
+		struct timeval timeout;
+		struct timeval now;
+		int64		timeoutval;
+		const char *errstr = NULL;
+
+		gettimeofday(&now, NULL);
+		timeoutval = (endtime.tv_sec * 1000000 + endtime.tv_usec) - (now.tv_sec * 1000000 + now.tv_usec);
+		if (timeoutval <= 0)
+		{
+			ereport(LOG,
+					(errmsg("timeout waiting for RADIUS response from %s",
+							server)));
+			closesocket(sock);
+			return STATUS_ERROR;
+		}
+		timeout.tv_sec = timeoutval / 1000000;
+		timeout.tv_usec = timeoutval % 1000000;
+
+		FD_ZERO(&fdset);
+		FD_SET(sock, &fdset);
+
+		r = select(sock + 1, &fdset, NULL, NULL, &timeout);
+		if (r < 0)
+		{
+			if (errno == EINTR)
+				continue;
+
+			/* Anything else is an actual error */
+			ereport(LOG,
+					(errmsg("could not check status on RADIUS socket: %m")));
+			closesocket(sock);
+			return STATUS_ERROR;
+		}
+		if (r == 0)
+		{
+			ereport(LOG,
+					(errmsg("timeout waiting for RADIUS response from %s",
+							server)));
+			closesocket(sock);
+			return STATUS_ERROR;
+		}
+
+		/*
+		 * Attempt to read the response packet, and verify the contents.
+		 *
+		 * Any packet that's not actually a RADIUS packet, or otherwise does
+		 * not validate as an explicit reject, is just ignored and we retry
+		 * for another packet (until we reach the timeout). This is to avoid
+		 * the possibility to denial-of-service the login by flooding the
+		 * server with invalid packets on the port that we're expecting the
+		 * RADIUS response on.
+		 */
+
+		addrsize = sizeof(remoteaddr);
+		packetlength = recvfrom(sock, receive_buffer, RADIUS_BUFFER_SIZE, 0,
+								(struct sockaddr *) &remoteaddr, &addrsize);
+		if (packetlength < 0)
+		{
+			ereport(LOG,
+					(errmsg("could not read RADIUS response: %m")));
+			closesocket(sock);
+			return STATUS_ERROR;
+		}
+
+#ifdef HAVE_IPV6
+		if (remoteaddr.sin6_port != pg_hton16(port))
+#else
+		if (remoteaddr.sin_port != pg_hton16(port))
+#endif
+		{
+#ifdef HAVE_IPV6
+			ereport(LOG,
+					(errmsg("RADIUS response from %s was sent from incorrect port: %d",
+							server, pg_ntoh16(remoteaddr.sin6_port))));
+#else
+			ereport(LOG,
+					(errmsg("RADIUS response from %s was sent from incorrect port: %d",
+							server, pg_ntoh16(remoteaddr.sin_port))));
+#endif
+			continue;
+		}
+
+		if (packetlength < RADIUS_HEADER_LENGTH)
+		{
+			ereport(LOG,
+					(errmsg("RADIUS response from %s too short: %d", server, packetlength)));
+			continue;
+		}
+
+		if (packetlength != pg_ntoh16(receivepacket->length))
+		{
+			ereport(LOG,
+					(errmsg("RADIUS response from %s has corrupt length: %d (actual length %d)",
+							server, pg_ntoh16(receivepacket->length), packetlength)));
+			continue;
+		}
+
+		if (packet->id != receivepacket->id)
+		{
+			ereport(LOG,
+					(errmsg("RADIUS response from %s is to a different request: %d (should be %d)",
+							server, receivepacket->id, packet->id)));
+			continue;
+		}
+
+		/*
+		 * Verify the response authenticator, which is calculated as
+		 * MD5(Code+ID+Length+RequestAuthenticator+Attributes+Secret)
+		 */
+		cryptvector = palloc(packetlength + strlen(secret));
+
+		memcpy(cryptvector, receivepacket, 4);	/* code+id+length */
+		memcpy(cryptvector + 4, packet->vector, RADIUS_VECTOR_LENGTH);	/* request
+																		 * authenticator, from
+																		 * original packet */
+		if (packetlength > RADIUS_HEADER_LENGTH)	/* there may be no
+													 * attributes at all */
+			memcpy(cryptvector + RADIUS_HEADER_LENGTH, receive_buffer + RADIUS_HEADER_LENGTH, packetlength - RADIUS_HEADER_LENGTH);
+		memcpy(cryptvector + packetlength, secret, strlen(secret));
+
+		if (!pg_md5_binary(cryptvector,
+						   packetlength + strlen(secret),
+						   encryptedpassword, &errstr))
+		{
+			ereport(LOG,
+					(errmsg("could not perform MD5 encryption of received packet: %s",
+							errstr)));
+			pfree(cryptvector);
+			continue;
+		}
+		pfree(cryptvector);
+
+		if (memcmp(receivepacket->vector, encryptedpassword, RADIUS_VECTOR_LENGTH) != 0)
+		{
+			ereport(LOG,
+					(errmsg("RADIUS response from %s has incorrect MD5 signature",
+							server)));
+			continue;
+		}
+
+		if (receivepacket->code == RADIUS_ACCESS_ACCEPT)
+		{
+			closesocket(sock);
+			return STATUS_OK;
+		}
+		else if (receivepacket->code == RADIUS_ACCESS_REJECT)
+		{
+			closesocket(sock);
+			return STATUS_EOF;
+		}
+		else
+		{
+			ereport(LOG,
+					(errmsg("RADIUS response from %s has invalid code (%d) for user \"%s\"",
+							server, receivepacket->code, user_name)));
+			continue;
+		}
+	}							/* while (true) */
+}
+
+/*----------------------------------------------------------------
+ * JWT authentication
+ *----------------------------------------------------------------
+ */
+
+static char *ybReadFile(const char *outer_filename, const char *inc_filename,
+						int elevel);
+
+static char *ybReadFromUrl(const char *url);
+
+static void
+ybGetJwtAuthOptionsFromPortAndJwks(Port *port, char *jwks,
+								   YbcPgJwtAuthOptions *opt)
+{
+	HbaLine    *hba_line = port->hba;
+
+	opt->jwks = jwks;
+	opt->usermap = hba_line->usermap;
+	opt->username = port->user_name;
+
+	/* Use "sub" as the default matching claim key */
+	opt->matching_claim_key = hba_line->yb_jwt_matching_claim_key ? : "sub";
+
+	opt->allowed_issuers = (char **)
+		YbPtrListToArray(hba_line->yb_jwt_issuers,
+						 &opt->allowed_issuers_length);
+
+	opt->allowed_audiences = (char **)
+		YbPtrListToArray(hba_line->yb_jwt_audiences,
+						 &opt->allowed_audiences_length);
+}
+
+static int
+YbCheckJwtAuth(Port *port)
+{
+	char	   *jwt;
+	char	   *jwks;
+	int			auth_result;
+
+	/*
+	 * Read the jwks file before the password prompt so that we fail fast if we
+	 * fail to read the jwks file or the content is invalid.
+	 * Check if jwt_jwks_url is provided then use that otherwise use jwt_jwks_path
+	 */
+	if (port->hba->yb_jwt_jwks_url)
+		jwks = ybReadFromUrl(port->hba->yb_jwt_jwks_url);
+	else
+		jwks = ybReadFile(HbaFileName, port->hba->yb_jwt_jwks_path, LOG);
+	if (jwks == NULL)
+		return STATUS_ERROR;
+
+	/* Send regular password request to client, and get the response */
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	/* Interpret password as jwt */
+	jwt = recv_password_packet(port);
+	if (jwt == NULL)
+		return STATUS_EOF;		/* client didn't send jwt */
+
+	/*
+	 * We are allocating a temporary array of char* for audiences and issuers
+	 * entries. We do that since there is no easy way to send the PG List to the
+	 * C++ layer.
+	 */
+	YbcPgJwtAuthOptions jwt_auth_options;
+
+	ybGetJwtAuthOptionsFromPortAndJwks(port, jwks, &jwt_auth_options);
+
+	YbcStatus	s = YBCValidateJWT(jwt, &jwt_auth_options);
+
+	auth_result = (s) ? STATUS_ERROR : STATUS_OK;
+	if (s)						/* !ok */
+	{
+		ereport(LOG,
+				(errmsg("JWT login failed with error: %s",
+						YBCStatusMessageBegin(s))));
+		YBCFreeStatus(s);
+	}
+
+	/* Free up the temporary arrays we made in YbJwtAuthOptionsFromHba */
+	pfree(jwt_auth_options.allowed_audiences);
+	pfree(jwt_auth_options.allowed_issuers);
+
+	pfree(jwks);
+	pfree(jwt);
+	return auth_result;
+}
+
+/*
+ * Reads the contents of the given file path. If the file path is a relative
+ * path, it is treated as relative to the directory of the provided
+ * outer_filename.
+ *
+ * An error is reported at elevel LOG if the file path is invalid,
+ * inaccessible or the contents are not in the database encoding.
+ *
+ * This function is derived from the tokenize_inc_file function from the
+ * src/postgres/src/backend/libpq/hba.c file. The tokenize_inc_file tokenizes
+ * the hba lines from an included file while this function just reads them.
+ */
+static char *
+ybReadFile(const char *outer_filename, const char *inc_filename, int elevel)
+{
+	char	   *file_fullname;
+	char	   *file_contents;
+	int			len;
+
+	if (is_absolute_path(inc_filename))
+	{
+		/* absolute path is taken as-is */
+		file_fullname = pstrdup(inc_filename);
+	}
+	else
+	{
+		/*
+		 * relative path is relative to dir of file from which the path was
+		 * referenced.
+		 */
+		file_fullname =
+			(char *) palloc(strlen(outer_filename) + 1 + strlen(inc_filename) + 1);
+		strcpy(file_fullname, outer_filename);
+		get_parent_directory(file_fullname);
+		join_path_components(file_fullname, file_fullname, inc_filename);
+		canonicalize_path(file_fullname);
+	}
+
+	file_contents = YbReadWholeFile(file_fullname, &len, elevel);
+	if (file_contents == NULL)
+	{
+		pfree(file_fullname);
+		return NULL;
+	}
+
+	/*
+	 * Make sure the contents are valid.
+	 *
+	 * We use noError as true because we want to have control over the ereport
+	 * elevel in case of invalid file contents.
+	 */
+	if (!pg_verifymbstr(file_contents, len, /* noError */ true))
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("invalid encoding of file \"%s\"", inc_filename)));
+		pfree(file_fullname);
+		return NULL;
+	}
+
+	pfree(file_fullname);
+	return file_contents;
+}
+
+static char *
+ybReadFromUrl(const char *url)
+{
+	char	   *url_contents = NULL;
+	int			len;
+	YbcStatus	status;
+
+	status = YBCFetchFromUrl(url, &url_contents);
+	if (status)					/* !ok */
+	{
+		ereport(LOG,
+				(errmsg("fetching from JWT_JWKS_URL failed with error: %s",
+						YBCStatusMessageBegin(status))));
+		YBCFreeStatus(status);
+		return NULL;
+	}
+	if (!url_contents)
+		return NULL;
+
+	len = strlen(url_contents);
+	if (!pg_verifymbstr(url_contents, len, true))
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("invalid encoding of contents at \"%s\"", url)));
+		return NULL;
+	}
+	return url_contents;
+}
+>>>>>>> bc662ba7050

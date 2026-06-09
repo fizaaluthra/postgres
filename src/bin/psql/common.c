@@ -279,9 +279,9 @@ void
 NoticeProcessor(void *arg, const char *message)
 {
 	(void) arg;					/* not used */
+
 	pg_log_info("%s", message);
 }
-
 
 
 /*

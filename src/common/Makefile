@@ -44,6 +44,8 @@ override CPPFLAGS := -DFRONTEND -I. -I$(top_srcdir)/src/common $(CPPFLAGS)
 LIBS += $(PTHREAD_LIBS)
 
 OBJS_COMMON = \
+	pg_yb_common.o \
+	\
 	archive.o \
 	base64.o \
 	binaryheap.o \

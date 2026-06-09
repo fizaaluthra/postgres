@@ -80,6 +80,7 @@ int			px_gen_salt(const char *salt_type, char *buf, int rounds);
  */
 
 /* crypt-gensalt.c */
+<<<<<<< HEAD
 char	   *_crypt_gensalt_traditional_rn(unsigned long count,
 										  const char *input, int size, char *output, int output_size);
 char	   *_crypt_gensalt_extended_rn(unsigned long count,
@@ -92,13 +93,23 @@ char	   *_crypt_gensalt_sha256_rn(unsigned long count,
 									 const char *input, int size, char *output, int output_size);
 char	   *_crypt_gensalt_sha512_rn(unsigned long count,
 									 const char *input, int size, char *output, int output_size);
+=======
+char	   *yb_crypt_gensalt_traditional_rn(unsigned long count,
+											const char *input, int size, char *output, int output_size);
+char	   *yb_crypt_gensalt_extended_rn(unsigned long count,
+										 const char *input, int size, char *output, int output_size);
+char	   *yb_crypt_gensalt_md5_rn(unsigned long count,
+									const char *input, int size, char *output, int output_size);
+char	   *yb_crypt_gensalt_blowfish_rn(unsigned long count,
+										 const char *input, int size, char *output, int output_size);
+>>>>>>> bc662ba7050
 
 /* disable 'extended DES crypt' */
 /* #define DISABLE_XDES */
 
 /* crypt-blowfish.c */
-char	   *_crypt_blowfish_rn(const char *key, const char *setting,
-							   char *output, int size);
+char	   *yb_crypt_blowfish_rn(const char *key, const char *setting,
+								 char *output, int size);
 
 /* crypt-des.c */
 char	   *px_crypt_des(const char *key, const char *setting);

@@ -37,9 +37,21 @@
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "access/table.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_opfamily.h"
+#include "commands/defrem.h"
+#include "parser/parse_coerce.h"
+#include "pg_yb_utils.h"
+#include "rewrite/rewriteHandler.h"
+
 /* These parameters are set by GUC */
 int			from_collapse_limit;
 int			join_collapse_limit;
+
+extern int	yb_bnl_batch_size;
 
 
 /*
@@ -139,6 +151,10 @@ static Relids get_join_domain_min_rels(PlannerInfo *root, Relids domain_relids);
 static void check_mergejoinable(RestrictInfo *restrictinfo);
 static void check_hashjoinable(RestrictInfo *restrictinfo);
 static void check_memoizable(RestrictInfo *restrictinfo);
+
+/* YB declarations */
+static void check_batchable(PlannerInfo *root, RestrictInfo *restrictinfo);
+static ListCell *yb_find_wholerow_of_record_type(List *expr);
 
 
 /*****************************************************************************
@@ -321,6 +337,25 @@ add_vars_to_targetlist(PlannerInfo *root, List *vars,
 				var->varnullingrels = NULL;
 				rel->reltarget->exprs = lappend(rel->reltarget->exprs, var);
 				/* reltarget cost and width will be computed later */
+			}
+			else if (IsYugaByteEnabled() && var->varattno == InvalidOid &&
+					 var->vartype != RECORDOID)
+			{
+				/*
+				 * YB note: var is a wholerow Var with vartype == rel_type_id.
+				 * Prioritize it over existing wholerow of RECOROID type (if
+				 * any) in rel->reltarget->exprs.
+				 */
+				ListCell   *lc = yb_find_wholerow_of_record_type(rel->reltarget->exprs);
+
+				if (lc)
+				{
+					rel->reltarget->exprs =
+						list_delete_cell(rel->reltarget->exprs, lc);
+					/* XXX is copyObject necessary here? */
+					rel->reltarget->exprs = lappend(rel->reltarget->exprs,
+													copyObject(var));
+				}
 			}
 			rel->attr_needed[attno] = bms_add_members(rel->attr_needed[attno],
 													  where_needed);
@@ -3206,6 +3241,10 @@ distribute_qual_to_rels(PlannerInfo *root, Node *clause,
 	 * relation, or between vars and consts.
 	 */
 	check_mergejoinable(restrictinfo);
+	if (IsYugaByteEnabled())
+	{
+		check_batchable(root, restrictinfo);
+	}
 
 	/*
 	 * If it is a true equivalence clause, send it to the EquivalenceClass
@@ -3846,6 +3885,10 @@ build_implied_join_equality(PlannerInfo *root,
 	check_hashjoinable(restrictinfo);
 	check_memoizable(restrictinfo);
 
+	if (IsYugaByteEnabled())
+	{
+		check_batchable(root, restrictinfo);
+	}
 	return restrictinfo;
 }
 
@@ -4203,6 +4246,191 @@ check_hashjoinable(RestrictInfo *restrictinfo)
 }
 
 /*
+ * check_batchable
+ *	  If the restrictinfo's clause can potentially be a batched join clause
+ *	  then yb_batched_rinfo is filled in with candidate batched versions of
+ *	  this clause.
+ *
+ *	  Note that this does nothing if yb_bnl_batch_size indicates no batching.
+ *	  Right now we only support batching mergejoinable conditions of the form
+ *	  var_1 op var_2. These yield batched expressions,
+ *	  var_1 op YbBatchedExpr(var_2) and var_2 op YbBatchedExpr(var_1).
+ */
+static void
+check_batchable(PlannerInfo *root, RestrictInfo *restrictinfo)
+{
+	Expr	   *clause = restrictinfo->clause;
+	Node	   *leftarg;
+	Node	   *rightarg;
+	OpExpr	   *opexpr = (OpExpr *) clause;
+
+	if (yb_bnl_batch_size <= 1)
+		return;
+
+	if (!restrictinfo->mergeopfamilies)
+		return;
+
+	if (bms_overlap(restrictinfo->left_relids, restrictinfo->right_relids))
+		return;
+
+	leftarg = linitial(opexpr->args);
+	rightarg = lsecond(opexpr->args);
+
+	Node	   *outer;
+	Node	   *inner;
+
+	Node	   *args[] = {leftarg, rightarg};
+
+	/*
+	 * We currently only support cross-type IN conditions within the integer
+	 * ops families.
+	 */
+	bool		is_supported_cross_type_op = false;
+	ListCell   *lc;
+
+	foreach(lc, restrictinfo->mergeopfamilies)
+	{
+		Oid			opfamily = lfirst_oid(lc);
+
+		is_supported_cross_type_op |= opfamily == INTEGER_BTREE_FAM_OID;
+		is_supported_cross_type_op |= opfamily == INTEGER_LSM_FAM_OID;
+	}
+
+	Oid			opno = opexpr->opno;
+
+	/*
+	 * Try to make batched expressions of the forms
+	 * leftarg = BatchedExpr(rightarg) or rightarg = BatchedExpr(leftarg)
+	 * with necessary type checking.
+	 */
+	for (int i = 0; i < 2; i++)
+	{
+		inner = args[i];
+		outer = args[1 - i];
+		Node	   *inner_var = inner;
+
+		if (IsA(inner_var, RelabelType))
+			inner_var = (Node *) ((RelabelType *) inner_var)->arg;
+		if (!IsA(inner_var, Var))
+			continue;
+
+		RangeTblEntry *rte = root->simple_rte_array[((Var *) inner_var)->varno];
+
+		/* Skip batching if inner relation is not a YB relation */
+		if (rte->rtekind == RTE_RELATION && !IsYBRelationById(rte->relid))
+			continue;
+
+		Oid			outerType = exprType(outer);
+		Oid			innerType = exprType(inner);
+		int			innerTypMod = exprTypmod(inner);
+
+		/*
+		 * If we need a unsupported cross-type join, try to coerce
+		 * both sides to be the same type.
+		 */
+		if (!is_supported_cross_type_op && (outerType != innerType))
+		{
+			/* We need to coerce the outer operand to the inner type. */
+			Oid			finalargtype = innerType;
+			Oid			finalargtypmod = innerTypMod;
+			Node	   *coerced = NULL;
+
+			MemoryContext cxt = CurrentMemoryContext;
+
+			PG_TRY();
+			{
+				coerced = coerce_to_target_type(NULL, outer, outerType,
+												finalargtype, finalargtypmod,
+												COERCION_IMPLICIT,
+												COERCE_IMPLICIT_CAST, -1);
+			}
+			PG_CATCH();
+			{
+				/*
+				 * Doing nothing here as if we encounter an error during type
+				 * coercion, we'll consider this coercion impossible. One would
+				 * usually expect coerce_to_target_type to return NULL in all
+				 * cases. Unfortunately, in some cases like where a record type
+				 * is being coerced into an incompatible complex UDT, it logs an
+				 * error instead. Making this a workaround for now.
+				 */
+
+				MemoryContext errcxt = MemoryContextSwitchTo(cxt);
+				ErrorData  *errdata = CopyErrorData();
+				int			errcode = errdata->sqlerrcode;
+
+				FreeErrorData(errdata);
+
+				if (errcode == ERRCODE_CANNOT_COERCE)
+				{
+					FlushErrorState();
+				}
+				else
+				{
+					MemoryContextSwitchTo(errcxt);
+					PG_RE_THROW();
+				}
+			}
+			PG_END_TRY();
+
+
+			/* Outer can't be coerced to inner type, bail and continue. */
+			if (coerced == NULL)
+				continue;
+
+			/* Make outer the new coerced expression. */
+			outer = coerced;
+
+			char	   *opname = get_opname(opno);
+			List	   *names = lappend(NIL, makeString(opname));
+
+			/*
+			 * Find an equivalent operator whose operands are of the same
+			 * type.
+			 */
+			Oid			newopno = OpernameGetOprid(names, finalargtype,
+												   finalargtype);
+
+			pfree(opname);
+
+			if (!OidIsValid(newopno))
+				continue;
+
+			opno = newopno;
+		}
+
+		YbBatchedExpr *bexpr = makeNode(YbBatchedExpr);
+
+		bexpr->orig_expr = (Expr *) copyObject(outer);
+
+		Expr	   *batched_op = make_opclause(opno,
+											   opexpr->opresulttype,
+											   opexpr->opretset,
+											   (Expr *) inner,
+											   (Expr *) bexpr,
+											   opexpr->opcollid,
+											   opexpr->inputcollid);
+		RestrictInfo *batched = make_restrictinfo(root,
+												  batched_op,
+												  restrictinfo->is_pushed_down,
+												  restrictinfo->outerjoin_delayed,
+												  false,
+												  restrictinfo->security_level,
+												  restrictinfo->required_relids,
+												  restrictinfo->outer_relids,
+												  restrictinfo->nullable_relids);
+
+		restrictinfo->yb_batched_rinfo =
+			lappend(restrictinfo->yb_batched_rinfo, batched);
+
+		opno = get_commutator(opno);
+
+		if (opno == InvalidOid)
+			break;
+	}
+}
+
+/*
  * check_memoizable
  *	  If the restrictinfo's clause is suitable to be used for a Memoize node,
  *	  set the left_hasheqoperator and right_hasheqoperator to the hash equality
@@ -4243,4 +4471,158 @@ check_memoizable(RestrictInfo *restrictinfo)
 
 	if (OidIsValid(typentry->hash_proc) && OidIsValid(typentry->eq_opr))
 		restrictinfo->right_hasheqoperator = typentry->eq_opr;
+}
+
+static ListCell *
+yb_find_wholerow_of_record_type(List *expr)
+{
+	ListCell   *lc;
+
+	foreach(lc, expr)
+	{
+		Var		   *var = lfirst_node(Var, lc);
+
+		if (var->varattno == InvalidOid && var->vartype == RECORDOID)
+			return lc;
+	}
+	return NULL;
+}
+
+/* Context for expression substitution */
+typedef struct YbSubstituteContext
+{
+	PlannerInfo *root;
+	Index		rti;
+	Index		target_rti;
+	bool		failed;			/* Set to true if any Var couldn't be
+								 * substituted */
+	Relids		nullable_relids;
+} YbSubstituteContext;
+
+/*
+ * yb_substitute_ec_members_mutator
+ *   Recursively substitute Vars with their EC equivalents.
+ *   Sets context->failed if any Var can't be substituted.
+ */
+static Node *
+yb_substitute_ec_members_mutator(Node *node, void *context)
+{
+	YbSubstituteContext *ctx = (YbSubstituteContext *) context;
+
+	if (node == NULL || ctx->failed)
+		return NULL;
+
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		/* only process Vars from our target relation */
+		if (var->varno == ctx->rti && var->varattno > 0)
+		{
+			EquivalenceMember *ec_member = yb_find_ec_member_for_var(ctx->root, var,
+																	 ctx->rti,
+																	 ctx->target_rti);
+
+			if (ec_member != NULL)
+			{
+				ctx->nullable_relids = bms_union(ctx->nullable_relids, ec_member->em_nullable_relids);
+				return (Node *) ec_member->em_expr;
+			}
+
+			/* can't substitute this Var - mark as failed */
+			ctx->failed = true;
+			return NULL;
+		}
+	}
+
+	return expression_tree_mutator(node, yb_substitute_ec_members_mutator, context);
+}
+
+/*
+ * yb_try_substitute_ec_members
+ *   Try to substitute all Vars in expression with EC equivalents.
+ *   Returns NULL if any Var couldn't be substituted.
+ */
+static Expr *
+yb_try_substitute_ec_members(PlannerInfo *root, Expr *expr, Index rti,
+							 Index target_rti, Relids *nullable_relids)
+{
+	YbSubstituteContext context;
+	Expr	   *result;
+
+	context.root = root;
+	context.rti = rti;
+	context.target_rti = target_rti;
+	context.failed = false;
+	context.nullable_relids = NULL;
+
+	result = (Expr *) yb_substitute_ec_members_mutator((Node *) expr, &context);
+	*nullable_relids = context.nullable_relids;
+
+	return context.failed ? NULL : result;
+}
+
+/*
+ * yb_create_derived_clause
+ *   Create inferrable_expr = substituted_expr clause
+ *   Returns NULL if can't create proper equality operator.
+ */
+static OpExpr *
+yb_create_derived_clause(Expr *inferrable_expr, Expr *substituted_expr,
+						 Oid opfamily)
+{
+	Oid			datatype = exprType((Node *) inferrable_expr);
+	Oid			collation = exprCollation((Node *) inferrable_expr);
+	Oid			eq_op = get_opfamily_member(opfamily, datatype, datatype,
+											BTEqualStrategyNumber);
+
+	if (!OidIsValid(eq_op))
+		return NULL;
+
+	return (OpExpr *) make_opclause(eq_op, BOOLOID, false,
+									inferrable_expr, substituted_expr,
+									InvalidOid, collation);
+}
+
+static RestrictInfo *
+yb_get_clause_restrictinfo(PlannerInfo *root, OpExpr *clause, Relids nullable_relids)
+{
+	Relids		clause_relids = pull_varnos(root, (Node *) clause);
+	bool		outerjoin_delayed = !bms_is_empty(nullable_relids);
+	bool		is_pushed_down = (bms_num_members(clause_relids) == 1 && !outerjoin_delayed);
+
+	RestrictInfo *rinfo = make_restrictinfo(root,
+											(Expr *) clause,
+											is_pushed_down,
+											outerjoin_delayed,
+											false,
+											root->qual_security_level,
+											clause_relids,
+											NULL,
+											nullable_relids);
+
+	check_mergejoinable(rinfo);
+	check_batchable(root, rinfo);
+	return rinfo;
+}
+
+RestrictInfo *
+yb_try_create_derived_clause(PlannerInfo *root, Index rti, Index target_rti,
+							 Expr *inferrable_expr, Expr *generation_expr,
+							 Oid opfamily)
+{
+	Expr	   *substituted = NULL;
+	Relids		nullable_relids = NULL;
+	OpExpr	   *clause = NULL;
+
+	substituted = yb_try_substitute_ec_members(root, generation_expr, rti,
+											   target_rti,
+											   &nullable_relids);
+	if (substituted)
+		clause = yb_create_derived_clause(inferrable_expr, substituted,
+										  opfamily);
+	if (clause)
+		return yb_get_clause_restrictinfo(root, clause, nullable_relids);
+	bms_free(nullable_relids);
+	return NULL;
 }

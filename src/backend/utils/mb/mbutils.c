@@ -1499,7 +1499,12 @@ pg_utf8_increment(unsigned char *charptr, int length)
 				charptr[3]++;
 				break;
 			}
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case 3:
 			a = charptr[2];
 			if (a < 0xBF)
@@ -1507,7 +1512,12 @@ pg_utf8_increment(unsigned char *charptr, int length)
 				charptr[2]++;
 				break;
 			}
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case 2:
 			a = charptr[1];
 			switch (*charptr)
@@ -1527,7 +1537,12 @@ pg_utf8_increment(unsigned char *charptr, int length)
 				charptr[1]++;
 				break;
 			}
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case 1:
 			a = *charptr;
 			if (a == 0x7F || a == 0xDF || a == 0xEF || a == 0xF4)

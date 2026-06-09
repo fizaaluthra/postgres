@@ -403,6 +403,7 @@ extern void heap_inplace_update_and_unlock(Relation relation,
 										   Buffer buffer);
 extern void heap_inplace_unlock(Relation relation,
 								HeapTuple oldtup, Buffer buffer);
+<<<<<<< HEAD
 extern bool heap_prepare_freeze_tuple(HeapTupleHeader tuple,
 									  const VacuumCutoffs *cutoffs,
 									  HeapPageFreeze *pagefrz,
@@ -412,6 +413,9 @@ extern void heap_pre_freeze_checks(Buffer buffer,
 								   HeapTupleFreeze *tuples, int ntuples);
 extern void heap_freeze_prepared_tuples(Buffer buffer,
 										HeapTupleFreeze *tuples, int ntuples);
+=======
+extern void heap_inplace_update(Relation relation, HeapTuple tuple, bool yb_shared_update);
+>>>>>>> bc662ba7050
 extern bool heap_freeze_tuple(HeapTupleHeader tuple,
 							  TransactionId relfrozenxid, TransactionId relminmxid,
 							  TransactionId FreezeLimit, TransactionId MultiXactCutoff);

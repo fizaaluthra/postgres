@@ -64,6 +64,13 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 
+/* YB includes */
+#include "catalog/namespace.h"
+#include "pg_yb_utils.h"
+#include "utils/varlena.h"
+#include "utils/yb_jumblefuncs.h"
+#include "yb_qpm.h"
+
 /* GUC parameters */
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
@@ -81,6 +88,11 @@ planner_shutdown_hook_type planner_shutdown_hook = NULL;
 
 /* Hook for plugins to get control when grouping_planner() plans upper rels */
 create_upper_paths_hook_type create_upper_paths_hook = NULL;
+
+/*
+ * YB: GUC flag, whether to attempt single RPC lock+select in RR and RC levels.
+ */
+bool		yb_lock_pk_single_rpc = true;
 
 
 /* Expression kind codes for preprocess_expression */
@@ -280,6 +292,20 @@ static void create_partial_unique_paths(PlannerInfo *root, RelOptInfo *input_rel
 										List *sortPathkeys, List *groupClause,
 										SpecialJoinInfo *sjinfo, RelOptInfo *unique_rel);
 
+/* YB declarations */
+static void ybAppendHintNameDisplayText(char *name, StringInfoData *buf);
+static char *ybGenerateHintStringBlock(PlannedStmt *plannedStmt, Plan *plan,
+									   int *maxBlockScanCnt);
+static bool ybGenerateHintStringNode(PlannedStmt *plannedStmt, Plan *plan,
+									 StringInfoData *leadingBuf,
+									 StringInfoData *methodBuf,
+									 List **scanList, List **subPlanHintStrings,
+									 int *maxBlockScanCnt, int numWorkers);
+static int	ybCmpHintAliases(const ListCell *lc1, const ListCell *lc2);
+static void ybPlanIdWalker(YbJumbleState *jstate, Plan *plan, bool isRoot);
+static void ybCalculatePlanId(PlannedStmt *plannedStmt);
+static int ybCmpRangeTblEntry(const ListCell *lc1, const ListCell *lc2);
+static int *ybBuildRtIndexMap(List *rtable, List *sortedRtable);
 
 /*****************************************************************************
  *
@@ -373,8 +399,69 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	glob->lastPlanNodeId = 0;
 	glob->transientPlan = false;
 	glob->dependsOnRole = false;
+<<<<<<< HEAD
 	glob->partition_directory = NULL;
 	glob->rel_notnullatts_hash = NULL;
+=======
+	glob->ybBaseRelCnt = 0;
+	glob->ybPlanHintsAliasMapping = NIL;
+	glob->ybBlockCnt = 0;
+	glob->ybNextUid = 0;
+	glob->ybNextNodeUid = 0;
+	glob->ybHintedUids = NIL;
+	ybInitHintedUids(glob);
+
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * Insert a NULL at position 0 since we start in position 1 for convenience and numbering/indexing
+		 * begins at 1 for relations when planning.
+		 */
+		glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, 0, NULL);
+
+		if (parse->resultRelation != 0)
+		{
+			/*
+			 * We have an INSERT, UPDATE, DELETE, or MERGE statement. Add the name of the target table to the
+			 * global hint alias list (if the target is a relation).
+			 */
+			RangeTblEntry *targetRte = rt_fetch(parse->resultRelation, parse->rtable);
+
+			if (targetRte->rtekind == RTE_RELATION)
+			{
+				/*
+				 * Assign a hint alias and unique id to the relation. Want to do this now and use it in
+				 * build_simple_rel() so we do not create any unnecessary hint aliases.
+				 */
+				targetRte->ybUniqueBaseId = ++(glob->ybBaseRelCnt);
+
+				char	   *hintAlias;
+
+				if (targetRte->eref != NULL && targetRte->eref->aliasname != NULL)
+				{
+					/* Use the alias. */
+					hintAlias = targetRte->eref->aliasname;
+				}
+				else
+				{
+					/* Get the relation's name. */
+					hintAlias = targetRte->ybScannedObjectName;
+					Assert (hintAlias != NULL);
+				}
+
+				/*
+				 * Insert the relation into the global list.
+				 */
+				glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, glob->ybBaseRelCnt, hintAlias);
+
+				/*
+				 * Store the info on the RTE.
+				 */
+				targetRte->ybHintAlias = hintAlias;
+			}
+		}
+	}
+>>>>>>> bc662ba7050
 
 	/*
 	 * Assess whether it's feasible to use parallel mode for this query. We
@@ -396,13 +483,16 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 * parallel worker.  We might eventually be able to relax this
 	 * restriction, but for now it seems best not to have parallel workers
 	 * trying to create their own parallel workers.
+	 *
+	 * YB: TODO GHI 23549: enable parallel query in serializable isolation.
 	 */
 	if ((cursorOptions & CURSOR_OPT_PARALLEL_OK) != 0 &&
 		IsUnderPostmaster &&
 		parse->commandType == CMD_SELECT &&
 		!parse->hasModifyingCTE &&
 		max_parallel_workers_per_gather > 0 &&
-		!IsParallelWorker())
+		!IsParallelWorker() &&
+		!IsolationIsSerializable())
 	{
 		/* all the cheap tests pass, so scan the query tree */
 		glob->maxParallelHazard = max_parallel_hazard(parse);
@@ -681,6 +771,8 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->elidedNodes = glob->elidedNodes;
 	result->stmt_location = parse->stmt_location;
 	result->stmt_len = parse->stmt_len;
+	result->yb_num_referenced_relations = root->yb_num_referenced_relations;
+	result->ybPlanId = 0;
 
 	result->jitFlags = PGJIT_NONE;
 	if (jit_enabled && jit_above_cost >= 0 &&
@@ -807,12 +899,23 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	root->hasAlternativeSubPlans = false;
 	root->placeholdersFrozen = false;
 	root->hasRecursion = hasRecursion;
+<<<<<<< HEAD
 	root->assumeReplanning = false;
+=======
+	root->yb_cur_batched_relids =
+		parent_root ? parent_root->yb_cur_batched_relids : NULL;
+	root->yb_cur_unbatched_relids =
+		parent_root ? parent_root->yb_cur_unbatched_relids : NULL;
+	root->yb_availBatchedRelids =
+		parent_root ? parent_root->yb_availBatchedRelids : NULL;
+	root->yb_cur_batch_no = -1;
+>>>>>>> bc662ba7050
 	if (hasRecursion)
 		root->wt_param_id = assign_special_exec_param(root);
 	else
 		root->wt_param_id = -1;
 	root->non_recursive_path = NULL;
+<<<<<<< HEAD
 
 	/*
 	 * Create the top-level join domain.  This won't have valid contents until
@@ -820,6 +923,15 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	 * that so we can build EquivalenceClasses referencing it.
 	 */
 	root->join_domains = list_make1(makeNode(JoinDomain));
+=======
+	root->partColsUpdated = false;
+	root->yb_num_referenced_relations = 0;
+	root->ybBlockId = 0;
+	root->ybHintedJoinsOuter = NIL;
+	root->ybHintedJoinsInner = NIL;
+	root->ybProhibitedJoinTypes = NIL;
+	root->ybProhibitedJoins = NIL;
+>>>>>>> bc662ba7050
 
 	/*
 	 * If there is a WITH list, process each WITH query and either convert it
@@ -1341,6 +1453,14 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	 */
 	set_cheapest(final_rel);
 
+	/*
+	 * YB: For the top-level query, parent_root is NULL. In all other cases,
+	 * update the number of relations that survived constraint exclusion
+	 * and partition pruning.
+	 */
+	if (parent_root)
+		parent_root->yb_num_referenced_relations +=
+			root->yb_num_referenced_relations;
 	return root;
 }
 
@@ -1500,6 +1620,173 @@ Expr *
 preprocess_phv_expression(PlannerInfo *root, Expr *expr)
 {
 	return (Expr *) preprocess_expression(root, (Node *) expr, EXPRKIND_PHV);
+}
+
+/*
+ * Returns whether the given IndexOptInfo represents the primary index in
+ * YugabyteDB (i.e., contains the primary source of truth for the data).
+ */
+static bool
+yb_is_main_table(IndexOptInfo *indexinfo)
+{
+	Relation	indrel;
+	bool		is_main_table = false;
+
+	if (!IsYugaByteEnabled())
+		return false;
+
+	if (indexinfo->rel->reloptkind != RELOPT_BASEREL)
+		return false;
+
+	indrel = RelationIdGetRelation(indexinfo->indexoid);
+	if (indrel != NULL && indrel->rd_index != NULL)
+		is_main_table = indrel->rd_index->indisprimary;
+	if (indrel != NULL)
+		RelationClose(indrel);
+	return is_main_table;
+}
+
+/* Returns whether the given index_path matches the primary key exactly. */
+static bool
+yb_ipath_matches_pk(IndexPath *index_path)
+{
+	ListCell   *values;
+	Bitmapset  *primary_key_attrs = NULL;
+	ListCell   *lc = NULL;
+
+	/*
+	 * Verify no non-primary-key filters are specified.
+	 */
+	foreach(values, index_path->indexinfo->indrestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, values);
+
+		if (!is_redundant_with_indexclauses(rinfo, index_path->indexclauses))
+			return false;
+	}
+
+	/*
+	 * Check that all WHERE clause conditions in the query use the equality
+	 * operator, and count the number of primary keys used.
+	 */
+	foreach(lc, index_path->indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+		ListCell   *lc2;
+
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Expr	   *clause = rinfo->clause;
+			Oid			clause_op;
+			int			op_strategy;
+
+			if (!IsA(clause, OpExpr))
+				return false;
+
+			clause_op = ((OpExpr *) clause)->opno;
+			if (!OidIsValid(clause_op))
+				return false;
+
+			/* indexcols is only set for RowCompareExpr. */
+			Assert(iclause->indexcols == NULL);
+
+			op_strategy =
+				get_op_opfamily_strategy(clause_op,
+										 index_path->indexinfo->opfamily[iclause->indexcol]);
+			Assert(op_strategy != 0);	/* not a member of opfamily?? */
+			if (op_strategy != BTEqualStrategyNumber)
+				return false;
+			/* Just used for counting, not matching. */
+			primary_key_attrs =
+				bms_add_member(primary_key_attrs, iclause->indexcol);
+		}
+	}
+
+	/*
+	 * After checking all queries are for equality on primary keys, now we just
+	 * have to ensure we've covered all the primary keys.
+	 */
+	return (bms_num_members(primary_key_attrs) ==
+			index_path->indexinfo->nkeycolumns);
+}
+
+/*
+ * Checks if conditions are suitable to create a path with a single-RPC
+ * lock+select, and creates that path. Because plans can be made in isolation
+ * level SERIALIZABLE and executed at a different isolation level, this
+ * is computed even in SERIALIZABLE, even though other logic takes precedence
+ * if executed in SERIALIZABLE.
+ */
+static void
+yb_consider_locking_scan(PlannerInfo *root, RelOptInfo *final_rel)
+{
+	IndexPath  *new_path = NULL;
+	ListCell   *lc;
+
+	/*
+	 * This optimization only happens if there are rowMarks in the parse
+	 * (meaning locking).
+	 */
+	if (!root->parse->rowMarks)
+		return;
+
+	foreach(lc, final_rel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		LockRowsPath *lr_path;
+		IndexPath  *original_index_path;
+
+		if (!IsA(path, LockRowsPath))
+			continue;
+		lr_path = castNode(LockRowsPath, path);
+		if (!IsA(lr_path->subpath, IndexPath))
+			continue;
+		original_index_path = castNode(IndexPath, lr_path->subpath);
+		if (original_index_path->indexclauses != NIL && yb_lock_pk_single_rpc &&
+			yb_is_main_table(original_index_path->indexinfo) &&
+			yb_ipath_matches_pk(original_index_path))
+		{
+			/*
+			 * We can't use create_index_path directly, Instead we do a
+			 * hack as in reparameterize_paths: flat-copy the path node,
+			 * add the lock mechanism, and redo the cost estimate.
+			 */
+			new_path = makeNode(IndexPath);
+			memcpy(new_path, original_index_path, sizeof(IndexPath));
+			new_path->yb_index_path_info.yb_lock_mechanism = YB_LOCK_CLAUSE_ON_PK;
+			cost_index(new_path, root, /* loop_count= */ 1.0, false);
+		}
+	}
+
+	/* The new path should dominate the old one because LockRows adds cost. */
+	if (new_path)
+		add_path(final_rel, (Path *) new_path);
+}
+
+/*
+ * We can skip the LockRows node only if we know that it won't be needed, which
+ * means:
+ *  * Must be an IndexScan
+ *  * Must have been determined to YB_LOCK_CLAUSE_ON_PK (meaning, if we're in
+ *    isolation levels READ COMMITTED or REPEATABLE READ, we can lock and read
+ *    in a single RPC).
+ *
+ * Note we can switch isolation levels between planning and execution, for
+ * example in the case of prepared plans. Skipping the LockRows node is easier
+ * if we can meet the above conditions, otherwise we would need more complicated
+ * logic in LockRows to detect this condition and avoid double-locking.
+ */
+static bool
+yb_skip_lockrows(Path *path)
+{
+	IndexPath  *index_scan_path;
+
+	if (!IsA(path, IndexPath))
+		return false;
+	index_scan_path = castNode(IndexPath, path);
+	return (index_scan_path->yb_index_path_info.yb_lock_mechanism ==
+			YB_LOCK_CLAUSE_ON_PK);
 }
 
 /*--------------------
@@ -2000,8 +2287,15 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		 * here.  If there are only non-locking rowmarks, they should be
 		 * handled by the ModifyTable node instead.  However, root->rowMarks
 		 * is what goes into the LockRows node.)
+		 *
+		 * YB: In isolation level SERIALIZABLE, locking is done in the scans,
+		 * but the LockRows path usually still needs to be created in case the
+		 * plan created in SERIALIZABLE is executed in isolation level RR or
+		 * RC. However, there is no need for a LockRows node if we do the
+		 * locking in the scan in all isolation levels, which is the case with
+		 * single-RPC locking on a PK.
 		 */
-		if (parse->rowMarks)
+		if (parse->rowMarks && !yb_skip_lockrows(path))
 		{
 			path = (Path *) create_lockrows_path(root, final_rel, path,
 												 root->rowMarks,
@@ -2058,6 +2352,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 					 */
 					if (IS_DUMMY_REL(this_result_rel))
 						continue;
+
+					root->yb_num_referenced_relations++;
 
 					/* Build per-target-rel lists needed by ModifyTable */
 					resultRelations = lappend_int(resultRelations,
@@ -2259,6 +2555,12 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		final_rel->fdwroutine->GetForeignUpperPaths(root, UPPERREL_FINAL,
 													current_rel, final_rel,
 													&extra);
+
+	/*
+	 * If YugabyteDB can create a more efficient path, let it do so.
+	 */
+	if (IsYugaByteEnabled())
+		yb_consider_locking_scan(root, final_rel);
 
 	/* Let extensions possibly add some more paths */
 	if (create_upper_paths_hook)
@@ -5140,6 +5442,26 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	double		numDistinctRows;
 	bool		allow_hash;
 
+	List	   *yb_distinct_paths;
+
+	/* YB: Figure out paths that are already distinct. */
+	yb_distinct_paths = NIL;
+	if (IsYugaByteEnabled())
+	{
+		foreach(lc, input_rel->pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lc);
+
+			/*
+			 * YB: Do not add these paths to distinct_rel yet because we refer
+			 * to them later on in this function and we don't want add_path()
+			 * to pfree these paths.
+			 */
+			if (yb_has_sufficient_uniqkeys(root, path))
+				yb_distinct_paths = lappend(yb_distinct_paths, path);
+		}
+	}
+
 	/* Estimate number of distinct rows there will be */
 	if (parse->groupClause || parse->groupingSets || parse->hasAggs ||
 		root->hasHavingQual)
@@ -5211,6 +5533,7 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 
 			foreach_node(List, useful_pathkeys, useful_pathkeys_list)
 			{
+<<<<<<< HEAD
 				sorted_path = make_ordered_path(root,
 												distinct_rel,
 												input_path,
@@ -5263,6 +5586,56 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				}
 			}
 		}
+=======
+				/* YB: Do not consider paths that are already distinct. */
+				if (!IsYugaByteEnabled() ||
+					!list_member_ptr(yb_distinct_paths, path))
+				{
+					/* YB: Avoid adding UpperUniquePath twice. */
+					if (IsYugaByteEnabled() && IsA(path, UpperUniquePath))
+						path = ((UpperUniquePath *) path)->subpath;
+
+					add_path(distinct_rel, (Path *)
+							 create_upper_unique_path(root, distinct_rel, path,
+													  list_length(root->distinct_pathkeys),
+													  numDistinctRows));
+				}
+			}
+		}
+
+		/* For explicit-sort case, always use the more rigorous clause */
+		if (list_length(root->distinct_pathkeys) <
+			list_length(root->sort_pathkeys))
+		{
+			needed_pathkeys = root->sort_pathkeys;
+			/* Assert checks that parser didn't mess up... */
+			Assert(pathkeys_contained_in(root->distinct_pathkeys,
+										 needed_pathkeys));
+		}
+		else
+			needed_pathkeys = root->distinct_pathkeys;
+
+		path = cheapest_input_path;
+		if (!pathkeys_contained_in(needed_pathkeys, path->pathkeys))
+			path = (Path *) create_sort_path(root, distinct_rel,
+											 path,
+											 needed_pathkeys,
+											 -1.0);
+
+		/* YB: Ignore sort+uniq if cheapest_input_path is already distinct. */
+		if (!IsYugaByteEnabled() ||
+			!list_member_ptr(yb_distinct_paths, cheapest_input_path))
+		{
+			/* YB: Avoid adding UpperUniquePath twice. */
+			if (IsYugaByteEnabled() && IsA(path, UpperUniquePath))
+				path = ((UpperUniquePath *) path)->subpath;
+
+			add_path(distinct_rel, (Path *)
+					 create_upper_unique_path(root, distinct_rel, path,
+											  list_length(root->distinct_pathkeys),
+											  numDistinctRows));
+		}
+>>>>>>> bc662ba7050
 	}
 
 	/*
@@ -5284,7 +5657,14 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	else
 		allow_hash = true;		/* default */
 
+<<<<<<< HEAD
 	if (allow_hash && grouping_is_hashable(root->processed_distinctClause))
+=======
+	/* YB: Ignore hashagg if cheapest_input_path is already distinct. */
+	if (allow_hash && grouping_is_hashable(parse->distinctClause) &&
+		!(IsYugaByteEnabled() && list_member_ptr(yb_distinct_paths,
+												 cheapest_input_path)))
+>>>>>>> bc662ba7050
 	{
 		/* Generate hashed aggregate path --- no sort needed */
 		add_path(distinct_rel, (Path *)
@@ -5299,6 +5679,12 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 								 NULL,
 								 numDistinctRows));
 	}
+
+	/*
+	 * YB: Now, add all paths that are already distinct.
+	 */
+	foreach(lc, yb_distinct_paths)
+		add_path(distinct_rel, (Path *) lfirst(lc));
 
 	return distinct_rel;
 }
@@ -6940,6 +7326,13 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 	query->commandType = CMD_SELECT;
 
 	glob = makeNode(PlannerGlobal);
+	glob->ybBaseRelCnt = 0;
+	glob->ybPlanHintsAliasMapping = NIL;
+	glob->ybBlockCnt = 0;
+	glob->ybNextUid = 0;
+	glob->ybNextNodeUid = 0;
+	glob->ybHintedUids = NIL;
+	ybInitHintedUids(glob);
 
 	root = makeNode(PlannerInfo);
 	root->parse = query;
@@ -6947,7 +7340,15 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 	root->query_level = 1;
 	root->planner_cxt = CurrentMemoryContext;
 	root->wt_param_id = -1;
+<<<<<<< HEAD
 	root->join_domains = list_make1(makeNode(JoinDomain));
+=======
+	root->ybBlockId = 0;
+	root->ybHintedJoinsOuter = NIL;
+	root->ybHintedJoinsInner = NIL;
+	root->ybProhibitedJoinTypes = NIL;
+	root->ybProhibitedJoins = NIL;
+>>>>>>> bc662ba7050
 
 	/* Build a minimal RTE for the rel */
 	rte = makeNode(RangeTblEntry);
@@ -7013,9 +7414,10 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 
 	/* Estimate the cost of index scan */
 	indexScanPath = create_index_path(root, indexInfo,
-									  NIL, NIL, NIL, NIL,
+									  NIL, NIL, NIL, NIL, NIL,
 									  ForwardScanDirection, false,
-									  NULL, 1.0, false);
+									  NULL, 1.0, false,
+									  NULL);	/* yb_merge_scan_saop_cols */
 
 	return (seqScanAndSortPath.total_cost < indexScanPath->path.total_cost);
 }
@@ -7064,6 +7466,13 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 	query->commandType = CMD_SELECT;
 
 	glob = makeNode(PlannerGlobal);
+	glob->ybBaseRelCnt = 0;
+	glob->ybPlanHintsAliasMapping = NIL;
+	glob->ybBlockCnt = 0;
+	glob->ybNextUid = 0;
+	glob->ybNextNodeUid = 0;
+	glob->ybHintedUids = NIL;
+	ybInitHintedUids(glob);
 
 	root = makeNode(PlannerInfo);
 	root->parse = query;
@@ -7071,7 +7480,15 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 	root->query_level = 1;
 	root->planner_cxt = CurrentMemoryContext;
 	root->wt_param_id = -1;
+<<<<<<< HEAD
 	root->join_domains = list_make1(makeNode(JoinDomain));
+=======
+	root->ybBlockId = 0;
+	root->ybHintedJoinsOuter = NIL;
+	root->ybHintedJoinsInner = NIL;
+	root->ybProhibitedJoinTypes = NIL;
+	root->ybProhibitedJoins = NIL;
+>>>>>>> bc662ba7050
 
 	/*
 	 * Build a minimal RTE.
@@ -8419,6 +8836,7 @@ group_by_has_partkey(RelOptInfo *input_rel,
 }
 
 /*
+<<<<<<< HEAD
  * generate_setop_child_grouplist
  *		Build a SortGroupClause list defining the sort/grouping properties
  *		of the child of a set operation.
@@ -9057,10 +9475,1626 @@ choose_plan_name(PlannerGlobal *glob, const char *name, bool always_number)
 		foreach_ptr(char, subplan_name, glob->subplanNames)
 		{
 			if (strcmp(subplan_name, name) == 0)
+=======
+ * Generate a hint string from a plan.
+ */
+char *
+ybGenerateHintString(PlannedStmt *plannedStmt)
+{
+	char	   *hintStr;
+
+	if (plannedStmt->commandType == CMD_SELECT || plannedStmt->commandType == CMD_DELETE || plannedStmt->commandType == CMD_UPDATE ||
+		plannedStmt->commandType == CMD_INSERT)
+	{
+		/*
+		 * Generate the string starting at the top blocks. Keep track of the max number of tables (rows sources) we see any
+		 * any block. We will use this to set the join and from collapse limits.
+		 */
+		int			maxBlockScanCnt = 0;
+
+		hintStr = ybGenerateHintStringBlock(plannedStmt, plannedStmt->planTree, &maxBlockScanCnt);
+
+		/*
+		 * Generate the hints for each subplan and add them to the string we are building.
+		 */
+		if (list_length(plannedStmt->subplans) > 0)
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+
+			if (hintStr != NULL)
+			{
+				appendStringInfoString(&buf, hintStr);
+				pfree(hintStr);
+			}
+
+			ListCell   *lc;
+
+			foreach(lc, plannedStmt->subplans)
+			{
+				Plan	   *subPlan = (Plan *) lfirst(lc);
+
+				char	   *subPlanHintStr = ybGenerateHintStringBlock(plannedStmt, subPlan, &maxBlockScanCnt);
+
+				if (subPlanHintStr != NULL)
+				{
+					if (buf.len > 0)
+					{
+						appendStringInfoSpaces(&buf, 1);
+					}
+
+					appendStringInfoString(&buf, subPlanHintStr);
+					pfree(subPlanHintStr);
+				}
+			}
+
+			hintStr = pstrdup(buf.data);
+			pfree(buf.data);
+		}
+
+		if (hintStr != NULL)
+		{
+			/*
+			 * Add the rest of the configuration parameters we need to guarantee the same plan.
+			 */
+			StringInfoData hintBuf;
+
+			initStringInfo(&hintBuf);
+			appendStringInfo(&hintBuf, "/*+ %s", hintStr);
+			pfree(hintStr);
+
+			/*
+			 * Since we will completely specify the join order for each block we want to make sure all the tables
+			 * for each block get planned together.
+			 */
+			int			fromCollapseLimit = (from_collapse_limit > maxBlockScanCnt) ? from_collapse_limit : maxBlockScanCnt;
+			int			joinCollapseLimit = (join_collapse_limit > maxBlockScanCnt) ? join_collapse_limit : maxBlockScanCnt;
+
+			/*
+			 * Add the GUC values.
+			 */
+			appendStringInfo(&hintBuf, " Set(yb_enable_optimizer_statistics %s)", yb_enable_optimizer_statistics ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(yb_enable_base_scans_cost_model %s)", yb_enable_base_scans_cost_model ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(enable_hashagg %s)", enable_hashagg ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(enable_material %s)", enable_material ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(enable_memoize %s)", enable_memoize ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(enable_sort %s)", enable_sort ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(enable_incremental_sort %s)", enable_incremental_sort ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(max_parallel_workers_per_gather %d)", max_parallel_workers_per_gather);
+			appendStringInfo(&hintBuf, " Set(parallel_tuple_cost %.2lf)", parallel_tuple_cost);
+			appendStringInfo(&hintBuf, " Set(parallel_setup_cost %.2lf)", parallel_setup_cost);
+			appendStringInfo(&hintBuf, " Set(min_parallel_table_scan_size %d)", min_parallel_table_scan_size);
+			appendStringInfo(&hintBuf, " Set(yb_prefer_bnl %s)", yb_prefer_bnl ? "on" : "off");
+			appendStringInfo(&hintBuf, " Set(yb_bnl_batch_size %d)", yb_bnl_batch_size);
+			appendStringInfo(&hintBuf, " Set(yb_fetch_row_limit %d)", yb_fetch_row_limit);
+			appendStringInfo(&hintBuf, " Set(from_collapse_limit %d)", fromCollapseLimit);
+			appendStringInfo(&hintBuf, " Set(join_collapse_limit %d)", joinCollapseLimit);
+			appendStringInfoString(&hintBuf, " Set(geqo false)");
+
+			appendStringInfoString(&hintBuf, " */");
+			hintStr = pstrdup(hintBuf.data);
+			pfree(hintBuf.data);
+		}
+	}
+	else
+	{
+		hintStr = NULL;
+	}
+
+	return hintStr;
+}
+
+/*
+ * Generate the hint string for one block.
+ */
+static char *
+ybGenerateHintStringBlock(PlannedStmt *plannedStmt, Plan *plan, int *maxBlockScanCnt)
+{
+	char	   *hintStr = NULL;
+	StringInfoData leadingBuf;
+
+	initStringInfo(&leadingBuf);
+	appendStringInfoString(&leadingBuf, "Leading(");
+
+	StringInfoData methodBuf;
+
+	initStringInfo(&methodBuf);
+
+	List	   *scanList = NIL;
+	List	   *subPlanHintStrings = NIL;
+
+	/*
+	 * Start with the top node. Will collect subblock hint strings in 'subPlanHintStrings'. 'maxBlockScanCnt/ contains
+	 * the maximum number of tables/relations/scans seen in any block. 'leadingBuf' has the leading hint and 'methodBuf'
+	 * has the join and access methods hints.
+	 */
+	if (ybGenerateHintStringNode(plannedStmt, plan, &leadingBuf, &methodBuf, &scanList,
+								 &subPlanHintStrings, maxBlockScanCnt, 0 /* no worker count yet */ ))
+	{
+		if (list_length(scanList) > *maxBlockScanCnt)
+		{
+			*maxBlockScanCnt = list_length(scanList);
+		}
+
+		appendStringInfoString(&leadingBuf, ")");
+
+		if (list_length(scanList) < 2)
+		{
+			resetStringInfo(&leadingBuf);
+		}
+
+		if (methodBuf.len > 0)
+		{
+			if (leadingBuf.len > 0)
+			{
+				appendStringInfoSpaces(&leadingBuf, 1);
+			}
+
+			appendStringInfoString(&leadingBuf, methodBuf.data);
+			pfree(methodBuf.data);
+		}
+
+		if (subPlanHintStrings != NULL)
+		{
+			if (leadingBuf.len > 0)
+			{
+				appendStringInfoSpaces(&leadingBuf, 1);
+			}
+
+			bool		first = true;
+			ListCell   *lc;
+
+			foreach(lc, subPlanHintStrings)
+			{
+				if (!first)
+				{
+					appendStringInfoSpaces(&leadingBuf, 1);
+				}
+
+				char	   *subPlanHintStr = (char *) lfirst(lc);
+
+				appendStringInfoSpaces(&leadingBuf, 1);
+				appendStringInfoString(&leadingBuf, subPlanHintStr);
+				first = false;
+			}
+
+			list_free_deep(subPlanHintStrings);
+		}
+
+		if (leadingBuf.len > 0)
+		{
+			hintStr = pstrdup(leadingBuf.data);
+			pfree(leadingBuf.data);
+		}
+
+		list_free(scanList);
+	}
+
+	return hintStr;
+}
+
+/*
+ * Generate name correctly if there are double quotes.
+ */
+static void
+ybAppendHintNameDisplayText(char *name, StringInfoData *buf)
+{
+	if (strchr(name, ' ') != NULL)
+	{
+		appendStringInfo(buf, "\"%s\"", name);
+	}
+	else
+	{
+		appendStringInfo(buf, "%s", name);
+	}
+}
+
+/*
+ * Comparison function for sorting lists of aliases.
+ */
+static int
+ybCmpHintAliases(const ListCell *lc1, const ListCell *lc2)
+{
+	char	   *alias1 = (char *) lfirst(lc1);
+	char	   *alias2 = (char *) lfirst(lc2);
+
+	return strcmp(alias1, alias2);
+}
+
+/*
+ * Generate hints for a plan node.
+ */
+static bool
+ybGenerateHintStringNode(PlannedStmt *plannedStmt, Plan *plan, StringInfoData *leadingBuf,
+						 StringInfoData *methodBuf, List **scanList, List **subPlanHintStrings,
+						 int *maxBlockScanCnt, int numWorkers)
+{
+	bool		generatedHintString = false;
+
+	if (plan != NULL)
+	{
+		if (plan->ybInheritedHintAlias != NULL)
+		{
+			/*
+			 * This means a subquery scan was eliminated and this plan node (that was the input to the subquery scan)
+			 * inherited the hint alias. This makes it clear in the EXPLAIN what the table/hint alias refers to.
+			 */
+			ybAppendHintNameDisplayText(plan->ybInheritedHintAlias, leadingBuf);
+			*scanList = lappend(*scanList, plan->ybInheritedHintAlias);
+
+			/*
+			 * Save the alias and set to NULL to avoid infinite recursion.
+			 */
+			char	   *saveInheritedHintAlias = plan->ybInheritedHintAlias;
+
+			plan->ybInheritedHintAlias = NULL;
+
+			/*
+			 * Recurse.
+			 */
+			char	   *subPlanHintString = ybGenerateHintStringBlock(plannedStmt, plan, maxBlockScanCnt);
+
+			plan->ybInheritedHintAlias = saveInheritedHintAlias;
+
+			if (subPlanHintString != NULL)
+			{
+				/*
+				 * Add the sublock hint string to subPlanHintStrings list.
+				 */
+				*subPlanHintStrings = lappend(*subPlanHintStrings, subPlanHintString);
+			}
+
+			generatedHintString = true;
+		}
+		else
+		{
+			/*
+			 * Generate hints for the node.
+			 */
+			generatedHintString = true;
+			bool		recurse = true;
+			char	   *joinName = NULL;
+			bool		nodeSupported = true;
+
+			switch (nodeTag(plan))
+			{
+				case T_Gather:
+					{
+						Gather	   *gather = (Gather *) plan;
+
+						numWorkers = gather->num_workers;
+					}
+					break;
+				case T_GatherMerge:
+					{
+						GatherMerge *gm = (GatherMerge *) plan;
+
+						numWorkers = gm->num_workers;
+					}
+					break;
+				case T_SeqScan:
+				case T_YbSeqScan:
+				case T_SampleScan:
+				case T_BitmapHeapScan:
+				case T_YbBitmapTableScan:
+				case T_TidScan:
+				case T_TidRangeScan:
+				case T_FunctionScan:
+				case T_TableFuncScan:
+				case T_ValuesScan:
+				case T_CteScan:
+				case T_WorkTableScan:
+				case T_ForeignScan:
+				case T_CustomScan:
+					{
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+
+							char	   *tableAccessName;
+
+							switch (nodeTag(plan))
+							{
+								case T_SeqScan:
+								case T_YbSeqScan:
+									tableAccessName = "SeqScan";
+									break;
+								case T_BitmapHeapScan:
+								case T_YbBitmapTableScan:
+									tableAccessName = "BitmapScan";
+									break;
+								case T_TidScan:
+								case T_TidRangeScan:
+									tableAccessName = "TidScan";
+									break;
+								default:
+									tableAccessName = NULL;
+									break;
+							}
+
+							if (tableAccessName != NULL)
+							{
+								if (methodBuf->len != 0)
+								{
+									appendStringInfoSpaces(methodBuf, 1);
+								}
+
+								ybAppendHintNameDisplayText(tableAccessName, methodBuf);
+								appendStringInfoChar(methodBuf, '(');
+								ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+								appendStringInfoChar(methodBuf, ')');
+
+								if (plan->parallel_aware)
+								{
+									appendStringInfo(methodBuf, " Parallel(");
+									ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+									appendStringInfo(methodBuf, " %d Hard)", numWorkers);
+								}
+							}
+						}
+						else
+						{
+							generatedHintString = false;
+						}
+					}
+
+					break;
+				case T_SubqueryScan:
+					{
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+						}
+
+						SubqueryScan *subqueryScan = (SubqueryScan *) plan;
+
+						/*
+						 * Start a new set of hints for the block that is scanned.
+						 */
+						char	   *subPlanHintString = ybGenerateHintStringBlock(plannedStmt, subqueryScan->subplan, maxBlockScanCnt);
+
+						if (subPlanHintString != NULL)
+						{
+							*subPlanHintStrings = lappend(*subPlanHintStrings, subPlanHintString);
+						}
+
+						recurse = false;
+					}
+					break;
+				case T_IndexScan:
+					{
+						IndexScan  *indexscan = (IndexScan *) plan;
+
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+
+							char *indexName = indexscan->scan.ybScannedObjectName;
+							Assert(indexName != NULL);
+
+							if (methodBuf->len != 0)
+							{
+								appendStringInfoSpaces(methodBuf, 1);
+							}
+
+							appendStringInfoString(methodBuf, "IndexScan(");
+							ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+							appendStringInfoSpaces(methodBuf, 1);
+							ybAppendHintNameDisplayText(indexName, methodBuf);
+							appendStringInfoChar(methodBuf, ')');
+
+							if (plan->parallel_aware)
+							{
+								appendStringInfo(methodBuf, " Parallel(");
+								ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+								appendStringInfo(methodBuf, " %d Hard)", numWorkers);
+							}
+						}
+						else
+						{
+							generatedHintString = false;
+						}
+					}
+					break;
+				case T_IndexOnlyScan:
+					{
+						IndexOnlyScan *indexonlyscan = (IndexOnlyScan *) plan;
+
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+
+							char *indexName = indexonlyscan->scan.ybScannedObjectName;
+							Assert(indexName != NULL);
+
+							if (methodBuf->len != 0)
+							{
+								appendStringInfoSpaces(methodBuf, 1);
+							}
+
+							appendStringInfoString(methodBuf, "IndexOnlyScan(");
+							ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+							appendStringInfoSpaces(methodBuf, 1);
+							ybAppendHintNameDisplayText(indexName, methodBuf);
+							appendStringInfoChar(methodBuf, ')');
+
+							if (plan->parallel_aware)
+							{
+								appendStringInfo(methodBuf, " Parallel(");
+								ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+								appendStringInfo(methodBuf, " %d Hard)", numWorkers);
+							}
+						}
+						else
+						{
+							generatedHintString = false;
+						}
+					}
+					break;
+				case T_BitmapIndexScan:
+				case T_YbBitmapIndexScan:
+					{
+						BitmapIndexScan *bitmapindexscan = (BitmapIndexScan *) plan;
+
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+
+							char	   *indexName = bitmapindexscan->scan.ybScannedObjectName;
+							Assert(indexName != NULL);
+
+							if (methodBuf->len != 0)
+							{
+								appendStringInfoSpaces(methodBuf, 1);
+							}
+
+							appendStringInfoString(methodBuf, "BitmapScan(");
+							ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+							appendStringInfoSpaces(methodBuf, 1);
+							ybAppendHintNameDisplayText(indexName, methodBuf);
+							appendStringInfoChar(methodBuf, ')');
+
+							if (plan->parallel_aware)
+							{
+								appendStringInfo(methodBuf, " Parallel(");
+								ybAppendHintNameDisplayText(ybHintAlias, methodBuf);
+								appendStringInfo(methodBuf, " %d Hard)", numWorkers);
+							}
+						}
+						else
+						{
+							generatedHintString = false;
+						}
+					}
+					break;
+
+				case T_NestLoop:
+					{
+						joinName = "NestLoop";
+					}
+					break;
+
+				case T_YbBatchedNestLoop:
+					{
+						joinName = "YbBatchedNL";
+					}
+					break;
+				case T_MergeJoin:
+					{
+						joinName = "MergeJoin";
+					}
+					break;
+				case T_HashJoin:
+					{
+						joinName = "HashJoin";
+					}
+					break;
+				case T_Append:
+					{
+						Append	   *append = (Append *) plan;
+
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+						}
+
+						/*
+						 * Recurse on the input blocks.
+						 */
+						ListCell   *lc;
+
+						foreach(lc, append->appendplans)
+						{
+							Plan	   *subPlan = (Plan *) lfirst(lc);
+
+							char	   *subPlanHintString = ybGenerateHintStringBlock(plannedStmt, subPlan, maxBlockScanCnt);
+
+							if (subPlanHintString != NULL)
+							{
+								*subPlanHintStrings = lappend(*subPlanHintStrings, subPlanHintString);
+							}
+						}
+
+						recurse = false;
+					}
+					break;
+				case T_MergeAppend:
+					{
+						MergeAppend *mergeAppend = (MergeAppend *) plan;
+
+						char	   *ybHintAlias = plan->ybHintAlias;
+
+						if (ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, ybHintAlias);
+						}
+
+						/*
+						 * Recurse on the input blocks.
+						 */
+						ListCell   *lc;
+
+						foreach(lc, mergeAppend->mergeplans)
+						{
+							Plan	   *subPlan = (Plan *) lfirst(lc);
+
+							char	   *subPlanHintString = ybGenerateHintStringBlock(plannedStmt, subPlan, maxBlockScanCnt);
+
+							if (subPlanHintString != NULL)
+							{
+								*subPlanHintStrings = lappend(*subPlanHintStrings, subPlanHintString);
+							}
+						}
+
+						recurse = false;
+					}
+					break;
+				case T_Result:
+					{
+						if (plan->ybHintAlias != NULL)
+						{
+							ybAppendHintNameDisplayText(plan->ybHintAlias, leadingBuf);
+							*scanList = lappend(*scanList, plan->ybHintAlias);
+
+							char	   *saveHintAlias = plan->ybHintAlias;
+
+							plan->ybHintAlias = NULL;
+
+							/*
+							 * Recurse.
+							 */
+							char	   *subPlanHintString = ybGenerateHintStringBlock(plannedStmt, plan, maxBlockScanCnt);
+
+							if (subPlanHintString != NULL)
+							{
+								*subPlanHintStrings = lappend(*subPlanHintStrings, subPlanHintString);
+							}
+
+							plan->ybHintAlias = saveHintAlias;
+
+							recurse = false;
+						}
+						else
+						{
+							generatedHintString = false;
+						}
+					}
+					break;
+				case T_RecursiveUnion:
+					{
+						/*
+						 * Not supported.
+						 */
+						generatedHintString = false;
+						nodeSupported = false;
+					}
+					break;
+				default:
+					break;
+			}
+
+			if (nodeSupported)
+			{
+				/*
+				 * Now recurse into child plans, if any and indicated by node type.
+				 */
+				if (recurse)
+				{
+					List	   *joinInputScanList = NIL;
+					List	  **inputScanList;
+
+					if (joinName != NULL)
+					{
+						inputScanList = &joinInputScanList;
+						appendStringInfoString(leadingBuf, "(");
+					}
+					else
+					{
+						inputScanList = scanList;
+					}
+
+					if (plan->lefttree != NULL)
+					{
+						generatedHintString = ybGenerateHintStringNode(plannedStmt, plan->lefttree, leadingBuf, methodBuf,
+																	   inputScanList, subPlanHintStrings, maxBlockScanCnt,
+																	   numWorkers);
+						if (generatedHintString)
+						{
+							if (joinName != NULL)
+							{
+								appendStringInfoSpaces(leadingBuf, 1);
+							}
+
+							if (plan->righttree != NULL)
+							{
+								generatedHintString = ybGenerateHintStringNode(plannedStmt, plan->righttree, leadingBuf, methodBuf,
+																			   inputScanList, subPlanHintStrings, maxBlockScanCnt,
+																			   numWorkers);
+							}
+						}
+					}
+
+					if (joinName != NULL)
+					{
+						if (generatedHintString)
+						{
+							appendStringInfoString(leadingBuf, ")");
+
+							if (methodBuf->len > 0)
+							{
+								appendStringInfoSpaces(methodBuf, 1);
+							}
+
+							appendStringInfo(methodBuf, "%s(", joinName);
+
+							list_sort(joinInputScanList, ybCmpHintAliases);
+							bool		first = true;
+							ListCell   *lc;
+
+							foreach(lc, joinInputScanList)
+							{
+								char	   *relName = (char *) lfirst(lc);
+
+								if (!first)
+								{
+									appendStringInfoSpaces(methodBuf, 1);
+								}
+
+								ybAppendHintNameDisplayText(relName, methodBuf);
+
+								first = false;
+							}
+
+							appendStringInfoString(methodBuf, ")");
+
+							*scanList = list_concat(*scanList, joinInputScanList);
+						}
+
+						list_free(joinInputScanList);
+					}
+				}
+			}
+		}
+	}
+
+	return generatedHintString;
+}
+
+/*
+ * Compare 2 plans. Consider only shape, join and access methods, and node uniqueness.
+ */
+bool
+ybComparePlanShapesAndMethods(PlannedStmt *plannedStmt1, Plan *plan1, PlannedStmt *plannedStmt2, Plan *plan2, bool trace)
+{
+	bool		plansAreEqual;
+
+	if (plan1 == NULL)
+	{
+		if (plan2 != NULL)
+		{
+			plansAreEqual = false;
+
+			if (trace)
+			{
+				ereport(INFO,
+						(errmsg("\n++ NOT EQUAL : Plan1 is NULL, plan2 (%u) is not.", plan2->ybUniqueId)));
+			}
+		}
+		else
+		{
+			plansAreEqual = true;
+		}
+	}
+	else if (plan2 == NULL)
+	{
+		plansAreEqual = false;
+
+		if (trace)
+		{
+			ereport(INFO,
+					(errmsg("\n++ NOT EQUAL : Plan1 (%u) is not NULL, plan2 is.", plan1->ybUniqueId)));
+		}
+	}
+	else
+	{
+		if (nodeTag(plan1) != nodeTag(plan2))
+		{
+			plansAreEqual = false;
+
+			if (trace)
+			{
+				ereport(INFO,
+						(errmsg("\n++ NOT EQUAL : nodeTag1 (%u) = %d , nodeTag2 (%u) = %d",
+								plan1->ybUniqueId, nodeTag(plan1), plan2->ybUniqueId, nodeTag(plan2))));
+			}
+		}
+		else
+		{
+			if (plan1->ybHintAlias == NULL)
+			{
+				if (plan2->ybHintAlias != NULL)
+				{
+					plansAreEqual = false;
+
+					if (trace)
+					{
+						ereport(INFO,
+								(errmsg("\n++ NOT EQUAL : hint alias 1 (%u) is null , hint alias 2 (%u) = %s",
+										plan1->ybUniqueId, plan2->ybUniqueId, plan2->ybHintAlias)));
+					}
+				}
+				else
+				{
+					plansAreEqual = true;
+				}
+			}
+			else if (plan2->ybHintAlias == NULL)
+			{
+				plansAreEqual = false;
+
+				if (trace)
+				{
+					ereport(INFO,
+							(errmsg("\n++ NOT EQUAL : hint alias 1 (%u) = %s , hint alias 2 (%u) is NULL",
+									plan1->ybUniqueId, plan1->ybHintAlias, plan2->ybUniqueId)));
+				}
+			}
+			else
+			{
+				plansAreEqual = (strcmp(plan1->ybHintAlias, plan2->ybHintAlias) == 0);
+
+				if (trace && !plansAreEqual)
+				{
+					ereport(INFO,
+							(errmsg("\n++ NOT EQUAL : hint alias 1 (%u) = %s , hint alias 2 (%u) = %s",
+									plan1->ybUniqueId, plan1->ybHintAlias, plan2->ybUniqueId, plan2->ybHintAlias)));
+				}
+			}
+
+			if (plansAreEqual && plan1->parallel_aware != plan2->parallel_aware)
+			{
+				plansAreEqual = false;
+
+				if (trace)
+				{
+					ereport(INFO,
+							(errmsg("\n++ NOT EQUAL : parallel aware 1 (%u) = %s , parallel aware 2 (%u) = %s",
+									plan1->ybUniqueId, plan1->parallel_aware ? "true" : "false",
+									plan2->ybUniqueId, plan2->parallel_aware ? "true" : "false")));
+				}
+			}
+
+			if (plansAreEqual)
+			{
+				switch (nodeTag(plan1))
+				{
+					case T_Gather:
+						{
+							Gather	   *gather1 = (Gather *) plan1;
+							Gather	   *gather2 = (Gather *) plan2;
+
+							plansAreEqual = (gather1->num_workers == gather2->num_workers);
+
+							if (trace && !plansAreEqual)
+							{
+								ereport(INFO,
+										(errmsg("\n++ NOT EQUAL : gather1 (%u) num workers = %d , gather2 (%u) num workers = %d",
+												gather1->plan.ybUniqueId, gather1->num_workers, gather2->plan.ybUniqueId, gather2->num_workers)));
+							}
+						}
+						break;
+					case T_GatherMerge:
+						{
+							GatherMerge *gm1 = (GatherMerge *) plan1;
+							GatherMerge *gm2 = (GatherMerge *) plan2;
+
+							plansAreEqual = (gm1->num_workers == gm2->num_workers);
+
+							if (trace && !plansAreEqual)
+							{
+								ereport(INFO,
+										(errmsg("\n++ NOT EQUAL : gather1 (%u) num workers = %d , gather2 (%u) num workers = %d",
+												gm1->plan.ybUniqueId, gm1->num_workers, gm2->plan.ybUniqueId, gm2->num_workers)));
+							}
+						}
+						break;
+					case T_Agg:
+						{
+							Agg		   *agg1 = (Agg *) plan1;
+							Agg		   *agg2 = (Agg *) plan2;
+
+							plansAreEqual = (agg1->aggstrategy == agg2->aggstrategy);
+
+							if (trace && !plansAreEqual)
+							{
+								ereport(INFO,
+										(errmsg("\n++ NOT EQUAL : agg1 (%u) strategy = %d , agg2 (%u) strategy = %d",
+												agg1->plan.ybUniqueId, agg1->aggstrategy, agg1->plan.ybUniqueId, agg2->aggstrategy)));
+							}
+						}
+						break;
+					case T_SeqScan:
+					case T_YbSeqScan:
+					case T_SampleScan:
+					case T_BitmapHeapScan:
+					case T_YbBitmapTableScan:
+					case T_TidScan:
+					case T_TidRangeScan:
+					case T_FunctionScan:
+					case T_TableFuncScan:
+					case T_ValuesScan:
+					case T_CteScan:
+					case T_WorkTableScan:
+					case T_ForeignScan:
+					case T_CustomScan:
+					case T_SubqueryScan:
+					case T_IndexScan:
+					case T_IndexOnlyScan:
+					case T_BitmapIndexScan:
+					case T_YbBitmapIndexScan:
+						{
+							Scan	   *scan1 = (Scan *) plan1;
+							RangeTblEntry *rte1 = rt_fetch(scan1->scanrelid, plannedStmt1->rtable);
+
+							Scan	   *scan2 = (Scan *) plan2;
+							RangeTblEntry *rte2 = rt_fetch(scan2->scanrelid, plannedStmt2->rtable);
+
+							if (rte1->ybHintAlias != NULL && rte2->ybHintAlias != NULL)
+							{
+								plansAreEqual = (strcmp(rte1->ybHintAlias, rte2->ybHintAlias) == 0);
+
+								if (trace && !plansAreEqual)
+								{
+									ereport(INFO,
+											(errmsg("\n++ NOT EQUAL : scan1 (%u) hint alias = %s , scan2 (%u) hint alias = %s",
+													plan1->ybUniqueId, rte1->ybHintAlias, plan2->ybUniqueId, rte2->ybHintAlias)));
+								}
+							}
+							else if (rte1->ybHintAlias != NULL && rte2->ybHintAlias == NULL)
+							{
+								if (trace)
+								{
+									ereport(INFO,
+											(errmsg("\n++ NOT EQUAL : scan1 (%u) hint alias = %s , scan2 (%u) hint alias = NULL",
+													plan1->ybUniqueId, rte1->ybHintAlias, plan2->ybUniqueId)));
+								}
+
+								plansAreEqual = false;
+							}
+							else if (rte1->ybHintAlias == NULL && rte2->ybHintAlias != NULL)
+							{
+								if (trace)
+								{
+									ereport(INFO,
+											(errmsg("\n++ NOT EQUAL : scan1 (%u) hint alias = NULL , scan2 (%u) hint alias = %s",
+													plan1->ybUniqueId, plan2->ybUniqueId, rte2->ybHintAlias)));
+								}
+
+								plansAreEqual = false;
+							}
+
+							if (plansAreEqual)
+							{
+								switch (nodeTag(plan1))
+								{
+									case T_IndexScan:
+										{
+											IndexScan  *indexscan1 = (IndexScan *) plan1;
+
+											char	   *indexName1 = indexscan1->scan.ybScannedObjectName;
+											Assert(indexName1 != NULL);
+
+											IndexScan  *indexscan2 = (IndexScan *) plan2;
+
+											char	   *indexName2 = indexscan2->scan.ybScannedObjectName;
+											Assert(indexName2 != NULL);
+
+											plansAreEqual = (strcmp(indexName1, indexName2) == 0);
+
+											if (trace && !plansAreEqual)
+											{
+												ereport(INFO,
+														(errmsg("\n++ NOT EQUAL : index scan1 (%u) name = %s , index scan2 (%u) name = %s",
+																plan1->ybUniqueId, indexName1, plan2->ybUniqueId, indexName2)));
+											}
+										}
+
+										break;
+
+									case T_IndexOnlyScan:
+										{
+											IndexOnlyScan *indexonlyscan1 = (IndexOnlyScan *) plan1;
+
+											char	   *indexName1 = indexonlyscan1->scan.ybScannedObjectName;
+											Assert(indexName1 != NULL);
+
+											IndexOnlyScan *indexonlyscan2 = (IndexOnlyScan *) plan2;
+
+											char	   *indexName2 = indexonlyscan2->scan.ybScannedObjectName;
+											Assert(indexName2 != NULL);
+
+											plansAreEqual = (strcmp(indexName1, indexName2) == 0);
+
+											if (trace && !plansAreEqual)
+											{
+												ereport(INFO,
+														(errmsg("\n++ NOT EQUAL : index only scan1 (%u) name = %s , index only scan2 (%u) name = %s",
+																plan1->ybUniqueId, indexName1, plan2->ybUniqueId, indexName2)));
+											}
+										}
+
+										break;
+
+									case T_BitmapIndexScan:
+									case T_YbBitmapIndexScan:
+										{
+											BitmapIndexScan *bitmapindexscan1 = (BitmapIndexScan *) plan1;
+
+											char	   *indexName1 = bitmapindexscan1->scan.ybScannedObjectName;
+											Assert(indexName1 != NULL);
+
+											BitmapIndexScan *bitmapindexscan2 = (BitmapIndexScan *) plan2;
+
+											char	   *indexName2 = bitmapindexscan2->scan.ybScannedObjectName;
+											Assert(indexName2 != NULL);
+
+											plansAreEqual = (strcmp(indexName1, indexName2) == 0);
+
+											if (trace && !plansAreEqual)
+											{
+												ereport(INFO,
+														(errmsg("\n++ NOT EQUAL : bitmap index scan1 (%u) name = %s , bitmap index scan2 (%u) name = %s",
+																plan1->ybUniqueId, indexName1, plan2->ybUniqueId, indexName2)));
+											}
+										}
+										break;
+
+									default:
+										plansAreEqual = true;
+										break;
+								}
+							}
+						}
+
+						break;
+					case T_NestLoop:
+					case T_YbBatchedNestLoop:
+					case T_MergeJoin:
+					case T_HashJoin:
+						{
+							char	   *joinName;
+
+							switch (nodeTag(plan1))
+							{
+								case T_NestLoop:
+									joinName = "NestLoop";
+									break;
+								case T_YbBatchedNestLoop:
+									joinName = "ybBatchedNestLoop";
+									break;
+								case T_MergeJoin:
+									joinName = "MergeJoin";
+									break;
+								case T_HashJoin:
+									joinName = "HashJoin";
+									break;
+								default:
+									joinName = NULL;
+									break;
+							}
+
+							Join	   *join1 = (Join *) plan1;
+							Join	   *join2 = (Join *) plan2;
+
+							if (join1->jointype != join2->jointype)
+							{
+								plansAreEqual = false;
+
+								if (trace)
+								{
+									ereport(INFO,
+											(errmsg("\n++ NOT EQUAL : %s (%u) type %d != %s (%u) type %d", joinName, plan1->ybUniqueId,
+													join1->jointype, joinName, plan2->ybUniqueId, join2->jointype)));
+								}
+							}
+							else
+							{
+								if (plansAreEqual)
+								{
+									plansAreEqual = (join1->inner_unique == join2->inner_unique);
+
+									if (trace && !plansAreEqual)
+									{
+										ereport(INFO,
+												(errmsg("\n++ NOT EQUAL : %s (%u) inner unique %s != %s (%u) inner unique %s",
+														joinName, plan1->ybUniqueId, join1->inner_unique ? "true" : "false",
+														joinName, plan2->ybUniqueId, join2->inner_unique ? "true" : "false")));
+									}
+								}
+							}
+						}
+						break;
+					case T_Append:
+						{
+							Append	   *append1 = (Append *) plan1;
+							Append	   *append2 = (Append *) plan2;
+
+							if (list_length(append1->appendplans) != list_length(append2->appendplans))
+							{
+								plansAreEqual = false;
+							}
+							else
+							{
+								ListCell   *lc1;
+								ListCell   *lc2;
+								int			index = 0;
+
+								forboth(lc1, append1->appendplans, lc2, append2->appendplans)
+								{
+									Plan	   *subPlan1 = (Plan *) lfirst(lc1);
+									Plan	   *subPlan2 = (Plan *) lfirst(lc2);
+
+									plansAreEqual = ybComparePlanShapesAndMethods(plannedStmt1, subPlan1, plannedStmt2, subPlan2, trace);
+
+									if (!plansAreEqual)
+									{
+										if (trace)
+										{
+											ereport(INFO,
+													(errmsg("\n++ NOT EQUAL : append1 subplan (%u) %d != append2 subplan (%u) %d",
+															subPlan1->ybUniqueId, index, subPlan2->ybUniqueId, index)));
+										}
+
+										break;
+									}
+
+									++index;
+								}
+							}
+						}
+						break;
+					default:
+						break;
+				}
+			}
+		}
+
+		if (plansAreEqual)
+		{
+			if (plan1->initPlan == NULL)
+			{
+				if (plan2->initPlan != NULL)
+				{
+					plansAreEqual = false;
+
+					if (trace)
+					{
+						ereport(INFO, (errmsg("\n++ NOT EQUAL : plan1 does not have init plans , plan2 does")));
+					}
+				}
+			}
+			else if (plan2->initPlan == NULL)
+			{
+				plansAreEqual = false;
+
+				if (trace)
+				{
+					ereport(INFO,
+							(errmsg("\n++ NOT EQUAL : plan1 (%u) has init plans , plan2 (%u) does not",
+									plan1->ybUniqueId, plan2->ybUniqueId)));
+				}
+			}
+			else
+			{
+				if (list_length(plan1->initPlan) != list_length(plan2->initPlan))
+				{
+					plansAreEqual = false;
+
+					if (trace)
+					{
+						ereport(INFO,
+								(errmsg("\n++ NOT EQUAL : plan1 (%u) has %d init plans , plan2 (%u) has %d init plans",
+										plan1->ybUniqueId, list_length(plan1->initPlan), plan2->ybUniqueId, list_length(plan2->initPlan))));
+					}
+				}
+				else
+				{
+					ListCell   *lc1;
+					ListCell   *lc2;
+					int			index = 0;
+
+					forboth(lc1, plan1->initPlan, lc2, plan2->initPlan)
+					{
+						SubPlan    *initPlan1 = (SubPlan *) lfirst(lc1);
+						Plan	   *subPlan1 = (Plan *) list_nth(plannedStmt1->subplans, initPlan1->plan_id - 1);
+						SubPlan    *initPlan2 = (SubPlan *) lfirst(lc2);
+						Plan	   *subPlan2 = (Plan *) list_nth(plannedStmt2->subplans, initPlan2->plan_id - 1);
+
+						plansAreEqual = ybComparePlanShapesAndMethods(plannedStmt1, subPlan1, plannedStmt2, subPlan2, trace);
+
+						if (!plansAreEqual)
+						{
+							if (trace)
+							{
+								ereport(INFO,
+										(errmsg("\n++ NOT EQUAL : plan1 initplan (%u) %d != plan2 initplan (%u) %d",
+												subPlan1->ybUniqueId, index, subPlan2->ybUniqueId, index)));
+							}
+
+							break;
+						}
+
+						++index;
+					}
+				}
+			}
+
+			if (plansAreEqual)
+			{
+				plansAreEqual = ybComparePlanShapesAndMethods(plannedStmt1, plan1->lefttree, plannedStmt2, plan2->lefttree, trace);
+
+				if (trace && !plansAreEqual)
+				{
+					ereport(INFO, (errmsg("\n++ NOT EQUAL : plan1 (%u) left input != plan2 (%u) left input", plan1->ybUniqueId, plan2->ybUniqueId)));
+				}
+
+				if (plansAreEqual)
+				{
+					plansAreEqual = ybComparePlanShapesAndMethods(plannedStmt2, plan2->righttree, plannedStmt2, plan2->righttree, trace);
+
+					if (trace && !plansAreEqual)
+					{
+						ereport(INFO, (errmsg("\n++ NOT EQUAL : plan1 (%u) right input != plan2 (%u) right input", plan1->ybUniqueId, plan2->ybUniqueId)));
+					}
+				}
+			}
+		}
+	}
+
+	return plansAreEqual;
+}
+
+uint32
+ybGetNextUid(PlannerGlobal *glob)
+{
+	Assert(glob != NULL);
+	return ++(glob->ybNextUid);
+}
+
+uint32
+ybGetNextNodeUid(PlannerGlobal *glob)
+{
+	Assert(glob != NULL);
+	return ++(glob->ybNextNodeUid);
+}
+
+void
+ybInitHintedUids(PlannerGlobal *glob)
+{
+	Assert(glob != NULL);
+	glob->ybHintedUids = NIL;
+
+	List	   *nameList = NIL;
+
+	if (SplitIdentifierString(yb_hinted_uids, ',', &nameList))
+	{
+		ListCell   *lc;
+
+		foreach(lc, nameList)
+		{
+			char	   *item = (char *) lfirst(lc);
+			char	   *end;
+
+			errno = 0;
+			uint32		uid = strtol(item, &end, 10);
+
+			if (errno == 0)
+			{
+				glob->ybHintedUids = lappend_int(glob->ybHintedUids, uid);
+			}
+		}
+
+		list_free(nameList);
+	}
+}
+
+bool
+ybIsHintedUid(PlannerGlobal *glob, uint32 uid)
+{
+	Assert(glob != NULL);
+	bool		isHintedUid = false;
+
+	if (glob->ybHintedUids != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, glob->ybHintedUids)
+		{
+			if (lfirst_int(lc) == uid)
+			{
+				isHintedUid = true;
+				break;
+			}
+		}
+	}
+
+	return isHintedUid;
+}
+
+/*
+ * Walk the plan and produce plan id. 'isRoot' is true if 'plan'
+ * is the top-most node.
+ */
+static void
+ybPlanIdWalker(YbJumbleState *jstate, Plan *plan, bool isRoot)
+{
+	ListCell   *l;
+
+	if (plan == NULL)
+		return;
+
+	/*
+	 * Plan-type-specific walks
+	 */
+	switch (nodeTag(plan))
+	{
+		case T_SubqueryScan:
+			{
+				SubqueryScan *sscan = (SubqueryScan *) plan;
+
+				ybPlanIdWalker(jstate, sscan->subplan, isRoot);
+			}
+			break;
+		case T_CustomScan:
+			{
+				CustomScan *cscan = (CustomScan *) plan;
+
+				foreach(l, cscan->custom_plans)
+				{
+					ybPlanIdWalker(jstate, (Plan *) lfirst(l), isRoot);
+				}
+			}
+			break;
+		case T_Append:
+			{
+				Append	   *aplan = (Append *) plan;
+
+				foreach(l, aplan->appendplans)
+				{
+					ybPlanIdWalker(jstate, (Plan *) lfirst(l), isRoot);
+				}
+			}
+			break;
+		case T_MergeAppend:
+			{
+				MergeAppend *mplan = (MergeAppend *) plan;
+
+				foreach(l, mplan->mergeplans)
+				{
+					ybPlanIdWalker(jstate, (Plan *) lfirst(l), isRoot);
+				}
+			}
+			break;
+		case T_BitmapAnd:
+			{
+				BitmapAnd  *splan = (BitmapAnd *) plan;
+
+				foreach(l, splan->bitmapplans)
+				{
+					ybPlanIdWalker(jstate, (Plan *) lfirst(l), isRoot);
+				}
+			}
+			break;
+		case T_BitmapOr:
+			{
+				BitmapOr   *splan = (BitmapOr *) plan;
+
+				foreach(l, splan->bitmapplans)
+				{
+					ybPlanIdWalker(jstate, (Plan *) lfirst(l), isRoot);
+				}
+			}
+			break;
+		default:
+			{
+				/* do nothing */
+			}
+	}
+
+	/* Process children. */
+	ybPlanIdWalker(jstate, plan->lefttree, false /* isRoot */ );
+	ybPlanIdWalker(jstate, plan->righttree, false /* isRoot */ );
+
+	/*
+	 * Hash the target list of the node. For a non-root node, we do
+	 * a symmetric hash, i.e. [a1, a2] will produce the same hash as
+	 * [a2, a1]. At the top node we consider order important, i.e.,
+	 * a non-symmetric hash.
+	 *
+	 * For example, "SELECT a1, b1 FROM t1" (Q1) will get a different plan id
+	 * from "SELECT b1, a1 FROM t1" (Q2). The plans are equivalent in a relational
+	 * sense, but we assume final output field order is important. If I ask for
+	 * the Q1 result, I do not want the Q2 result instead.
+	 */
+	YbJumbleList(jstate, plan->targetlist, !isRoot);
+
+	if (yb_enable_planner_trace)
+		elog(DEBUG1, "jumble after target list node %d : %lu", plan->plan_node_id, YbHashJumbleState(jstate));
+
+	/*
+	 * Hash the quals of the node. Treat the hash symmetrically.
+	 */
+	YbJumbleList(jstate, plan->qual, true /* symmetric */ );
+
+	if (yb_enable_planner_trace)
+		elog(DEBUG1, "jumble after qual list node %d : %lu", plan->plan_node_id, YbHashJumbleState(jstate));
+
+	/*
+	 * Set the node's target and qual lists to NULL so the jumble code does not
+	 * process them. However, we save the node's target list in the jumble state
+	 * because we need it to resolve sort column indices when jumbling the node.
+	 */
+	jstate->ybTargetList = plan->targetlist;
+	plan->targetlist = NIL;
+	List *saveQual = plan->qual;
+	plan->qual = NIL;
+
+	/* Jumble the node itself. */
+	YbJumbleNode(jstate, (Node *) plan);
+
+	if (yb_enable_planner_trace)
+		elog(DEBUG1, "jumble after node %d : %lu", plan->plan_node_id, YbHashJumbleState(jstate));
+
+	/* Restore the target and qual lists. */
+	plan->targetlist = jstate->ybTargetList;
+	plan->qual = saveQual;
+}
+
+/*
+ * Compare range table entries for sorting.
+ */
+static int
+ybCmpRangeTblEntry(const ListCell *lc1, const ListCell *lc2)
+{
+	RangeTblEntry *rte1 = (RangeTblEntry *) lfirst(lc1);
+	RangeTblEntry *rte2 = (RangeTblEntry *) lfirst(lc2);
+
+	int cmp = 0;
+
+	if (rte1 != rte2)
+	{
+		if (rte1->rtekind == RTE_RELATION)
+		{
+			if (rte2->rtekind == RTE_RELATION)
+			{
+				/*
+				 * We have 2 relations.
+				 */
+				if (rte1->relkind == RELKIND_RELATION && rte2->relkind == RELKIND_RELATION)
+				{
+					/*
+					 * We expect the ybScannedObjectName fields to be non-NULL in most
+					 * cases. However, makeNode(RangeTblEntry) is called is many
+					 * places and there are no guarantees the field is set by all the
+					 * callers.
+					 */
+					 if (rte1->ybScannedObjectName == NULL && rte1->relid != InvalidOid)
+					{
+						char *relName = get_rel_name(rte1->relid);
+						if (relName != NULL)
+							rte1->ybScannedObjectName = pstrdup(relName);
+					}
+
+					if (rte2->ybScannedObjectName == NULL && rte2->relid != InvalidOid)
+					{
+						char *relName = get_rel_name(rte2->relid);
+						if (relName != NULL)
+							rte2->ybScannedObjectName = pstrdup(relName);
+					}
+
+					if (rte1->ybScannedObjectName != NULL &&
+						rte2->ybScannedObjectName != NULL)
+					{
+						cmp = strcmp(rte1->ybScannedObjectName, rte2->ybScannedObjectName);
+					}
+
+					if (cmp == 0)
+					{
+						char *schemaName1 = rte1->ybSchemaName;
+
+						if (schemaName1 == NULL)
+						{
+							Oid schemaOid1 = get_rel_namespace(rte1->relid);
+							schemaName1 = get_namespace_name(schemaOid1);
+							rte1->ybSchemaName = schemaName1;
+						}
+
+						char *schemaName2 = rte2->ybSchemaName;
+
+						if (schemaName2 == NULL)
+						{
+							Oid schemaOid2 = get_rel_namespace(rte2->relid);
+							schemaName2 = get_namespace_name(schemaOid2);
+							rte2->ybSchemaName = schemaName2;
+						}
+
+						if (schemaName1 != NULL && schemaName2 != NULL)
+							cmp = strcmp(schemaName1, schemaName2);
+
+						if (cmp == 0)
+						{
+							if (rte1->eref != NULL && rte1->eref->aliasname != NULL &&
+								rte2->eref != NULL && rte2->eref->aliasname != NULL)
+								/*
+								 * Compare the expanded reference names.
+								 */
+								cmp = strcmp(rte1->eref->aliasname, rte2->eref->aliasname);
+							else if (rte1->alias != NULL &&
+									rte1->alias->aliasname != NULL &&
+									rte2->alias != NULL &&
+									rte2->alias->aliasname != NULL)
+								/*
+								 * Compare the user-written alias clauses.
+								 */
+								cmp = strcmp(rte1->alias->aliasname, rte2->alias->aliasname);
+						}
+
+						if (cmp == 0)
+							/*
+							 * Must be different blocks since the names are the same.
+							 * In this case, unique id is OK to use since all rels
+							* in a block get assigned before the rels in another block.
+							 */
+							cmp = rte1->ybUniqueBaseId - rte2->ybUniqueBaseId;
+					}
+				}
+				else if (rte1->relkind == RELKIND_RELATION)
+					cmp = -1;
+				else if (rte2->relkind == RELKIND_RELATION)
+					cmp = 1;
+				else if (rte1->relkind != rte2->relkind)
+					cmp = (rte1->relkind < rte2->relkind);
+				else if (rte1->eref != NULL && rte1->eref->aliasname != NULL &&
+						rte2->eref != NULL && rte2->eref->aliasname != NULL)
+					/*
+					 * Compare the expanded reference names.
+					 */
+					cmp = strcmp(rte1->eref->aliasname, rte2->eref->aliasname);
+				else if (rte1->alias != NULL && rte1->alias->aliasname != NULL &&
+						rte2->alias != NULL && rte2->alias->aliasname != NULL)
+					/*
+					 * Compare the user-written alias clauses.
+					 */
+					cmp = strcmp(rte1->alias->aliasname, rte2->alias->aliasname);
+				/* 2 non-relations will compare equal if none of the above conditions is true */
+			}
+			else
+				/*
+				 * Relations sort before non-relations.
+				 */
+				cmp = -1;
+		}
+		else if (rte2->rtekind == RTE_RELATION)
+			/*
+			 * Relations sort before non-relations.
+			 */
+			cmp = 1;
+		else if (rte1->rtekind == RTE_CTE)
+		{
+			if (rte2->rtekind == RTE_CTE)
+				/* Compare CTE names. */
+				cmp = strcmp(rte1->ctename, rte2->ctename);
+			else
+				/* CTEs sort before non-CTEs. */
+				cmp = -1;
+		}
+		else if (rte2->rtekind == RTE_CTE)
+			/* CTEs sort before non-CTEs. */
+			cmp = 1;
+		else if (rte1->rtekind != rte2->rtekind)
+			/* Different RTE types so pick one. */
+			cmp = rte1->rtekind - rte2->rtekind;
+		else if (rte1->eref != NULL && rte1->eref->aliasname != NULL &&
+				rte2->eref != NULL && rte2->eref->aliasname != NULL)
+			/*
+			 * Compare the expanded reference names.
+			 */
+			cmp = strcmp(rte1->eref->aliasname, rte2->eref->aliasname);
+		else if (rte1->alias != NULL && rte1->alias->aliasname != NULL &&
+				rte2->alias != NULL && rte2->alias->aliasname != NULL)
+			/*
+			 * Compare the user-written alias clauses.
+			 */
+			cmp = strcmp(rte1->alias->aliasname, rte2->alias->aliasname);
+		else
+			/*
+			 * Must be different blocks so unique id is OK to use.
+			 */
+			cmp = rte1->ybUniqueBaseId - rte2->ybUniqueBaseId;
+	}
+
+	return cmp;
+}
+
+/*
+ * Build a map from an RT index to a sorted RT index. E.g., if we have
+ * a rangle table list with 3 RTEs t3, t1, and t2 (usually because
+ * that is their order in the FROM clause), the RT indexes will be
+ * 1, 2, and 3, respectively. The sorted (by name) RT list will be (t1, t2, t3)
+ * and the map will contain [3, 1, 2]:
+ *
+ *    table t3 has a RT index of 1 and maps to sorted entry 3.
+ *    table t1 has a RT index of 2 and maps to sorted entry 1.
+ *    table t2 has a RT index of 3 and maps to sorted entry 2.
+ *
+ * This function returns the sorted RT index (ie. [3, 1, 2]
+ *
+ * We will use the sorted RT indexes to generate
+ * a canonical hash (jumble) for the RTEs.
+ */
+static int *
+ybBuildRtIndexMap(List *rtable, List *sortedRtable)
+{
+	int numRts = list_length(rtable);
+	int *ybRtIndexMap = (int *) palloc(numRts * sizeof(int));
+	int rti;
+	for (rti = 0; rti < numRts; rti++)
+	{
+		RangeTblEntry *rte = rt_fetch(rti + 1, rtable);
+
+		ListCell *lc;
+		int sortedRtIndex = 1;
+		bool found = false;
+		foreach(lc, sortedRtable)
+		{
+			RangeTblEntry *rte2 = (RangeTblEntry *) lfirst(lc);
+			if (rte == rte2)
+>>>>>>> bc662ba7050
 			{
 				found = true;
 				break;
 			}
+<<<<<<< HEAD
 		}
 
 		if (!found)
@@ -9101,3 +11135,149 @@ choose_plan_name(PlannerGlobal *glob, const char *name, bool always_number)
 		pfree(proposed_name);
 	}
 }
+=======
+
+			++sortedRtIndex;
+		}
+
+		Assert(found);
+
+		ybRtIndexMap[rti] = sortedRtIndex;
+	}
+
+	return ybRtIndexMap;
+}
+
+/*
+ * Do the plan id calculation.
+ */
+static void
+ybCalculatePlanId(PlannedStmt *plannedStmt)
+{
+	YbJumbleState *jstate = YbInitJumble();
+	ListCell *lc;
+	ListCell *lc2;
+
+	jstate->ybUseNames = true;
+
+	/*
+	 * Sort the range table list.
+	 */
+	List *sortedRtable = list_copy(plannedStmt->rtable);
+	bool duplPresent = false;
+
+	/* See if the list contains duplicate relations. */
+	List *saveAliasList = NIL;
+	foreach(lc, plannedStmt->rtable)
+	{
+		RangeTblEntry *rte1 = (RangeTblEntry *) lfirst(lc);
+
+		if (rte1->relid != InvalidOid)
+		{
+			foreach(lc2, plannedStmt->rtable)
+			{
+				if (lc != lc2)
+				{
+					RangeTblEntry *rte2 = (RangeTblEntry *) lfirst(lc2);
+					if (rte1->relid == rte2->relid)
+					{
+						duplPresent = true;
+						break;
+					}
+				}
+			}
+		}
+		else
+			duplPresent = true;
+
+		if (duplPresent)
+			break;
+
+		/* Save the alias. */
+		saveAliasList = lappend(saveAliasList, rte1->eref->aliasname);
+	}
+
+	if (!duplPresent)
+		/*
+		 * Put the actual relation name on the range table entry.
+		 * We do this so if a query is aliased differently and
+		 * there are no duplicates, but gets the same plan,
+		 * then we get the same plan id. This is because the FROM lists
+		 * will sort the same using actual names.
+		 */
+		foreach(lc, plannedStmt->rtable)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+			char *relName = rte->ybScannedObjectName;
+
+			if (relName == NULL)
+			{
+				relName = get_rel_name(rte->relid);
+				rte->ybScannedObjectName = relName;
+			}
+
+			rte->eref->aliasname = relName;
+		}
+
+	list_sort(sortedRtable, ybCmpRangeTblEntry);
+
+	if (!duplPresent)
+		forboth(lc, plannedStmt->rtable, lc2, saveAliasList)
+		{
+			RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+			char *alias = (char *) lfirst(lc2);
+
+			rte->eref->aliasname = alias;
+		}
+
+	list_free(saveAliasList);
+
+	/*
+	 * Build the map from RT indexes to sorted RT indexes and store
+	 * it on the jumble state.
+	 */
+	jstate->ybRtIndexMap = ybBuildRtIndexMap(plannedStmt->rtable, sortedRtable);
+
+	/* Walk the plan and calculate the jumble. */
+	ybPlanIdWalker(jstate, plannedStmt->planTree, true /* isRoot */ );
+
+	/* Now walk each subplan. */
+	foreach(lc, plannedStmt->subplans)
+	{
+		Plan	   *subplan = (Plan *) lfirst(lc);
+
+		ybPlanIdWalker(jstate, subplan, false /* isRoot */ );
+	}
+
+	/* Jumble the sorted range table list. */
+	YbJumbleRangeTableList(jstate, sortedRtable);
+
+	if (yb_enable_planner_trace)
+		elog(DEBUG1, "jumble after range table list : %lu", YbHashJumbleState(jstate));
+
+	/* Store the plan id on the planned statement. */
+	plannedStmt->ybPlanId = YbHashJumbleState(jstate);
+
+	/* Clean up. */
+	list_free(sortedRtable);
+	pfree(jstate->ybRtIndexMap);
+	pfree(jstate);
+}
+
+/*
+ * Get the plan id.
+ */
+ uint64
+ ybGetPlanId(PlannedStmt *plannedStmt)
+ {
+	/*
+	 * If the plan id has not been computed, call the function to calculate it.
+	 * E.g., even if QPM is on, we would need to calculate the plan id if an
+	 * EXPLAIN requests it.
+	 */
+	if (plannedStmt->ybPlanId == 0)
+		ybCalculatePlanId(plannedStmt);
+
+	return plannedStmt->ybPlanId;
+ }
+>>>>>>> bc662ba7050

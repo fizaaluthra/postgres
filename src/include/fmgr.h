@@ -63,7 +63,13 @@ typedef struct FmgrInfo
 	unsigned char fn_stats;		/* collect stats if track_functions > this */
 	void	   *fn_extra;		/* extra space for use by handler */
 	MemoryContext fn_mcxt;		/* memory context to store fn_extra in */
+<<<<<<< HEAD
 	Node	   *fn_expr;		/* expression parse tree for call, or NULL */
+=======
+	fmNodePtr	fn_expr;		/* expression parse tree for call, or NULL */
+	void	   *fn_alt;			/* alternative function implementation for
+								 * special cases */
+>>>>>>> bc662ba7050
 } FmgrInfo;
 
 /*
@@ -849,5 +855,10 @@ extern PGDLLIMPORT fmgr_hook_type fmgr_hook;
 
 #define FmgrHookIsNeeded(fn_oid)							\
 	(!needs_fmgr_hook ? false : (*needs_fmgr_hook)(fn_oid))
+
+/* YB */
+extern void StringInfoSendFunctionCall(fmStringInfo buf, FmgrInfo *flinfo,
+									   Datum val);
+extern bool is_builtin_func(Oid id);
 
 #endif							/* FMGR_H */

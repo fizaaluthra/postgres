@@ -56,6 +56,7 @@
 #include <shlwapi.h>
 #endif
 
+<<<<<<< HEAD
 /* Error triggered for locale-sensitive subroutines */
 #define		PGLOCALE_SUPPORT_ERROR(provider) \
 	elog(ERROR, "unsupported collprovider for %s: %c", __func__, provider)
@@ -65,6 +66,10 @@
  * that we feel comfortable putting it on the stack
  */
 #define		TEXTBUFLEN			1024
+=======
+/* YB includes */
+#include "pg_yb_utils.h"
+>>>>>>> bc662ba7050
 
 #define		MAX_L10N_DATA		80
 
@@ -1121,12 +1126,130 @@ create_pg_locale(Oid collid, MemoryContext context)
 
 	ReleaseSysCache(tp);
 
+<<<<<<< HEAD
 	return result;
+=======
+
+/*
+ * Detect whether collation's LC_COLLATE property is C
+ */
+bool
+lc_collate_is_c(Oid collation)
+{
+	/*
+	 * If we're asked about "collation 0", return false, so that the code will
+	 * go into the non-C path and report that the collation is bogus.
+	 */
+	if (!OidIsValid(collation))
+		return false;
+
+	/*
+	 * At tserver side (for YB expression pushdown) YBCPgIsYugaByteEnabled()
+	 * is false. We assert at PG side before default collation is resolved,
+	 * only C collation is possible (PG 15 has made all catalog tables with
+	 * collation aware columns to all have C collation.
+	 */
+	Assert(!YBCPgIsYugaByteEnabled() || yb_default_collation_resolved || collation == C_COLLATION_OID);
+
+	/*
+	 * If we're asked about the default collation, we have to inquire of the C
+	 * library.  Cache the result so we only have to compute it once.
+	 */
+	if (collation == DEFAULT_COLLATION_OID)
+	{
+		static YB_THREAD_LOCAL int result = -1;
+		char	   *localeptr;
+
+		if (default_locale.provider == COLLPROVIDER_ICU)
+			return false;
+
+		if (result >= 0)
+			return (bool) result;
+		localeptr = setlocale(LC_COLLATE, NULL);
+		if (!localeptr)
+			elog(ERROR, "invalid LC_COLLATE setting");
+
+		if (strcmp(localeptr, "C") == 0)
+			result = true;
+		else if (strcmp(localeptr, "POSIX") == 0)
+			result = true;
+		else
+			result = false;
+		return (bool) result;
+	}
+
+	/*
+	 * If we're asked about the built-in C/POSIX collations, we know that.
+	 */
+	if (collation == C_COLLATION_OID ||
+		collation == POSIX_COLLATION_OID)
+		return true;
+
+	/*
+	 * Otherwise, we have to consult pg_collation, but we cache that.
+	 */
+	return (lookup_collation_cache(collation, true))->collate_is_c;
+>>>>>>> bc662ba7050
 }
 
 /*
  * Initialize default_locale with database locale settings.
  */
+<<<<<<< HEAD
+=======
+bool
+lc_ctype_is_c(Oid collation)
+{
+	/*
+	 * If we're asked about "collation 0", return false, so that the code will
+	 * go into the non-C path and report that the collation is bogus.
+	 */
+	if (!OidIsValid(collation))
+		return false;
+
+	/*
+	 * If we're asked about the default collation, we have to inquire of the C
+	 * library.  Cache the result so we only have to compute it once.
+	 */
+	if (collation == DEFAULT_COLLATION_OID)
+	{
+		static YB_THREAD_LOCAL int result = -1;
+		char	   *localeptr;
+
+		if (default_locale.provider == COLLPROVIDER_ICU)
+			return false;
+
+		if (result >= 0)
+			return (bool) result;
+		localeptr = setlocale(LC_CTYPE, NULL);
+		if (!localeptr)
+			elog(ERROR, "invalid LC_CTYPE setting");
+
+		if (strcmp(localeptr, "C") == 0)
+			result = true;
+		else if (strcmp(localeptr, "POSIX") == 0)
+			result = true;
+		else
+			result = false;
+		return (bool) result;
+	}
+
+	/*
+	 * If we're asked about the built-in C/POSIX collations, we know that.
+	 */
+	if (collation == C_COLLATION_OID ||
+		collation == POSIX_COLLATION_OID)
+		return true;
+
+	/*
+	 * Otherwise, we have to consult pg_collation, but we cache that.
+	 */
+	return (lookup_collation_cache(collation, true))->ctype_is_c;
+}
+
+struct pg_locale_struct default_locale;
+
+>>>>>>> bc662ba7050
 void
 init_database_collation(void)
 {
@@ -1221,11 +1344,157 @@ pg_newlocale_from_collation(Oid collid)
 	cache_entry = collation_cache_insert(CollationCache, collid, &found);
 	if (!found)
 	{
+<<<<<<< HEAD
 		/*
 		 * Make sure cache entry is marked invalid, in case we fail before
 		 * setting things.
 		 */
 		cache_entry->locale = NULL;
+=======
+		/* We haven't computed this yet in this session, so do it */
+		HeapTuple	tp;
+		Form_pg_collation collform;
+		struct pg_locale_struct result;
+		pg_locale_t resultp;
+		Datum		datum;
+		bool		isnull;
+
+		tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
+		if (!HeapTupleIsValid(tp))
+			elog(ERROR, "cache lookup failed for collation %u", collid);
+		collform = (Form_pg_collation) GETSTRUCT(tp);
+
+		/* We'll fill in the result struct locally before allocating memory */
+		memset(&result, 0, sizeof(result));
+		result.provider = collform->collprovider;
+		result.deterministic = collform->collisdeterministic;
+
+		if (collform->collprovider == COLLPROVIDER_LIBC)
+		{
+#ifdef HAVE_LOCALE_T
+			const char *collcollate;
+			const char *collctype pg_attribute_unused();
+			locale_t	loc;
+
+			datum = SysCacheGetAttr(COLLOID, tp, Anum_pg_collation_collcollate, &isnull);
+			Assert(!isnull);
+			collcollate = TextDatumGetCString(datum);
+			datum = SysCacheGetAttr(COLLOID, tp, Anum_pg_collation_collctype, &isnull);
+			Assert(!isnull);
+			collctype = TextDatumGetCString(datum);
+
+			if (strcmp(collcollate, collctype) == 0)
+			{
+				/* Normal case where they're the same */
+				errno = 0;
+#ifndef WIN32
+				loc = newlocale(LC_COLLATE_MASK | LC_CTYPE_MASK, collcollate,
+								NULL);
+#else
+				loc = _create_locale(LC_ALL, collcollate);
+#endif
+				if (!loc)
+					report_newlocale_failure(collcollate);
+				else
+					YbCheckUnsupportedLibcLocale(collcollate);
+			}
+			else
+			{
+#ifndef WIN32
+				/* We need two newlocale() steps */
+				locale_t	loc1;
+
+				errno = 0;
+				loc1 = newlocale(LC_COLLATE_MASK, collcollate, NULL);
+				if (!loc1)
+					report_newlocale_failure(collcollate);
+				else
+					YbCheckUnsupportedLibcLocale(collcollate);
+				errno = 0;
+				loc = newlocale(LC_CTYPE_MASK, collctype, loc1);
+				if (!loc)
+					report_newlocale_failure(collctype);
+				else
+					YbCheckUnsupportedLibcLocale(collctype);
+#else
+
+				/*
+				 * XXX The _create_locale() API doesn't appear to support
+				 * this. Could perhaps be worked around by changing
+				 * pg_locale_t to contain two separate fields.
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("collations with different collate and ctype values are not supported on this platform")));
+#endif
+			}
+
+			result.info.lt = loc;
+#else							/* not HAVE_LOCALE_T */
+			/* platform that doesn't support locale_t */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("collation provider LIBC is not supported on this platform")));
+#endif							/* not HAVE_LOCALE_T */
+		}
+		else if (collform->collprovider == COLLPROVIDER_ICU)
+		{
+			const char *iculocstr;
+
+			datum = SysCacheGetAttr(COLLOID, tp, Anum_pg_collation_colliculocale, &isnull);
+			Assert(!isnull);
+			iculocstr = TextDatumGetCString(datum);
+			make_icu_collator(iculocstr, &result);
+		}
+
+		datum = SysCacheGetAttr(COLLOID, tp, Anum_pg_collation_collversion,
+								&isnull);
+		if (!isnull)
+		{
+			char	   *actual_versionstr;
+			char	   *collversionstr;
+
+			collversionstr = TextDatumGetCString(datum);
+
+			datum = SysCacheGetAttr(COLLOID, tp, collform->collprovider == COLLPROVIDER_ICU ? Anum_pg_collation_colliculocale : Anum_pg_collation_collcollate, &isnull);
+			Assert(!isnull);
+
+			actual_versionstr = get_collation_actual_version(collform->collprovider,
+															 TextDatumGetCString(datum));
+			if (!actual_versionstr)
+			{
+				/*
+				 * This could happen when specifying a version in CREATE
+				 * COLLATION but the provider does not support versioning, or
+				 * manually creating a mess in the catalogs.
+				 */
+				ereport(ERROR,
+						(errmsg("collation \"%s\" has no actual version, but a version was recorded",
+								NameStr(collform->collname))));
+			}
+
+			if (strcmp(actual_versionstr, collversionstr) != 0)
+				ereport(WARNING,
+						(errmsg("collation \"%s\" has version mismatch",
+								NameStr(collform->collname)),
+						 errdetail("The collation in the database was created using version %s, "
+								   "but the operating system provides version %s.",
+								   collversionstr, actual_versionstr),
+						 errhint("Rebuild all objects affected by this collation and run "
+								 "ALTER COLLATION %s REFRESH VERSION, "
+								 "or build PostgreSQL with the right library version.",
+								 quote_qualified_identifier(get_namespace_name(collform->collnamespace),
+															NameStr(collform->collname)))));
+		}
+
+		ReleaseSysCache(tp);
+
+		/* We'll keep the pg_locale_t structures in TopMemoryContext */
+		resultp = MemoryContextAlloc(TopMemoryContext, sizeof(*resultp));
+		*resultp = result;
+
+		cache_entry->locale = resultp;
+>>>>>>> bc662ba7050
 	}
 
 	if (cache_entry->locale == NULL)
@@ -1257,6 +1526,27 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 	else if (collprovider == COLLPROVIDER_LIBC)
 		collversion = get_collation_actual_version_libc(collcollate);
 
+	/* MacOS specific YB change to make unit test results stable. */
+	if (IsYugaByteEnabled())
+	{
+#ifdef __APPLE__
+		if (!collversion &&
+			yb_test_collation &&
+			collprovider == COLLPROVIDER_LIBC &&
+			pg_strcasecmp("C", collcollate) != 0 &&
+			pg_strncasecmp("C.", collcollate, 2) != 0 &&
+			pg_strcasecmp("POSIX", collcollate) != 0)
+			collversion = "2.28";
+#endif
+	}
+
+	if (yb_test_collation)
+
+		/*
+		 * Make unit test output stable across different OS types and
+		 * versions.
+		 */
+		return collversion ? "yb-test-2.28" : NULL;
 	return collversion;
 }
 

@@ -47,6 +47,7 @@
 #include "utils/tuplesort.h"
 #include "utils/wait_event.h"
 
+<<<<<<< HEAD
 /* Magic numbers for parallel state sharing */
 #define PARALLEL_KEY_BRIN_SHARED		UINT64CONST(0xB000000000000001)
 #define PARALLEL_KEY_TUPLESORT			UINT64CONST(0xB000000000000002)
@@ -151,6 +152,11 @@ typedef struct BrinLeader
 	WalUsage   *walusage;
 	BufferUsage *bufferusage;
 } BrinLeader;
+=======
+/* YB includes */
+#include "utils/guc.h"
+
+>>>>>>> bc662ba7050
 
 /*
  * We use a BrinBuildState during initial construction of a BRIN index.
@@ -1818,7 +1824,12 @@ summarize_range(IndexInfo *indexInfo, BrinBuildState *state, Relation heapRel,
 	state->bs_currRangeStart = heapBlk;
 	table_index_build_range_scan(heapRel, state->bs_irel, indexInfo, false, true, false,
 								 heapBlk, scanNumBlks,
+<<<<<<< HEAD
 								 brinbuildCallback, state, NULL);
+=======
+								 brinbuildCallback, (void *) state, NULL,
+								 NULL /* bfinfo */ , NULL /* bfresult */ );
+>>>>>>> bc662ba7050
 
 	/*
 	 * Now we update the values obtained by the scan with the placeholder

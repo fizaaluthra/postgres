@@ -134,8 +134,19 @@ bool	   *wal_consistency_checking = NULL;
 bool		wal_init_zero = true;
 bool		wal_recycle = true;
 bool		log_checkpoints = true;
+<<<<<<< HEAD
 int			wal_sync_method = DEFAULT_WAL_SYNC_METHOD;
 int			wal_level = WAL_LEVEL_REPLICA;
+=======
+int			sync_method = DEFAULT_SYNC_METHOD;
+
+/*
+ * YB NOTE: wal_level is not applicable to YB. So for user experience, we set
+ * the default to logical, so that any logical replication client doesn't throw
+ * any errors based on the value of the wal_level.
+ */
+int			wal_level = WAL_LEVEL_LOGICAL;
+>>>>>>> bc662ba7050
 int			CommitDelay = 0;	/* precommit delay in microseconds */
 int			CommitSiblings = 5; /* # concurrent xacts needed to sleep */
 int			wal_retrieve_retry_interval = 5000;

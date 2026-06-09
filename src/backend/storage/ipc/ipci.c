@@ -25,6 +25,13 @@
 #include "storage/subsystems.h"
 #include "utils/guc.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+#include "yb_ash.h"
+#include "yb_qpm.h"
+#include "yb_query_diagnostics.h"
+#include "yb_terminated_queries.h"
+
 /* GUCs */
 int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
 
@@ -70,6 +77,18 @@ CalculateShmemSize(void)
 	size = 100000;
 	size = add_size(size, ShmemGetRequestedSize());
 
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_ash)
+		size = add_size(size, YbAshShmemSize());
+
+	if (YBIsEnabledInPostgresEnvVar())
+		size = add_size(size, YbQpmShmemSize());
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
+		size = add_size(size, YbQueryDiagnosticsShmemSize());
+
+	/* include additional shmem for yb_terminated_queries */
+	size = add_size(size, YbTerminatedQueriesShmemSize());
+
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
 
@@ -101,8 +120,108 @@ AttachSharedMemoryStructs(void)
 	 */
 	InitializeFastPathLocks();
 
+<<<<<<< HEAD
 	/* Establish pointers to all shared memory areas in this backend */
 	ShmemAttachRequested();
+=======
+	/*
+	 * Now initialize LWLocks, which do shared memory allocation and are
+	 * needed for InitShmemIndex.
+	 */
+	CreateLWLocks();
+
+	/*
+	 * Set up shmem.c index hashtable
+	 */
+	InitShmemIndex();
+
+	dsm_shmem_init();
+
+	/*
+	 * Set up xlog, clog, and buffers
+	 */
+	XLOGShmemInit();
+	XLogPrefetchShmemInit();
+	XLogRecoveryShmemInit();
+	CLOGShmemInit();
+	CommitTsShmemInit();
+	SUBTRANSShmemInit();
+	MultiXactShmemInit();
+	InitBufferPool();
+
+	/*
+	 * Set up lock manager
+	 */
+	InitLocks();
+
+	/*
+	 * Set up predicate lock manager
+	 */
+	InitPredicateLocks();
+
+	/*
+	 * Set up process table
+	 */
+	if (!IsUnderPostmaster)
+		InitProcGlobal();
+	CreateSharedProcArray();
+	CreateSharedBackendStatus();
+	TwoPhaseShmemInit();
+	BackgroundWorkerShmemInit();
+
+	/*
+	 * Set up shared-inval messaging
+	 */
+	CreateSharedInvalidationState();
+
+	/*
+	 * Set up interprocess signaling mechanisms
+	 */
+	PMSignalShmemInit();
+	ProcSignalShmemInit();
+	CheckpointerShmemInit();
+	AutoVacuumShmemInit();
+	ReplicationSlotsShmemInit();
+	ReplicationOriginShmemInit();
+	WalSndShmemInit();
+	WalRcvShmemInit();
+	PgArchShmemInit();
+	ApplyLauncherShmemInit();
+
+	/*
+	 * Set up other modules that need some shared memory space
+	 */
+	SnapMgrInit();
+	BTreeShmemInit();
+	SyncScanShmemInit();
+	AsyncShmemInit();
+	StatsShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_ash)
+		YbAshShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_query_diagnostics)
+		YbQueryDiagnosticsShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar())
+		YbQpmShmemInit();
+
+	/* Setting up yb_terminated_queries shared memory space. */
+	YbTerminatedQueriesShmemInit();
+
+#ifdef EXEC_BACKEND
+
+	/*
+	 * Alloc the win32 shared backend array
+	 */
+	if (!IsUnderPostmaster)
+		ShmemBackendArrayAllocation();
+#endif
+
+	/* Initialize dynamic shared memory facilities. */
+	if (!IsUnderPostmaster)
+		dsm_postmaster_startup(shim);
+>>>>>>> bc662ba7050
 
 	/*
 	 * Now give loadable modules a chance to set up their shmem allocations

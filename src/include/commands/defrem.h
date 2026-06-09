@@ -163,4 +163,13 @@ extern int	defGetTypeLength(DefElem *def);
 extern List *defGetStringList(DefElem *def);
 pg_noreturn extern void errorConflictingDefElem(DefElem *defel, ParseState *pstate);
 
+/* YB */
+extern ObjectAddress AlterFunctionOwner(AlterOwnerStmt *stmt, Oid newOwnerId);
+extern void AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId);
+extern ObjectAddress RenameFunction(RenameStmt *stmt, const char *newname);
+extern void RenameFunction_internal(Relation rel, HeapTuple tup, const char *newname);
+extern char *YbChooseExtendedStatisticName(const char *name1,
+										   const char *name2,
+										   const char *label, Oid namespaceid);
+
 #endif							/* DEFREM_H */

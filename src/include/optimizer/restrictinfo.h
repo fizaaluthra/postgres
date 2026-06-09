@@ -59,6 +59,7 @@ extern bool join_clause_is_movable_into(RestrictInfo *rinfo,
 										Relids currentrelids,
 										Relids current_and_outer);
 
+<<<<<<< HEAD
 /*
  * clause_sides_match_join
  *	  Determine whether a join clause is of the right form to use in this join.
@@ -89,5 +90,17 @@ clause_sides_match_join(RestrictInfo *rinfo, Relids outerrelids,
 	}
 	return false;				/* no good for these input relations */
 }
+=======
+/* YB */
+extern bool yb_can_hash_batched_rinfo(RestrictInfo *batched_rinfo,
+									  Relids outer_relids,
+									  Relids inner_relids);
+extern bool yb_can_batch_rinfo(RestrictInfo *rinfo,
+							   Relids outer_batched_relids,
+							   Relids inner_relids);
+extern RestrictInfo *yb_get_batched_restrictinfo(RestrictInfo *rinfo,
+												 Relids outer_batched_relids,
+												 Relids inner_relids);
+>>>>>>> bc662ba7050
 
 #endif							/* RESTRICTINFO_H */

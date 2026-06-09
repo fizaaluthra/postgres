@@ -193,7 +193,12 @@ WalReceiverMain(const void *startup_data, size_t startup_data_len)
 		case WALRCV_STOPPING:
 			/* If we've already been requested to stop, don't start up. */
 			walrcv->walRcvState = WALRCV_STOPPED;
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* fall through */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case WALRCV_STOPPED:
 			SpinLockRelease(&walrcv->mutex);

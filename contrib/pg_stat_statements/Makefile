@@ -6,6 +6,7 @@ OBJS = \
 	pg_stat_statements.o
 
 EXTENSION = pg_stat_statements
+<<<<<<< HEAD
 DATA = pg_stat_statements--1.4.sql \
 	pg_stat_statements--1.12--1.13.sql \
 	pg_stat_statements--1.11--1.12.sql pg_stat_statements--1.10--1.11.sql \
@@ -14,7 +15,15 @@ DATA = pg_stat_statements--1.4.sql \
 	pg_stat_statements--1.5--1.6.sql pg_stat_statements--1.4--1.5.sql \
 	pg_stat_statements--1.3--1.4.sql pg_stat_statements--1.2--1.3.sql \
 	pg_stat_statements--1.1--1.2.sql pg_stat_statements--1.0--1.1.sql
+=======
+DATA = pg_stat_statements--1.10-yb-2.1.sql \
+	pg_stat_statements--1.10-yb-2.0--1.10-yb-2.1.sql \
+	pg_stat_statements--1.10-yb-1.0--1.10-yb-2.0.sql \
+	pg_stat_statements--1.6-yb-1.0--1.10-yb-1.0.sql \
+	pg_stat_statements--1.6--1.6-yb-1.0.sql
+>>>>>>> bc662ba7050
 PGFILEDESC = "pg_stat_statements - execution statistics of SQL statements"
+SHLIB_LINK += -L$(YB_BUILD_ROOT)/lib -lserver_process -lyb_pggate_webserver -lhdr_histogram
 
 LDFLAGS_SL += $(filter -lm, $(LIBS))
 

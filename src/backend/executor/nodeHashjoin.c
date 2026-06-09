@@ -429,8 +429,13 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				}
 				else
 					node->hj_JoinState = HJ_NEED_NEW_OUTER;
+<<<<<<< HEAD
 
 				pg_fallthrough;
+=======
+				/* FALL THRU */
+				yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 			case HJ_NEED_NEW_OUTER:
 
@@ -531,7 +536,12 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				/* OK, let's scan the bucket for matches */
 				node->hj_JoinState = HJ_SCAN_BUCKET;
 
+<<<<<<< HEAD
 				pg_fallthrough;
+=======
+				/* FALL THRU */
+				yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 			case HJ_SCAN_BUCKET:
 
@@ -1470,13 +1480,23 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
 					if (BarrierArriveAndWait(batch_barrier,
 											 WAIT_EVENT_HASH_BATCH_ELECT))
 						ExecParallelHashTableAlloc(hashtable, batchno);
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* Fall through. */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 				case PHJ_BATCH_ALLOCATE:
 					/* Wait for allocation to complete. */
 					BarrierArriveAndWait(batch_barrier,
 										 WAIT_EVENT_HASH_BATCH_ALLOCATE);
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* Fall through. */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 				case PHJ_BATCH_LOAD:
 					/* Start (or join in) loading tuples. */
@@ -1496,7 +1516,12 @@ ExecParallelHashJoinNewBatch(HashJoinState *hjstate)
 					sts_end_parallel_scan(inner_tuples);
 					BarrierArriveAndWait(batch_barrier,
 										 WAIT_EVENT_HASH_BATCH_LOAD);
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* Fall through. */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 				case PHJ_BATCH_PROBE:
 

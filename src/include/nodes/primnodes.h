@@ -771,6 +771,17 @@ typedef enum CoercionForm
 } CoercionForm;
 
 /*
+ * YbConcurrencyContext - distinguishes between different forms of concurrency
+ * specified in CREATE INDEX.
+ */
+typedef enum YbConcurrencyContext
+{
+	YB_CONCURRENCY_DISABLED,	/* CONCURRENTLY is disabled */
+	YB_CONCURRENCY_IMPLICIT_ENABLED,	/* CONCURRENTLY is implicitly enabled */
+	YB_CONCURRENCY_EXPLICIT_ENABLED /* CONCURRENTLY is explicitly enabled */
+} YbConcurrencyContext;
+
+/*
  * FuncExpr - expression node for a function call
  *
  * Collation information is irrelevant for the query jumbling, only the
@@ -1485,11 +1496,20 @@ typedef struct RowExpr
  *
  * A RowCompareExpr node is only generated for the < <= > >= cases;
  * the = and <> cases are translated to simple AND or OR combinations
+<<<<<<< HEAD
  * of the pairwise comparisons.
+=======
+ * of the pairwise comparisons.  However, we include = and <> in the
+ * RowCompareType enum for the convenience of parser logic.
+ *
+ * YB: In the execution layer, YB indexes support the = case for when
+ * the RHS is an array of rows much like an IN condition.
+>>>>>>> bc662ba7050
  */
 typedef struct RowCompareExpr
 {
 	Expr		xpr;
+<<<<<<< HEAD
 
 	/* LT LE GE or GT, never EQ or NE */
 	CompareType cmptype;
@@ -1503,6 +1523,15 @@ typedef struct RowCompareExpr
 	List	   *largs;
 	/* the right-hand input arguments */
 	List	   *rargs;
+=======
+	RowCompareType rctype;		/* LT LE GE or GT, never EQ or NE */
+	List	   *opnos;			/* OID list of pairwise comparison ops */
+	List	   *opfamilies;		/* OID list of containing operator families */
+	List	   *inputcollids;	/* OID list of collations for comparisons */
+	List	   *largs;			/* the left-hand input arguments */
+	/* YB note: change rargs type from List to Node */
+	Node	   *rargs;			/* the right-hand input arguments */
+>>>>>>> bc662ba7050
 } RowCompareExpr;
 
 /*

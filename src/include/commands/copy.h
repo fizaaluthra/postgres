@@ -97,6 +97,14 @@ typedef struct CopyFormatOptions
 	CopyLogVerbosityChoice log_verbosity;	/* verbosity of logged messages */
 	int64		reject_limit;	/* maximum tolerable number of errors */
 	List	   *convert_select; /* list of column names (can be NIL) */
+
+	/* Yugabytes attributes */
+	int			batch_size;		/* copy from executes in batch sizes */
+	uint64		num_initial_skipped_rows;	/* rows to skip at the beginning
+											 * of the file */
+	bool		disable_fk_check;	/* Disable FK check? */
+	OnConflictAction on_conflict_action;	/* How to handle when the new row
+											 * conflicts with existing row */
 } CopyFormatOptions;
 
 /* These are private in commands/copy[from|to].c */
@@ -106,7 +114,23 @@ typedef struct CopyToStateData *CopyToState;
 typedef int (*copy_data_source_cb) (void *outbuf, int minread, int maxread);
 typedef void (*copy_data_dest_cb) (void *data, int len);
 
+<<<<<<< HEAD
 extern void DoCopy(ParseState *pstate, const CopyStmt *stmt,
+=======
+/*
+ * This is Yugabyte macros.
+ */
+#define DEFAULT_BATCH_ROWS_PER_TRANSACTION  20000
+
+/**
+ * YSQL guc variables that can be used to set rows per transaciton for batch copy from.
+ * e.g. 'SET yb_default_copy_from_rows_per_transaction=1000'
+ * See also the corresponding entries in guc.c.
+ */
+extern int	yb_default_copy_from_rows_per_transaction;
+
+extern void DoCopy(ParseState *state, const CopyStmt *stmt,
+>>>>>>> bc662ba7050
 				   int stmt_location, int stmt_len,
 				   uint64 *processed);
 
@@ -116,7 +140,7 @@ extern CopyFromState BeginCopyFrom(ParseState *pstate, Relation rel, Node *where
 								   bool is_program, copy_data_source_cb data_source_cb, List *attnamelist, List *options);
 extern void EndCopyFrom(CopyFromState cstate);
 extern bool NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
-						 Datum *values, bool *nulls);
+						 Datum *values, bool *nulls, bool skip_row);
 extern bool NextCopyFromRawFields(CopyFromState cstate,
 								  char ***fields, int *nfields);
 extern void CopyFromErrorCallback(void *arg);

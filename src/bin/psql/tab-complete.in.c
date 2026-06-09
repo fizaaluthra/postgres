@@ -1049,6 +1049,10 @@ static const SchemaQuery Query_for_trigger_of_table = {
 "SELECT spcname FROM pg_catalog.pg_tablespace "\
 " WHERE spcname LIKE '%s'"
 
+#define Query_for_list_of_tablegroups \
+"SELECT grpname FROM pg_catalog.pg_yb_tablegroup "\
+" WHERE grpname LIKE '%s'"
+
 #define Query_for_list_of_encodings \
 " SELECT DISTINCT pg_catalog.pg_encoding_to_char(conforencoding) "\
 "   FROM pg_catalog.pg_conversion "\
@@ -1357,6 +1361,7 @@ static const pgsql_thing_t words_after_create[] = {
 	{"SYSTEM", NULL, NULL, NULL, NULL, THING_NO_CREATE | THING_NO_DROP},
 	{"TABLE", NULL, NULL, &Query_for_list_of_tables},
 	{"TABLESPACE", Query_for_list_of_tablespaces},
+	{"TABLEGROUP", Query_for_list_of_tablegroups},
 	{"TEMP", NULL, NULL, NULL, NULL, THING_NO_DROP | THING_NO_ALTER},	/* for CREATE TEMP TABLE
 																		 * ... */
 	{"TEMPLATE", NULL, NULL, &Query_for_list_of_ts_templates, NULL, THING_NO_SHOW},
@@ -3104,6 +3109,7 @@ match_previous_words(int pattern_id,
 	else if (Matches("ALTER", "TABLE", MatchAny, "DETACH", "PARTITION", MatchAny))
 		COMPLETE_WITH("CONCURRENTLY", "FINALIZE");
 
+<<<<<<< HEAD:src/bin/psql/tab-complete.in.c
 	/* ALTER TABLE <name> SPLIT PARTITION <name> */
 	else if (Matches("ALTER", "TABLE", MatchAny, "SPLIT", "PARTITION", MatchAny))
 		COMPLETE_WITH("INTO ( PARTITION");
@@ -3120,6 +3126,11 @@ match_previous_words(int pattern_id,
 	/* ALTER TABLE <name> OF */
 	else if (Matches("ALTER", "TABLE", MatchAny, "OF"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_composite_datatypes);
+=======
+	/* YB: ALTER TABLEGROUP <foo> with RENAME TO, OWNER TO */
+	else if (Matches("ALTER", "TABLEGROUP", MatchAny))
+		COMPLETE_WITH("RENAME TO", "OWNER TO");
+>>>>>>> bc662ba7050:src/bin/psql/tab-complete.c
 
 	/* ALTER TABLESPACE <foo> with RENAME TO, OWNER TO, SET, RESET */
 	else if (Matches("ALTER", "TABLESPACE", MatchAny))
@@ -3323,6 +3334,7 @@ match_previous_words(int pattern_id,
 					  "PROCEDURE", "PROCEDURAL LANGUAGE", "PROPERTY GRAPH", "PUBLICATION", "ROLE",
 					  "ROUTINE", "RULE", "SCHEMA", "SEQUENCE", "SERVER",
 					  "STATISTICS", "SUBSCRIPTION", "TABLE",
+					  "TABLEGROUP", /* YB */
 					  "TABLESPACE", "TEXT SEARCH", "TRANSFORM FOR",
 					  "TRIGGER", "TYPE", "VIEW");
 	else if (Matches("COMMENT", "ON", "ACCESS", "METHOD"))
@@ -3904,12 +3916,20 @@ match_previous_words(int pattern_id,
 	else if (TailMatches("CREATE", "TEMP|TEMPORARY", "TABLE", MatchAny, "(*)", "ON", "COMMIT"))
 		COMPLETE_WITH("DELETE ROWS", "DROP", "PRESERVE ROWS");
 
+/* YB: CREATE TABLEGROUP */
+	else if (Matches("CREATE", "TABLEGROUP", MatchAny))
+		COMPLETE_WITH("OWNER", "TABLESPACE");
+	/* Complete CREATE TABLEGROUP name OWNER name with "TABLESPACE" */
+	else if (Matches("CREATE", "TABLEGROUP", MatchAny, "OWNER", MatchAny))
+		COMPLETE_WITH("TABLESPACE");
+
 /* CREATE TABLESPACE */
+	/* YB note: replace "LOCATION" with "WITH" */
 	else if (Matches("CREATE", "TABLESPACE", MatchAny))
-		COMPLETE_WITH("OWNER", "LOCATION");
-	/* Complete CREATE TABLESPACE name OWNER name with "LOCATION" */
+		COMPLETE_WITH("OWNER", "WITH");
+	/* Complete CREATE TABLESPACE name OWNER name with "WITH" */
 	else if (Matches("CREATE", "TABLESPACE", MatchAny, "OWNER", MatchAny))
-		COMPLETE_WITH("LOCATION");
+		COMPLETE_WITH("WITH");
 
 /* CREATE TEXT SEARCH --- is allowed inside CREATE SCHEMA, so use TailMatches */
 	else if (TailMatches("CREATE", "TEXT", "SEARCH"))
@@ -4378,6 +4398,7 @@ match_previous_words(int pattern_id,
 /* DROP */
 	/* Complete DROP object with CASCADE / RESTRICT */
 	else if (Matches("DROP",
+					 "TABLEGROUP|"	/* YB */
 					 "COLLATION|CONVERSION|DOMAIN|EXTENSION|LANGUAGE|PUBLICATION|SCHEMA|SEQUENCE|SERVER|SUBSCRIPTION|STATISTICS|TABLE|TYPE|VIEW",
 					 MatchAny) ||
 			 Matches("DROP", "ACCESS", "METHOD", MatchAny) ||
@@ -4773,6 +4794,8 @@ match_previous_words(int pattern_id,
 			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_sequences);
 		else if (TailMatches("TABLE"))
 			COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_grantables);
+		else if (TailMatches("TABLEGROUP")) /* YB */
+			COMPLETE_WITH_QUERY(Query_for_list_of_tablegroups);
 		else if (TailMatches("TABLESPACE"))
 			COMPLETE_WITH_QUERY(Query_for_list_of_tablespaces);
 		else if (TailMatches("TYPE"))
@@ -5102,6 +5125,10 @@ match_previous_words(int pattern_id,
 	else if (TailMatches("OWNER", "TO"))
 		COMPLETE_WITH_QUERY_PLUS(Query_for_list_of_roles,
 								 Keywords_for_list_of_owner_roles);
+
+/* Yugabyte - OWNER  - complete with available roles */
+	else if (TailMatches("OWNER"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_roles);
 
 /* ORDER BY */
 	else if (TailMatches("FROM", MatchAny, "ORDER"))
@@ -5654,6 +5681,8 @@ match_previous_words(int pattern_id,
 	else if (TailMatchesCS("\\dF*"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_ts_configurations);
 
+	else if (TailMatchesCS("\\dgr*"))	/* YB */
+		COMPLETE_WITH_QUERY(Query_for_list_of_tablegroups);
 	else if (TailMatchesCS("\\di*"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes);
 	else if (TailMatchesCS("\\dL*"))

@@ -73,8 +73,15 @@ extern List *pg_plan_queries(List *querytrees, const char *query_string,
 extern void die(SIGNAL_ARGS);
 pg_noreturn extern void quickdie(SIGNAL_ARGS);
 extern void StatementCancelHandler(SIGNAL_ARGS);
+<<<<<<< HEAD
 pg_noreturn extern void FloatExceptionHandler(SIGNAL_ARGS);
 extern void HandleRecoveryConflictInterrupt(void);
+=======
+extern void FloatExceptionHandler(SIGNAL_ARGS) pg_attribute_noreturn();
+extern void YbCriticalSignalHandler(SIGNAL_ARGS);
+extern void RecoveryConflictInterrupt(ProcSignalReason reason); /* called from SIGUSR1
+																 * handler */
+>>>>>>> bc662ba7050
 extern void ProcessClientReadInterrupt(bool blocked);
 extern void ProcessClientWriteInterrupt(bool blocked);
 
@@ -93,4 +100,5 @@ extern bool set_plan_disabling_options(const char *arg,
 									   GucContext context, GucSource source);
 extern const char *get_stats_option_name(const char *arg);
 
+extern bool YBRefreshCacheUsingInvalMsgs();
 #endif							/* TCOPPROT_H */

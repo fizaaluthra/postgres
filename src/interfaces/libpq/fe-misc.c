@@ -51,6 +51,9 @@
 #include "pg_config_paths.h"
 #include "port/pg_bswap.h"
 
+/* YB includes */
+#include <stdatomic.h>
+
 static int	pqPutMsgBytes(const void *buf, size_t len, PGconn *conn);
 static int	pqSendSome(PGconn *conn, int len);
 static int	pqSocketCheck(PGconn *conn, int forRead, int forWrite,
@@ -1310,7 +1313,7 @@ libpq_binddomain(void)
 	 * not known that similar bugs exist on non-Windows platforms, but we
 	 * might as well do it the same way everywhere.
 	 */
-	static volatile bool already_bound = false;
+	static volatile atomic_bool already_bound = false;
 	static pthread_mutex_t binddomain_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 	if (!already_bound)

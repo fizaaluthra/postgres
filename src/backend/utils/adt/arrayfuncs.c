@@ -1021,6 +1021,7 @@ Datum
 array_out(PG_FUNCTION_ARGS)
 {
 	AnyArrayType *v = PG_GETARG_ANY_ARRAY_P(0);
+	YbDatumDecodeOptions *decode_options = NULL;
 	Oid			element_type = AARR_ELEMTYPE(v);
 	int			typlen;
 	bool		typbyval;
@@ -1051,38 +1052,49 @@ array_out(PG_FUNCTION_ARGS)
 	array_iter	iter;
 	ArrayMetaState *my_extra;
 
-	/*
-	 * We arrange to look up info about element type, including its output
-	 * conversion proc, only once per series of calls, assuming the element
-	 * type doesn't change underneath us.
-	 */
-	my_extra = (ArrayMetaState *) fcinfo->flinfo->fn_extra;
-	if (my_extra == NULL)
+	/* YB */
+	if (PG_NARGS() == 2)
 	{
-		fcinfo->flinfo->fn_extra = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-													  sizeof(ArrayMetaState));
-		my_extra = (ArrayMetaState *) fcinfo->flinfo->fn_extra;
-		my_extra->element_type = ~element_type;
+		decode_options = (YbDatumDecodeOptions *) PG_GETARG_POINTER(1);
+		typlen = decode_options->elem_len;
+		typbyval = decode_options->elem_by_val;
+		typalign = decode_options->elem_align;
+		typdelim = decode_options->elem_delim;
 	}
-
-	if (my_extra->element_type != element_type)
+	else
 	{
 		/*
-		 * Get info about element type, including its output conversion proc
+		 * We arrange to look up info about element type, including its output
+		 * conversion proc, only once per series of calls, assuming the element
+		 * type doesn't change underneath us.
 		 */
-		get_type_io_data(element_type, IOFunc_output,
-						 &my_extra->typlen, &my_extra->typbyval,
-						 &my_extra->typalign, &my_extra->typdelim,
-						 &my_extra->typioparam, &my_extra->typiofunc);
-		fmgr_info_cxt(my_extra->typiofunc, &my_extra->proc,
-					  fcinfo->flinfo->fn_mcxt);
-		my_extra->element_type = element_type;
-	}
-	typlen = my_extra->typlen;
-	typbyval = my_extra->typbyval;
-	typalign = my_extra->typalign;
-	typdelim = my_extra->typdelim;
+		my_extra = (ArrayMetaState *) fcinfo->flinfo->fn_extra;
+		if (my_extra == NULL)
+		{
+			fcinfo->flinfo->fn_extra = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
+														  sizeof(ArrayMetaState));
+			my_extra = (ArrayMetaState *) fcinfo->flinfo->fn_extra;
+			my_extra->element_type = ~element_type;
+		}
 
+		if (my_extra->element_type != element_type)
+		{
+			/*
+			 * Get info about element type, including its output conversion proc
+			 */
+			get_type_io_data(element_type, IOFunc_output,
+							 &my_extra->typlen, &my_extra->typbyval,
+							 &my_extra->typalign, &my_extra->typdelim,
+							 &my_extra->typioparam, &my_extra->typiofunc);
+			fmgr_info_cxt(my_extra->typiofunc, &my_extra->proc,
+						  fcinfo->flinfo->fn_mcxt);
+			my_extra->element_type = element_type;
+		}
+		typlen = my_extra->typlen;
+		typbyval = my_extra->typbyval;
+		typalign = my_extra->typalign;
+		typdelim = my_extra->typdelim;
+	}
 	ndim = AARR_NDIM(v);
 	dims = AARR_DIMS(v);
 	lb = AARR_LBOUND(v);
@@ -1135,7 +1147,32 @@ array_out(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			values[i] = OutputFunctionCall(&my_extra->proc, itemvalue);
+			if (decode_options != NULL && decode_options->from_YB)
+			{
+				if (decode_options->option == 't')
+				{
+					YbDatumDecodeOptions tz_datum_decodeOptions;
+
+					tz_datum_decodeOptions.timezone = decode_options->timezone;
+					tz_datum_decodeOptions.from_YB = decode_options->from_YB;
+					values[i] = DatumGetCString(FunctionCall2(decode_options->elem_finfo, itemvalue,
+															  PointerGetDatum(&tz_datum_decodeOptions)));
+				}
+				else if (decode_options->option == 'r' &&
+						 decode_options->range_datum_decode_options != NULL)
+				{
+					YbDatumDecodeOptions *range_decodeOptions = decode_options->range_datum_decode_options;
+
+					values[i] = DatumGetCString(FunctionCall2(decode_options->elem_finfo, itemvalue,
+															  PointerGetDatum(range_decodeOptions)));
+				}
+				else
+				{
+					values[i] = OutputFunctionCall(decode_options->elem_finfo, itemvalue);
+				}
+			}
+			else
+				values[i] = OutputFunctionCall(&my_extra->proc, itemvalue);
 
 			/* count data plus backslashes; detect chars needing quotes */
 			if (values[i][0] == '\0')
@@ -1635,13 +1672,7 @@ array_send(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			bytea	   *outputbytes;
-
-			outputbytes = SendFunctionCall(&my_extra->proc, itemvalue);
-			pq_sendint32(&buf, VARSIZE(outputbytes) - VARHDRSZ);
-			pq_sendbytes(&buf, VARDATA(outputbytes),
-						 VARSIZE(outputbytes) - VARHDRSZ);
-			pfree(outputbytes);
+			StringInfoSendFunctionCall(&buf, &my_extra->proc, itemvalue);
 		}
 	}
 

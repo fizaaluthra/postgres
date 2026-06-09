@@ -145,4 +145,12 @@ extern Snapshot RestoreSnapshot(char *start_address);
 struct PGPROC;
 extern void RestoreTransactionSnapshot(Snapshot snapshot, struct PGPROC *source_pgproc);
 
+/* YB */
+extern void PopAllActiveSnapshots(void);
+extern void YBCheckSnapshotsAllowed(bool check_isolation_level);
+extern void YbInitSnapshot(Snapshot snap, YbOptionalReadPointHandle read_point_handle);
+extern void YbLogSnapshotData(const char *msg, const SnapshotData *snap, bool log_stack_trace);
+extern YbcReadPointHandle YbGetCatalogSnapshotReadPoint(YbcPgOid table_oid, bool create_if_not_exists);
+extern void YbInvalidateCatalogSnapshot(void);
+
 #endif							/* SNAPMGR_H */

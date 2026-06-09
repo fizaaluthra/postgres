@@ -51,6 +51,10 @@
 #endif
 #endif
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb_ysql_conn_mgr_helper.h"
+
 
 /* callback data for check_network_callback */
 typedef struct check_network_data
@@ -87,8 +91,28 @@ static List *parsed_hba_lines = NIL;
 static MemoryContext parsed_hba_context = NULL;
 
 /*
+ * The following character array contains the additional hardcoded HBA config
+ * lines that are set internally.  These lines take priority over user defined
+ * config lines.
+ */
+static const char *const HardcodedHbaLines[] =
+{
+	"local all postgres yb-tserver-key",
+};
+
+/*
  * pre-parsed content of ident mapping file: list of IdentLine structs.
  * parsed_ident_context is the memory context where it lives.
+<<<<<<< HEAD
+=======
+ *
+ * NOTE: the IdentLine structs can contain pre-compiled regular expressions
+ * that live outside the memory context. Before destroying or resetting the
+ * memory context, they need to be explicitly free'd.
+ *
+ * YB: Ident mapping is also used in YCQL. When used in YCQL, this lives in the
+ * ycql_jwt_ident_memctx_ memory context.
+>>>>>>> bc662ba7050
  */
 static List *parsed_ident_lines = NIL;
 static MemoryContext parsed_ident_context = NULL;
@@ -108,14 +132,21 @@ static const char *const UserAuthName[] =
 	"password",
 	"md5",
 	"scram-sha-256",
+	"yb-tserver-key",			/* For internal tserver-postgres connection */
 	"gss",
 	"sspi",
 	"pam",
 	"bsd",
 	"ldap",
 	"cert",
+<<<<<<< HEAD
 	"peer",
 	"oauth",
+=======
+	"radius",
+	"peer",
+	"jwt"
+>>>>>>> bc662ba7050
 };
 
 /*
@@ -124,10 +155,19 @@ static const char *const UserAuthName[] =
 StaticAssertDecl(lengthof(UserAuthName) == USER_AUTH_LAST + 1,
 				 "UserAuthName[] must match the UserAuth enum");
 
+<<<<<<< HEAD
 
 static List *tokenize_expand_file(List *tokens, const char *outer_filename,
 								  const char *inc_filename, int elevel,
 								  int depth, char **err_msg);
+=======
+static List *tokenize_inc_file(List *tokens, const char *outer_filename,
+							   const char *inc_filename, int elevel, char **err_msg);
+static void yb_tokenize_hardcoded(List **tok_lines_all, int elevel);
+static TokenizedAuthLine *yb_tokenize_line(const char *filename, int elevel,
+										   int line_number, char *rawline,
+										   char *err_msg);
+>>>>>>> bc662ba7050
 static bool parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 							   int elevel, char **err_msg);
 static int	regcomp_auth_token(AuthToken *token, char *filename, int line_num,
@@ -910,6 +950,101 @@ next_line:
 	error_context_stack = tokenerrcontext.previous;
 }
 
+/*
+ * Tokenize the hardcoded configuration lines.
+ *
+ * The output is a list of TokenizedAuthLine structs; see struct definition above.
+ *
+ * tok_lines: receives output list
+ * elevel: message logging level
+ *
+ * Errors are reported by logging messages at ereport level elevel and by
+ * adding TokenizedAuthLine structs containing non-null err_msg fields to the
+ * output list.
+ */
+static void
+yb_tokenize_hardcoded(List **tok_lines, int elevel)
+{
+	int			line_number = -1;
+
+	*tok_lines = NIL;
+
+	for (int i = 0; i < sizeof(HardcodedHbaLines) / sizeof(char *); ++i)
+	{
+		char	   *err_msg = NULL;
+		TokenizedAuthLine *tok_line;
+
+		tok_line = yb_tokenize_line("(hardcoded: no filename)" /* filename */ ,
+									elevel, line_number,
+									pstrdup(HardcodedHbaLines[i]), err_msg);
+		if (tok_line != NULL)
+			*tok_lines = lappend(*tok_lines, tok_line);
+
+		line_number--;
+	}
+}
+
+/*
+ * Tokenize the given line.
+ *
+ * The output is a TokenizedAuthLine struct.
+ *
+ * filename: the absolute path to the target file
+ * elevel: message logging level
+ * line_number: line in the target file
+ * rawline: the input line (strip trailing line breaks)
+ * err_msg: error message (inherit it, set it, or leave it null)
+ *
+ * Errors are reported by logging messages at ereport level elevel and by
+ * putting a non-null err_msg in the TokenizedAuthLine struct.
+ *
+ * Return value is a palloc'd tokenized line.
+ */
+static TokenizedAuthLine *
+yb_tokenize_line(const char *filename,
+				 int elevel,
+				 int line_number,
+				 char *rawline,
+				 char *err_msg)
+{
+	char	   *lineptr;
+	List	   *current_line = NIL;
+
+	if (rawline == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("line is null")));
+
+	/* Strip trailing linebreak from rawline */
+	pg_strip_crlf(rawline);
+
+	/* Parse fields */
+	lineptr = rawline;
+	while (*lineptr && err_msg == NULL)
+	{
+		List	   *current_field;
+
+		current_field = next_field_expand(filename, &lineptr,
+										  elevel, &err_msg);
+		/* add field to line, unless we are at EOL or comment start */
+		if (current_field != NIL)
+			current_line = lappend(current_line, current_field);
+	}
+
+	/* Reached EOL; emit line unless it's boring */
+	if (current_line != NIL || err_msg != NULL)
+	{
+		TokenizedAuthLine *tok_line;
+
+		tok_line = (TokenizedAuthLine *) palloc(sizeof(TokenizedAuthLine));
+		tok_line->fields = current_line;
+		tok_line->line_num = line_number;
+		tok_line->raw_line = pstrdup(rawline);
+		tok_line->err_msg = err_msg;
+		return tok_line;
+	}
+	return NULL;
+}
 
 /*
  * Does user belong to role?
@@ -1719,6 +1854,8 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		parsedline->auth_method = uaMD5;
 	else if (strcmp(token->string, "scram-sha-256") == 0)
 		parsedline->auth_method = uaSCRAM;
+	else if (strcmp(token->string, "yb-tserver-key") == 0)
+		parsedline->auth_method = uaYbTserverKey;
 	else if (strcmp(token->string, "pam") == 0)
 #ifdef USE_PAM
 		parsedline->auth_method = uaPAM;
@@ -1743,8 +1880,15 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 #else
 		unsupauth = "cert";
 #endif
+<<<<<<< HEAD
 	else if (strcmp(token->string, "oauth") == 0)
 		parsedline->auth_method = uaOAuth;
+=======
+	else if (strcmp(token->string, "radius") == 0)
+		parsedline->auth_method = uaRADIUS;
+	else if (strcmp(token->string, "jwt") == 0)
+		parsedline->auth_method = uaYbJWT;
+>>>>>>> bc662ba7050
 	else
 	{
 		ereport(elevel,
@@ -1944,6 +2088,126 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		}
 	}
 
+<<<<<<< HEAD
+=======
+	if (parsedline->auth_method == uaRADIUS)
+	{
+		MANDATORY_AUTH_ARG(parsedline->radiusservers, "radiusservers", "radius");
+		MANDATORY_AUTH_ARG(parsedline->radiussecrets, "radiussecrets", "radius");
+
+		if (list_length(parsedline->radiusservers) < 1)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("list of RADIUS servers cannot be empty"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "list of RADIUS servers cannot be empty";
+			return NULL;
+		}
+
+		if (list_length(parsedline->radiussecrets) < 1)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("list of RADIUS secrets cannot be empty"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "list of RADIUS secrets cannot be empty";
+			return NULL;
+		}
+
+		/*
+		 * Verify length of option lists - each can be 0 (except for secrets,
+		 * but that's already checked above), 1 (use the same value
+		 * everywhere) or the same as the number of servers.
+		 */
+		if (!(list_length(parsedline->radiussecrets) == 1 ||
+			  list_length(parsedline->radiussecrets) == list_length(parsedline->radiusservers)))
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("the number of RADIUS secrets (%d) must be 1 or the same as the number of RADIUS servers (%d)",
+							list_length(parsedline->radiussecrets),
+							list_length(parsedline->radiusservers)),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf("the number of RADIUS secrets (%d) must be 1 or the same as the number of RADIUS servers (%d)",
+								list_length(parsedline->radiussecrets),
+								list_length(parsedline->radiusservers));
+			return NULL;
+		}
+		if (!(list_length(parsedline->radiusports) == 0 ||
+			  list_length(parsedline->radiusports) == 1 ||
+			  list_length(parsedline->radiusports) == list_length(parsedline->radiusservers)))
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("the number of RADIUS ports (%d) must be 1 or the same as the number of RADIUS servers (%d)",
+							list_length(parsedline->radiusports),
+							list_length(parsedline->radiusservers)),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf("the number of RADIUS ports (%d) must be 1 or the same as the number of RADIUS servers (%d)",
+								list_length(parsedline->radiusports),
+								list_length(parsedline->radiusservers));
+			return NULL;
+		}
+		if (!(list_length(parsedline->radiusidentifiers) == 0 ||
+			  list_length(parsedline->radiusidentifiers) == 1 ||
+			  list_length(parsedline->radiusidentifiers) == list_length(parsedline->radiusservers)))
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("the number of RADIUS identifiers (%d) must be 1 or the same as the number of RADIUS servers (%d)",
+							list_length(parsedline->radiusidentifiers),
+							list_length(parsedline->radiusservers)),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf("the number of RADIUS identifiers (%d) must be 1 or the same as the number of RADIUS servers (%d)",
+								list_length(parsedline->radiusidentifiers),
+								list_length(parsedline->radiusservers));
+			return NULL;
+		}
+	}
+
+	if (parsedline->auth_method == uaYbJWT)
+	{
+		if (!(parsedline->yb_jwt_jwks_url || parsedline->yb_jwt_jwks_path))
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("atleast one of jwt_jwks_url or jwt_jwks_path must be given"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "atleast one of jwt_jwks_url or jwt_jwks_path must be given";
+			return NULL;
+		}
+
+		if (list_length(parsedline->yb_jwt_audiences) < 1)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("list of JWT audiences cannot be empty"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "list of JWT audiences cannot be empty";
+			return NULL;
+		}
+
+		if (list_length(parsedline->yb_jwt_issuers) < 1)
+		{
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("list of JWT issuers cannot be empty"),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = "list of JWT issuers cannot be empty";
+			return NULL;
+		}
+	}
+
+>>>>>>> bc662ba7050
 	/*
 	 * Enforce any parameters implied by other settings.
 	 */
@@ -1956,6 +2220,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		parsedline->clientcert = clientCertFull;
 	}
 
+<<<<<<< HEAD
 	/*
 	 * Enforce proper configuration of OAuth authentication.
 	 */
@@ -1984,6 +2249,52 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 			*err_msg = "map cannot be used in combination with delegate_ident_mapping";
 			return NULL;
 		}
+=======
+	parsedline->maskedline = NULL;
+	if (parsedline->ldapbindpasswd)
+	{
+		/*
+		 * We manually mask ldapbindpasswd field of the the rawline
+		 * by creating a duplicate modified version of it and storing
+		 * that in the maskedline field
+		 */
+		static const char *passkey = "ldapbindpasswd=";
+		static const char *pass_replacement_string = "ldapbindpasswd=***";
+		char	   *passfield = strstr(parsedline->rawline, passkey);
+
+		Assert(passfield != NULL);
+
+		/*
+		 * Caching various string lengths
+		 */
+		size_t		total_len = strlen(parsedline->rawline);
+		size_t		prefix_len = passfield - parsedline->rawline;
+		size_t		passkey_len = strlen(passkey);
+		size_t		passwd_len = strlen(parsedline->ldapbindpasswd);
+		size_t		pass_replacement_string_len = strlen(pass_replacement_string);
+		size_t		maskedlinelength = (total_len - passkey_len - passwd_len +
+										pass_replacement_string_len + 1);
+
+		parsedline->maskedline = palloc0(maskedlinelength);
+		size_t		head = 0;
+		size_t		copy_size = prefix_len;
+
+		strncpy(parsedline->maskedline + head, parsedline->rawline, copy_size);
+		head += copy_size;
+
+		copy_size = pass_replacement_string_len;
+		strncpy(parsedline->maskedline + head,
+				pass_replacement_string, copy_size);
+		head += copy_size;
+
+		copy_size = total_len - prefix_len - passkey_len - passwd_len;
+		strncpy(parsedline->maskedline + head,
+				passfield + passkey_len
+				+ passwd_len, copy_size);
+		head += copy_size;
+
+		parsedline->maskedline[maskedlinelength - 1] = '\0';
+>>>>>>> bc662ba7050
 	}
 
 	return parsedline;
@@ -2014,8 +2325,13 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 			hbaline->auth_method != uaGSS &&
 			hbaline->auth_method != uaSSPI &&
 			hbaline->auth_method != uaCert &&
+<<<<<<< HEAD
 			hbaline->auth_method != uaOAuth)
 			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, and oauth"));
+=======
+			hbaline->auth_method != uaYbJWT)
+			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, and jwt"));
+>>>>>>> bc662ba7050
 		hbaline->usermap = pstrdup(val);
 	}
 	else if (strcmp(name, "clientcert") == 0)
@@ -2315,6 +2631,76 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 		else
 			hbaline->oauth_skip_usermap = false;
 	}
+	/* YB */
+	else if (strcmp(name, "jwt_jwks_path") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_jwks_path", "jwt");
+
+		hbaline->yb_jwt_jwks_path = pstrdup(val);
+	}
+	/* YB */
+	else if (strcmp(name, "jwt_jwks_url") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_jwks_url", "jwt");
+
+		hbaline->yb_jwt_jwks_url = pstrdup(val);
+	}
+	/* YB */
+	else if (strcmp(name, "jwt_audiences") == 0)
+	{
+		List	   *parsed_audiences;
+		char	   *dupval = pstrdup(val);
+
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_audiences", "jwt");
+
+		if (!SplitGUCList(dupval, ',', &parsed_audiences))
+		{
+			/* syntax error in list */
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not parse JWT audience list \"%s\"",
+							val),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf("could not parse JWT audience list: \"%s\"",
+								val);
+			return false;
+		}
+
+		hbaline->yb_jwt_audiences = parsed_audiences;
+		hbaline->yb_jwt_audiences_s = pstrdup(val);
+	}
+	/* YB */
+	else if (strcmp(name, "jwt_issuers") == 0)
+	{
+		List	   *parsed_issuers;
+		char	   *dupval = pstrdup(val);
+
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_issuers", "jwt");
+
+		if (!SplitGUCList(dupval, ',', &parsed_issuers))
+		{
+			/* syntax error in list */
+			ereport(elevel,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not parse JWT issuer list \"%s\"",
+							val),
+					 errcontext("line %d of configuration file \"%s\"",
+								line_num, HbaFileName)));
+			*err_msg = psprintf("could not parse JWT issuer list: \"%s\"",
+								val);
+			return false;
+		}
+
+		hbaline->yb_jwt_issuers = parsed_issuers;
+		hbaline->yb_jwt_issuers_s = pstrdup(val);
+	}
+	/* YB */
+	else if (strcmp(name, "jwt_matching_claim_key") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaYbJWT, "jwt_matching_claim_key", "jwt");
+		hbaline->yb_jwt_matching_claim_key = pstrdup(val);
+	}
 	else
 	{
 		ereport(elevel,
@@ -2360,7 +2746,10 @@ check_hba(Port *port)
 				continue;
 
 			/* Check SSL state */
-			if (port->ssl_in_use)
+			if ((YbIsClientYsqlConnMgr() &&
+				 (port->yb_is_auth_passthrough_req || yb_is_auth_backend)) ?
+				port->yb_is_ssl_enabled_in_logical_conn :
+				port->ssl_in_use)
 			{
 				/* Connection is SSL, match both "host" and "hostssl" */
 				if (hba->conntype == ctHostNoSSL)
@@ -2428,6 +2817,15 @@ check_hba(Port *port)
 
 		/* Found a record that matched! */
 		port->hba = hba;
+
+		/*
+		 * YB: Also persist whether the auth method is yb-tserver-key because
+		 * this information gets lost upon deleting the memory context for
+		 * auth.
+		 */
+		if (hba->auth_method == uaYbTserverKey)
+			port->yb_is_tserver_auth_method = true;
+
 		return;
 	}
 
@@ -2467,6 +2865,14 @@ load_hba(void)
 	}
 
 	tokenize_auth_file(HbaFileName, file, &hba_lines, LOG, 0);
+
+	/* YB: Add hardcoded hba config lines in front of user-defined ones. */
+	List	   *hba_lines_hardcoded = NIL;
+
+	oldcxt = MemoryContextSwitchTo(linecxt);
+	yb_tokenize_hardcoded(&hba_lines_hardcoded, LOG);
+	hba_lines = list_concat(hba_lines_hardcoded, hba_lines);
+	MemoryContextSwitchTo(oldcxt);
 
 	/* Now parse all the lines */
 	Assert(PostmasterContext);
@@ -2843,7 +3249,7 @@ check_usermap(const char *usermap_name,
  * This works the same as load_hba(), but for the user config file.
  */
 bool
-load_ident(void)
+load_ident(MemoryContext yb_ident_context)
 {
 	FILE	   *file;
 	List	   *ident_lines = NIL;
@@ -2864,12 +3270,22 @@ load_ident(void)
 
 	tokenize_auth_file(IdentFileName, file, &ident_lines, LOG, 0);
 
-	/* Now parse all the lines */
-	Assert(PostmasterContext);
-	ident_context = AllocSetContextCreate(PostmasterContext,
-										  "ident parser context",
-										  ALLOCSET_SMALL_SIZES);
-	oldcxt = MemoryContextSwitchTo(ident_context);
+	/*
+	 * Now parse all the lines
+	 *
+	 * YB: yb_ident_context is non-null when called from YCQL.
+	 */
+	if (yb_ident_context)
+		oldcxt = MemoryContextSwitchTo(yb_ident_context);
+	else
+	{
+		Assert(PostmasterContext);
+		ident_context = AllocSetContextCreate(PostmasterContext,
+											  "ident parser context",
+											  ALLOCSET_SMALL_SIZES);
+		oldcxt = MemoryContextSwitchTo(ident_context);
+	}
+
 	foreach(line_cell, ident_lines)
 	{
 		TokenizedAuthLine *tok_line = (TokenizedAuthLine *) lfirst(line_cell);
@@ -2907,7 +3323,22 @@ load_ident(void)
 		 * File contained one or more errors, so bail out. MemoryContextDelete
 		 * is enough to clean up everything, including regexes.
 		 */
+<<<<<<< HEAD
 		MemoryContextDelete(ident_context);
+=======
+		foreach(parsed_line_cell, new_parsed_lines)
+		{
+			newline = (IdentLine *) lfirst(parsed_line_cell);
+			if (newline->ident_user[0] == '/')
+				pg_regfree(&newline->re);
+		}
+
+		/*
+		 * YB: ident_context is unused when yb_ident_context is passed as param.
+		 */
+		if (!yb_ident_context)
+			MemoryContextDelete(ident_context);
+>>>>>>> bc662ba7050
 		return false;
 	}
 
@@ -2915,13 +3346,76 @@ load_ident(void)
 	if (parsed_ident_context != NULL)
 		MemoryContextDelete(parsed_ident_context);
 
-	parsed_ident_context = ident_context;
+	/*
+	 * YB: ident_context is unused when yb_ident_context is passed as param.
+	 * In such cases, the parsed_ident_lines are allocated in the
+	 * yb_ident_context and the responsibility of managing the context is left
+	 * to the caller.
+	 */
+	if (!yb_ident_context)
+		parsed_ident_context = ident_context;
 	parsed_ident_lines = new_parsed_lines;
 
 	return true;
 }
 
+static inline bool
+yb_set_hba_tserver_key(hbaPort *port)
+{
+	if (!IsYugaByteEnabled())
+		return false;
 
+	/* Not supported in auth passthrough */
+	if (port->yb_is_auth_passthrough_req)
+		return false;
+
+	/* Supported only in unix domain socket */
+	if (port->raddr.addr.ss_family != AF_UNIX)
+		return false;
+
+	/*
+	 * Check that client connections are allowed to set yb-tserver-key
+	 * as the authentication method via the startup packet.
+	 */
+	char	   *is_allowed = getenv("YB_ALLOW_CLIENT_SET_TSERVER_KEY_AUTH");
+
+	if (is_allowed == NULL || strcmp(is_allowed, "1") != 0)
+		return false;
+
+	ListCell   *gucopts;
+
+	/*
+	 * Parsing and setting startup parameter happen after authentication.
+	 * Therefore, the startup parameter "yb_use_tserver_key_auth" is not yet
+	 * set, we need to parse the startup parameter list.
+	 */
+	gucopts = list_head(port->guc_options);
+	while (gucopts)
+	{
+		char	   *name;
+		char	   *value;
+
+		name = lfirst(gucopts);
+		gucopts = lnext(port->guc_options, gucopts);
+
+		value = lfirst(gucopts);
+		gucopts = lnext(port->guc_options, gucopts);
+
+		if (strcasecmp(name, "yb_use_tserver_key_auth") == 0)
+		{
+			bool		result;
+
+			if (!parse_bool(value, &result))
+				ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								errmsg("parameter \"%s\" requires a Boolean "
+									   "value", name)));
+
+			return result;
+		}
+	}
+
+	return false;
+}
 
 /*
  *	Determine what authentication method should be used when accessing database
@@ -2934,6 +3428,17 @@ load_ident(void)
 void
 hba_getauthmethod(Port *port)
 {
+	if (yb_set_hba_tserver_key(port))
+	{
+		port->yb_is_tserver_auth_method = true;
+		port->hba = palloc0(sizeof(HbaLine));
+		*port->hba = (HbaLine)
+		{
+			.auth_method = uaYbTserverKey
+		};
+		return;
+	}
+
 	check_hba(port);
 }
 

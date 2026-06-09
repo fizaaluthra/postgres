@@ -184,6 +184,11 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 #define		  RELPERSISTENCE_UNLOGGED	'u' /* unlogged permanent table */
 #define		  RELPERSISTENCE_TEMP		't' /* temporary table */
 
+/*
+ * YB Note: The Replica Identity values must be kept in the sync with the YBC_*
+ * declarations in ybc_pg_typedefs.h
+ */
+
 /* default selection for replica identity (primary key or nothing) */
 #define		  REPLICA_IDENTITY_DEFAULT	'd'
 /* no replica identity is logged for this relation */
@@ -196,6 +201,11 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
  * has the same meaning as 'n'.
  */
 #define		  REPLICA_IDENTITY_INDEX	'i'
+/*
+ * YB: only the modified columns of the updated record are logged as replica
+ * identity
+ */
+#define		  YB_REPLICA_IDENTITY_CHANGE 'c'
 
 /*
  * Relation kinds that have physical storage. These relations normally have

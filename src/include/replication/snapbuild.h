@@ -72,7 +72,12 @@ extern void FreeSnapshotBuilder(SnapBuild *builder);
 extern void SnapBuildSnapDecRefcount(Snapshot snap);
 
 extern Snapshot SnapBuildInitialSnapshot(SnapBuild *builder);
+<<<<<<< HEAD
 extern const char *SnapBuildExportSnapshot(SnapBuild *builder);
+=======
+extern const char *SnapBuildExportSnapshot(SnapBuild *snapstate);
+
+>>>>>>> bc662ba7050
 extern void SnapBuildClearExportedSnapshot(void);
 extern void SnapBuildResetExportedSnapshotState(void);
 
@@ -96,6 +101,15 @@ extern void SnapBuildProcessRunningXacts(SnapBuild *builder, XLogRecPtr lsn,
 										 bool db_specific);
 extern void SnapBuildSerializationPoint(SnapBuild *builder, XLogRecPtr lsn);
 
+<<<<<<< HEAD
 extern bool SnapBuildSnapshotExists(XLogRecPtr lsn);
 
+=======
+extern void SnapBuildXidSetCatalogChanges(SnapBuild *builder, TransactionId xid,
+										  int subxcnt, TransactionId *subxacts,
+										  XLogRecPtr lsn);
+
+/* YB */
+extern const char *YbSnapBuildExportSnapshotWithReadTime(uint64_t read_time);
+>>>>>>> bc662ba7050
 #endif							/* SNAPBUILD_H */

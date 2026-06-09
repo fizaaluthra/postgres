@@ -273,7 +273,12 @@ MultiExecParallelHash(HashState *node)
 			 * way, wait for everyone to arrive here so we can proceed.
 			 */
 			BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ALLOCATE);
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_BUILD_HASH_INNER:
 
@@ -1356,13 +1361,24 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 				/* All other participants just flush their tuples to disk. */
 				ExecParallelHashCloseBatchAccessors(hashtable);
 			}
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_GROW_BATCHES_REALLOCATE:
 			/* Wait for the above to be finished. */
 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
+<<<<<<< HEAD
 								 WAIT_EVENT_HASH_GROW_BATCHES_REALLOCATE);
 			pg_fallthrough;
+=======
+								 WAIT_EVENT_HASH_GROW_BATCHES_ALLOCATE);
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_GROW_BATCHES_REPARTITION:
 			/* Make sure that we have the current dimensions and buckets. */
@@ -1375,7 +1391,12 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 			/* Wait for the above to be finished. */
 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
 								 WAIT_EVENT_HASH_GROW_BATCHES_REPARTITION);
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_GROW_BATCHES_DECIDE:
 
@@ -1437,7 +1458,12 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 				dsa_free(hashtable->area, pstate->old_batches);
 				pstate->old_batches = InvalidDsaPointer;
 			}
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_GROW_BATCHES_FINISH:
 			/* Wait for the above to complete. */
@@ -1715,13 +1741,24 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
 				/* Clear the flag. */
 				pstate->growth = PHJ_GROWTH_OK;
 			}
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_GROW_BUCKETS_REALLOCATE:
 			/* Wait for the above to complete. */
 			BarrierArriveAndWait(&pstate->grow_buckets_barrier,
+<<<<<<< HEAD
 								 WAIT_EVENT_HASH_GROW_BUCKETS_REALLOCATE);
 			pg_fallthrough;
+=======
+								 WAIT_EVENT_HASH_GROW_BUCKETS_ALLOCATE);
+			/* Fall through. */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 		case PHJ_GROW_BUCKETS_REINSERT:
 			/* Reinsert all tuples into the hash table. */

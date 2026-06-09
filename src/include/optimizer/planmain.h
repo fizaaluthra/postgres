@@ -132,4 +132,18 @@ extern void record_plan_function_dependency(PlannerInfo *root, Oid funcid);
 extern void record_plan_type_dependency(PlannerInfo *root, Oid typid);
 extern bool extract_query_dependencies_walker(Node *node, PlannerInfo *context);
 
+/* YB */
+extern Scan *create_indexscan_plan(PlannerInfo *root, IndexPath *best_path,
+								   List *tlist, List *scan_clauses,
+								   bool indexonly, bool bitmapindex);
+extern List *yb_get_bitmap_index_quals(PlannerInfo *root, Path *bitmapqual,
+									   List *scan_clauses);
+extern bool is_index_only_attribute_nums(List *colrefs, IndexOptInfo *indexinfo,
+										 bool bitmapindex);
+extern RestrictInfo *yb_try_create_derived_clause(PlannerInfo *root, Index rti,
+												  Index target_rti,
+												  Expr *inferrable_expr,
+												  Expr *generation_expr,
+												  Oid opfamily);
+
 #endif							/* PLANMAIN_H */

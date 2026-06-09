@@ -40,6 +40,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+<<<<<<< HEAD
 /* Records association between publication and published table */
 typedef struct
 {
@@ -47,6 +48,16 @@ typedef struct
 	Oid			pubid;			/* OID of publication that publishes this
 								 * table. */
 } published_rel;
+=======
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/util/ybc_guc.h"
+
+static Datum yb_pg_relation_is_publishable(PG_FUNCTION_ARGS, Oid relid);
+
+static void publication_translate_columns(Relation targetrel, List *columns,
+										  int *natts, AttrNumber **attrs);
+>>>>>>> bc662ba7050
 
 /*
  * Check if relation can be in given publication and throws appropriate
@@ -96,6 +107,14 @@ check_publication_add_relation(PublicationRelInfo *pri)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg(errormsg, RelationGetRelationName(targetrel)),
 				 errdetail("This operation is not supported for unlogged tables.")));
+
+	if (IsYugaByteEnabled() && !yb_cdcsdk_stream_tables_without_primary_key &&
+		!YBRelationHasPrimaryKey(targetrel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table \"%s\" cannot be replicated",
+						RelationGetRelationName(targetrel)),
+				 errdetail("Replicating tables without primary key is not yet supported.")));
 }
 
 /*
@@ -314,6 +333,7 @@ is_table_publication(Oid pubid)
 	HeapTuple	tup;
 	bool		result = false;
 
+<<<<<<< HEAD
 	pubrelsrel = table_open(PublicationRelRelationId, AccessShareLock);
 	ScanKeyInit(&scankey,
 				Anum_pg_publication_rel_prpubid,
@@ -388,6 +408,19 @@ check_and_fetch_column_list(Publication *pub, Oid relid, MemoryContext mcxt,
 	}
 
 	return found;
+=======
+	if (IsYugaByteEnabled())
+	{
+		return yb_pg_relation_is_publishable(fcinfo, relid);
+	}
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		PG_RETURN_NULL();
+	result = is_publishable_class(relid, (Form_pg_class) GETSTRUCT(tuple));
+	ReleaseSysCache(tuple);
+	PG_RETURN_BOOL(result);
+>>>>>>> bc662ba7050
 }
 
 /*
@@ -1066,6 +1099,19 @@ GetAllPublicationRelations(Oid pubid, char relkind, bool pubviaroot)
 		Form_pg_class relForm = (Form_pg_class) GETSTRUCT(tuple);
 		Oid			relid = relForm->oid;
 
+		if (IsYugaByteEnabled())
+		{
+			Relation	rel;
+
+			rel = table_open(relid, AccessShareLock);
+			if (yb_is_publishable_relation(rel))
+				result = lappend_oid(result, relid);
+			table_close(rel, AccessShareLock);
+
+			/* Skip the below is_publishable_class call. */
+			continue;
+		}
+
 		if (is_publishable_class(relid, relForm) &&
 			!(relForm->relispartition && pubviaroot) &&
 			!list_member_oid(exceptlist, relid))
@@ -1243,6 +1289,57 @@ GetAllSchemaPublicationRelations(Oid pubid, PublicationPartOpt pub_partopt)
 		result = list_concat(result, schemaRels);
 	}
 
+	return result;
+}
+
+/*
+ * Gets list of publications by its name.
+ */
+List *
+YBGetPublicationsByNames(List *pubnames, bool missing_ok)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, pubnames)
+	{
+		char	   *pubname = (char *) lfirst(lc);
+		Publication *pub = GetPublicationByName(pubname, missing_ok);
+
+		result = lappend(result, pub);
+	}
+
+	return result;
+}
+
+/*
+ * Gets list of publications oids by name. It is the responsibility of the
+ * caller to free the memory allocated to the result.
+ */
+Oid *
+YBGetPublicationOidsByNames(List *pubnames)
+{
+	List	   *yb_publications = NIL;
+	Oid		   *result = palloc(sizeof(Oid) * list_length(pubnames));
+	ListCell   *lc;
+
+	if (pubnames == NIL)
+	{
+		return result;
+	}
+
+	yb_publications = YBGetPublicationsByNames(pubnames, false /* missing_ok */ );
+
+	size_t		table_idx = 0;
+
+	foreach(lc, yb_publications)
+	{
+		Publication *pub = (Publication *) lfirst(lc);
+
+		result[table_idx++] = pub->oid;
+	}
+
+	list_free(yb_publications);
 	return result;
 }
 
@@ -1718,4 +1815,148 @@ pg_get_publication_sequences(PG_FUNCTION_ARGS)
 	}
 
 	SRF_RETURN_DONE(funcctx);
+}
+
+List *
+yb_pg_get_publications_tables(List *publications, bool *yb_is_pub_all_tables)
+{
+	/* hash table for O(1) rel_oid lookup */
+	HTAB	   *seen_tables;
+	HASHCTL		ctl;
+	List	   *tables = NIL;
+	ListCell   *lc;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	ctl.hcxt = CurrentMemoryContext;
+
+	seen_tables = hash_create("yb_pg_get_publications_tables temporary table",
+							  32,	/* start small and extend */
+							  &ctl,
+							  HASH_ELEM | HASH_BLOBS);
+
+	foreach(lc, publications)
+	{
+		List	   *pub_tables;
+		ListCell   *lc_tables;
+		Publication *pub = (Publication *) lfirst(lc);
+		bool		has_alltables = pub->alltables;
+
+		if (has_alltables)
+			pub_tables = GetAllTablesPublicationRelations(pub->pubviaroot);
+		else
+			pub_tables = GetPublicationRelations(pub->oid,
+												 pub->pubviaroot ?
+												 PUBLICATION_PART_ROOT :
+												 PUBLICATION_PART_LEAF);
+
+		foreach(lc_tables, pub_tables)
+		{
+			Oid			rel = lfirst_oid(lc_tables);
+			bool		found;
+
+			hash_search(seen_tables, &rel, HASH_ENTER, &found);
+			if (!found)
+				tables = lappend_oid(tables, rel);
+		}
+
+		list_free(pub_tables);
+
+		/*
+		 * Once we have processed a publication with alltables, we have found
+		 * all tables of the database. So, we don't need to process other
+		 * publications.
+		 */
+		if (has_alltables)
+		{
+			*yb_is_pub_all_tables = true;
+			break;
+		}
+	}
+
+	hash_destroy(seen_tables);
+
+	return tables;
+}
+
+static Datum
+yb_pg_relation_is_publishable(PG_FUNCTION_ARGS, Oid relid)
+{
+	Relation	rel;
+	HeapTuple	tuple;
+	bool		result;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!tuple)
+		PG_RETURN_NULL();
+
+	rel = table_open(relid, AccessShareLock);
+	result = yb_is_publishable_relation(rel);
+	table_close(rel, AccessShareLock);
+
+	ReleaseSysCache(tuple);
+	PG_RETURN_BOOL(result);
+}
+
+/*
+ * Similar to is_publishable_relation but with additional check for user defined
+ * primary key when GUC variable 'yb_cdcsdk_stream_tables_without_primary_key'
+ * is set to false.
+ */
+bool
+yb_is_publishable_relation(Relation rel)
+{
+	return (is_publishable_class(RelationGetRelid(rel), rel->rd_rel) &&
+			(yb_cdcsdk_stream_tables_without_primary_key ||
+			 YBRelationHasPrimaryKey(rel)));
+}
+
+/*
+ * Log a NOTICE if a relation that cannot be published via logical replication
+ * is found.
+ * A slightly modified version of the GetAllTablesPublicationRelations function
+ * defined earlier in this file.
+ */
+void
+yb_log_unsupported_publication_relations(void)
+{
+	Relation	classRel;
+	ScanKeyData key[1];
+	TableScanDesc scan;
+	HeapTuple	tuple;
+
+	classRel = table_open(RelationRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_class_relkind,
+				BTEqualStrategyNumber, F_CHAREQ,
+				CharGetDatum(RELKIND_RELATION));
+
+	scan = table_beginscan_catalog(classRel, 1, key);
+
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_class relForm = (Form_pg_class) GETSTRUCT(tuple);
+		Oid			relid = relForm->oid;
+		Relation	rel;
+
+		rel = table_open(relid, AccessShareLock);
+
+		if (is_publishable_class(RelationGetRelid(rel), relForm) &&
+			!yb_cdcsdk_stream_tables_without_primary_key &&
+			!YBRelationHasPrimaryKey(rel))
+		{
+			ereport(NOTICE,
+					(errmsg("tables without primary key will be skipped")));
+
+			table_close(rel, AccessShareLock);
+			break;
+		}
+
+		table_close(rel, AccessShareLock);
+	}
+
+	table_endscan(scan);
+	table_close(classRel, AccessShareLock);
 }

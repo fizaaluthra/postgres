@@ -17,6 +17,9 @@
 #include "catalog/objectaddress.h"
 #include "nodes/execnodes.h"
 
+/* YB includes */
+#include "access/tableam.h"
+
 
 /*
  * forward references in this file
@@ -25,6 +28,8 @@ typedef struct AttrMap AttrMap;
 
 
 #define DEFAULT_INDEX_TYPE	"btree"
+
+#define DEFAULT_YB_INDEX_TYPE	"lsm"
 
 /* Action code for index_set_state_flags */
 typedef enum
@@ -93,7 +98,13 @@ extern Oid	index_create(Relation heapRelation,
 						 uint16 constr_flags,
 						 bool allow_system_table_mods,
 						 bool is_internal,
-						 Oid *constraintId);
+						 Oid *constraintId,
+						 YbOptSplit *split_options,
+						 const bool skip_index_backfill,
+						 bool is_colocated,
+						 Oid tablegroupId,
+						 Oid colocationId,
+						 bool yb_skip_index_creation);
 
 #define	INDEX_CONSTR_CREATE_MARK_AS_PRIMARY	(1 << 0)
 #define	INDEX_CONSTR_CREATE_DEFERRABLE		(1 << 1)
@@ -152,15 +163,38 @@ extern void index_build(Relation heapRelation,
 						bool parallel,
 						bool progress);
 
+extern double yb_index_backfill(Relation heapRelation,
+								Relation indexRelation,
+								IndexInfo *indexInfo,
+								bool isprimary,
+								YbBackfillInfo *bfinfo,
+								YbPgExecOutParam *bfresult);
+
+/* TODO: add Yb prefix. */
+extern double IndexBackfillHeapRangeScan(Relation heapRelation,
+										 Relation indexRelation,
+										 IndexInfo *indexInfo,
+										 YbIndexBuildCallback ybcallback,
+										 void *callback_state,
+										 YbBackfillInfo *bfinfo,
+										 YbPgExecOutParam *bfresult);
+
 extern void validate_index(Oid heapId, Oid indexId, Snapshot snapshot);
 
 extern void index_set_state_flags(Oid indexId, IndexStateFlagsAction action);
 
 extern Oid	IndexGetRelation(Oid indexId, bool missing_ok);
 
+<<<<<<< HEAD
 extern void reindex_index(const ReindexStmt *stmt, Oid indexId,
 						  bool skip_constraint_checks, char persistence,
 						  const ReindexParams *params);
+=======
+extern void reindex_index(Oid indexId, bool skip_constraint_checks,
+						  char relpersistence, ReindexParams *params,
+						  bool is_yb_table_rewrite, bool yb_copy_split_options,
+						  YbOptSplit *preserved_index_split_options);
+>>>>>>> bc662ba7050
 
 /* Flag bits for reindex_relation(): */
 #define REINDEX_REL_PROCESS_TOAST			0x01
@@ -169,8 +203,16 @@ extern void reindex_index(const ReindexStmt *stmt, Oid indexId,
 #define REINDEX_REL_FORCE_INDEXES_UNLOGGED	0x08
 #define REINDEX_REL_FORCE_INDEXES_PERMANENT 0x10
 
+<<<<<<< HEAD
 extern bool reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 							 const ReindexParams *params);
+=======
+extern bool reindex_relation(Oid relid, int flags, ReindexParams *params,
+							 bool is_yb_table_rewrite,
+							 bool yb_copy_split_options,
+							 List *changedIndexNames,
+							 List *changedIndexSplitOpts);
+>>>>>>> bc662ba7050
 
 extern bool ReindexIsProcessingHeap(Oid heapOid);
 extern bool ReindexIsProcessingIndex(Oid indexOid);
@@ -222,5 +264,26 @@ itemptr_decode(ItemPointer itemptr, int64 encoded)
 
 	ItemPointerSet(itemptr, block, offset);
 }
+
+/*
+ * YB: This should exactly match the IndexPermissions enum in
+ * src/yb/common/common.proto.  See the definition there for details.
+ */
+typedef enum
+{
+	YB_INDEX_PERM_DELETE_ONLY = 0,
+	YB_INDEX_PERM_WRITE_AND_DELETE = 2,
+	YB_INDEX_PERM_DO_BACKFILL = 4,
+	YB_INDEX_PERM_READ_WRITE_AND_DELETE = 6,
+	YB_INDEX_PERM_WRITE_AND_DELETE_WHILE_REMOVING = 8,
+	YB_INDEX_PERM_DELETE_ONLY_WHILE_REMOVING = 10,
+	YB_INDEX_PERM_INDEX_UNUSED = 12,
+} YBIndexPermissions;
+
+extern bool YBRelationHasPrimaryKey(Relation rel);
+
+extern void yb_index_update_stats(Relation rel,
+	bool hasindex,
+	double reltuples);
 
 #endif							/* INDEX_H */

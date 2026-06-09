@@ -77,6 +77,10 @@ extern "C"
 #define PG_COPYRES_EVENTS		  0x04
 #define PG_COPYRES_NOTICEHOOKS	  0x08
 
+/* YB */
+#define DEF_YBPORT 5433
+#define DEF_YBPORT_STR "5433"
+
 /* Application-visible enum types */
 
 /*
@@ -649,6 +653,7 @@ extern int	PQsetResultAttrs(PGresult *res, int numAttributes, PGresAttDesc *attD
 extern void *PQresultAlloc(PGresult *res, size_t nBytes);
 extern size_t PQresultMemorySize(const PGresult *res);
 extern int	PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len);
+extern void YbPQsaveMessageField(PGresult *res, char code, const char *value, bool translate);
 
 /* Quoting strings before inclusion in queries. */
 extern size_t PQescapeStringConn(PGconn *conn,

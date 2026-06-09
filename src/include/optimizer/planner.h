@@ -79,10 +79,21 @@ extern Path *get_cheapest_fractional_path(RelOptInfo *rel,
 
 extern Expr *preprocess_phv_expression(PlannerInfo *root, Expr *expr);
 
+<<<<<<< HEAD
 extern RelOptInfo *create_unique_paths(PlannerInfo *root, RelOptInfo *rel,
 									   SpecialJoinInfo *sjinfo);
 
 extern char *choose_plan_name(PlannerGlobal *glob, const char *name,
 							  bool always_number);
+=======
+/* YB */
+extern char *ybGenerateHintString(PlannedStmt *plannedStmt);
+extern bool ybComparePlanShapesAndMethods(PlannedStmt *plannedStmt1, Plan *plan1, PlannedStmt *plannedStmt2, Plan *plan2, bool trace);
+extern uint32 ybGetNextUid(PlannerGlobal *glob);
+extern uint32 ybGetNextNodeUid(PlannerGlobal *glob);
+extern void ybInitHintedUids(PlannerGlobal *glob);
+extern bool ybIsHintedUid(PlannerGlobal *glob, uint32 uid);
+extern uint64 ybGetPlanId(PlannedStmt *plannedStmt);
+>>>>>>> bc662ba7050
 
 #endif							/* PLANNER_H */

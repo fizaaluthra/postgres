@@ -353,7 +353,12 @@ flattenJsonPathParseItem(StringInfo buf, int *result, struct Node *escontext,
 			break;
 		case jpiFilter:
 			argNestingLevel++;
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case jpiIsUnknown:
 		case jpiNot:
 		case jpiPlus:
@@ -495,6 +500,7 @@ alignStringInfoInt(StringInfo buf)
 	{
 		case 3:
 			appendStringInfoCharMacro(buf, 0);
+<<<<<<< HEAD
 			pg_fallthrough;
 		case 2:
 			appendStringInfoCharMacro(buf, 0);
@@ -502,6 +508,18 @@ alignStringInfoInt(StringInfo buf)
 		case 1:
 			appendStringInfoCharMacro(buf, 0);
 			pg_fallthrough;
+=======
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+		case 2:
+			appendStringInfoCharMacro(buf, 0);
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+		case 1:
+			appendStringInfoCharMacro(buf, 0);
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		default:
 			break;
 	}
@@ -1102,7 +1120,12 @@ jspInitByBuffer(JsonPathItem *v, char *base, int32 pos)
 		case jpiKey:
 		case jpiVariable:
 			read_int32(v->content.value.datalen, base, pos);
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case jpiNumeric:
 		case jpiBool:
 			v->content.value.data = base + pos;

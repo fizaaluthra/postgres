@@ -46,8 +46,13 @@
 #include "pg_backup_utils.h"
 #include "pgtar.h"
 
-#define TEXT_DUMP_HEADER "--\n-- PostgreSQL database dump\n--\n\n"
-#define TEXT_DUMPALL_HEADER "--\n-- PostgreSQL database cluster dump\n--\n\n"
+/* YB includes */
+#include "catalog/pg_class_d.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_yb_tablegroup_d.h"
+
+#define TEXT_DUMP_HEADER "--\n-- YSQL database dump\n--\n\n"
+#define TEXT_DUMPALL_HEADER "--\n-- YSQL database cluster dump\n--\n\n"
 
 #define TOC_PREFIX_NONE		""
 #define TOC_PREFIX_DATA		"Data for "
@@ -128,6 +133,43 @@ static void inhibit_data_for_failed_table(ArchiveHandle *AH, TocEntry *te);
 
 static void StrictNamesCheck(RestoreOptions *ropt);
 
+/* YB variables */
+static bool IsYugabyteEnabled = true;
+
+/*
+ * Add the set GUC command to the archive handler in a backward compatible manner.
+ * Checks for the presence of the GUC before setting it.Example of usage:
+ * YbBackwardCompatibleSetGuc(AH, "yb_ignore_relfilenode_ids", "off", false);
+ */
+void
+YbBackwardCompatibleSetGuc(ArchiveHandle *AH,
+						   const char *guc_name,
+						   const char *value,
+						   bool db_scoped)
+{
+	char	   *set_guc_command;
+
+	if (db_scoped)
+	{
+		set_guc_command = psprintf("format('ALTER DATABASE %%I SET %s TO %s', "
+								   "current_database())",
+								   guc_name, value);
+	}
+	else
+	{
+		set_guc_command = psprintf("'SET %s TO %s'", guc_name, value);
+	}
+	char	   *cmd = psprintf("DO $$\n"
+							   "BEGIN\n"
+							   "  IF EXISTS (SELECT 1 FROM pg_settings WHERE name = '%s') THEN\n"
+							   "    EXECUTE %s;\n"
+							   "  END IF;\n"
+							   "END $$;\n", guc_name, set_guc_command);
+
+	ahprintf(AH, "%s", cmd);
+	free(set_guc_command);
+	free(cmd);
+}
 
 /*
  * Allocate a new DumpOptions block containing all default values.
@@ -154,7 +196,12 @@ InitDumpOptions(DumpOptions *opts)
 	opts->dumpSections = DUMP_UNSECTIONED;
 	opts->dumpSchema = true;
 	opts->dumpData = true;
+<<<<<<< HEAD
 	opts->dumpStatistics = false;
+=======
+	/* YB: Dump statistics by default */
+	opts->dumpStatistics = true;
+>>>>>>> bc662ba7050
 }
 
 /*
@@ -466,7 +513,7 @@ RestoreArchive(Archive *AHX, bool append_data)
 	if (ropt->filename || ropt->compression_spec.algorithm != PG_COMPRESSION_NONE)
 		SetOutput(AH, ropt->filename, ropt->compression_spec, append_data);
 
-	ahprintf(AH, "--\n-- PostgreSQL database dump\n--\n\n");
+	ahprintf(AH, "--\n-- YSQL database dump\n--\n\n");
 
 	/*
 	 * If generating plain-text output, enter restricted mode to block any
@@ -483,7 +530,7 @@ RestoreArchive(Archive *AHX, bool append_data)
 		ahprintf(AH, "-- Dumped from database version %s\n",
 				 AH->archiveRemoteVersion);
 	if (AH->archiveDumpVersion)
-		ahprintf(AH, "-- Dumped by pg_dump version %s\n",
+		ahprintf(AH, "-- Dumped by ysql_dump version %s\n",
 				 AH->archiveDumpVersion);
 
 	ahprintf(AH, "\n");
@@ -815,11 +862,22 @@ RestoreArchive(Archive *AHX, bool append_data)
 		}
 	}
 
+<<<<<<< HEAD
 	/*
 	 * Close out any persistent transaction we may have.  While these two
 	 * cases are started in different places, we can end both cases here.
 	 */
 	if (ropt->single_txn || ropt->txn_size > 0)
+=======
+	if (AH->public.dopt->include_yb_metadata && !AH->public.ropt->createDB)
+	{
+		ahprintf(AH, "-- YB: re-enable auto analyze after all catalog changes\n");
+		YbBackwardCompatibleSetGuc(AH, "yb_disable_auto_analyze", "off", true);
+		ahprintf(AH, "\n");
+	}
+
+	if (ropt->single_txn)
+>>>>>>> bc662ba7050
 	{
 		if (AH->connection)
 			CommitTransaction(AHX);
@@ -830,7 +888,7 @@ RestoreArchive(Archive *AHX, bool append_data)
 	if (AH->public.verbose)
 		dumpTimestamp(AH, "Completed on", time(NULL));
 
-	ahprintf(AH, "--\n-- PostgreSQL database dump complete\n--\n\n");
+	ahprintf(AH, "--\n-- YSQL database dump complete\n--\n\n");
 
 	/*
 	 * If generating plain-text output, exit restricted mode at the very end
@@ -1371,7 +1429,7 @@ PrintTOCSummary(Archive *AHX)
 		ahprintf(AH, ";     Dumped from database version: %s\n",
 				 AH->archiveRemoteVersion);
 	if (AH->archiveDumpVersion)
-		ahprintf(AH, ";     Dumped by pg_dump version: %s\n",
+		ahprintf(AH, ";     Dumped by ysql_dump version: %s\n",
 				 AH->archiveDumpVersion);
 
 	ahprintf(AH, ";\n;\n; Selected TOC Entries:\n;\n");
@@ -3444,6 +3502,13 @@ _doSetFixedOutputState(ArchiveHandle *AH)
 	/*
 	 * Disable timeouts to allow for slow commands, idle parallel workers, etc
 	 */
+	if (AH->public.dopt->include_yb_metadata)
+	{
+		ahprintf(AH, "SET yb_binary_restore = true;\n");
+		ahprintf(AH, "SET yb_ignore_pg_class_oids = false;\n");
+		YbBackwardCompatibleSetGuc(AH, "yb_ignore_relfilenode_ids", "false", false);
+		ahprintf(AH, "SET yb_non_ddl_txn_for_sys_tables_allowed = true;\n");
+	}
 	ahprintf(AH, "SET statement_timeout = 0;\n");
 	ahprintf(AH, "SET lock_timeout = 0;\n");
 	ahprintf(AH, "SET idle_in_transaction_session_timeout = 0;\n");
@@ -3480,6 +3545,7 @@ _doSetFixedOutputState(ArchiveHandle *AH)
 	else
 		ahprintf(AH, "SET row_security = off;\n");
 
+<<<<<<< HEAD
 	/*
 	 * In --transaction-size mode, we should always be in a transaction when
 	 * we begin to restore objects.
@@ -3491,6 +3557,40 @@ _doSetFixedOutputState(ArchiveHandle *AH)
 		else
 			ahprintf(AH, "\nBEGIN;\n");
 		AH->txnCount = 0;
+=======
+	static bool first_run = true;
+
+	if (AH->public.dopt->include_yb_metadata && first_run)
+	{
+		first_run = false;
+		ahprintf(AH,
+				 "\n-- Set variable use_tablespaces (if not already set)\n"
+				 "\\if :{?use_tablespaces}\n"
+				 "\\else\n"
+				 "\\set use_tablespaces true\n"
+				 "\\endif\n");
+		ahprintf(AH,
+				 "\n-- Set variable use_roles (if not already set)\n"
+				 "\\if :{?use_roles}\n"
+				 "\\else\n"
+				 "\\set use_roles true\n"
+				 "\\endif\n");
+
+		/*
+		 * If the --create option is specified, the target database will be
+		 * created and connected to. The current connection is to another
+		 * database and we don't want to disable auto analyze on that.
+		 *
+		 * TODO: If --create is specified, disable auto analyze after the
+		 * target database is created and we connect to it.
+		 */
+		if (!AH->public.ropt->createDB)
+		{
+			ahprintf(AH,
+					 "\n-- YB: disable auto analyze to avoid conflicts with catalog changes\n");
+			YbBackwardCompatibleSetGuc(AH, "yb_disable_auto_analyze", "on", true);
+		}
+>>>>>>> bc662ba7050
 	}
 
 	ahprintf(AH, "\n");
@@ -3588,6 +3688,19 @@ _reconnectToDB(ArchiveHandle *AH, const char *dbname)
 
 	/* re-establish fixed state */
 	_doSetFixedOutputState(AH);
+
+	/*
+	 * YB: in createDB restore flows, we reconnect to the target database.
+	 * Re-apply this session-scoped setting after reconnect so CREATE INDEX
+	 * does not overwrite restored reltuples when statistics restore is enabled.
+	 */
+	if (AH->public.dopt->include_yb_metadata && AH->public.ropt->dumpStatistics)
+	{
+		ahprintf(AH,
+				 "\n-- YB: preserve restored reltuples during index creation\n");
+		YbBackwardCompatibleSetGuc(AH,
+			"yb_enable_update_reltuples_after_create_index", "false", false);
+	}
 }
 
 /*
@@ -3733,6 +3846,12 @@ _selectTablespace(ArchiveHandle *AH, const char *tablespace)
 
 		PQclear(res);
 	}
+	else if (AH->public.dopt->include_yb_metadata)
+		ahprintf(AH,
+				 "\\if :use_tablespaces\n"
+				 "    %s;\n"
+				 "\\endif\n\n",
+				 qry->data);
 	else
 		ahprintf(AH, "%s;\n\n", qry->data);
 
@@ -3870,7 +3989,13 @@ _getObjectDescription(PQExpBuffer buf, const TocEntry *te)
 		strcmp(type, "FOREIGN DATA WRAPPER") == 0 ||
 		strcmp(type, "SERVER") == 0 ||
 		strcmp(type, "PUBLICATION") == 0 ||
+<<<<<<< HEAD
 		strcmp(type, "SUBSCRIPTION") == 0)
+=======
+		strcmp(type, "TABLEGROUP") == 0 ||	/* YB */
+		strcmp(type, "SUBSCRIPTION") == 0 ||
+		strcmp(type, "USER MAPPING") == 0)
+>>>>>>> bc662ba7050
 	{
 		appendPQExpBuffer(buf, "%s ", type);
 		if (te->namespace && *te->namespace)
@@ -4078,6 +4203,7 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, const char *pfx)
 	}
 	else if (te->defn && strlen(te->defn) > 0)
 	{
+<<<<<<< HEAD
 		ahprintf(AH, "%s\n\n", te->defn);
 
 		/*
@@ -4101,6 +4227,68 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, const char *pfx)
 			}
 			if (nsemis > 1)
 				AH->txnCount += nsemis - 1;
+=======
+		if (te->defn && strlen(te->defn) > 0)
+		{
+			/*
+			 * Yugabyte-specific
+			 *
+			 * During a major PG version upgrade, for table creation in binary
+			 * upgrade mode, pg_dump/pg_restore send a number of statements to
+			 * the backend as a single request string. For example, for a table
+			 * with a dropped column, they will send:
+			 *   1) Various "set next oid" and "set next relfilenode" statements
+			 *   2) The CREATE TABLE itself
+			 *   3) UPDATE the dropped column's pg_attribute table entry
+			 *   4) ALTER TABLE ... DROP COLUMN
+			 *
+			 * When multiple statements are sent in the same request, they're
+			 * executed inside an implicit transaction. YugabyteDB doesn't
+			 * currently support mixing DDLs with modifications to the PG
+			 * catalog. So, as a hack for table creation, we set AH->outputKind
+			 * to OUTPUT_OTHERDATA, so that ahprintf sends each statement to the
+			 * backend separately, avoiding the limitation.
+			 *
+			 * We do the same for tablegroup creation because CREATE TABLEGROUP
+			 * cannot run inside a transaction block.
+			 *
+			 * We also do the same for the database properties TOC entry,
+			 * because it contains an ALTER DATABASE statement and an UPDATE
+			 * statement that modifies the same rows that the ALTER command
+			 * touched. The quick succession of these two statements can result
+			 * in read-restart errors, as the read time picked for the UPDATE
+			 * may be earlier than the commit time of the ALTER.
+			 * As a work-around, send the commands in separate requests.
+			 * Note: the database properties TOC entry does not have a catalogId
+			 * set, so we use te->desc in the condition below.
+			 */
+			if (IsYugabyteEnabled && AH->currentTE &&
+				(AH->currentTE->catalogId.tableoid == RelationRelationId ||
+				 AH->currentTE->catalogId.tableoid == YbTablegroupRelationId ||
+				 strcmp(te->desc, "DATABASE PROPERTIES") == 0) &&
+				AH->outputKind == OUTPUT_SQLCMDS)
+			{
+				ArchiverOutput yb_saved_output_kind = AH->outputKind;
+				static const char yb_zero_sqlparse[sizeof(AH->sqlparse)];
+
+				if (memcmp(&AH->sqlparse, &yb_zero_sqlparse,
+						   sizeof(AH->sqlparse)) != 0)
+					pg_fatal("AH->sqlparse not 0 before printing definition");
+				AH->outputKind = OUTPUT_OTHERDATA;
+				ahprintf(AH, "%s\n\n", te->defn);
+				/*
+				 * We've ended on a statement boundary or whitespace (after all,
+				 * in upstream Postgres, this sequence of SQL statements is sent
+				 * to the backend as one block), so reset the state of sqlparse,
+				 * which is normally meant to be stitching together strings with
+				 * arbitrary boundaries.
+				 */
+				memset(&AH->sqlparse, 0, sizeof(AH->sqlparse));
+				AH->outputKind = yb_saved_output_kind;
+			}
+			else
+				ahprintf(AH, "%s\n\n", te->defn);
+>>>>>>> bc662ba7050
 		}
 	}
 
@@ -4118,13 +4306,92 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, const char *pfx)
 		te->owner && strlen(te->owner) > 0 &&
 		te->dropStmt && strlen(te->dropStmt) > 0)
 	{
+<<<<<<< HEAD
 		if (strcmp(te->desc, "BLOB METADATA") == 0)
+=======
+		if (strcmp(te->desc, "AGGREGATE") == 0 ||
+			strcmp(te->desc, "BLOB") == 0 ||
+			strcmp(te->desc, "COLLATION") == 0 ||
+			strcmp(te->desc, "CONVERSION") == 0 ||
+			strcmp(te->desc, "DATABASE") == 0 ||
+			strcmp(te->desc, "DOMAIN") == 0 ||
+			strcmp(te->desc, "FUNCTION") == 0 ||
+			strcmp(te->desc, "OPERATOR") == 0 ||
+			strcmp(te->desc, "OPERATOR CLASS") == 0 ||
+			strcmp(te->desc, "OPERATOR FAMILY") == 0 ||
+			strcmp(te->desc, "PROCEDURE") == 0 ||
+			strcmp(te->desc, "PROCEDURAL LANGUAGE") == 0 ||
+			strcmp(te->desc, "SCHEMA") == 0 ||
+			strcmp(te->desc, "EVENT TRIGGER") == 0 ||
+			strcmp(te->desc, "TABLE") == 0 ||
+			strcmp(te->desc, "TABLEGROUP") == 0 ||	/* YB */
+			strcmp(te->desc, "TYPE") == 0 ||
+			strcmp(te->desc, "VIEW") == 0 ||
+			strcmp(te->desc, "MATERIALIZED VIEW") == 0 ||
+			strcmp(te->desc, "SEQUENCE") == 0 ||
+			strcmp(te->desc, "FOREIGN TABLE") == 0 ||
+			strcmp(te->desc, "TEXT SEARCH DICTIONARY") == 0 ||
+			strcmp(te->desc, "TEXT SEARCH CONFIGURATION") == 0 ||
+			strcmp(te->desc, "FOREIGN DATA WRAPPER") == 0 ||
+			strcmp(te->desc, "SERVER") == 0 ||
+			strcmp(te->desc, "STATISTICS") == 0 ||
+			strcmp(te->desc, "PUBLICATION") == 0 ||
+			strcmp(te->desc, "SUBSCRIPTION") == 0)
+>>>>>>> bc662ba7050
 		{
 			/* BLOB METADATA needs special code to handle multiple LOs */
 			char	   *cmdEnd = psprintf(" OWNER TO %s", fmtId(te->owner));
 
+<<<<<<< HEAD
 			IssueCommandPerBlob(AH, te, "ALTER LARGE OBJECT ", cmdEnd);
 			pg_free(cmdEnd);
+=======
+			appendPQExpBufferStr(temp, "ALTER ");
+			_getObjectDescription(temp, te);
+			appendPQExpBuffer(temp, " OWNER TO %s;", fmtId(te->owner));
+
+			if (AH->public.dopt->include_yb_metadata)
+			{
+				ahprintf(AH, "\\if :use_roles\n");
+				if (AH->public.dopt->yb_dump_role_checks)
+				{
+					PQExpBuffer role_buf = createPQExpBuffer();
+
+					appendStringLiteralAHX(role_buf, te->owner, AH);
+					ahprintf(AH, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = %s"
+							 ") AS role_exists \\gset\n"
+							 "\\if :role_exists\n"
+							 "    %s\n"
+							 "\\else\n"
+							 "    \\echo 'Skipping owner privilege due to missing role:' %s\n"
+							 "\\endif\n", role_buf->data, temp->data, fmtId(te->owner));
+					destroyPQExpBuffer(role_buf);
+				}
+				else
+					ahprintf(AH, "    %s\n", temp->data);
+
+				ahprintf(AH, "\\endif\n\n");
+			}
+			else
+				ahprintf(AH, "%s\n\n", temp->data);
+
+			destroyPQExpBuffer(temp);
+		}
+		else if (strcmp(te->desc, "CAST") == 0 ||
+				 strcmp(te->desc, "CHECK CONSTRAINT") == 0 ||
+				 strcmp(te->desc, "CONSTRAINT") == 0 ||
+				 strcmp(te->desc, "DATABASE PROPERTIES") == 0 ||
+				 strcmp(te->desc, "DEFAULT") == 0 ||
+				 strcmp(te->desc, "FK CONSTRAINT") == 0 ||
+				 strcmp(te->desc, "INDEX") == 0 ||
+				 strcmp(te->desc, "RULE") == 0 ||
+				 strcmp(te->desc, "TRIGGER") == 0 ||
+				 strcmp(te->desc, "ROW SECURITY") == 0 ||
+				 strcmp(te->desc, "POLICY") == 0 ||
+				 strcmp(te->desc, "USER MAPPING") == 0)
+		{
+			/* these object types don't have separate owners */
+>>>>>>> bc662ba7050
 		}
 		else
 		{

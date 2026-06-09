@@ -23,9 +23,26 @@
 #include "utils/resowner.h"
 
 
+<<<<<<< HEAD
 /* Forward declarations, to avoid including parsenodes.h here */
 typedef struct Query Query;
 typedef struct RawStmt RawStmt;
+=======
+/*
+ * YB: GUC variable to control how many times a custom plan is chosen over
+ * a generic plan unconditionally. See guc.c for details.
+ */
+extern int	yb_test_planner_custom_plan_threshold;
+
+/*
+ * YB: GUC variable to control whether to prefer a custom plan over a generic
+ * plan based on the number of partitions pruned.
+ */
+extern bool enable_choose_custom_plan_for_partition_pruning;
+
+/* Forward declaration, to avoid including parsenodes.h here */
+struct RawStmt;
+>>>>>>> bc662ba7050
 
 /* possible values for plan_cache_mode */
 typedef enum
@@ -144,6 +161,15 @@ typedef struct CachedPlanSource
 	double		total_custom_cost;	/* total cost of custom plans so far */
 	int64		num_custom_plans;	/* # of custom plans included in total */
 	int64		num_generic_plans;	/* # of generic plans */
+
+	/* YB */
+	bool		yb_plan_references_pg_rel;	/* Does this plan use pg relations */
+	int			yb_generic_num_referenced_rels; /* Num rels referenced by
+												 * generic plan */
+	int			yb_custom_max_num_referenced_rels;	/* Max number of relations
+													 * referenced by a custom
+													 * plan */
+
 } CachedPlanSource;
 
 /*
@@ -211,6 +237,7 @@ extern CachedPlanSource *CreateCachedPlanForQuery(Query *analyzed_parse_tree,
 extern CachedPlanSource *CreateOneShotCachedPlan(RawStmt *raw_parse_tree,
 												 const char *query_string,
 												 CommandTag commandTag);
+extern bool YbIsCachedQueryValid(CachedPlanSource *plansource);
 extern void CompleteCachedPlan(CachedPlanSource *plansource,
 							   List *querytree_list,
 							   MemoryContext querytree_context,
@@ -236,12 +263,13 @@ extern bool CachedPlanIsValid(CachedPlanSource *plansource);
 
 extern List *CachedPlanGetTargetList(CachedPlanSource *plansource,
 									 QueryEnvironment *queryEnv);
-
 extern CachedPlan *GetCachedPlan(CachedPlanSource *plansource,
 								 ParamListInfo boundParams,
 								 ResourceOwner owner,
 								 QueryEnvironment *queryEnv);
 extern void ReleaseCachedPlan(CachedPlan *plan, ResourceOwner owner);
+
+extern void YBAcquireExecutorLocksForRetry(List *stmt_list);
 
 extern bool CachedPlanAllowsSimpleValidityCheck(CachedPlanSource *plansource,
 												CachedPlan *plan,

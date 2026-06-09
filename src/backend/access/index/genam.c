@@ -37,6 +37,11 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+#include "executor/ybModifyTable.h"
+#include <pg_yb_utils.h>
+
 
 /* ----------------------------------------------------------------
  *		general access method routines
@@ -125,6 +130,21 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 	scan->xs_itupdesc = NULL;
 	scan->xs_hitup = NULL;
 	scan->xs_hitupdesc = NULL;
+
+	/*
+	 * Upstream PG commit c2fe139c201c48f1133e9fbea2dd99b8efe2fadd removes
+	 * setting the item pointer invalid.  Bring that back for the sake of YB
+	 * asserts that that PG field is not changed in YB logic.
+	 */
+	ItemPointerSetInvalid(&scan->xs_heaptid);
+	scan->yb_exec_params = NULL;
+	scan->yb_scan_plan = NULL;
+	scan->yb_rel_pushdown = NULL;
+	scan->yb_idx_pushdown = NULL;
+	scan->yb_aggrefs = NIL;
+	scan->yb_agg_slot = NULL;
+	scan->yb_distinct_prefixlen = 0;
+	scan->fetch_ybctids_only = false;
 
 	return scan;
 }
@@ -395,12 +415,26 @@ systable_beginscan(Relation heapRelation,
 	Relation	irel;
 
 	/*
+<<<<<<< HEAD
 	 * If this backend promised that it won't access shared catalogs during
 	 * logical decoding, this it the right place to verify.
 	 */
 	Assert(!HistoricSnapshotActive() ||
 		   accessSharedCatalogsInDecoding ||
 		   !heapRelation->rd_rel->relisshared);
+=======
+	 * PG sometimes calls systable_beginscan on non-YB tables.
+	 * e.g. toast_delete_datum, which uses systable_beginscan
+	 * on TOAST tables, which can be temporary (and thus non-YB).
+	 */
+	if (IsYBRelation(heapRelation))
+		return ybc_systable_beginscan(heapRelation,
+									  indexId,
+									  indexOK,
+									  snapshot,
+									  nkeys,
+									  key);
+>>>>>>> bc662ba7050
 
 	if (indexOK &&
 		!IgnoreSystemIndexes &&
@@ -411,6 +445,7 @@ systable_beginscan(Relation heapRelation,
 
 	sysscan = palloc_object(SysScanDescData);
 
+	sysscan->ybscan = NULL;
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = irel;
 	sysscan->slot = table_slot_create(heapRelation, NULL);
@@ -524,6 +559,11 @@ systable_getnext(SysScanDesc sysscan)
 {
 	HeapTuple	htup = NULL;
 
+	YbSysScanBase ybscan = sysscan->ybscan;
+
+	if (ybscan)
+		return ybscan->vtable->next(ybscan);
+
 	if (sysscan->irel)
 	{
 		if (index_getnext_slot(sysscan->iscan, ForwardScanDirection, sysscan->slot))
@@ -581,6 +621,13 @@ systable_getnext(SysScanDesc sysscan)
 bool
 systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 {
+	/*
+	 * If YugaByte is enabled, systable_recheck_tuple doesn't work
+	 * since the function uses the buffer to determine the tuple's visibility.
+	 */
+	if (IsYugaByteEnabled())
+		return true;
+
 	Snapshot	freshsnap;
 	bool		result;
 
@@ -611,6 +658,11 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
+	YbSysScanBase ybscan = sysscan->ybscan;
+
+	if (ybscan)
+		return ybscan->vtable->end(ybscan);
+
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);
@@ -654,6 +706,8 @@ systable_endscan(SysScanDesc sysscan)
  * wrappers around index_beginscan/index_getnext_slot.  The main reason for
  * their existence is to centralize possible future support of lossy operators
  * in catalog scans.
+ * TODO: This is not yet formally supported in YB, but cannot disable it
+ *       because it is used for enum types (see issues #6259).
  */
 SysScanDesc
 systable_beginscan_ordered(Relation heapRelation,
@@ -873,6 +927,14 @@ systable_inplace_update_begin(Relation relation,
 			return;
 		}
 
+		/*
+		 * TODO: cover this case if we intend to set TEST_enable_obj_tuple_locks to true.
+		 */
+		if (IsYBRelation(relation))
+		{
+			break;
+		}
+
 		slot = scan->slot;
 		Assert(TTS_IS_BUFFERTUPLE(slot));
 		bslot = (BufferHeapTupleTableSlot *) slot;
@@ -889,13 +951,51 @@ systable_inplace_update_begin(Relation relation,
  *
  * The tuple cannot change size, and therefore its header fields and null
  * bitmap (if any) don't change either.
+ *
+ * If yb_shared_update is specified, this update will be done in every
+ * database (including template0 and template1). Such operation will assume
+ * the tuple is exactly the same in all databases.
+ * This is needed when creating shared relations.
+ * This flag should not be used during initdb bootstrap.
  */
 void
-systable_inplace_update_finish(void *state, HeapTuple tuple)
+systable_inplace_update_finish(void *state, HeapTuple tuple,
+							   bool yb_shared_update)
 {
 	SysScanDesc scan = (SysScanDesc) state;
 	Relation	relation = scan->heap_rel;
 	TupleTableSlot *slot = scan->slot;
+
+	if (IsYBRelation(relation))
+	{
+		/* Note: none of the variables above except "relation" are valid. */
+
+		if (yb_shared_update)
+		{
+			if (!IsYsqlUpgrade)
+				elog(ERROR, "shared update cannot be done outside of YSQL upgrade");
+
+			YB_FOR_EACH_DB(pg_db_tuple)
+			{
+				Oid			dboid = ((Form_pg_database) GETSTRUCT(pg_db_tuple))->oid;
+
+				/* YB doesn't use PG locks so it's okay not to take them. */
+				YBCUpdateSysCatalogTupleForDb(dboid, relation, NULL /* oldtuple */ , tuple);
+			}
+			YB_FOR_EACH_DB_END;
+		}
+		else
+		{
+			YBCUpdateSysCatalogTuple(relation, NULL /* oldtuple */ , tuple);
+		}
+
+		/*
+		 * TODO: cover this case if we intend to set TEST_enable_obj_tuple_locks to true.
+		 */
+		systable_endscan(scan);
+		return;
+	}
+
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	HeapTuple	oldtup = bslot->base.tuple;
 	Buffer		buffer = bslot->buffer;
@@ -915,6 +1015,16 @@ systable_inplace_update_cancel(void *state)
 	SysScanDesc scan = (SysScanDesc) state;
 	Relation	relation = scan->heap_rel;
 	TupleTableSlot *slot = scan->slot;
+
+	if (IsYBRelation(relation))
+	{
+		/*
+		 * TODO: cover this case if we intend to set TEST_enable_obj_tuple_locks to true.
+		 */
+		systable_endscan(scan);
+		return;
+	}
+
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	HeapTuple	oldtup = bslot->base.tuple;
 	Buffer		buffer = bslot->buffer;

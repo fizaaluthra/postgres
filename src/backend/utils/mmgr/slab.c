@@ -372,6 +372,8 @@ SlabContextCreate(MemoryContext parent,
 						   name)));
 	}
 
+	YbPgMemAddConsumption(headerSize);
+
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
 	 * we'd leak the header if we ereport in this stretch.
@@ -477,10 +479,18 @@ SlabReset(MemoryContext context)
 			wipe_mem(block, slab->blockSize);
 #endif
 
+<<<<<<< HEAD
 			/* As in aset.c, free block-header vchunks explicitly */
 			VALGRIND_MEMPOOL_FREE(slab, block);
 
 			free(block);
+=======
+			size_t		freed_sz = slab->blockSize;
+
+			free(block);
+			YbPgMemSubConsumption(freed_sz);
+			slab->nblocks--;
+>>>>>>> bc662ba7050
 			context->mem_allocated -= slab->blockSize;
 		}
 	}
@@ -508,11 +518,16 @@ SlabDelete(MemoryContext context)
 	/* Reset to release all the SlabBlocks */
 	SlabReset(context);
 
+<<<<<<< HEAD
 	/* Destroy the vpool -- see notes in aset.c */
 	VALGRIND_DESTROY_MEMPOOL(context);
+=======
+	size_t		freed_sz = ((SlabContext *) context)->headerSize;
+>>>>>>> bc662ba7050
 
 	/* And free the context header */
 	free(context);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -593,8 +608,15 @@ SlabAllocFromNewBlock(MemoryContext context, Size size, int flags)
 		if (unlikely(block == NULL))
 			return MemoryContextAllocationFailure(context, size, flags);
 
+<<<<<<< HEAD
 		/* Make a vchunk covering the new block's header */
 		VALGRIND_MEMPOOL_ALLOC(slab, block, Slab_BLOCKHDRSZ);
+=======
+		YbPgMemAddConsumption(slab->blockSize);
+
+		block->nfree = slab->chunksPerBlock;
+		block->firstFreeChunk = 0;
+>>>>>>> bc662ba7050
 
 		block->slab = slab;
 		context->mem_allocated += slab->blockSize;
@@ -813,8 +835,20 @@ SlabFree(void *pointer)
 	/* Handle when a block becomes completely empty */
 	if (unlikely(block->nfree == slab->chunksPerBlock))
 	{
+<<<<<<< HEAD
 		/* remove the block */
 		dlist_delete_from(&slab->blocklist[newBlocklistIdx], &block->node);
+=======
+		size_t		freed_sz = slab->blockSize;
+
+		free(block);
+		YbPgMemSubConsumption(freed_sz);
+		slab->nblocks--;
+		context->mem_allocated -= slab->blockSize;
+	}
+	else
+		dlist_push_head(&slab->freelist[block->nfree], &block->node);
+>>>>>>> bc662ba7050
 
 		/*
 		 * To avoid thrashing malloc/free, we keep a list of empty blocks that

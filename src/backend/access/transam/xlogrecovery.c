@@ -1833,7 +1833,11 @@ PerformWalRecovery(void)
 					recoveryPausesHere(true);
 
 					/* drop into promote */
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 				case RECOVERY_TARGET_ACTION_PROMOTE:
 					break;

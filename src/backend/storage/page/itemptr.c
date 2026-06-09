@@ -16,6 +16,9 @@
 
 #include "storage/itemptr.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * We really want ItemPointerData to be exactly 6 bytes.

@@ -15,6 +15,9 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
+	ybbitmatrix.o \
+	ybtidbitmap.o \
+	\
 	bitmapset.o \
 	copyfuncs.o \
 	equalfuncs.o \

@@ -99,7 +99,12 @@ gin_extract_query_trgm(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case LikeStrategyNumber:
 
 			/*
@@ -113,7 +118,12 @@ gin_extract_query_trgm(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case RegExpStrategyNumber:
 			trg = createTrgmNFA(val, PG_GET_COLLATION(),
 								&graph, CurrentMemoryContext);
@@ -224,7 +234,12 @@ gin_trgm_consistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case LikeStrategyNumber:
 		case EqualStrategyNumber:
 			/* Check if all extracted trigrams are presented. */
@@ -242,7 +257,12 @@ gin_trgm_consistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case RegExpStrategyNumber:
 			if (nkeys < 1)
 			{
@@ -310,7 +330,12 @@ gin_trgm_triconsistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case LikeStrategyNumber:
 		case EqualStrategyNumber:
 			/* Check if all extracted trigrams are presented. */
@@ -328,7 +353,12 @@ gin_trgm_triconsistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALL THRU */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case RegExpStrategyNumber:
 			if (nkeys < 1)
 			{

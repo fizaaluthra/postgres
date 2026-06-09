@@ -23,7 +23,13 @@
 #include "utils/guc.h"
 #include "utils/ps_status.h"
 
+<<<<<<< HEAD
 #if !defined(WIN32)
+=======
+/* YB includes */
+#include "yb/util/debug/leak_annotations.h"
+
+>>>>>>> bc662ba7050
 extern char **environ;
 #endif
 
@@ -100,6 +106,7 @@ static void flush_ps_display(void);
 static int	save_argc;
 static char **save_argv;
 
+<<<<<<< HEAD
 /*
  * Valgrind seems not to consider the global "environ" variable as a valid
  * root pointer; so when we allocate a new environment array, it claims that
@@ -111,6 +118,18 @@ extern char **ps_status_new_environ;
 char	  **ps_status_new_environ;
 #endif
 
+=======
+#if defined(PS_USE_CLOBBER_ARGV)
+static char **
+allocate_new_environ(int i)
+{
+	char	  **result = (char **) malloc((i + 1) * sizeof(char *));
+
+	__lsan_ignore_object(result);
+	return result;
+}
+#endif
+>>>>>>> bc662ba7050
 
 /*
  * Call this early in startup to save the original argc/argv values.
@@ -200,7 +219,7 @@ save_ps_display_args(int argc, char **argv)
 		/*
 		 * move the environment out of the way
 		 */
-		new_environ = (char **) malloc((i + 1) * sizeof(char *));
+		new_environ = allocate_new_environ(i);;
 		if (!new_environ)
 		{
 			write_stderr("out of memory\n");

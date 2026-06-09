@@ -64,6 +64,13 @@
 #include "nodes/pathnodes.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "executor/nodeYbBatchedNestloop.h"
+#include "executor/nodeYbBitmapIndexscan.h"
+#include "executor/nodeYbBitmapTablescan.h"
+#include "executor/nodeYbSeqscan.h"
+#include "pg_yb_utils.h"
+
 static bool IndexSupportsBackwardScan(Oid indexid);
 
 
@@ -167,6 +174,10 @@ ExecReScan(PlanState *node)
 			ExecReScanSeqScan((SeqScanState *) node);
 			break;
 
+		case T_YbSeqScanState:
+			ExecReScanYbSeqScan((YbSeqScanState *) node);
+			break;
+
 		case T_SampleScanState:
 			ExecReScanSampleScan((SampleScanState *) node);
 			break;
@@ -191,8 +202,17 @@ ExecReScan(PlanState *node)
 			ExecReScanBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
+
+		case T_YbBitmapIndexScanState:
+			ExecReScanYbBitmapIndexScan((YbBitmapIndexScanState *) node);
+			break;
+
 		case T_BitmapHeapScanState:
 			ExecReScanBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_YbBitmapTableScanState:
+			ExecReScanYbBitmapTableScan((YbBitmapTableScanState *) node);
 			break;
 
 		case T_TidScanState:
@@ -241,6 +261,10 @@ ExecReScan(PlanState *node)
 
 		case T_NestLoopState:
 			ExecReScanNestLoop((NestLoopState *) node);
+			break;
+
+		case T_YbBatchedNestLoopState:
+			ExecReScanYbBatchedNestLoop((YbBatchedNestLoopState *) node);
 			break;
 
 		case T_MergeJoinState:
@@ -427,11 +451,23 @@ ExecSupportsMarkRestore(Path *pathnode)
 	{
 		case T_IndexScan:
 		case T_IndexOnlyScan:
-
-			/*
-			 * Not all index types support mark/restore.
-			 */
-			return castNode(IndexPath, pathnode)->indexinfo->amcanmarkpos;
+			if (!IsYugaByteEnabled())
+			{
+				/*
+				 * Not all index types support mark/restore.
+				 */
+				return castNode(IndexPath, pathnode)->indexinfo->amcanmarkpos;
+			}
+			else
+			{
+				/*
+				 * Yugabyte index scan do not support mark/restore, that would force
+				 * a Materialize plan node on top of the scan.
+				 * TODO Consider to support mark/restore. Though Materialize remote
+				 * index scan may be more efficient solution anyway.
+				 */
+				return false;
+			}
 
 		case T_Material:
 		case T_Sort:
@@ -566,6 +602,9 @@ ExecSupportsBackwardScan(Plan *node)
 		case T_CustomScan:
 			if (((CustomScan *) node)->flags & CUSTOMPATH_SUPPORT_BACKWARD_SCAN)
 				return true;
+			return false;
+
+		case T_YbSeqScan:
 			return false;
 
 		case T_SeqScan:

@@ -83,9 +83,15 @@ CheckAndCreateToastTable(Oid relOid, Datum reloptions, LOCKMODE lockmode,
 
 	rel = table_open(relOid, lockmode);
 
-	/* create_toast_table does all the work */
-	(void) create_toast_table(rel, InvalidOid, InvalidOid, reloptions, lockmode,
-							  check, OIDOldToast);
+	/* Skip toast table creation for non-temp relations in YB mode */
+	if (!IsYugaByteEnabled() || isTempOrTempToastNamespace(rel->rd_rel->relnamespace))
+	{
+		/* create_toast_table does all the work */
+
+		elog(DEBUG1, "Creating toast table for %d", relOid);
+		(void) create_toast_table(rel, InvalidOid, InvalidOid, reloptions, lockmode,
+								  check, OIDOldToast);
+	}
 
 	table_close(rel, NoLock);
 }
@@ -254,6 +260,7 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	toast_relid = heap_create_with_catalog(toast_relname,
 										   namespaceid,
 										   rel->rd_rel->reltablespace,
+										   InvalidOid,	/* tablegroup */
 										   toastOid,
 										   InvalidOid,
 										   InvalidOid,
@@ -271,7 +278,8 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 										   true,
 										   true,
 										   OIDOldToast,
-										   NULL);
+										   NULL,
+										   false);
 	Assert(toast_relid != InvalidOid);
 
 	/* make the toast relation visible, else table_open will fail */
@@ -331,8 +339,16 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 				 list_make2("chunk_id", "chunk_seq"),
 				 BTREE_AM_OID,
 				 rel->rd_rel->reltablespace,
+<<<<<<< HEAD
 				 collationIds, opclassIds, NULL, coloptions, NULL, (Datum) 0,
 				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL);
+=======
+				 collationObjectId, classObjectId, coloptions, (Datum) 0,
+				 INDEX_CREATE_IS_PRIMARY, 0, true, true, NULL, NULL,
+				 true /* skip_index_backfill */ , false /* is_colocated */ ,
+				 InvalidOid /* tablegroupId */ , InvalidOid /* colocationId */,
+				 false /* yb_skip_index_creation */ );
+>>>>>>> bc662ba7050
 
 	table_close(toast_rel, NoLock);
 
@@ -370,7 +386,8 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 
 		((Form_pg_class) GETSTRUCT(reltup))->reltoastrelid = toast_relid;
 
-		systable_inplace_update_finish(state, reltup);
+		systable_inplace_update_finish(state, reltup,
+									   false /* yb_shared_update */ );
 	}
 
 	heap_freetuple(reltup);

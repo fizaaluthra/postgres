@@ -40,6 +40,12 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "storage/procsignal.h"
+#include "utils/catcache.h"
+#include "yb_tcmalloc_utils.h"
+
 /*
  * The SIGUSR1 signal is multiplexed to support signaling multiple event
  * types. The specific reason is communicated via flags in shared memory.
@@ -223,6 +229,34 @@ ProcSignalInit(const uint8 *cancel_key, int cancel_key_len)
 	on_shmem_exit(CleanupProcSignalState, (Datum) 0);
 }
 
+/* CleanupProcSignalStateInternal
+ * 		Remove the given process from ProcSignalSlots
+ */
+static void
+CleanupProcSignalStateInternal(PGPROC *proc, int pss_idx, ProcSignalSlot *slot)
+{
+	/* sanity check */
+	if (slot->pss_pid != proc->pid)
+	{
+		/*
+		 * don't ERROR here. We're exiting anyway, and don't want to get into
+		 * infinite loop trying to exit
+		 */
+		elog(LOG, "process %d releasing ProcSignal slot %d, but it contains %d",
+			 proc->pid, pss_idx, (int) slot->pss_pid);
+		return;					/* XXX better to zero the slot anyway? */
+	}
+
+	/*
+	 * Make this slot look like it's absorbed all possible barriers, so that
+	 * no barrier waits block on it.
+	 */
+	pg_atomic_write_u64(&slot->pss_barrierGeneration, PG_UINT64_MAX);
+	YbConditionVariableBroadcastForProc(&slot->pss_barrierCV, proc);
+
+	slot->pss_pid = 0;
+}
+
 /*
  * CleanupProcSignalState
  *		Remove current process from ProcSignal mechanism
@@ -243,6 +277,7 @@ CleanupProcSignalState(int status, Datum arg)
 	Assert(MyProcSignalSlot != NULL);
 	MyProcSignalSlot = NULL;
 
+<<<<<<< HEAD
 	/* sanity check */
 	SpinLockAcquire(&slot->pss_mutex);
 	old_pid = pg_atomic_read_u32(&slot->pss_pid);
@@ -271,6 +306,27 @@ CleanupProcSignalState(int status, Datum arg)
 	SpinLockRelease(&slot->pss_mutex);
 
 	ConditionVariableBroadcast(&slot->pss_barrierCV);
+=======
+	CleanupProcSignalStateInternal(MyProc, pss_idx, slot);
+}
+
+/*
+ * CleanupProcSignalStateForProc
+ *		Remove the given process from ProcSignalSlots
+ *
+ * This function is called from reaper() when the parent is notified that its
+ * child died unexpectedly.
+ */
+void
+CleanupProcSignalStateForProc(PGPROC *proc)
+{
+	int			pss_idx = proc->backendId;
+	ProcSignalSlot *slot;
+
+	slot = &ProcSignal->psh_slot[pss_idx - 1];
+
+	CleanupProcSignalStateInternal(proc, pss_idx, slot);
+>>>>>>> bc662ba7050
 }
 
 /*
@@ -705,8 +761,22 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 	if (CheckProcSignal(PROCSIG_LOG_MEMORY_CONTEXT))
 		HandleLogMemoryContextInterrupt();
 
+<<<<<<< HEAD
 	if (CheckProcSignal(PROCSIG_PARALLEL_APPLY_MESSAGE))
 		HandleParallelApplyMessageInterrupt();
+=======
+	if (CheckProcSignal(PROCSIG_LOG_HEAP_SNAPSHOT))
+		HandleLogHeapSnapshotInterrupt();
+
+	if (CheckProcSignal(PROCSIG_LOG_HEAP_SNAPSHOT_PEAK))
+		HandleLogHeapSnapshotPeakInterrupt();
+
+	if (CheckProcSignal(YB_PROCSIG_LOG_CATCACHE_STATS))
+		YbHandleLogCatcacheStatsInterrupt();
+
+	if (CheckProcSignal(PROCSIG_RECOVERY_CONFLICT_DATABASE))
+		RecoveryConflictInterrupt(PROCSIG_RECOVERY_CONFLICT_DATABASE);
+>>>>>>> bc662ba7050
 
 	if (CheckProcSignal(PROCSIG_REPACK_MESSAGE))
 		HandleRepackMessageInterrupt();

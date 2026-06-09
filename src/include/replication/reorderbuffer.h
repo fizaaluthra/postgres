@@ -30,9 +30,31 @@ extern PGDLLIMPORT int debug_logical_replication_streaming;
 /* possible values for debug_logical_replication_streaming */
 typedef enum
 {
+<<<<<<< HEAD
 	DEBUG_LOGICAL_REP_STREAMING_BUFFERED,
 	DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE,
 }			DebugLogicalRepStreamingMode;
+=======
+	/* position in preallocated list */
+	slist_node	node;
+
+	/* tuple header, the interesting bit for users of logical decoding */
+	HeapTupleData tuple;
+
+	/* pre-allocated size of tuple buffer, different from tuple size */
+	Size		alloc_tuple_size;
+
+	/* YB: allocated separately but in the reorder buffer memory context. */
+	bool	   *yb_is_omitted;
+	int			yb_is_omitted_size;
+
+	/* actual tuple data follows */
+} ReorderBufferTupleBuf;
+
+/* pointer to the data stored in a TupleBuf */
+#define ReorderBufferTupleBufData(p) \
+	((HeapTupleHeader) MAXALIGN(((char *) p) + sizeof(ReorderBufferTupleBuf)))
+>>>>>>> bc662ba7050
 
 /*
  * Types of the change passed to a 'change' callback.
@@ -103,7 +125,14 @@ typedef struct ReorderBufferChange
 			/* valid for DELETE || UPDATE */
 			HeapTuple	oldtuple;
 			/* valid for INSERT || UPDATE */
+<<<<<<< HEAD
 			HeapTuple	newtuple;
+=======
+			ReorderBufferTupleBuf *newtuple;
+
+			/* YB */
+			Oid			yb_table_oid;
+>>>>>>> bc662ba7050
 		}			tp;
 
 		/*
@@ -566,10 +595,16 @@ typedef void (*ReorderBufferStreamTruncateCB) (ReorderBuffer *rb,
 											   Relation relations[],
 											   ReorderBufferChange *change);
 
+<<<<<<< HEAD
 /* update progress txn callback signature */
 typedef void (*ReorderBufferUpdateProgressTxnCB) (ReorderBuffer *rb,
 												  ReorderBufferTXN *txn,
 												  XLogRecPtr lsn);
+=======
+typedef void (*YBReorderBufferSchemaChangeCB) (
+											   ReorderBuffer *rb,
+											   Oid relid);
+>>>>>>> bc662ba7050
 
 struct ReorderBuffer
 {
@@ -613,6 +648,8 @@ struct ReorderBuffer
 	ReorderBufferApplyTruncateCB apply_truncate;
 	ReorderBufferCommitCB commit;
 	ReorderBufferMessageCB message;
+
+	YBReorderBufferSchemaChangeCB yb_schema_change;
 
 	/*
 	 * Callbacks to be called when streaming a transaction at prepare time.
@@ -782,5 +819,13 @@ extern uint32 ReorderBufferGetInvalidations(ReorderBuffer *rb,
 											SharedInvalidationMessage **msgs);
 
 extern void StartupReorderBuffer(void);
+
+/*
+ * YB: Return a palloc'd array of bool allocated in the reorderbuffer's memory
+ * context to be used for storing yb_is_omitted values for each attribute.
+ */
+bool	   *YBAllocateIsOmittedArray(ReorderBuffer *rb, int nattrs);
+
+void		YBReorderBufferSchemaChange(ReorderBuffer *, Oid relid);
 
 #endif

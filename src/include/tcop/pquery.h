@@ -19,8 +19,17 @@
 
 typedef struct PlannedStmt PlannedStmt; /* avoid including plannodes.h here */
 
+enum YbPgBatchDetection
+{
+	DETECT_BY_PEEKING = 0,
+	ASSUME_ALL_BATCH_EXECUTIONS,
+	IGNORE_BATCH_DELETE_AND_UPDATE_MAY_FAIL,
+};
+
 
 extern PGDLLIMPORT Portal ActivePortal;
+
+extern int	yb_pg_batch_detection_mechanism;
 
 
 extern PortalStrategy ChoosePortalStrategy(List *stmts);

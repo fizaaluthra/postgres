@@ -2065,7 +2065,25 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 				if (ptype != 0)
 				{
 					char	   *cp;
+<<<<<<< HEAD
 					int			value;
+=======
+					int			val;
+
+					/* Only accept a date under limited circumstances */
+					switch (ptype)
+					{
+						case DTK_JULIAN:
+						case DTK_YEAR:
+						case DTK_MONTH:
+						case DTK_DAY:
+							if (tzp == NULL)
+								return DTERR_BAD_FORMAT;
+							yb_switch_fallthrough();
+						default:
+							break;
+					}
+>>>>>>> bc662ba7050
 
 					errno = 0;
 					value = strtoint(field[i], &cp, 10);
@@ -3595,7 +3613,12 @@ DecodeInterval(char **field, int *ftype, int nf, int range,
 				 * handle signed float numbers and signed year-month values.
 				 */
 
+<<<<<<< HEAD
 				pg_fallthrough;
+=======
+				/* FALLTHROUGH */
+				yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 
 			case DTK_DATE:
 			case DTK_NUMBER:
@@ -4029,7 +4052,12 @@ DecodeISO8601Interval(char *str,
 						continue;
 					}
 					/* Else fall through to extended alternative format */
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* FALLTHROUGH */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 				case '-':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)
@@ -4112,7 +4140,12 @@ DecodeISO8601Interval(char *str,
 						return 0;
 					}
 					/* Else fall through to extended alternative format */
+<<<<<<< HEAD
 					pg_fallthrough;
+=======
+					/* FALLTHROUGH */
+					yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 				case ':':		/* ISO 8601 4.4.3.3 Alternative Format,
 								 * Extended */
 					if (havefield)

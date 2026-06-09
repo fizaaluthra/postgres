@@ -25,6 +25,9 @@
 #include "nodes/nodeFuncs.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "utils/builtins.h"
+
 
 /*
  * It's sufficient to check varattno to identify the CTID variable, as any
@@ -81,13 +84,23 @@ MakeTidOpExpr(OpExpr *expr, TidRangeScanState *tidstate)
 	{
 		case TIDLessEqOperator:
 			tidopexpr->inclusive = true;
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* fall through */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case TIDLessOperator:
 			tidopexpr->exprtype = invert ? TIDEXPR_LOWER_BOUND : TIDEXPR_UPPER_BOUND;
 			break;
 		case TIDGreaterEqOperator:
 			tidopexpr->inclusive = true;
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* fall through */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case TIDGreaterOperator:
 			tidopexpr->exprtype = invert ? TIDEXPR_UPPER_BOUND : TIDEXPR_LOWER_BOUND;
 			break;

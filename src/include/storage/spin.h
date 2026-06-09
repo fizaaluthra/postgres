@@ -14,6 +14,7 @@
  *		Acquire a spinlock, waiting if necessary.
  *		Time out and abort() if unable to acquire the lock in a
  *		"reasonable" amount of time --- typically ~ 1 minute.
+ *		YB note: instead of 1 minute, it's roughly 15 seconds.
  *
  *	void SpinLockRelease(volatile slock_t *lock)
  *		Unlock a previously acquired lock.
@@ -46,11 +47,18 @@
 
 #include "storage/s_lock.h"
 
+<<<<<<< HEAD
 static inline void
 SpinLockInit(volatile slock_t *lock)
 {
 	S_INIT_LOCK(lock);
 }
+=======
+/* YB includes */
+#include "miscadmin.h"
+#include "storage/proc.h"
+
+>>>>>>> bc662ba7050
 
 static inline void
 SpinLockAcquire(volatile slock_t *lock)
@@ -58,10 +66,41 @@ SpinLockAcquire(volatile slock_t *lock)
 	S_LOCK(lock);
 }
 
+<<<<<<< HEAD
 static inline void
 SpinLockRelease(volatile slock_t *lock)
 {
 	S_UNLOCK(lock);
 }
+=======
+/* YB modified */
+#define SpinLockAcquire(lock) \
+	do \
+	{ \
+		if (IsUnderPostmaster && MyProc) \
+			MyProc->ybSpinLocksAcquired++; \
+		S_LOCK(lock); \
+	} while (0)
+
+/* YB modified */
+#define SpinLockRelease(lock) \
+	do \
+	{ \
+		S_UNLOCK(lock); \
+		if (IsUnderPostmaster && MyProc && MyProc->ybSpinLocksAcquired >= 1) \
+			MyProc->ybSpinLocksAcquired--; \
+	} while (0)
+
+#define SpinLockFree(lock)	S_LOCK_FREE(lock)
+
+
+extern int	SpinlockSemas(void);
+extern Size SpinlockSemaSize(void);
+
+#ifndef HAVE_SPINLOCKS
+extern void SpinlockSemaInit(void);
+extern PGDLLIMPORT PGSemaphore *SpinlockSemaArray;
+#endif
+>>>>>>> bc662ba7050
 
 #endif							/* SPIN_H */

@@ -28,6 +28,13 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "commands/trigger.h"
+#include "executor/ybModifyTable.h"
+#include "optimizer/ybplan.h"
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_dist_trace.h"
+
 
 /*
  * ActivePortal is the currently executing Portal (the most closely nested,
@@ -35,6 +42,7 @@
  */
 Portal		ActivePortal = NULL;
 
+int			yb_pg_batch_detection_mechanism;
 
 static void ProcessQuery(PlannedStmt *plan,
 						 const char *sourceText,
@@ -74,7 +82,13 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 				QueryEnvironment *queryEnv,
 				int instrument_options)
 {
+<<<<<<< HEAD
 	QueryDesc  *qd = palloc_object(QueryDesc);
+=======
+	YbPgMemResetStmtConsumption();
+
+	QueryDesc  *qd = (QueryDesc *) palloc(sizeof(QueryDesc));
+>>>>>>> bc662ba7050
 
 	qd->operation = plannedstmt->commandType;	/* operation */
 	qd->plannedstmt = plannedstmt;	/* plan */
@@ -92,7 +106,12 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 	qd->tupDesc = NULL;
 	qd->estate = NULL;
 	qd->planstate = NULL;
+<<<<<<< HEAD
 	qd->query_instr = NULL;
+=======
+	qd->totaltime = NULL;
+	qd->yb_query_stats = NULL;
+>>>>>>> bc662ba7050
 
 	/* not yet executed */
 	qd->already_executed = false;
@@ -155,6 +174,10 @@ ProcessQuery(PlannedStmt *plan,
 	 * Call ExecutorStart to prepare the plan for execution
 	 */
 	ExecutorStart(queryDesc, 0);
+
+	/* Set whether this is a single-row, single-stmt modify, used in YB mode. */
+	queryDesc->estate->yb_es_is_single_row_modify_txn =
+		YbIsSingleRowModifyTxnPlanned(plan, queryDesc->estate);
 
 	/*
 	 * Run the plan to completion.
@@ -694,6 +717,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
 	Assert(PortalIsValid(portal));
 
 	TRACE_POSTGRESQL_QUERY_EXECUTE_START();
+	YB_DIST_TRACE_START_SPAN("execute");
 
 	/* Initialize empty completion data */
 	if (qc)
@@ -797,6 +821,19 @@ PortalRun(Portal portal, long count, bool isTopLevel,
 				result = false; /* keep compiler quiet */
 				break;
 		}
+
+		/*
+		 * YB: We flush buffered ops here to ensure that any errors in the ops
+		 * can be caught by the PG_CATCH() and mark the portal failed. If some
+		 * ops are not flushed here and say flushed later at a place that
+		 * doesn't catch the error and mark the portal failed, it can result in
+		 * spurious WARNING messages (like "Snapshot reference leak") when
+		 * releasing the portal resources later (for example via a
+		 * CreatePortal() call that drops existing duplicate portal of an
+		 * earlier execution).
+		 */
+		if (isTopLevel)
+			YBFlushBufferedOperations(YBCMakeFlushDebugContextEndOfTopLevelStmt());
 	}
 	PG_CATCH();
 	{
@@ -833,6 +870,7 @@ PortalRun(Portal portal, long count, bool isTopLevel,
 	if (log_executor_stats && portal->strategy != PORTAL_MULTI_QUERY)
 		ShowUsage("EXECUTOR STATISTICS");
 
+	YB_DIST_TRACE_END_SPAN();
 	TRACE_POSTGRESQL_QUERY_EXECUTE_DONE();
 
 	return result;
@@ -1221,6 +1259,7 @@ PortalRunMulti(Portal portal,
 			 * process a plannable query.
 			 */
 			TRACE_POSTGRESQL_QUERY_EXECUTE_START();
+			YB_DIST_TRACE_START_SPAN("execute");
 
 			if (log_executor_stats)
 				ResetUsage();
@@ -1285,6 +1324,7 @@ PortalRunMulti(Portal portal,
 			if (log_executor_stats)
 				ShowUsage("EXECUTOR STATISTICS");
 
+			YB_DIST_TRACE_END_SPAN();
 			TRACE_POSTGRESQL_QUERY_EXECUTE_DONE();
 		}
 		else

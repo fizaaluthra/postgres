@@ -21,8 +21,13 @@ generate_old_dump(void)
 
 	/* run new pg_dumpall binary for globals */
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+<<<<<<< HEAD
 			  "\"%s/pg_dumpall\" %s%s --globals-only --quote-all-identifiers "
 			  "--binary-upgrade %s --no-sync -f \"%s/%s\"",
+=======
+			  "\"%s/ysql_dumpall\" %s --globals-only --quote-all-identifiers "
+			  "--binary-upgrade %s -f \"%s/%s\"",
+>>>>>>> bc662ba7050
 			  new_cluster.bindir, cluster_conn_opts(&old_cluster),
 			  protocol_negotiation_supported(&old_cluster) ? "" : " -d \"max_protocol_version=3.0\"",
 			  log_opts.verbose ? "--verbose" : "",
@@ -56,13 +61,22 @@ generate_old_dump(void)
 		snprintf(log_file_name, sizeof(log_file_name), DB_DUMP_LOG_FILE_MASK, old_db->db_oid);
 
 		parallel_exec_prog(log_file_name, NULL,
+<<<<<<< HEAD
 						   "\"%s/pg_dump\" %s --no-data %s %s --quote-all-identifiers "
 						   "--binary-upgrade --format=custom %s --no-sync --file=\"%s/%s\" %s",
+=======
+						   "\"%s/ysql_dump\" %s --no-data %s --quote-all-identifiers "
+						   "--binary-upgrade --format=custom %s --file=\"%s/%s\" %s",
+>>>>>>> bc662ba7050
 						   new_cluster.bindir, cluster_conn_opts(&old_cluster),
 						   (user_opts.transfer_mode == TRANSFER_MODE_SWAP) ?
 						   "" : "--sequence-data",
 						   log_opts.verbose ? "--verbose" : "",
+<<<<<<< HEAD
 						   user_opts.do_statistics ? "--statistics" : "--no-statistics",
+=======
+						   user_opts.do_statistics ? "--with-statistics" : "--no-statistics",
+>>>>>>> bc662ba7050
 						   log_opts.dumpdir,
 						   sql_file_name, escaped_connstr.data);
 

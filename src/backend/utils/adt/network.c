@@ -1060,6 +1060,20 @@ match_network_subset(Node *leftop,
 	rightopval = ((Const *) rightop)->constvalue;
 
 	/*
+<<<<<<< HEAD
+=======
+	 * Must check that index's opfamily supports the operators we will want to
+	 * apply.
+	 *
+	 * We insist on the opfamily being the specific one we expect, else we'd
+	 * do the wrong thing if someone were to make a reverse-sort opfamily with
+	 * the same operators.
+	 */
+	if (opfamily != NETWORK_BTREE_FAM_OID && opfamily != NETWORK_LSM_FAM_OID)
+		return NIL;
+
+	/*
+>>>>>>> bc662ba7050
 	 * create clause "key >= network_scan_first( rightopval )", or ">" if the
 	 * operator disallows equality.
 	 */

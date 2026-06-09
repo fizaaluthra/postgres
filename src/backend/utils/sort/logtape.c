@@ -302,8 +302,19 @@ ltsReadFillBuffer(LogicalTape *lt)
 
 	do
 	{
+<<<<<<< HEAD
 		char	   *thisbuf = lt->buffer + lt->nbytes;
 		int64		datablocknum = lt->nextBlockNumber;
+=======
+		/*
+		 * YB: Applying an offset to a null pointer is undefined behavior.
+		 * It is possible that if lt->buffer is NULL, we would always exit
+		 * on datablocknum == -1L, so just set thisbuf = NULL in that case.
+		 * https://github.com/yugabyte/yugabyte-db/issues/10295
+		 */
+		char	   *thisbuf = lt->buffer ? lt->buffer + lt->nbytes : NULL;
+		long		datablocknum = lt->nextBlockNumber;
+>>>>>>> bc662ba7050
 
 		/* Fetch next block number */
 		if (datablocknum == -1L)

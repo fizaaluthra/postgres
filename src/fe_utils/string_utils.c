@@ -963,6 +963,7 @@ appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
 	char	  **options;
 	int			noptions;
 	int			i;
+	bool		appended = false;
 
 	if (!parsePGArray(reloptions, &options, &noptions))
 	{
@@ -991,9 +992,20 @@ appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
 		else
 			value = "";
 
-		if (i > 0)
+		/*
+		 * YB: Update reloption 'colocated' to 'colocation' in case we fully
+		 * deprecate 'colocated' syntax in the future.
+		 */
+		if (strcmp(name, "colocated") == 0)
+		{
+			name = "colocation";
+		}
+
+		if (appended)
 			appendPQExpBufferStr(buffer, ", ");
 		appendPQExpBuffer(buffer, "%s%s=", prefix, fmtId(name));
+
+		appended = true;
 
 		/*
 		 * In general we need to quote the value; but to avoid unnecessary

@@ -39,6 +39,11 @@
 #include "utils/timeout.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "commands/async.h"
+#include "yb_ash.h"
+#include "yb_query_diagnostics.h"
+
 /*
  * The postmaster's list of registered background workers, in private memory.
  */
@@ -140,6 +145,7 @@ static const struct
 		.fn_addr = ApplyWorkerMain
 	},
 	{
+<<<<<<< HEAD
 		.fn_name = "ParallelApplyWorkerMain",
 		.fn_addr = ParallelApplyWorkerMain
 	},
@@ -166,6 +172,21 @@ static const struct
 	{
 		.fn_name = "DataChecksumsWorkerMain",
 		.fn_addr = DataChecksumsWorkerMain
+=======
+		"ApplyWorkerMain", ApplyWorkerMain
+	},
+	{
+		"YbAshMain", YbAshMain
+	},
+	{
+		"YbQueryDiagnosticsMain", YbQueryDiagnosticsMain
+	},
+	{
+		"YbQueryDiagnosticsDatabaseConnectionWorkerMain", YbQueryDiagnosticsDatabaseConnectionWorkerMain
+	},
+	{
+		"YbNotifsPollerMain", YbNotifsPollerMain
+>>>>>>> bc662ba7050
 	}
 };
 
@@ -780,6 +801,8 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 		pqsignal(SIGINT, StatementCancelHandler);
 		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 		pqsignal(SIGFPE, FloatExceptionHandler);
+		pqsignal(SIGSEGV, YbCriticalSignalHandler);
+		pqsignal(SIGABRT, YbCriticalSignalHandler);
 
 		/* XXX Any other handlers needed here? */
 	}
@@ -858,6 +881,8 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 	 * need to wait until the user code does it via
 	 * BackgroundWorkerInitializeConnection().
 	 */
+
+	MyProc->ybInitializationCompleted = true;
 
 	/*
 	 * Now invoke the user-defined worker code
@@ -1419,6 +1444,7 @@ GetBackgroundWorkerTypeByPid(pid_t pid)
 	return result;
 }
 
+<<<<<<< HEAD
 /*
  * Terminate all background workers connected to the given database, if the
  * workers can be interrupted.
@@ -1462,4 +1488,10 @@ TerminateBackgroundWorkersForDatabase(Oid databaseId)
 	/* Make sure the postmaster notices the change to shared memory. */
 	if (signal_postmaster)
 		SendPostmasterSignal(PMSIGNAL_BACKGROUND_WORKER_CHANGE);
+=======
+size_t
+YbBackgroundWorkerHandleSize()
+{
+	return sizeof(BackgroundWorkerHandle);
+>>>>>>> bc662ba7050
 }

@@ -25,6 +25,9 @@
 #include "libpq/pqformat.h"
 #include "utils/fmgrprotos.h"
 
+/* YB includes */
+#include "miscadmin.h"
+
 
 /*
  * These macros generate input and output functions for a pseudo-type that
@@ -330,8 +333,22 @@ shell_out(PG_FUNCTION_ARGS)
  * We must disallow input of pg_node_tree values because the SQL functions
  * that operate on the type are not secure against malformed input.
  * We do want to allow output, though.
+ *
+ * YB note: we allow pg_node_tree_in in YSQL upgrade mode.
  */
-PSEUDOTYPE_DUMMY_INPUT_FUNC(pg_node_tree);
+Datum
+pg_node_tree_in(PG_FUNCTION_ARGS)
+{
+	if (IsYsqlUpgrade)
+		return textin(fcinfo);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "pg_node_tree")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
+}
+
 PSEUDOTYPE_DUMMY_RECEIVE_FUNC(pg_node_tree);
 
 Datum

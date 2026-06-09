@@ -52,6 +52,10 @@
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "executor/nodeYbSeqscan.h"
+#include "pg_yb_utils.h"
+
 /*
  * Magic numbers for parallel executor communication.  We use constants
  * greater than any 32-bit integer here so that values < 2^32 can be used
@@ -260,6 +264,11 @@ ExecParallelEstimate(PlanState *planstate, ExecParallelEstimateContext *e)
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecSeqScanInstrumentEstimate((SeqScanState *) planstate,
 										  e->pcxt);
+			break;
+		case T_YbSeqScanState:
+			if (planstate->plan->parallel_aware)
+				ExecYbSeqScanEstimate((YbSeqScanState *) planstate,
+									  e->pcxt);
 			break;
 		case T_IndexScanState:
 			if (planstate->plan->parallel_aware)
@@ -509,6 +518,11 @@ ExecParallelInitializeDSM(PlanState *planstate,
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecSeqScanInstrumentInitDSM((SeqScanState *) planstate,
 										 d->pcxt);
+			break;
+		case T_YbSeqScanState:
+			if (planstate->plan->parallel_aware)
+				ExecYbSeqScanInitializeDSM((YbSeqScanState *) planstate,
+										   d->pcxt);
 			break;
 		case T_IndexScanState:
 			if (planstate->plan->parallel_aware)
@@ -1032,6 +1046,11 @@ ExecParallelReInitializeDSM(PlanState *planstate,
 				ExecSeqScanReInitializeDSM((SeqScanState *) planstate,
 										   pcxt);
 			break;
+		case T_YbSeqScanState:
+			if (planstate->plan->parallel_aware)
+				ExecYbSeqScanReInitializeDSM((YbSeqScanState *) planstate,
+											 pcxt);
+			break;
 		case T_IndexScanState:
 			if (planstate->plan->parallel_aware)
 				ExecIndexScanReInitializeDSM((IndexScanState *) planstate,
@@ -1409,6 +1428,10 @@ ExecParallelInitializeWorker(PlanState *planstate, ParallelWorkerContext *pwcxt)
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecSeqScanInstrumentInitWorker((SeqScanState *) planstate, pwcxt);
 			break;
+		case T_YbSeqScanState:
+			if (planstate->plan->parallel_aware)
+				ExecYbSeqScanInitializeWorker((YbSeqScanState *) planstate, pwcxt);
+			break;
 		case T_IndexScanState:
 			if (planstate->plan->parallel_aware)
 				ExecIndexScanInitializeWorker((IndexScanState *) planstate,
@@ -1532,7 +1555,12 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
 	receiver = ExecParallelGetReceiver(seg, toc);
 	instrumentation = shm_toc_lookup(toc, PARALLEL_KEY_INSTRUMENTATION, true);
 	if (instrumentation != NULL)
+	{
 		instrument_options = instrumentation->instrument_options;
+		/* Fetch DocDB statistics if parallel query is instrumented */
+		YbToggleSessionStatsTimer(true);
+		YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_ALL);
+	}
 	jit_instrumentation = shm_toc_lookup(toc, PARALLEL_KEY_JIT_INSTRUMENTATION,
 										 true);
 	queryDesc = ExecParallelGetQueryDesc(toc, receiver, instrument_options);
@@ -1595,8 +1623,12 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
 
 	/* Report instrumentation data if any instrumentation options are set. */
 	if (instrumentation != NULL)
+	{
 		ExecParallelReportInstrumentation(queryDesc->planstate,
 										  instrumentation);
+		YbToggleSessionStatsTimer(false);
+		YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_NONE);
+	}
 
 	/* Report JIT instrumentation data if any */
 	if (queryDesc->estate->es_jit && jit_instrumentation != NULL)

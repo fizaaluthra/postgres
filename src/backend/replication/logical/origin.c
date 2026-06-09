@@ -105,6 +105,9 @@
 /* GUC variables */
 int			max_active_replication_origins = 10;
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Replay progress of a single remote node.
  */
@@ -361,7 +364,26 @@ replorigin_create(const char *roname)
 			values[Anum_pg_replication_origin_roname - 1] = roname_d;
 
 			tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+
+			bool yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+			if (IsYugaByteEnabled())
+			{
+				if (yb_use_regular_txn_block)
+					YBAddDdlTxnState(YB_DDL_MODE_SILENT_ALTERING);
+				else
+					YBIncrementDdlNestingLevel(YB_DDL_MODE_SILENT_ALTERING);
+			}
+
 			CatalogTupleInsert(rel, tuple);
+
+			if (IsYugaByteEnabled())
+			{
+				if (yb_use_regular_txn_block)
+					YBMergeDdlTxnState();
+				else
+					YBDecrementDdlNestingLevel();
+			}
+
 			CommandCounterIncrement();
 			break;
 		}
@@ -448,6 +470,40 @@ restart:
 	}
 	LWLockRelease(ReplicationOriginLock);
 	ConditionVariableCancelSleep();
+<<<<<<< HEAD
+=======
+
+	/*
+	 * Now, we can delete the catalog entry.
+	 */
+	tuple = SearchSysCache1(REPLORIGIDENT, ObjectIdGetDatum(roident));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for replication origin with ID %d",
+			 roident);
+
+	bool yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBAddDdlTxnState(YB_DDL_MODE_SILENT_ALTERING);
+		else
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_SILENT_ALTERING);
+	}
+
+	CatalogTupleDelete(rel, tuple);
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBMergeDdlTxnState();
+		else
+			YBDecrementDdlNestingLevel();
+	}
+
+	ReleaseSysCache(tuple);
+
+	CommandCounterIncrement();
+>>>>>>> bc662ba7050
 }
 
 /*
@@ -1263,6 +1319,12 @@ replorigin_session_setup(ReplOriginId node, int acquired_by)
 		Assert(!XLogRecPtrIsValid(session_replication_state->remote_lsn));
 		Assert(!XLogRecPtrIsValid(session_replication_state->local_lsn));
 		session_replication_state->roident = node;
+	}
+
+	if (YbIsClientYsqlConnMgr())
+	{
+		elog(LOG, "Incrementing sticky object count for setting replication origin in session");
+		increment_sticky_object_count();
 	}
 
 

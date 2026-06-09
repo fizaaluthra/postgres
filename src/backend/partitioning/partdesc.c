@@ -46,10 +46,6 @@ typedef struct PartitionDirectoryEntry
 	PartitionDesc pd;
 } PartitionDirectoryEntry;
 
-static PartitionDesc RelationBuildPartitionDesc(Relation rel,
-												bool omit_detached);
-
-
 /*
  * RelationGetPartitionDesc -- get partition descriptor, if relation is partitioned
  *
@@ -130,7 +126,7 @@ RelationGetPartitionDesc(Relation rel, bool omit_detached)
  * through the requesting Portal, so we use the corresponding memory context
  * for them.
  */
-static PartitionDesc
+PartitionDesc
 RelationBuildPartitionDesc(Relation rel, bool omit_detached)
 {
 	PartitionDesc partdesc;

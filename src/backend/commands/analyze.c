@@ -56,6 +56,9 @@
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "access/yb_scan.h"
+
 
 /* Per-index data for ANALYZE */
 typedef struct AnlIndexData
@@ -93,6 +96,9 @@ static int	compare_rows(const void *a, const void *b, void *arg);
 static int	acquire_inherited_sample_rows(Relation onerel, int elevel,
 										  HeapTuple *rows, int targrows,
 										  double *totalrows, double *totaldeadrows);
+static int	yb_acquire_sample_rows(Relation onerel, int elevel,
+								   HeapTuple *rows, int targrows,
+								   double *totalrows, double *totaldeadrows);
 static void update_attstats(Oid relid, bool inh,
 							int natts, VacAttrStats **vacattrstats);
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
@@ -209,8 +215,13 @@ analyze_rel(Oid relid, RangeVar *relation,
 	/*
 	 * Check that it's of an analyzable relkind, and set up appropriately.
 	 */
-	if (onerel->rd_rel->relkind == RELKIND_RELATION ||
-		onerel->rd_rel->relkind == RELKIND_MATVIEW)
+	if (IsYBRelation(onerel))
+	{
+		acquirefunc = yb_acquire_sample_rows;
+		relpages = 0;
+	}
+	else if (onerel->rd_rel->relkind == RELKIND_RELATION ||
+			 onerel->rd_rel->relkind == RELKIND_MATVIEW)
 	{
 		/* Regular table, so we'll use the regular row acquisition function */
 		acquirefunc = acquire_sample_rows;
@@ -1523,8 +1534,26 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 		}
 
 		/* Check table type (MATVIEW can't happen, but might as well allow) */
-		if (childrel->rd_rel->relkind == RELKIND_RELATION ||
-			childrel->rd_rel->relkind == RELKIND_MATVIEW)
+		if (IsYBRelation(childrel))
+		{
+			/* Use the YB row acquisition function */
+			acquirefunc = yb_acquire_sample_rows;
+
+			/*
+			 * Unlike analyze_rel, we can't simply set relpages to 0 here
+			 * because it is used for dividing targrows according to the
+			 * partition sizes.  If we do that, no samples will be collected
+			 * for the partitions, resulting in no statistics being gathered at
+			 * the parent level.  Use reltuples instead until we add a
+			 * RelationGetNumberOfBlocks alternative DocDB API.  The actual
+			 * value of relpages for the parent is always set to -1 by
+			 * `do_analyze_rel`.
+			 */
+			relpages = (childrel->rd_rel->reltuples < 0 ?
+						YBC_DEFAULT_NUM_ROWS : childrel->rd_rel->reltuples);
+		}
+		else if (childrel->rd_rel->relkind == RELKIND_RELATION ||
+				 childrel->rd_rel->relkind == RELKIND_MATVIEW)
 		{
 			/* Regular table, so use the regular row acquisition function */
 			acquirefunc = acquire_sample_rows;
@@ -1687,6 +1716,45 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 	return numrows;
 }
 
+/*
+ * yb_acquire_sample_rows -- acquire a random sample of rows from the YB table
+ *
+ * This has the same API as acquire_sample_rows, and uses similar approach.
+ */
+static int
+yb_acquire_sample_rows(Relation onerel, int elevel,
+					   HeapTuple *rows, int targrows,
+					   double *totalrows, double *totaldeadrows)
+{
+	YbSample	ybSample;
+	int			numrows = 0;
+
+	Assert(targrows > 0);
+
+	/* Prepare to take sample */
+	ybSample = ybBeginSample(onerel, targrows);
+
+	/* Loop over the table blocks until sample is selected */
+	while (ybSampleNextBlock(ybSample))
+	{
+		vacuum_delay_point();
+	}
+
+	/* Fetch selected rows */
+	numrows = ybFetchSample(ybSample, rows);
+
+	/* Get row counters */
+	*totalrows = ybSample->liverows + ybSample->deadrows;
+	*totaldeadrows = ybSample->deadrows;
+
+	ereport(elevel,
+			(errmsg("\"%s\": scanned, "
+					"%d rows in sample, %.0f estimated total rows",
+					RelationGetRelationName(onerel),
+					numrows, *totalrows)));
+
+	return numrows;
+}
 
 /*
  *	update_attstats() -- update attribute statistics for one relation

@@ -1620,9 +1620,13 @@ AutoVacWorkerMain(const void *startup_data, size_t startup_data_len)
 		 * Note: if we have selected a just-deleted database (due to using
 		 * stale stats info), we'll fail and exit here.
 		 */
+<<<<<<< HEAD
 		InitPostgres(NULL, dbid, NULL, InvalidOid,
 					 INIT_PG_OVERRIDE_ALLOW_CONNS,
 					 dbname);
+=======
+		InitPostgres(NULL, dbid, NULL, InvalidOid, false, true, dbname);
+>>>>>>> bc662ba7050
 		SetProcessingMode(NormalProcessing);
 		set_ps_display(dbname);
 		ereport(DEBUG1,

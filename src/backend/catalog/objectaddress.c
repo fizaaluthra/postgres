@@ -92,6 +92,14 @@
 #include "utils/regproc.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "commands/yb_profile.h"
+#include "commands/yb_tablegroup.h"
+#include "pg_yb_utils.h"
+
 /*
  * ObjectProperty
  *
@@ -516,6 +524,20 @@ static const ObjectPropertyType ObjectProperty[] =
 		true
 	},
 	{
+		"tablegroup",
+		YbTablegroupRelationId,
+		YbTablegroupOidIndexId,
+		YBTABLEGROUPOID,
+		-1,
+		Anum_pg_yb_tablegroup_oid,
+		Anum_pg_yb_tablegroup_grpname,
+		InvalidAttrNumber,
+		Anum_pg_yb_tablegroup_grpowner,
+		Anum_pg_yb_tablegroup_grpacl,
+		OBJECT_YBTABLEGROUP,
+		true
+	},
+	{
 		"tablespace",
 		TableSpaceRelationId,
 		TablespaceOidIndexId,
@@ -711,6 +733,20 @@ static const ObjectPropertyType ObjectProperty[] =
 		OBJECT_USER_MAPPING,
 		false
 	},
+	{
+		"ybprofile",
+		YbProfileRelationId,
+		YbProfileOidIndexId,
+		-1,
+		-1,
+		Anum_pg_yb_profile_oid,
+		Anum_pg_yb_profile_prfname,
+		InvalidAttrNumber,
+		InvalidAttrNumber,
+		InvalidAttrNumber,
+		OBJECT_YBPROFILE,
+		true
+	},
 };
 
 /*
@@ -865,6 +901,14 @@ static const struct object_type_map
 	{
 		"database", OBJECT_DATABASE
 	},
+<<<<<<< HEAD
+=======
+	/* OCLASS_YBTBLGROUP */
+	{
+		"tablegroup", OBJECT_YBTABLEGROUP
+	},
+	/* OCLASS_TBLSPACE */
+>>>>>>> bc662ba7050
 	{
 		"tablespace", OBJECT_TABLESPACE
 	},
@@ -918,6 +962,10 @@ static const struct object_type_map
 	},
 	{
 		"statistics object", OBJECT_STATISTIC_EXT
+	},
+	/* OBJECT_YBPROFILE */
+	{
+		"profile", OBJECT_YBPROFILE
 	}
 };
 
@@ -1014,6 +1062,7 @@ get_object_address(ObjectType objtype, Node *object,
 	ObjectAddress old_address = {InvalidOid, InvalidOid, 0};
 	Relation	relation = NULL;
 	uint64		inval_count;
+	uint64		yb_inval_count;
 
 	/* Some kind of lock must be taken. */
 	Assert(lockmode != NoLock);
@@ -1026,6 +1075,7 @@ get_object_address(ObjectType objtype, Node *object,
 		 * been processed that might require a do-over.
 		 */
 		inval_count = SharedInvalidMessageCounter;
+		yb_inval_count = YbGetCatCacheDeltaRefreshes();
 
 		/* Look up object address. */
 		switch (objtype)
@@ -1093,6 +1143,8 @@ get_object_address(ObjectType objtype, Node *object,
 			case OBJECT_ACCESS_METHOD:
 			case OBJECT_PUBLICATION:
 			case OBJECT_SUBSCRIPTION:
+			case OBJECT_YBTABLEGROUP:
+			case OBJECT_YBPROFILE:
 				address = get_object_address_unqualified(objtype,
 														 castNode(String, object), missing_ok);
 				break;
@@ -1288,7 +1340,8 @@ get_object_address(ObjectType objtype, Node *object,
 		 * up no longer refers to the object we locked, so we retry the lookup
 		 * and see whether we get the same answer.
 		 */
-		if (inval_count == SharedInvalidMessageCounter || relation != NULL)
+		if ((inval_count == SharedInvalidMessageCounter &&
+			 yb_inval_count == YbGetCatCacheDeltaRefreshes()) || relation != NULL)
 			break;
 		old_address = address;
 	}
@@ -1358,6 +1411,11 @@ get_object_address_unqualified(ObjectType objtype,
 			address.objectId = get_extension_oid(name, missing_ok);
 			address.objectSubId = 0;
 			break;
+		case OBJECT_YBTABLEGROUP:
+			address.classId = YbTablegroupRelationId;
+			address.objectId = get_tablegroup_oid(name, missing_ok);
+			address.objectSubId = 0;
+			break;
 		case OBJECT_TABLESPACE:
 			address.classId = TableSpaceRelationId;
 			address.objectId = get_tablespace_oid(name, missing_ok);
@@ -1406,6 +1464,11 @@ get_object_address_unqualified(ObjectType objtype,
 		case OBJECT_SUBSCRIPTION:
 			address.classId = SubscriptionRelationId;
 			address.objectId = get_subscription_oid(name, missing_ok);
+			address.objectSubId = 0;
+			break;
+		case OBJECT_YBPROFILE:
+			address.classId = YbProfileRelationId;
+			address.objectId = yb_get_profile_oid(name, missing_ok);
 			address.objectSubId = 0;
 			break;
 		default:
@@ -2100,8 +2163,13 @@ get_object_address_defacl(List *object, bool missing_ok)
 		case DEFACLOBJ_NAMESPACE:
 			objtype_str = "schemas";
 			break;
+<<<<<<< HEAD
 		case DEFACLOBJ_LARGEOBJECT:
 			objtype_str = "large objects";
+=======
+		case DEFACLOBJ_TABLEGROUP:
+			objtype_str = "tablegroups";
+>>>>>>> bc662ba7050
 			break;
 		default:
 			ereport(ERROR,
@@ -2113,7 +2181,11 @@ get_object_address_defacl(List *object, bool missing_ok)
 							 DEFACLOBJ_FUNCTION,
 							 DEFACLOBJ_TYPE,
 							 DEFACLOBJ_NAMESPACE,
+<<<<<<< HEAD
 							 DEFACLOBJ_LARGEOBJECT)));
+=======
+							 DEFACLOBJ_TABLEGROUP)));
+>>>>>>> bc662ba7050
 	}
 
 	/*
@@ -2327,7 +2399,12 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name list length must be exactly %d", 1)));
 			/* fall through to check args length */
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case OBJECT_DOMCONSTRAINT:
 		case OBJECT_CAST:
 		case OBJECT_PUBLICATION_REL:
@@ -2352,7 +2429,12 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("name list length must be at least %d", 3)));
 			/* fall through to check args length */
+<<<<<<< HEAD
 			pg_fallthrough;
+=======
+			/* FALLTHROUGH */
+			yb_switch_fallthrough();
+>>>>>>> bc662ba7050
 		case OBJECT_OPERATOR:
 			if (list_length(args) != 2)
 				ereport(ERROR,
@@ -2392,6 +2474,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_TABCONSTRAINT:
 		case OBJECT_OPCLASS:
 		case OBJECT_OPFAMILY:
+		case OBJECT_YBPROFILE:
 			objnode = (Node *) name;
 			break;
 		case OBJECT_ACCESS_METHOD:
@@ -2406,6 +2489,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		case OBJECT_ROLE:
 		case OBJECT_SCHEMA:
 		case OBJECT_SUBSCRIPTION:
+		case OBJECT_YBTABLEGROUP:
 		case OBJECT_TABLESPACE:
 			if (list_length(name) != 1)
 				ereport(ERROR,
@@ -2498,13 +2582,26 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_PROPGRAPH:
 		case OBJECT_COLUMN:
 		case OBJECT_RULE:
-		case OBJECT_TRIGGER:
 		case OBJECT_POLICY:
 		case OBJECT_TABCONSTRAINT:
 			if (!object_ownercheck(RelationRelationId, RelationGetRelid(relation), roleid))
 				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
 							   RelationGetRelationName(relation));
 			break;
+<<<<<<< HEAD
+=======
+		case OBJECT_TRIGGER:
+			if (!pg_class_ownercheck(RelationGetRelid(relation), roleid) &&
+				!IsYbDbAdminUser(roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
+							   RelationGetRelationName(relation));
+			break;
+		case OBJECT_DATABASE:
+			if (!pg_database_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
+							   strVal(object));
+			break;
+>>>>>>> bc662ba7050
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:
 		case OBJECT_ATTRIBUTE:
@@ -2551,9 +2648,13 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 		case OBJECT_LANGUAGE:
 		case OBJECT_PUBLICATION:
 		case OBJECT_SCHEMA:
+<<<<<<< HEAD
 		case OBJECT_SUBSCRIPTION:
 		case OBJECT_TABLESPACE:
 			if (!object_ownercheck(address.classId, address.objectId, roleid))
+=======
+			if (!pg_namespace_ownercheck(address.objectId, roleid) && !IsYbDbAdminUser(roleid))
+>>>>>>> bc662ba7050
 				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
 							   strVal(object));
 			break;
@@ -2602,6 +2703,29 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 					aclcheck_error_type(ACLCHECK_NOT_OWNER, typeid);
 			}
 			break;
+<<<<<<< HEAD
+=======
+		case OBJECT_YBTABLEGROUP:
+			if (!pg_tablegroup_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
+							   strVal(object));
+			break;
+		case OBJECT_TABLESPACE:
+			if (!pg_tablespace_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
+							   strVal(object));
+			break;
+		case OBJECT_TSDICTIONARY:
+			if (!pg_ts_dict_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
+							   NameListToString(castNode(List, object)));
+			break;
+		case OBJECT_TSCONFIGURATION:
+			if (!pg_ts_config_ownercheck(address.objectId, roleid))
+				aclcheck_error(ACLCHECK_NOT_OWNER, objtype,
+							   NameListToString(castNode(List, object)));
+			break;
+>>>>>>> bc662ba7050
 		case OBJECT_ROLE:
 
 			/*
@@ -2637,9 +2761,21 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 														 true))));
 			}
 			break;
+		case OBJECT_ACCESS_METHOD:
+			/*
+			 * YB: Access methods can be owned by super users (always) or
+			 * extension users (only while creating an extension).
+			 */
+			if (!superuser_arg(roleid) &&
+				!(IsYbExtensionUser(GetUserId()) && creating_extension))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("must be superuser or command must be invoked "
+								"as part of creating an extension by a member "
+								"of the yb_extension role")));
+			break;
 		case OBJECT_TSPARSER:
 		case OBJECT_TSTEMPLATE:
-		case OBJECT_ACCESS_METHOD:
 		case OBJECT_PARAMETER_ACL:
 			/* We treat these object types as being owned by superusers */
 			if (!superuser_arg(roleid))
@@ -2657,6 +2793,21 @@ check_object_ownership(Oid roleid, ObjectType objtype, ObjectAddress address,
 			/* These are currently not supported or don't make sense here. */
 			elog(ERROR, "unsupported object type: %d", (int) objtype);
 			break;
+<<<<<<< HEAD
+=======
+		case OBJECT_YBPROFILE:
+			/* A profile can be dropped by the super user or yb_db_admin */
+			if (!superuser() && !IsYbDbAdminUser(GetUserId()))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission denied to drop profile"),
+						 errhint("Must be superuser or a member of the"
+								 " yb_db_admin role to drop a profile.")));
+			break;
+		default:
+			elog(ERROR, "unrecognized object type: %d",
+				 (int) objtype);
+>>>>>>> bc662ba7050
 	}
 }
 
@@ -3784,7 +3935,23 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				break;
 			}
 
+<<<<<<< HEAD
 		case TableSpaceRelationId:
+=======
+		case OCLASS_YBTBLGROUP:
+			{
+				char	   *tblgroup;
+
+				tblgroup = get_tablegroup_name(object->objectId);
+				if (!tblgroup)
+					elog(ERROR, "cache lookup failed for tablegroup %u",
+						 object->objectId);
+				appendStringInfo(&buffer, _("tablegroup %s"), tblgroup);
+				break;
+			}
+
+		case OCLASS_TBLSPACE:
+>>>>>>> bc662ba7050
 			{
 				char	   *tblspace;
 
@@ -3945,10 +4112,22 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 										 _("default privileges on new schemas belonging to role %s"),
 										 rolename);
 						break;
+<<<<<<< HEAD
 					case DEFACLOBJ_LARGEOBJECT:
 						Assert(!nspname);
 						appendStringInfo(&buffer,
 										 _("default privileges on new large objects belonging to role %s"),
+=======
+					case DEFACLOBJ_TABLEGROUP:
+
+						/*
+						 * Cannot set default perms for tablegroups on a
+						 * per-schema level. Must be per-db.
+						 */
+						Assert(!nspname);
+						appendStringInfo(&buffer,
+										 _("default privileges on new tablegroups belonging to role %s"),
+>>>>>>> bc662ba7050
 										 rolename);
 						break;
 					default:
@@ -4314,9 +4493,38 @@ getObjectDescription(const ObjectAddress *object, bool missing_ok)
 				ReleaseSysCache(trfTup);
 				break;
 			}
+		case OCLASS_YBPROFILE:
+			{
+				char	   *profile;
 
+<<<<<<< HEAD
 		default:
 			elog(ERROR, "unsupported object class: %u", object->classId);
+=======
+				profile = yb_get_profile_name(object->objectId);
+				appendStringInfo(&buffer, _("profile %s"), profile);
+				break;
+			}
+		case OCLASS_YBROLE_PROFILE:
+			{
+				HeapTuple	tup = yb_get_role_profile_tuple_by_oid(object->objectId);
+
+				if (!HeapTupleIsValid(tup))
+					elog(ERROR, "could not find tuple for role profile %u",
+						 object->objectId);
+
+				Form_pg_yb_role_profile rolprfform = (Form_pg_yb_role_profile) GETSTRUCT(tup);
+
+				appendStringInfo(&buffer, _("association between role \"%s\" and profile %s"),
+								 GetUserNameFromId(rolprfform->rolprfrole, false),
+								 yb_get_profile_name(rolprfform->rolprfprofile));
+				break;
+			}
+			/*
+			 * There's intentionally no default: case here; we want the
+			 * compiler to warn if a new OCLASS hasn't been handled above.
+			 */
+>>>>>>> bc662ba7050
 	}
 
 	/* an empty buffer is equivalent to no object found */
@@ -4865,7 +5073,15 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 			appendStringInfoString(&buffer, "database");
 			break;
 
+<<<<<<< HEAD
 		case TableSpaceRelationId:
+=======
+		case OCLASS_YBTBLGROUP:
+			appendStringInfoString(&buffer, "tablegroup");
+			break;
+
+		case OCLASS_TBLSPACE:
+>>>>>>> bc662ba7050
 			appendStringInfoString(&buffer, "tablespace");
 			break;
 
@@ -4933,8 +5149,22 @@ getObjectTypeDescription(const ObjectAddress *object, bool missing_ok)
 			appendStringInfoString(&buffer, "transform");
 			break;
 
+<<<<<<< HEAD
 		default:
 			elog(ERROR, "unsupported object class: %u", object->classId);
+=======
+		case OCLASS_YBPROFILE:
+			appendStringInfoString(&buffer, "profile");
+			break;
+
+		case OCLASS_YBROLE_PROFILE:
+			appendStringInfoString(&buffer, "role profile");
+			break;
+			/*
+			 * There's intentionally no default: case here; we want the
+			 * compiler to warn if a new OCLASS hasn't been handled above.
+			 */
+>>>>>>> bc662ba7050
 	}
 
 	/* the result can never be empty */
@@ -5880,7 +6110,26 @@ getObjectIdentityParts(const ObjectAddress *object,
 				break;
 			}
 
+<<<<<<< HEAD
 		case TableSpaceRelationId:
+=======
+		case OCLASS_YBTBLGROUP:
+			{
+				char	   *tblgroup;
+
+				tblgroup = get_tablegroup_name(object->objectId);
+				if (!tblgroup)
+					elog(ERROR, "cache lookup failed for tablegroup %u",
+						 object->objectId);
+				if (objname)
+					*objname = list_make1(tblgroup);
+				appendStringInfoString(&buffer,
+									   quote_identifier(tblgroup));
+				break;
+			}
+
+		case OCLASS_TBLSPACE:
+>>>>>>> bc662ba7050
 			{
 				char	   *tblspace;
 
@@ -6042,9 +6291,15 @@ getObjectIdentityParts(const ObjectAddress *object,
 						appendStringInfoString(&buffer,
 											   " on schemas");
 						break;
+<<<<<<< HEAD
 					case DEFACLOBJ_LARGEOBJECT:
 						appendStringInfoString(&buffer,
 											   " on large objects");
+=======
+					case DEFACLOBJ_TABLEGROUP:
+						appendStringInfoString(&buffer,
+											   " on tablegroups");
+>>>>>>> bc662ba7050
 						break;
 				}
 
@@ -6352,6 +6607,32 @@ getObjectIdentityParts(const ObjectAddress *object,
 				table_close(transformDesc, AccessShareLock);
 			}
 			break;
+		case OCLASS_YBPROFILE:
+			{
+				char	   *profile;
+
+				profile = yb_get_profile_name(object->objectId);
+				if (objname)
+					*objname = list_make1(profile);
+				appendStringInfoString(&buffer,
+									   quote_identifier(profile));
+				break;
+			}
+		case OCLASS_YBROLE_PROFILE:
+			{
+				HeapTuple	tup = yb_get_role_profile_tuple_by_oid(object->objectId);
+
+				if (!HeapTupleIsValid(tup))
+					elog(ERROR, "could not find tuple for role profile %u",
+						 object->objectId);
+
+				Form_pg_yb_role_profile rolprfform = (Form_pg_yb_role_profile) GETSTRUCT(tup);
+
+				appendStringInfo(&buffer, _("association between role \"%s\" and profile %s"),
+								 GetUserNameFromId(rolprfform->rolprfrole, false),
+								 yb_get_profile_name(rolprfform->rolprfprofile));
+				break;
+			}
 
 		default:
 			elog(ERROR, "unsupported object class: %u", object->classId);

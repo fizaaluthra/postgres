@@ -55,4 +55,11 @@ extern void get_reloptions(StringInfo buf, Datum reloptions);
 
 extern char *pg_get_statisticsobjdef_string(Oid statextid);
 
+/* YB */
+extern char *yb_deparse_expression(Node *expr, List *dpcontext,
+								   bool forceprefix, bool showimplicit,
+								   bool verbose);
+extern void yb_get_dependent_views(Oid relid, List **view_oids,
+								   List **view_defs);
+
 #endif							/* RULEUTILS_H */

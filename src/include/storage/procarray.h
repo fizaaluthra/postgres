@@ -98,4 +98,6 @@ extern void ProcArraySetReplicationSlotXmin(TransactionId xmin,
 extern void ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 											TransactionId *catalog_xmin);
 
+extern void YbStorePgAshSamples(TimestampTz sample_time);
+
 #endif							/* PROCARRAY_H */

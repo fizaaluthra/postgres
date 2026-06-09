@@ -85,10 +85,17 @@ typedef enum
 	DO_PUBLICATION_TABLE_IN_SCHEMA,
 	DO_REL_STATS,
 	DO_SUBSCRIPTION,
+<<<<<<< HEAD
 	DO_SUBSCRIPTION_REL,		/* see note for SubRelInfo */
 } DumpableObjectType;
 
 #define NUM_DUMPABLE_OBJECT_TYPES (DO_SUBSCRIPTION_REL + 1)
+=======
+	DO_TABLEGROUP
+} DumpableObjectType;
+
+#define NUM_DUMPABLE_OBJECT_TYPES (DO_TABLEGROUP + 1)
+>>>>>>> bc662ba7050
 
 /*
  * DumpComponents is a bitmask of the potentially dumpable components of
@@ -390,7 +397,23 @@ typedef struct _tableInfo
 	struct _tableDataInfo *dataObj; /* TableDataInfo, if dumping its data */
 	int			numTriggers;	/* number of triggers for table */
 	struct _triggerInfo *triggers;	/* array of TriggerInfo structs */
+
+	/* YB */
+	struct _indxInfo *primaryKeyIndex;	/* Associated index of a PRIMARY KEY
+										 * constraint */
 } TableInfo;
+
+typedef struct _ybTablegroupInfo
+{
+	/*
+	 * These fields are collected for every tablegroup in the database.
+	 */
+	DumpableObject dobj;
+	DumpableAcl dacl;
+	const char *rolname;
+	char	   *grptablespace;
+	char	   *grpoptions;		/* options specified by WITH (...) */
+} YbTablegroupInfo;
 
 typedef struct _tableAttachInfo
 {
@@ -436,6 +459,9 @@ typedef struct _indxInfo
 
 	/* if there is an associated constraint object, its dumpId: */
 	DumpId		indexconstraint;
+
+	/* YB */
+	Oid		   *indoptions;		/* Access flags for each column of the index */
 } IndxInfo;
 
 typedef struct _indexAttachInfo
@@ -835,5 +861,9 @@ extern void getPublicationTables(Archive *fout, TableInfo tblinfo[],
 								 int numTables);
 extern void getSubscriptions(Archive *fout);
 extern void getSubscriptionRelations(Archive *fout);
+
+/* YB */
+extern YbTablegroupInfo *findTablegroupByOid(Oid oid);
+extern YbTablegroupInfo *getTablegroups(Archive *fout, int *numTablegroups);
 
 #endif							/* PG_DUMP_H */
