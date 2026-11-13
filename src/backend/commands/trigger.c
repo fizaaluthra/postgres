@@ -885,8 +885,17 @@ CreateTriggerFiringOn(const CreateTrigStmt *stmt, const char *queryString,
 	{
 		ListCell   *le;
 		char	   *args;
-		int16		nargs = list_length(stmt->args);
+		int			nargs = list_length(stmt->args);
 		int			len = 0;
+
+		Assert(nargs >= 0);
+		if (nargs > PG_INT16_MAX)
+			ereport(ERROR,
+					errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					errmsg_plural("triggers cannot have more than %d argument",
+								  "triggers cannot have more than %d arguments",
+								  PG_INT16_MAX,
+								  PG_INT16_MAX));
 
 		foreach(le, stmt->args)
 		{
@@ -1132,8 +1141,13 @@ CreateTriggerFiringOn(const CreateTrigStmt *stmt, const char *queryString,
 	 * expression (eg, functions, as well as any columns used).
 	 */
 	if (whenRtable != NIL)
+	{
+		if (!isInternal)
+			CheckUsageOnTypesInExpr(whenClause, whenRtable, GetUserId());
+
 		recordDependencyOnExpr(&myself, whenClause, whenRtable,
 							   DEPENDENCY_NORMAL);
+	}
 
 	/* Post creation hook for new trigger */
 	InvokeObjectPostCreateHookArg(TriggerRelationId, trigoid, 0,
@@ -3893,8 +3907,6 @@ typedef struct AfterTriggersData
 	/* per-subtransaction-level data: */
 	AfterTriggersTransData *trans_stack;	/* array of structs shown below */
 	int			maxtransdepth;	/* allocated len of above array */
-
-	List	   *batch_callbacks;	/* List of AfterTriggerCallbackItem */
 } AfterTriggersData;
 
 struct AfterTriggersQueryData
@@ -3931,21 +3943,7 @@ struct AfterTriggersTableData
 	TupleTableSlot *storeslot;	/* for converting to tuplestore's format */
 };
 
-/* Entry in afterTriggers.batch_callbacks */
-typedef struct AfterTriggerCallbackItem
-{
-	AfterTriggerBatchCallback callback;
-	void	   *arg;
-} AfterTriggerCallbackItem;
-
 static AfterTriggersData afterTriggers;
-
-/*
- * Incremented before invoking afterTriggerInvokeEvents().  Used by
- * AfterTriggerIsActive() to determine whether batch callbacks will fire,
- * so that RI trigger functions can take the batched fast path.
- */
-static int	afterTriggerFiringDepth = 0;
 
 static void AfterTriggerExecute(EState *estate,
 								AfterTriggerEvent event,
@@ -3980,7 +3978,6 @@ static SetConstraintState SetConstraintStateAddItem(SetConstraintState state,
 													Oid tgoid, bool tgisdeferred);
 static void cancel_prior_stmt_triggers(Oid relid, CmdType cmdType, int tgevent);
 
-static void FireAfterTriggerBatchCallbacks(void);
 
 /*
  * Get the FDW tuplestore for the current trigger query level, creating it
@@ -5106,7 +5103,6 @@ AfterTriggerBeginXact(void)
 	 */
 	afterTriggers.firing_counter = (CommandId) 1;	/* mustn't be 0 */
 	afterTriggers.query_depth = -1;
-	afterTriggers.batch_callbacks = NIL;
 
 	/*
 	 * Verify that there is no leftover state remaining.  If these assertions
@@ -5120,7 +5116,6 @@ AfterTriggerBeginXact(void)
 	Assert(afterTriggers.events.head == NULL);
 	Assert(afterTriggers.trans_stack == NULL);
 	Assert(afterTriggers.maxtransdepth == 0);
-	Assert(afterTriggerFiringDepth == 0);
 }
 
 
@@ -5192,7 +5187,6 @@ AfterTriggerEndQuery(EState *estate)
 	 */
 	qs = &afterTriggers.query_stack[afterTriggers.query_depth];
 
-	afterTriggerFiringDepth++;
 	for (;;)
 	{
 		if (afterTriggerMarkEvents(&qs->events, &afterTriggers.events, true))
@@ -5230,20 +5224,10 @@ AfterTriggerEndQuery(EState *estate)
 			break;
 	}
 
-	/*
-	 * Fire batch callbacks before releasing query-level storage and before
-	 * decrementing query_depth.  Callbacks may do real work (index probes,
-	 * error reporting) and rely on query_depth still reflecting the current
-	 * batch level so that nested calls from SPI inside AFTER triggers are
-	 * correctly suppressed by FireAfterTriggerBatchCallbacks's depth guard.
-	 */
-	FireAfterTriggerBatchCallbacks();
-
 	/* Release query-level-local storage, including tuplestores if any */
 	AfterTriggerFreeQuery(&afterTriggers.query_stack[afterTriggers.query_depth]);
 
 	afterTriggers.query_depth--;
-	afterTriggerFiringDepth--;
 }
 
 
@@ -5339,7 +5323,6 @@ AfterTriggerFireDeferred(void)
 	 * Run all the remaining triggers.  Loop until they are all gone, in case
 	 * some trigger queues more for us to do.
 	 */
-	afterTriggerFiringDepth++;
 	while (afterTriggerMarkEvents(events, NULL, false))
 	{
 		CommandId	firing_id = afterTriggers.firing_counter++;
@@ -5347,11 +5330,6 @@ AfterTriggerFireDeferred(void)
 		if (afterTriggerInvokeEvents(events, firing_id, NULL, true))
 			break;				/* all fired */
 	}
-
-	/* Flush any fast-path batches accumulated by the triggers just fired. */
-	FireAfterTriggerBatchCallbacks();
-
-	afterTriggerFiringDepth--;
 
 	/*
 	 * We don't bother freeing the event list, since it will go away anyway
@@ -5417,8 +5395,6 @@ AfterTriggerEndXact(bool isCommit)
 
 	/* No more afterTriggers manipulation until next transaction starts. */
 	afterTriggers.query_depth = -1;
-
-	afterTriggerFiringDepth = 0;
 }
 
 /*
@@ -6068,7 +6044,6 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 		AfterTriggerEventList *events = &afterTriggers.events;
 		bool		snapshot_set = false;
 
-		afterTriggerFiringDepth++;
 		while (afterTriggerMarkEvents(events, NULL, true))
 		{
 			CommandId	firing_id = afterTriggers.firing_counter++;
@@ -6097,12 +6072,6 @@ AfterTriggerSetState(ConstraintsSetStmt *stmt)
 										 !IsSubTransaction()))
 				break;			/* all fired */
 		}
-
-		/*
-		 * Flush any fast-path batches accumulated by the triggers just fired.
-		 */
-		FireAfterTriggerBatchCallbacks();
-		afterTriggerFiringDepth--;
 
 		if (snapshot_set)
 			PopActiveSnapshot();
@@ -6799,82 +6768,4 @@ check_modified_virtual_generated(TupleDesc tupdesc, HeapTuple tuple)
 	}
 
 	return tuple;
-}
-
-/*
- * RegisterAfterTriggerBatchCallback
- *		Register a function to be called when the current trigger-firing
- *		batch completes.
- *
- * Must be called from within a trigger function's execution context
- * (i.e., while afterTriggers state is active).
- *
- * The callback list is cleared after invocation, so the caller must
- * re-register for each new batch if needed.
- */
-void
-RegisterAfterTriggerBatchCallback(AfterTriggerBatchCallback callback,
-								  void *arg)
-{
-	AfterTriggerCallbackItem *item;
-	MemoryContext oldcxt;
-
-	/*
-	 * Allocate in TopTransactionContext so the item survives for the duration
-	 * of the batch, which may span multiple trigger invocations.
-	 *
-	 * Must be called while afterTriggers is active; callbacks registered
-	 * outside a trigger-firing context would never fire.
-	 */
-	Assert(afterTriggerFiringDepth > 0);
-	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-	item = palloc(sizeof(AfterTriggerCallbackItem));
-	item->callback = callback;
-	item->arg = arg;
-	afterTriggers.batch_callbacks =
-		lappend(afterTriggers.batch_callbacks, item);
-	MemoryContextSwitchTo(oldcxt);
-}
-
-/*
- * FireAfterTriggerBatchCallbacks
- *		Invoke and clear all registered batch callbacks.
- *
- * Only fires at the outermost query level (query_depth == 0) or from
- * top-level operations (query_depth == -1, e.g. AfterTriggerFireDeferred
- * at COMMIT).  Nested queries from SPI inside AFTER triggers run at
- * depth > 0 and must not tear down resources the outer batch still needs.
- */
-static void
-FireAfterTriggerBatchCallbacks(void)
-{
-	ListCell   *lc;
-
-	if (afterTriggers.query_depth > 0)
-		return;
-
-	Assert(afterTriggerFiringDepth > 0);
-	foreach(lc, afterTriggers.batch_callbacks)
-	{
-		AfterTriggerCallbackItem *item = lfirst(lc);
-
-		item->callback(item->arg);
-	}
-
-	list_free_deep(afterTriggers.batch_callbacks);
-	afterTriggers.batch_callbacks = NIL;
-}
-
-/*
- * AfterTriggerIsActive
- *		Returns true if we're inside the after-trigger framework where
- *		registered batch callbacks will actually be invoked.
- *
- * This is false during validateForeignKeyConstraint(), which calls
- * RI trigger functions directly outside the after-trigger framework.
- */
-bool
-AfterTriggerIsActive(void)
-{
-	return afterTriggerFiringDepth > 0;
 }

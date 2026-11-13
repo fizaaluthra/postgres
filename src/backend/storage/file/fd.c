@@ -563,7 +563,7 @@ retry:
 		{
 			int			elevel;
 
-			if (rc == EINTR)
+			if (errno == EINTR)
 				goto retry;
 
 			/*
@@ -686,6 +686,9 @@ retry:
 
 		if (rc != 0)
 		{
+			/* update errno for %m et al */
+			errno = rc;
+
 			/* don't error out, this is just a performance optimization */
 			ereport(WARNING,
 					(errcode_for_file_access(),
@@ -1643,7 +1646,7 @@ PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
  * with PG_TEMP_FILE_PREFIX, so that they can be identified as temporary and
  * deleted at startup by RemovePgTempFiles().  Further subdirectories below
  * that do not need any particular prefix.
-*/
+ */
 void
 PathNameCreateTemporaryDir(const char *basedir, const char *directory)
 {
@@ -2078,7 +2081,7 @@ FilePrefetch(File file, pgoff_t offset, pgoff_t amount, uint32 wait_event_info)
 
 		returnCode = FileAccess(file);
 		if (returnCode < 0)
-			return returnCode;
+			return errno;
 
 retry:
 		pgstat_report_wait_start(wait_event_info);
@@ -2102,7 +2105,7 @@ retry:
 
 		returnCode = FileAccess(file);
 		if (returnCode < 0)
-			return returnCode;
+			return errno;
 
 		ra.ra_offset = offset;
 		ra.ra_count = amount;
@@ -2748,11 +2751,11 @@ OpenPipeStream(const char *command, const char *mode)
 
 TryAgain:
 	fflush(NULL);
-	pqsignal(SIGPIPE, SIG_DFL);
+	pqsignal(SIGPIPE, PG_SIG_DFL);
 	errno = 0;
 	file = popen(command, mode);
 	save_errno = errno;
-	pqsignal(SIGPIPE, SIG_IGN);
+	pqsignal(SIGPIPE, PG_SIG_IGN);
 	errno = save_errno;
 	if (file != NULL)
 	{
