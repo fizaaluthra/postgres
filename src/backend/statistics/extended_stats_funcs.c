@@ -1675,7 +1675,7 @@ delete_pg_statistic_ext_data(Oid stxoid, bool inherited)
 
 	if (HeapTupleIsValid(oldtup))
 	{
-		CatalogTupleDelete(sed, &oldtup->t_self);
+		CatalogTupleDelete(sed, oldtup);
 		ReleaseSysCache(oldtup);
 		result = true;
 	}

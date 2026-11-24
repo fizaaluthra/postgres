@@ -77,6 +77,12 @@
 #include "utils/varlena.h"
 #include "utils/xml.h"
 
+/* YB includes */
+#include "catalog/pg_rewrite.h"
+#include "commands/yb_tablegroup.h"
+#include "pg_yb_utils.h"
+#include <inttypes.h>
+
 /* ----------
  * Pretty formatting constants
  * ----------
@@ -93,6 +99,8 @@
 #define PRETTYFLAG_PAREN		0x0001
 #define PRETTYFLAG_INDENT		0x0002
 #define PRETTYFLAG_SCHEMA		0x0004
+#define YB_PRETTYFLAG_ARRAY				0x0008
+#define YB_PRETTYFLAG_MASK_CONSTANTS	0x0010
 
 /* Standard conversion of a "bool pretty" option to detailed flags */
 #define GET_PRETTY_FLAGS(pretty) \
@@ -106,7 +114,12 @@
 #define PRETTY_PAREN(context)	((context)->prettyFlags & PRETTYFLAG_PAREN)
 #define PRETTY_INDENT(context)	((context)->prettyFlags & PRETTYFLAG_INDENT)
 #define PRETTY_SCHEMA(context)	((context)->prettyFlags & PRETTYFLAG_SCHEMA)
+#define YB_PRETTY_ARRAY(context) ((context)->prettyFlags & \
+									YB_PRETTYFLAG_ARRAY)
+#define YB_MASK_CONSTANTS(context) ((context)->prettyFlags & \
+									YB_PRETTYFLAG_MASK_CONSTANTS)
 
+#define YB_TRUNC_ARRAY_LIMIT 3
 
 /* ----------
  * Local data types
@@ -365,7 +378,10 @@ static char *pg_get_indexdef_worker(Oid indexrelid, int colno,
 									const Oid *excludeOps,
 									bool attrsOnly, bool keysOnly,
 									bool showTblSpc, bool inherits,
-									int prettyFlags, bool missing_ok);
+									int prettyFlags, bool missing_ok,
+									bool useNonconcurrently,
+									bool includeYbMetadata,
+									bool is_yb_alter_table);
 static void make_propgraphdef_elements(StringInfo buf, Oid pgrelid, char pgekind);
 static void make_propgraphdef_labels(StringInfo buf, Oid elid, const char *elalias, Oid elrelid);
 static void make_propgraphdef_properties(StringInfo buf, Oid ellabelid, Oid elrelid);
@@ -374,7 +390,8 @@ static char *pg_get_statisticsobj_worker(Oid statextid, bool columns_only,
 static char *pg_get_partkeydef_worker(Oid relid, int prettyFlags,
 									  bool attrsOnly, bool missing_ok);
 static char *pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
-										 int prettyFlags, bool missing_ok);
+										 int prettyFlags, bool missing_ok,
+										 bool is_yb_alter_table);
 static text *pg_get_expr_worker(text *expr, Oid relid, int prettyFlags);
 static int	print_function_arguments(StringInfo buf, HeapTuple proctup,
 									 bool print_table_args, bool print_defaults);
@@ -460,7 +477,8 @@ static void get_special_variable(Node *node, deparse_context *context,
 static void resolve_special_varno(Node *node, deparse_context *context,
 								  rsv_callback callback, void *callback_arg);
 static Node *find_param_referent(Param *param, deparse_context *context,
-								 deparse_namespace **dpns_p, ListCell **ancestor_cell_p);
+								 deparse_namespace **dpns_p, ListCell **ancestor_cell_p,
+								 bool *yb_bnl_filler_p);
 static SubPlan *find_param_generator(Param *param, deparse_context *context,
 									 int *column_p);
 static SubPlan *find_param_generator_initplan(Param *param, Plan *plan,
@@ -557,6 +575,16 @@ static void get_json_table_nested_columns(TableFunc *tf, JsonTablePlan *plan,
 										  deparse_context *context,
 										  bool showimplicit,
 										  bool needcomma);
+
+/* YB functions */
+static char *yb_flatten_reloptions_filtered(Oid relid, const char *skip_option);
+static char *yb_extract_reloption_value(Oid relid, const char *option_name);
+static void get_batched_expr(YbBatchedExpr *var,
+							 deparse_context *context,
+							 bool showimplicit);
+static int	yb_decompile_pk_column_index_array(Datum column_index_array,
+											   Oid relId, Oid indexId,
+											   StringInfo buf);
 
 #define only_marker(rte)  ((rte)->inh ? "" : "ONLY ")
 
@@ -1173,6 +1201,45 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 	return buf.data;
 }
 
+/*
+ * If an index has options, append " WITH (options)" clause to the buffer.
+ * This includes "hidden" reloptions like colocation_id.
+ */
+static void
+YbAppendIndexReloptions(StringInfo buf,
+						Oid index_oid,
+						YbcTableProperties yb_table_properties)
+{
+	/*
+	 * Use filtered version to skip yb_presplit from the WITH clause.
+	 * yb_presplit is handled separately via ALTER INDEX SET.
+	 */
+	char	   *str = yb_flatten_reloptions_filtered(index_oid, "yb_presplit");
+
+	bool		has_reloptions = str && strcmp(str, "") != 0;
+	bool		has_colocation_id = (yb_table_properties &&
+									 OidIsValid(yb_table_properties->colocation_id));
+
+	if (has_reloptions || has_colocation_id)
+	{
+		appendStringInfo(buf, " WITH (");
+
+		if (has_reloptions)
+		{
+			appendStringInfo(buf, "%s", str);
+			pfree(str);
+		}
+
+		if (has_reloptions && has_colocation_id)
+			appendStringInfo(buf, ", ");
+
+		if (has_colocation_id)
+			appendStringInfo(buf, "colocation_id=%u", yb_table_properties->colocation_id);
+
+		appendStringInfo(buf, ")");
+	}
+}
+
 /* ----------
  * pg_get_indexdef			- Get the definition of an index
  *
@@ -1197,7 +1264,9 @@ pg_get_indexdef(PG_FUNCTION_ARGS)
 	res = pg_get_indexdef_worker(indexrelid, 0, NULL,
 								 false, false,
 								 false, false,
-								 prettyFlags, true);
+								 prettyFlags, true,
+								 false, yb_format_funcs_include_yb_metadata,
+								 false /* is_yb_alter_table */ );
 
 	if (res == NULL)
 		PG_RETURN_NULL();
@@ -1219,7 +1288,9 @@ pg_get_indexdef_ext(PG_FUNCTION_ARGS)
 	res = pg_get_indexdef_worker(indexrelid, colno, NULL,
 								 colno != 0, false,
 								 false, false,
-								 prettyFlags, true);
+								 prettyFlags, true,
+								 false, yb_format_funcs_include_yb_metadata,
+								 false /* is_yb_alter_table */ );
 
 	if (res == NULL)
 		PG_RETURN_NULL();
@@ -1230,6 +1301,9 @@ pg_get_indexdef_ext(PG_FUNCTION_ARGS)
 /*
  * Internal version for use by ALTER TABLE.
  * Includes a tablespace clause in the result.
+ * YB: TODO: We also currently add NONCONCURRENTLY here, but this can be
+ * removed with #6703.
+ *
  * Returns a palloc'd C string; no pretty-printing.
  */
 char *
@@ -1238,7 +1312,10 @@ pg_get_indexdef_string(Oid indexrelid)
 	return pg_get_indexdef_worker(indexrelid, 0, NULL,
 								  false, false,
 								  true, true,
-								  0, false);
+								  0, false,
+								  IsYugaByteEnabled() /* useNonconcurrently */ ,
+								  yb_format_funcs_include_yb_metadata,
+								  IsYugaByteEnabled() /* is_yb_alter_table */ );
 }
 
 /* Internal version that just reports the key-column definitions */
@@ -1252,7 +1329,8 @@ pg_get_indexdef_columns(Oid indexrelid, bool pretty)
 	return pg_get_indexdef_worker(indexrelid, 0, NULL,
 								  true, true,
 								  false, false,
-								  prettyFlags, false);
+								  prettyFlags, false,
+								  false, false, false /* is_yb_alter_table */ );
 }
 
 /* Internal version, extensible with flags to control its behavior */
@@ -1268,7 +1346,10 @@ pg_get_indexdef_columns_extended(Oid indexrelid, uint16 flags)
 	return pg_get_indexdef_worker(indexrelid, 0, NULL,
 								  true, keys_only,
 								  false, false,
-								  prettyFlags, false);
+								  prettyFlags, false,
+								  false,	/* useNonconcurrently */
+								  false,	/* includeYbMetadata */
+								  false);	/* is_yb_alter_table */
 }
 
 /*
@@ -1276,13 +1357,18 @@ pg_get_indexdef_columns_extended(Oid indexrelid, uint16 flags)
  *
  * This is now used for exclusion constraints as well: if excludeOps is not
  * NULL then it points to an array of exclusion operator OIDs.
+ *
+ * YB: TODO: can remove useNonconcurrently when we support #6703.
  */
 static char *
 pg_get_indexdef_worker(Oid indexrelid, int colno,
 					   const Oid *excludeOps,
 					   bool attrsOnly, bool keysOnly,
 					   bool showTblSpc, bool inherits,
-					   int prettyFlags, bool missing_ok)
+					   int prettyFlags, bool missing_ok,
+					   bool useNonconcurrently,
+					   bool includeYbMetadata,
+					   bool is_yb_alter_table)
 {
 	/* might want a separate isConstraint parameter later */
 	bool		isConstraint = (excludeOps != NULL);
@@ -1388,8 +1474,10 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 	if (!attrsOnly)
 	{
 		if (!isConstraint)
-			appendStringInfo(&buf, "CREATE %sINDEX %s ON %s%s USING %s (",
+			/* YB: pass NONCONCURRENTLY if needed */
+			appendStringInfo(&buf, "CREATE %sINDEX %s%s ON %s%s USING %s (",
 							 idxrec->indisunique ? "UNIQUE " : "",
+							 useNonconcurrently || includeYbMetadata ? "NONCONCURRENTLY " : "",
 							 quote_identifier(NameStr(idxrelrec->relname)),
 							 idxrelrec->relkind == RELKIND_PARTITIONED_INDEX
 							 && !inherits ? "ONLY " : "",
@@ -1402,6 +1490,13 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 							 quote_identifier(NameStr(amrec->amname)));
 	}
 
+	/* YB: Count hash columns */
+	int			hash_count = 0;
+
+	for (keyno = 0; keyno < idxrec->indnkeyatts; keyno++)
+		if (indoption->values[keyno] & INDOPTION_HASH)
+			hash_count++;
+
 	/*
 	 * Report the indexed attributes
 	 */
@@ -1411,6 +1506,11 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		AttrNumber	attnum = idxrec->indkey.values[keyno];
 		Oid			keycoltype;
 		Oid			keycolcollation;
+		bool		yb_close_hashcol_list = false;
+
+		/* YB: Put hash column group in a parenthesis */
+		if (!attrsOnly && keyno == 0 && !colno && hash_count > 1)
+			appendStringInfoString(&buf, "(");
 
 		/*
 		 * Ignore non-key attributes if told to.
@@ -1502,13 +1602,26 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 					if (!(opt & INDOPTION_NULLS_FIRST))
 						appendStringInfoString(&buf, " NULLS LAST");
 				}
-				else
+				else if (!(opt & INDOPTION_HASH))	/* YB: ASC */
 				{
+					appendStringInfoString(&buf, " ASC");
+					/* NULLS LAST is the default in this case */
 					if (opt & INDOPTION_NULLS_FIRST)
 						appendStringInfoString(&buf, " NULLS FIRST");
 				}
+
+				/* YB: Report hash column with optional closing parenthesis */
+				if (opt & INDOPTION_HASH)
+				{
+					if (colno == keyno + 1 || hash_count == 1)
+						appendStringInfoString(&buf, " HASH");
+					else if (keyno == hash_count - 1)
+						yb_close_hashcol_list = true;
+				}
 			}
 
+			/* YB: we currently don't support exclusion operators */
+			Assert(IsYugaByteEnabled() && !excludeOps);
 			/* Add the exclusion operator if relevant */
 			if (excludeOps != NULL)
 				appendStringInfo(&buf, " WITH %s",
@@ -1516,23 +1629,67 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 														keycoltype,
 														keycoltype));
 		}
+
+		/*
+		 * YB: During a YSQL major upgrade, we want to recreate an index with
+		 * the correct original column names, even if the table
+		 * columns were renamed after the index's creation.
+		 * Therefore, when yb_major_version_upgrade_compatibility is set and
+		 * includeYbMetadata is true, for non-expression columns (attnum != 0)
+		 * we compare the index column name with the current table column name
+		 * If they differ, we emit the original index column name as an alias
+		 * (using "AS <name>") to preserve it in the recreated index definition.
+		 */
+		if (yb_major_version_upgrade_compatibility != 0 && includeYbMetadata
+			&& attnum != 0)
+		{
+			char	   *index_attname;
+			char	   *rel_attname;
+
+			index_attname = get_attname(indexrelid, keyno + 1, false);
+			rel_attname = get_attname(indrelid, attnum, false);
+			if (strcmp(index_attname, rel_attname) != 0)
+				/*
+				 * If the index column name differs from the table column name
+				 * emit the original index column name as an alias so that we
+				 * preserve it.
+				 */
+				appendStringInfo(&buf, " AS %s", quote_identifier(index_attname));
+		}
+
+		if (yb_close_hashcol_list)
+		{
+			appendStringInfoString(&buf, ") HASH");
+			yb_close_hashcol_list = false;
+		}
 	}
 
 	if (!attrsOnly)
 	{
+		Relation	indexrel = index_open(indexrelid, AccessShareLock);
+
 		appendStringInfoChar(&buf, ')');
 
 		if (idxrec->indnullsnotdistinct)
 			appendStringInfoString(&buf, " NULLS NOT DISTINCT");
 
-		/*
-		 * If it has options, append "WITH (options)"
-		 */
-		str = flatten_reloptions(indexrelid);
-		if (str)
+		if (includeYbMetadata && IsYBRelation(indexrel) &&
+			!idxrec->indisprimary)
 		{
-			appendStringInfo(&buf, " WITH (%s)", str);
-			pfree(str);
+			YbAppendIndexReloptions(&buf, indexrelid, YbGetTableProperties(indexrel));
+		}
+
+		if (!IsYBRelation(indexrel))
+		{
+			/*
+			 * If it has options, append "WITH (options)"
+			 */
+			str = flatten_reloptions(indexrelid);
+			if (str)
+			{
+				appendStringInfo(&buf, " WITH (%s)", str);
+				pfree(str);
+			}
 		}
 
 		/*
@@ -1540,15 +1697,55 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		 */
 		if (showTblSpc)
 		{
-			Oid			tblspc;
-
-			tblspc = get_rel_tablespace(indexrelid);
-			if (OidIsValid(tblspc))
+			if (IsYBRelation(indexrel) && is_yb_alter_table)
 			{
-				if (isConstraint)
-					appendStringInfoString(&buf, " USING INDEX");
-				appendStringInfo(&buf, " TABLESPACE %s",
-								 quote_identifier(get_tablespace_name(tblspc)));
+				YbGetTableProperties(indexrel);
+				/*
+				 * If this is a YB index that is colocated and being
+				 * re-created as part of an alter table operation, do not
+				 * include the tablespace clause, as it is not permitted.
+				 */
+				if (!indexrel->yb_table_properties->is_colocated)
+				{
+					Oid			tblspc;
+
+					tblspc = indexrel->rd_rel->reltablespace;
+					if (OidIsValid(tblspc))
+					{
+						if (isConstraint)
+							appendStringInfoString(&buf, " USING INDEX");
+						appendStringInfo(&buf, " TABLESPACE %s",
+										 quote_identifier(get_tablespace_name(tblspc)));
+					}
+				}
+			}
+		}
+
+		/*
+		 * YB: Emit split clause based on the current configuration.
+		 * - Hash indexes: SPLIT INTO N TABLETS (current tablet count).
+		 * - Range indexes: SPLIT AT VALUES (...) from yb_presplit, since
+		 *   SPLIT INTO N TABLETS is not valid for range-partitioned indexes.
+		 */
+		if (includeYbMetadata && indexrel->yb_table_properties &&
+			indexrel->yb_table_properties->num_tablets > 1)
+		{
+			if (indexrel->yb_table_properties->num_hash_key_columns > 0)
+			{
+				appendStringInfo(&buf, " SPLIT INTO %" PRIu64 " TABLETS",
+								 indexrel->yb_table_properties->num_tablets);
+			}
+			else if (!amroutine->yb_amiscopartitioned)
+			{
+				/* Skip range SPLIT for copartitioned AMs (e.g. ybhnsw); not valid on vector index. */
+				char	   *presplit = yb_extract_reloption_value(indexrelid,
+																  "yb_presplit");
+
+				if (presplit && presplit[0] == '(')
+				{
+					appendStringInfo(&buf, " SPLIT AT VALUES %s", presplit);
+					pfree(presplit);
+				}
 			}
 		}
 
@@ -1576,6 +1773,8 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 			else
 				appendStringInfo(&buf, " WHERE %s", str);
 		}
+
+		index_close(indexrel, AccessShareLock);
 	}
 
 	/* Clean up */
@@ -2491,7 +2690,8 @@ pg_get_partconstrdef_string(Oid partitionId, char *aliasname)
 	constr_expr = get_partition_qual_relid(partitionId);
 	context = deparse_context_for(aliasname, partitionId);
 
-	return deparse_expression((Node *) constr_expr, context, true, false);
+	return deparse_expression((Node *) constr_expr, context, true, false,
+							  false, false); /* yb_pretty, yb_maskconstants */
 }
 
 /*
@@ -2509,7 +2709,8 @@ pg_get_constraintdef(PG_FUNCTION_ARGS)
 
 	prettyFlags = PRETTYFLAG_INDENT;
 
-	res = pg_get_constraintdef_worker(constraintId, false, prettyFlags, true);
+	res = pg_get_constraintdef_worker(constraintId, false, prettyFlags, true,
+									  false /* is_yb_alter_table */ );
 
 	if (res == NULL)
 		PG_RETURN_NULL();
@@ -2527,7 +2728,8 @@ pg_get_constraintdef_ext(PG_FUNCTION_ARGS)
 
 	prettyFlags = GET_PRETTY_FLAGS(pretty);
 
-	res = pg_get_constraintdef_worker(constraintId, false, prettyFlags, true);
+	res = pg_get_constraintdef_worker(constraintId, false, prettyFlags, true,
+									  false /* is_yb_alter_table */ );
 
 	if (res == NULL)
 		PG_RETURN_NULL();
@@ -2541,7 +2743,8 @@ pg_get_constraintdef_ext(PG_FUNCTION_ARGS)
 char *
 pg_get_constraintdef_command(Oid constraintId)
 {
-	return pg_get_constraintdef_worker(constraintId, true, 0, false);
+	return pg_get_constraintdef_worker(constraintId, true, 0, false,
+									   IsYugaByteEnabled() /* is_yb_alter_table */ );
 }
 
 /*
@@ -2549,7 +2752,8 @@ pg_get_constraintdef_command(Oid constraintId)
  */
 static char *
 pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
-							int prettyFlags, bool missing_ok)
+							int prettyFlags, bool missing_ok,
+							bool is_yb_alter_table)
 {
 	HeapTuple	tup;
 	Form_pg_constraint conForm;
@@ -2752,7 +2956,8 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				else
 					appendStringInfoString(&buf, "UNIQUE ");
 
-				indexId = conForm->conindid;
+				indexId = (!is_yb_alter_table ? conForm->conindid :
+						   get_constraint_index(constraintId));
 
 				indtup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexId));
 				if (!HeapTupleIsValid(indtup))
@@ -2767,7 +2972,20 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				val = SysCacheGetAttrNotNull(CONSTROID, tup,
 											 Anum_pg_constraint_conkey);
 
-				keyatts = decompile_column_index_array(val, conForm->conrelid, false, &buf);
+				/*
+				 * YB note: If we are retrieving the primary key definition
+				 * for a YB relation to recreate it as a part of an alter table
+				 * operation, make sure to specify "HASH"/"ASC"/"DESC" options
+				 * for the columns.
+				 */
+				if (is_yb_alter_table && IsYBRelationById(indexId)
+					&& conForm->contype == CONSTRAINT_PRIMARY)
+					keyatts = yb_decompile_pk_column_index_array(val,
+																 conForm->conrelid,
+																 indexId,
+																 &buf);
+				else
+					keyatts = decompile_column_index_array(val, conForm->conrelid, false, &buf);
 				if (conForm->conperiod)
 					appendStringInfoString(&buf, " WITHOUT OVERLAPS");
 
@@ -2809,25 +3027,39 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				/* XXX why do we only print these bits if fullCommand? */
 				if (fullCommand && OidIsValid(indexId))
 				{
-					char	   *options = flatten_reloptions(indexId);
+					Relation	indexrel = index_open(indexId, AccessShareLock);
 					Oid			tblspc;
 
-					if (options)
-					{
-						appendStringInfo(&buf, " WITH (%s)", options);
-						pfree(options);
-					}
+					/*
+					 * YB: When this function is called internally as a part of
+					 * an alter table rewrite, we don't need to emit the
+					 * colocation id, as we want a new one to be assigned.
+					 */
+					if (IsYBRelation(indexrel) && conForm->contype != CONSTRAINT_PRIMARY
+						&& !is_yb_alter_table)
+						YbAppendIndexReloptions(&buf, indexId, YbGetTableProperties(indexrel));
 
 					/*
-					 * Print the tablespace, unless it's the database default.
-					 * This is to help ALTER TABLE usage of this facility,
-					 * which needs this behavior to recreate exact catalog
-					 * state.
+					 * If this is a YB primary key that is being re-created as
+					 * part of an alter table operation, do not add the
+					 * TABLESPACE clause, as it is not permitted.
 					 */
-					tblspc = get_rel_tablespace(indexId);
-					if (OidIsValid(tblspc))
-						appendStringInfo(&buf, " USING INDEX TABLESPACE %s",
-										 quote_identifier(get_tablespace_name(tblspc)));
+					if (!(is_yb_alter_table && IsYBRelation(indexrel) &&
+						  conForm->contype == CONSTRAINT_PRIMARY))
+					{
+						/*
+						 * Print the tablespace, unless it's the database default.
+						 * This is to help ALTER TABLE usage of this facility,
+						 * which needs this behavior to recreate exact catalog
+						 * state.
+						 */
+						tblspc = indexrel->rd_rel->reltablespace;
+						if (OidIsValid(tblspc))
+							appendStringInfo(&buf, " USING INDEX TABLESPACE %s",
+											 quote_identifier(get_tablespace_name(tblspc)));
+					}
+
+					index_close(indexrel, AccessShareLock);
 				}
 
 				break;
@@ -2943,7 +3175,10 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 															  false,
 															  false,
 															  prettyFlags,
-															  false));
+															  false,
+															  false,
+															  false,
+															  false /* is_yb_alter_table */ ));
 				break;
 			}
 		default:
@@ -3787,8 +4022,9 @@ print_function_arguments(StringInfo buf, HeapTuple proctup,
 			expr = (Node *) lfirst(nextargdefault);
 			nextargdefault = lnext(argdefaults, nextargdefault);
 
-			appendStringInfo(buf, " DEFAULT %s",
-							 deparse_expression(expr, NIL, false, false));
+		appendStringInfo(buf, " DEFAULT %s",
+						 deparse_expression(expr, NIL, false, false,
+											false, false)); /* yb_pretty, yb_maskconstants */
 		}
 		argsprinted++;
 
@@ -3907,7 +4143,8 @@ pg_get_function_arg_default(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 	node = list_nth(argdefaults, nth_default);
-	str = deparse_expression(node, NIL, false, false);
+	str = deparse_expression(node, NIL, false, false,
+							 false, false); /* yb_pretty, yb_maskconstants */
 
 	ReleaseSysCache(proctup);
 
@@ -4005,10 +4242,21 @@ pg_get_function_sqlbody(PG_FUNCTION_ARGS)
  */
 char *
 deparse_expression(Node *expr, List *dpcontext,
-				   bool forceprefix, bool showimplicit)
+				   bool forceprefix, bool showimplicit,
+				   bool yb_pretty, bool yb_maskconstants)
 {
+	int			yb_extra_flags = 0;
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_pretty)
+			yb_extra_flags |= YB_PRETTYFLAG_ARRAY;
+		if (yb_maskconstants)
+			yb_extra_flags |= YB_PRETTYFLAG_MASK_CONSTANTS;
+	}
+
 	return deparse_expression_pretty(expr, dpcontext, forceprefix,
-									 showimplicit, 0, 0);
+									 showimplicit, yb_extra_flags, 0);
 }
 
 /* ----------
@@ -4325,6 +4573,13 @@ set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 		{
 			/* Otherwise use whatever the parser assigned */
 			refname = rte->eref->aliasname;
+		}
+
+		/* YB: Check for a hint alias and that the RTE is not unreferenced. */
+		if (IsYugaByteEnabled() && rte->ybHintAlias != NULL && (!rels_used || bms_is_member(rtindex, rels_used)))
+		{
+			/* Use the hint alias from the RTE. */
+			refname = rte->ybHintAlias;
 		}
 
 		/*
@@ -5578,6 +5833,10 @@ set_deparse_plan(deparse_namespace *dpns, Plan *plan)
 	/* Set up referent for INDEX_VAR Vars, if needed */
 	if (IsA(plan, IndexOnlyScan))
 		dpns->index_tlist = ((IndexOnlyScan *) plan)->indextlist;
+	else if (IsA(plan, IndexScan))	/* YB */
+		dpns->index_tlist = ((IndexScan *) plan)->indextlist;
+	else if (IsA(plan, YbBitmapIndexScan))	/* YB */
+		dpns->index_tlist = ((YbBitmapIndexScan *) plan)->indextlist;
 	else if (IsA(plan, ForeignScan))
 		dpns->index_tlist = ((ForeignScan *) plan)->fdw_scan_tlist;
 	else if (IsA(plan, CustomScan))
@@ -8433,6 +8692,16 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 	return attname;
 }
 
+static void
+get_batched_expr(YbBatchedExpr *bexpr,
+				 deparse_context *context,
+				 bool showimplicit)
+{
+	appendStringInfo(context->buf, "BATCHED EXPR(");
+	(void) get_rule_expr((Node *) bexpr->orig_expr, context, showimplicit);
+	appendStringInfo(context->buf, ")");
+}
+
 /*
  * Deparse a Var which references OUTER_VAR, INNER_VAR, or INDEX_VAR.  This
  * routine is actually a callback for resolve_special_varno, which handles
@@ -8603,7 +8872,8 @@ get_name_for_var_field(Var *var, int fieldno,
 		Param	   *param = (Param *) var;
 		ListCell   *ancestor_cell;
 
-		expr = find_param_referent(param, context, &dpns, &ancestor_cell);
+		expr = find_param_referent(param, context, &dpns, &ancestor_cell,
+								   NULL /* yb_bnl_filler_p */ );
 		if (expr)
 		{
 			/* Found a match, so recurse to decipher the field name */
@@ -9007,14 +9277,22 @@ get_name_for_var_field(Var *var, int fieldno,
  * If successful, return the expression and set *dpns_p and *ancestor_cell_p
  * appropriately for calling push_ancestor_plan().  If no referent can be
  * found, return NULL.
+ *
+ * YB: if yb_bnl_filler_p is non-NULL, set *yb_bnl_filler_p when paramid falls
+ * in a reserved BNL batch span (paramno, paramno+yb_batch_size) of an ancestor
+ * NestLoopParam. Only the first slot has a NestLoopParam referent.
  */
 static Node *
 find_param_referent(Param *param, deparse_context *context,
-					deparse_namespace **dpns_p, ListCell **ancestor_cell_p)
+					deparse_namespace **dpns_p, ListCell **ancestor_cell_p,
+					bool *yb_bnl_filler_p)
 {
 	/* Initialize output parameters to prevent compiler warnings */
 	*dpns_p = NULL;
 	*ancestor_cell_p = NULL;
+
+	if (yb_bnl_filler_p)
+		*yb_bnl_filler_p = false;
 
 	/*
 	 * If it's a PARAM_EXEC parameter, look for a matching NestLoopParam or
@@ -9038,7 +9316,7 @@ find_param_referent(Param *param, deparse_context *context,
 			/*
 			 * NestLoops transmit params to their inner child only.
 			 */
-			if (IsA(ancestor, NestLoop) &&
+			if ((IsA(ancestor, NestLoop) || IsA(ancestor, YbBatchedNestLoop)) &&
 				child_plan == innerPlan(ancestor))
 			{
 				NestLoop   *nl = (NestLoop *) ancestor;
@@ -9054,6 +9332,18 @@ find_param_referent(Param *param, deparse_context *context,
 						*ancestor_cell_p = lc;
 						return (Node *) nlp->paramval;
 					}
+
+					/*
+					 * YB: BNL reserves yb_batch_size consecutive PARAM_EXEC
+					 * slots per nestParam; only the first slot has a
+					 * NestLoopParam referent. Report ids in the reserved span
+					 * so the caller can tell batch fillers from orphaned
+					 * params.
+					 */
+					if (yb_bnl_filler_p &&
+						param->paramid > nlp->paramno &&
+						param->paramid < nlp->paramno + nlp->yb_batch_size)
+						*yb_bnl_filler_p = true;
 				}
 			}
 
@@ -9248,13 +9538,14 @@ get_parameter(Param *param, deparse_context *context)
 	ListCell   *ancestor_cell;
 	SubPlan    *subplan;
 	int			column;
+	bool		yb_bnl_filler;
 
 	/*
 	 * If it's a PARAM_EXEC parameter, try to locate the expression from which
 	 * the parameter was computed.  This stanza handles only cases in which
 	 * the Param represents an input to the subplan we are currently in.
 	 */
-	expr = find_param_referent(param, context, &dpns, &ancestor_cell);
+	expr = find_param_referent(param, context, &dpns, &ancestor_cell, &yb_bnl_filler);
 	if (expr)
 	{
 		/* Found a match, so print it */
@@ -9373,8 +9664,12 @@ get_parameter(Param *param, deparse_context *context)
 	 *
 	 * It's a bug if we get here for anything except PARAM_EXTERN Params, but
 	 * in production builds printing $N seems more useful than failing.
+	 *
+	 * YB: BNL batch fillers are PARAM_EXEC slots with no NestLoopParam
+	 * referent (except the first one). EXPLAIN intentionally prints placeholder
+	 * values as $N when describing these slots (e.g. ARRAY[r.a, $1, $2, ... $1023]).
 	 */
-	Assert(param->paramkind == PARAM_EXTERN);
+	Assert(param->paramkind == PARAM_EXTERN || yb_bnl_filler);
 
 	appendStringInfo(context->buf, "$%d", param->paramid);
 }
@@ -9465,6 +9760,11 @@ isSimpleNode(Node *node, Node *parentNode, int prettyFlags)
 			 * treat like FieldSelect (probably doesn't matter)
 			 */
 			return !IsA(parentNode, FieldStore);
+
+		case T_YbBatchedExpr:
+			return isSimpleNode((Node *) ((YbBatchedExpr *) node)->orig_expr,
+								parentNode,
+								prettyFlags);
 
 		case T_CoerceToDomain:
 			/* maybe simple, check args */
@@ -9869,6 +10169,10 @@ get_rule_expr(Node *node, deparse_context *context,
 			appendStringInfoString(buf, "MERGE_ACTION()");
 			break;
 
+		case T_YbBatchedExpr:
+			get_batched_expr((YbBatchedExpr *) node, context, showimplicit);
+			break;
+
 		case T_SubscriptingRef:
 			{
 				SubscriptingRef *sbsref = (SubscriptingRef *) node;
@@ -10227,11 +10531,41 @@ get_rule_expr(Node *node, deparse_context *context,
 					appendStringInfoChar(buf, ')');
 
 				/*
-				 * Get and print the field name.
+				 * YB: Skip deparsing fieldname for YB BNL batched
+				 * index condition expression.
+				 * Take this index condition as one example:
+				 * Index Cond: (a = ANY (ARRAY[func.b, $1, $2, ..., $1023])
+				 * We only want to resolve the field name b for the first
+				 * batched expression and skip resolving the fieldname for
+				 * all other batched expressions ($1, $2, ...). The dollar sign
+				 * indicates we cannot find what an execution parameter refers
+				 * to. See get_parameter() in ruleutils.c.
 				 */
-				fieldname = get_name_for_var_field((Var *) arg, fno,
-												   0, context);
-				appendStringInfo(buf, ".%s", quote_identifier(fieldname));
+				bool		yb_skip_deparsing_fieldname_for_param = false;
+
+				if (IsA(arg, Param))
+				{
+					Node	   *expr;
+					deparse_namespace *dpns;
+					ListCell   *ancestor_cell;
+
+					expr = find_param_referent((Param *) arg, context, &dpns,
+											   &ancestor_cell,
+											   NULL /* yb_bnl_filler_p */ );
+					if (!expr && ((Param *) arg)->paramkind == PARAM_EXEC)
+					{
+						yb_skip_deparsing_fieldname_for_param = true;
+					}
+				}
+				if (!yb_skip_deparsing_fieldname_for_param)
+				{
+					/*
+					 * Get and print the field name.
+					 */
+					fieldname = get_name_for_var_field((Var *) arg, fno,
+													   0, context);
+					appendStringInfo(buf, ".%s", quote_identifier(fieldname));
+				}
 			}
 			break;
 
@@ -10446,7 +10780,10 @@ get_rule_expr(Node *node, deparse_context *context,
 				ArrayExpr  *arrayexpr = (ArrayExpr *) node;
 
 				appendStringInfoString(buf, "ARRAY[");
+				int			before_prettyflags = context->prettyFlags;
+
 				get_rule_expr((Node *) arrayexpr->elements, context, true);
+				context->prettyFlags = before_prettyflags;
 				appendStringInfoChar(buf, ']');
 
 				/*
@@ -10542,11 +10879,32 @@ get_rule_expr(Node *node, deparse_context *context,
 				 * since the construct was parsed, but there seems no way to
 				 * be perfect.
 				 */
-				appendStringInfo(buf, ") %s ROW(",
+				Oid			rhs_type;
+
+				if (IsA(rcexpr->rargs, List))
+					rhs_type = exprType(linitial(castNode(List, rcexpr->rargs)));
+				else
+				{
+					List	   *elems = castNode(ArrayExpr, rcexpr->rargs)->elements;
+					RowExpr    *row = (RowExpr *) linitial(elems);
+
+					rhs_type = exprType(linitial(row->args));
+				}
+
+				appendStringInfo(buf, ") %s ",
 								 generate_operator_name(linitial_oid(rcexpr->opnos),
 														exprType(linitial(rcexpr->largs)),
-														exprType(linitial(rcexpr->rargs))));
-				get_rule_list_toplevel(rcexpr->rargs, context, true);
+														rhs_type));
+				if (IsA(rcexpr->rargs, List))
+				{
+					appendStringInfo(buf, "ROW(");
+					get_rule_list_toplevel(castNode(List, rcexpr->rargs), context, true);
+				}
+				else
+				{
+					appendStringInfo(buf, "ANY (");
+					get_rule_expr(rcexpr->rargs, context, true);
+				}
 				appendStringInfoString(buf, "))");
 			}
 			break;
@@ -11181,11 +11539,33 @@ get_rule_expr(Node *node, deparse_context *context,
 				ListCell   *l;
 
 				sep = "";
+				int			limit = -1;
+				int			cur_index = 0;
+
+				if (IsYugaByteEnabled() &&
+					YB_PRETTY_ARRAY(context) &&
+					YB_TRUNC_ARRAY_LIMIT < ((List *) node)->length)
+				{
+					limit = YB_TRUNC_ARRAY_LIMIT;
+				}
 				foreach(l, (List *) node)
 				{
 					appendStringInfoString(buf, sep);
 					get_rule_expr((Node *) lfirst(l), context, showimplicit);
 					sep = ", ";
+					if (limit > 0 && ++cur_index == limit)
+					{
+						appendStringInfoString(buf, ", ..., ");
+						break;
+					}
+				}
+
+				if (IsYugaByteEnabled() &&
+					limit > 0)
+				{
+					Node	   *last_elem = (Node *) lfirst(list_tail((List *) node));
+
+					get_rule_expr(last_elem, context, showimplicit);
 				}
 			}
 			break;
@@ -12069,7 +12449,10 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 		 * Always label the type of a NULL constant to prevent misdecisions
 		 * about type when reparsing.
 		 */
-		appendStringInfoString(buf, "NULL");
+		if (!YB_MASK_CONSTANTS(context))
+			appendStringInfoString(buf, "NULL");
+		else
+			appendStringInfoChar(buf, '?');
 		if (showtype >= 0)
 		{
 			appendStringInfo(buf, "::%s",
@@ -12080,10 +12463,17 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 		return;
 	}
 
+	char *yb_extval_mask;
 	getTypeOutputInfo(constval->consttype,
 					  &typoutput, &typIsVarlena);
-
 	extval = OidOutputFunctionCall(typoutput, constval->constvalue);
+
+	if (YB_MASK_CONSTANTS(context))
+	{
+		yb_extval_mask = "?";
+	}
+	else
+		yb_extval_mask = NULL;
 
 	switch (constval->consttype)
 	{
@@ -12099,10 +12489,10 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 			 * seem that much prettier anyway.
 			 */
 			if (extval[0] != '-')
-				appendStringInfoString(buf, extval);
+				appendStringInfoString(buf, yb_extval_mask ? yb_extval_mask : extval);
 			else
 			{
-				appendStringInfo(buf, "'%s'", extval);
+				appendStringInfo(buf, "'%s'", yb_extval_mask ? yb_extval_mask : extval);
 				needlabel = true;	/* we must attach a cast */
 			}
 			break;
@@ -12117,24 +12507,24 @@ get_const_expr(Const *constval, deparse_context *context, int showtype)
 			if (isdigit((unsigned char) extval[0]) &&
 				strcspn(extval, "eE.") != strlen(extval))
 			{
-				appendStringInfoString(buf, extval);
+				appendStringInfoString(buf, yb_extval_mask ? yb_extval_mask : extval);
 			}
 			else
 			{
-				appendStringInfo(buf, "'%s'", extval);
+				appendStringInfo(buf, "'%s'", yb_extval_mask ? yb_extval_mask : extval);
 				needlabel = true;	/* we must attach a cast */
 			}
 			break;
 
 		case BOOLOID:
 			if (strcmp(extval, "t") == 0)
-				appendStringInfoString(buf, "true");
+				appendStringInfoString(buf, yb_extval_mask ? yb_extval_mask : "true");
 			else
-				appendStringInfoString(buf, "false");
+				appendStringInfoString(buf, yb_extval_mask ? yb_extval_mask : "false");
 			break;
 
 		default:
-			simple_quote_literal(buf, extval);
+			simple_quote_literal(buf, yb_extval_mask ? yb_extval_mask : extval);
 			break;
 	}
 
@@ -12470,7 +12860,8 @@ get_sublink_expr(SubLink *sublink, deparse_context *context)
 			get_rule_expr((Node *) rcexpr->largs, context, true);
 			opname = generate_operator_name(linitial_oid(rcexpr->opnos),
 											exprType(linitial(rcexpr->largs)),
-											exprType(linitial(rcexpr->rargs)));
+											exprType(linitial(castNode(List,
+																	   rcexpr->rargs))));
 			appendStringInfoChar(buf, ')');
 		}
 		else
@@ -14271,6 +14662,16 @@ get_reloptions(StringInfo buf, Datum reloptions)
 		else
 			value = "";
 
+		/*
+		 * YB: We ignore the reloption for tablegroup.
+		 * It is parsed seperately in describe.c.
+		 */
+		if (strcmp(name, "tablegroup") == 0)
+		{
+			pfree(option);
+			continue;
+		}
+
 		if (i > 0)
 			appendStringInfoString(buf, ", ");
 		appendStringInfo(buf, "%s=", quote_identifier(name));
@@ -14325,6 +14726,137 @@ flatten_reloptions(Oid relid)
 }
 
 /*
+ * Generate a C string representing a relation's reloptions, skipping
+ * the option named skip_option (if non-NULL), or NULL if no remaining
+ * options.
+ */
+static char *
+yb_flatten_reloptions_filtered(Oid relid, const char *skip_option)
+{
+	char	   *result = NULL;
+	HeapTuple	tuple;
+	Datum		reloptions;
+	bool		isnull;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	reloptions = SysCacheGetAttr(RELOID, tuple,
+								 Anum_pg_class_reloptions, &isnull);
+	if (!isnull)
+	{
+		Datum	   *options;
+		int			noptions;
+		int			i;
+		bool		first = true;
+		StringInfoData buf;
+
+		initStringInfo(&buf);
+
+		deconstruct_array(DatumGetArrayTypeP(reloptions),
+						  TEXTOID, -1, false, TYPALIGN_INT,
+						  &options, NULL, &noptions);
+
+		for (i = 0; i < noptions; i++)
+		{
+			char	   *option = TextDatumGetCString(options[i]);
+			char	   *name;
+			char	   *separator;
+			char	   *value;
+
+			name = option;
+			separator = strchr(option, '=');
+			if (separator)
+			{
+				*separator = '\0';
+				value = separator + 1;
+			}
+			else
+				value = "";
+
+			/* Skip tablegroup (handled separately) and the specified option */
+			if (strcmp(name, "tablegroup") == 0 ||
+				(skip_option && strcmp(name, skip_option) == 0))
+			{
+				pfree(option);
+				continue;
+			}
+
+			if (!first)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfo(&buf, "%s=", quote_identifier(name));
+
+			if (quote_identifier(value) == value)
+				appendStringInfoString(&buf, value);
+			else
+				simple_quote_literal(&buf, value);
+
+			first = false;
+			pfree(option);
+		}
+
+		result = buf.data;
+	}
+
+	ReleaseSysCache(tuple);
+
+	return result;
+}
+
+/*
+ * yb_extract_reloption_value
+ *		Extract the value of a specific reloption for a relation.
+ *		Returns a palloc'd string, or NULL if the option is not found.
+ */
+static char *
+yb_extract_reloption_value(Oid relid, const char *option_name)
+{
+	char	   *result = NULL;
+	HeapTuple	tuple;
+	Datum		reloptions;
+	bool		isnull;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	reloptions = SysCacheGetAttr(RELOID, tuple,
+								 Anum_pg_class_reloptions, &isnull);
+	if (!isnull)
+	{
+		Datum	   *options;
+		int			noptions;
+		int			i;
+
+		deconstruct_array(DatumGetArrayTypeP(reloptions),
+						  TEXTOID, -1, false, TYPALIGN_INT,
+						  &options, NULL, &noptions);
+
+		for (i = 0; i < noptions; i++)
+		{
+			char	   *option = TextDatumGetCString(options[i]);
+			char	   *separator = strchr(option, '=');
+
+			if (separator)
+			{
+				*separator = '\0';
+				if (strcmp(option, option_name) == 0)
+				{
+					result = pstrdup(separator + 1);
+					pfree(option);
+					break;
+				}
+			}
+			pfree(option);
+		}
+	}
+
+	ReleaseSysCache(tuple);
+	return result;
+}
+
+/*
  * get_range_partbound_string
  *		A C string representation of one range partition bound
  */
@@ -14363,4 +14895,170 @@ get_range_partbound_string(List *bound_datums)
 	appendStringInfoChar(&buf, ')');
 
 	return buf.data;
+}
+
+/*
+ * Used in YB to retrieve a relation's dependant views' oids and queries.
+ * We first retrieve the relations' dependent rules' oids using
+ * SELECT objid FROM pg_depend WHERE refclassid = 'pg_class'::regclass
+ * AND refobjid = 16384 AND classid = 'pg_rewrite'::regclass AND deptype = 'n'.
+ * For each of these rules, we retrieve the relation that the rule is defined
+ * for (ev_class) and the rule's underlying query (ev_action) by using
+ * SELECT ev_class, ev_action FROM pg_rewrite WHERE oid = pg_depend.objid.
+ * If the ev_class relation is a view/materialized view, we have found a
+ * dependent view, so we track its oid and underlying query.
+ * Note:
+ * 1. It is possible for a single view to have multiple pg_depend records that
+ * point to the base table. Therefore, we must check for duplicates. Example:
+ * CREATE TABLE test_table (id int PRIMARY KEY, v int);
+ * CREATE VIEW test_view AS SELECT v FROM test_table WHERE id = 1;
+ * 2. We need to check if the dependent rule's ev_class is a view because it
+ * could also be a different type of relation. Example:
+ * CREATE TABLE test_table (id int PRIMARY KEY);
+ * CREATE RULE test_rule AS ON INSERT TO test_table DO NOTHING;
+ */
+void
+yb_get_dependent_views(Oid relid, List **view_oids, List **view_queries)
+{
+	Relation	pg_depend,
+				pg_rewrite;
+	ScanKeyData key[4];
+	SysScanDesc pg_depend_scan,
+				pg_rewrite_scan;
+	HeapTuple	pg_depend_tuple,
+				pg_rewrite_tuple;
+
+	pg_depend = table_open(DependRelationId, RowExclusiveLock);
+	pg_rewrite = table_open(RewriteRelationId, RowExclusiveLock);
+
+	/* Only interested in objects that are dependent on the given relation. */
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+	/* Only interested in dependent rules. */
+	ScanKeyInit(&key[2], Anum_pg_depend_classid, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(RewriteRelationId));
+	/* Only interested in normal dependencies. */
+	ScanKeyInit(&key[3], Anum_pg_depend_deptype, BTEqualStrategyNumber,
+				F_OIDEQ, CharGetDatum(DEPENDENCY_NORMAL));
+
+	pg_depend_scan = systable_beginscan(pg_depend, InvalidOid, true,
+										NULL, 4, key);
+
+	while (HeapTupleIsValid(pg_depend_tuple = systable_getnext(pg_depend_scan)))
+	{
+		ScanKeyData key;
+		Relation	r;
+		Form_pg_depend depend_form = (Form_pg_depend) GETSTRUCT(pg_depend_tuple);
+		Oid			view_oid;
+
+		ScanKeyInit(&key, Anum_pg_rewrite_oid, BTEqualStrategyNumber,
+					F_OIDEQ, ObjectIdGetDatum(depend_form->objid));
+		pg_rewrite_scan = systable_beginscan(pg_rewrite, RewriteOidIndexId,
+											 true, NULL, 1, &key);
+		pg_rewrite_tuple = systable_getnext(pg_rewrite_scan);
+
+		/*
+		 * We are only looking at dependent rules, so the pg_rewrite tuple
+		 * must be valid.
+		 */
+		Assert(HeapTupleIsValid(pg_rewrite_tuple));
+
+		Form_pg_rewrite rewrite_form = (Form_pg_rewrite) GETSTRUCT(pg_rewrite_tuple);
+
+		view_oid = rewrite_form->ev_class;
+
+		/* Exclude duplicates. */
+		if (list_member_oid(*view_oids, view_oid))
+			continue;
+
+		r = table_open(view_oid, NoLock);
+
+		/* If the relation is indeed a view, record its oid and query. */
+		if (r->rd_rel->relkind == RELKIND_VIEW ||
+			r->rd_rel->relkind == RELKIND_MATVIEW)
+		{
+			StringInfoData buf;
+			bool		isnull;
+			Datum		ev_action_datum = heap_getattr(pg_rewrite_tuple,
+													   Anum_pg_rewrite_ev_action,
+													   RelationGetDescr(pg_rewrite),
+													   &isnull);
+
+			if (isnull)
+				continue;
+
+			*view_oids = lappend_oid(*view_oids, view_oid);
+
+			List	   *actions = (List *) stringToNode(TextDatumGetCString(ev_action_datum));
+
+			initStringInfo(&buf);
+			get_query_def(linitial(actions), &buf, NIL,
+						  RelationGetDescr(r), true, PRETTYFLAG_INDENT,
+						  WRAP_COLUMN_DEFAULT, 0);
+			*view_queries = lappend(*view_queries, pstrdup(buf.data));
+		}
+		systable_endscan(pg_rewrite_scan);
+		table_close(r, NoLock);
+	}
+	systable_endscan(pg_depend_scan);
+	table_close(pg_rewrite, RowExclusiveLock);
+	table_close(pg_depend, RowExclusiveLock);
+}
+
+/*
+ * This function is copied from the code in dumpTableSchema() pg_dump.c for
+ * adding primary keys and decompile_pk_column_index_array.
+ */
+static int
+yb_decompile_pk_column_index_array(Datum column_index_array, Oid relId,
+								   Oid indexId, StringInfo buf)
+{
+	Datum	   *keys;
+	int			nKeys;
+	int			j;
+	Relation	indexrel = relation_open(indexId, NoLock);
+
+	/* Extract data from array of int16 */
+	deconstruct_array(DatumGetArrayTypeP(column_index_array),
+					  INT2OID, 2, true, 's',
+					  &keys, NULL, &nKeys);
+
+	bool		doing_hash = false;
+
+	for (j = 0; j < nKeys; j++)
+	{
+		char	   *colName;
+		int			indoption = indexrel->rd_indoption[j];
+
+		colName = get_attname(relId, DatumGetInt16(keys[j]), false);
+
+		if (doing_hash && !(indoption & INDOPTION_HASH))
+		{
+			appendStringInfoString(buf, ") HASH");
+			doing_hash = false;
+		}
+
+		if (j > 0)
+			appendStringInfoString(buf, ", ");
+
+		if (!doing_hash && (indoption & INDOPTION_HASH))
+		{
+			appendStringInfoString(buf, "(");
+			doing_hash = true;
+		}
+
+		appendStringInfoString(buf, quote_identifier(colName));
+		if (indoption & INDOPTION_DESC)
+			appendStringInfoString(buf, " DESC");
+		else if (!doing_hash)
+			appendStringInfoString(buf, " ASC");
+	}
+	if (doing_hash)
+		appendStringInfoString(buf, ") HASH");
+	relation_close(indexrel, NoLock);
+	return nKeys;
 }

@@ -140,4 +140,7 @@ extern Bitmapset *ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
 										   bool initial_prune,
 										   Bitmapset **validsubplan_rtis);
 
+/* YB */
+extern Oid	YbPartitionTupleRoutingRootRelid(PartitionTupleRouting *proute);
+
 #endif							/* EXECPARTITION_H */

@@ -1,0 +1,7 @@
+# src/test/regress/yb_table_schedule
+# This schedule is for non-ported tests only.
+#
+# ALTER TABLE tests go in yb_alter_table_schedule.
+
+test: yb.orig.create_table
+test: yb.orig.drop_table

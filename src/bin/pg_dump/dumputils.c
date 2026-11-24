@@ -31,6 +31,7 @@ static char *dequoteAclUserName(PQExpBuffer output, char *input);
 static void AddAcl(PQExpBuffer aclbuf, const char *keyword,
 				   const char *subname);
 
+static void YBDropDuplicateStr(const char **str1, const char **str2);
 
 /*
  * Sanitize a string to be included in an SQL comment or TOC listing, by
@@ -101,9 +102,11 @@ sanitize_line(const char *str, bool want_hyphen)
  * since this routine uses fmtId() internally.
  */
 bool
-buildACLCommands(const char *name, const char *subname, const char *nspname,
+buildACLCommands(PGconn *yb_conn,
+				 const char *name, const char *subname, const char *nspname,
 				 const char *type, const char *acls, const char *baseacls,
 				 const char *owner, const char *prefix, int remoteVersion,
+				 bool yb_dump_role_checks, const char *yb_restrict_key,
 				 PQExpBuffer sql)
 {
 	bool		ok = true;
@@ -220,18 +223,32 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 
 		if (privs->len > 0)
 		{
-			appendPQExpBuffer(firstsql, "%sREVOKE %s ON %s ",
+			PQExpBuffer yb_sql = yb_dump_role_checks ? createPQExpBuffer() : firstsql;
+
+			appendPQExpBuffer(yb_sql, "%sREVOKE %s ON %s ",
 							  prefix, privs->data, type);
 			if (nspname && *nspname)
-				appendPQExpBuffer(firstsql, "%s.", fmtId(nspname));
+				appendPQExpBuffer(yb_sql, "%s.", fmtId(nspname));
 			if (name && *name)
-				appendPQExpBuffer(firstsql, "%s ", name);
-			appendPQExpBufferStr(firstsql, "FROM ");
+				appendPQExpBuffer(yb_sql, "%s ", name);
+			appendPQExpBufferStr(yb_sql, "FROM ");
 			if (grantee->len == 0)
-				appendPQExpBufferStr(firstsql, "PUBLIC;\n");
+				appendPQExpBufferStr(yb_sql, "PUBLIC;\n");
 			else
-				appendPQExpBuffer(firstsql, "%s;\n",
+				appendPQExpBuffer(yb_sql, "%s;\n",
 								  fmtId(grantee->data));
+
+			if (yb_dump_role_checks)
+			{
+				YBWwrapInRoleChecks(yb_conn, yb_sql, "revoke privilege",
+				/* if not PUBLIC role */
+									grantee->len > 0 ? grantee->data : NULL,	/* role1 */
+				/* if ALTER DEFAULT PRIVILEGES FOR ROLE case */
+									(*prefix != '\0' && owner) ? owner : NULL,	/* role2 */
+									NULL,	/* role3 */
+									firstsql, yb_restrict_key);
+				destroyPQExpBuffer(yb_sql);
+			}
 		}
 	}
 
@@ -284,44 +301,59 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
 				else
 					thissql = secondsql;
 
-				if (grantor->len > 0
-					&& (!owner || strcmp(owner, grantor->data) != 0))
-					appendPQExpBuffer(thissql, "SET SESSION AUTHORIZATION %s;\n",
+				PQExpBuffer yb_sql = yb_dump_role_checks ? createPQExpBuffer() : thissql;
+				const bool	yb_need_session_auth =
+					(grantor->len > 0 && (!owner || strcmp(owner, grantor->data) != 0));
+
+				if (yb_need_session_auth)
+					appendPQExpBuffer(yb_sql, "SET SESSION AUTHORIZATION %s;\n",
 									  fmtId(grantor->data));
 
 				if (privs->len > 0)
 				{
-					appendPQExpBuffer(thissql, "%sGRANT %s ON %s ",
+					appendPQExpBuffer(yb_sql, "%sGRANT %s ON %s ",
 									  prefix, privs->data, type);
 					if (nspname && *nspname)
-						appendPQExpBuffer(thissql, "%s.", fmtId(nspname));
+						appendPQExpBuffer(yb_sql, "%s.", fmtId(nspname));
 					if (name && *name)
-						appendPQExpBuffer(thissql, "%s ", name);
-					appendPQExpBufferStr(thissql, "TO ");
+						appendPQExpBuffer(yb_sql, "%s ", name);
+					appendPQExpBufferStr(yb_sql, "TO ");
 					if (grantee->len == 0)
-						appendPQExpBufferStr(thissql, "PUBLIC;\n");
+						appendPQExpBufferStr(yb_sql, "PUBLIC;\n");
 					else
-						appendPQExpBuffer(thissql, "%s;\n", fmtId(grantee->data));
+						appendPQExpBuffer(yb_sql, "%s;\n", fmtId(grantee->data));
 				}
 				if (privswgo->len > 0)
 				{
-					appendPQExpBuffer(thissql, "%sGRANT %s ON %s ",
+					appendPQExpBuffer(yb_sql, "%sGRANT %s ON %s ",
 									  prefix, privswgo->data, type);
 					if (nspname && *nspname)
-						appendPQExpBuffer(thissql, "%s.", fmtId(nspname));
+						appendPQExpBuffer(yb_sql, "%s.", fmtId(nspname));
 					if (name && *name)
-						appendPQExpBuffer(thissql, "%s ", name);
-					appendPQExpBufferStr(thissql, "TO ");
+						appendPQExpBuffer(yb_sql, "%s ", name);
+					appendPQExpBufferStr(yb_sql, "TO ");
 					if (grantee->len == 0)
-						appendPQExpBufferStr(thissql, "PUBLIC");
+						appendPQExpBufferStr(yb_sql, "PUBLIC");
 					else
-						appendPQExpBufferStr(thissql, fmtId(grantee->data));
-					appendPQExpBufferStr(thissql, " WITH GRANT OPTION;\n");
+						appendPQExpBufferStr(yb_sql, fmtId(grantee->data));
+					appendPQExpBufferStr(yb_sql, " WITH GRANT OPTION;\n");
 				}
 
-				if (grantor->len > 0
-					&& (!owner || strcmp(owner, grantor->data) != 0))
-					appendPQExpBufferStr(thissql, "RESET SESSION AUTHORIZATION;\n");
+				if (yb_need_session_auth)
+					appendPQExpBufferStr(yb_sql, "RESET SESSION AUTHORIZATION;\n");
+
+				if (yb_dump_role_checks)
+				{
+					YBWwrapInRoleChecks(yb_conn, yb_sql, "grant privilege",
+					/* not PUBLIC role */
+										grantee->len > 0 ? grantee->data : NULL,	/* role1 */
+					/* Additional SET SESSION AUTHORIZATION statement */
+										yb_need_session_auth ? grantor->data : NULL,	/* role2 */
+					/* ALTER DEFAULT PRIVILEGES FOR ROLE case */
+										(*prefix != '\0' && owner) ? owner : NULL,	/* role3 */
+										thissql, yb_restrict_key);
+					destroyPQExpBuffer(yb_sql);
+				}
 			}
 		}
 		else
@@ -363,10 +395,11 @@ buildACLCommands(const char *name, const char *subname, const char *nspname,
  * The resulting commands (if any) are appended to the contents of 'sql'.
  */
 bool
-buildDefaultACLCommands(const char *type, const char *nspname,
+buildDefaultACLCommands(PGconn *yb_conn,
+						const char *type, const char *nspname,
 						const char *acls, const char *acldefault,
-						const char *owner,
-						int remoteVersion,
+						const char *owner, int remoteVersion,
+						bool yb_dump_role_checks, const char *yb_restrict_key,
 						PQExpBuffer sql)
 {
 	PQExpBuffer prefix;
@@ -388,9 +421,10 @@ buildDefaultACLCommands(const char *type, const char *nspname,
 	 * There's no such thing as initprivs for a default ACL, so the base ACL
 	 * is always just the object-type-specific default.
 	 */
-	if (!buildACLCommands("", NULL, NULL, type,
+	if (!buildACLCommands(yb_conn, "", NULL, NULL, type,
 						  acls, acldefault, owner,
-						  prefix->data, remoteVersion, sql))
+						  prefix->data, remoteVersion, yb_dump_role_checks,
+						  yb_restrict_key, sql))
 	{
 		destroyPQExpBuffer(prefix);
 		return false;
@@ -399,6 +433,91 @@ buildDefaultACLCommands(const char *type, const char *nspname,
 	destroyPQExpBuffer(prefix);
 
 	return true;
+}
+
+static void
+YBDropDuplicateStr(const char **str1, const char **str2)
+{
+	if (*str1 && *str2 && strcmp(*str1, *str2) == 0)
+		*str2 = NULL;
+}
+
+void
+YBWwrapInRoleChecks(PGconn *conn,
+					PQExpBuffer sql, const char *op_name,
+					const char *role_name1, const char *role_name2,
+					const char *role_name3, PQExpBuffer result,
+					const char *yb_restrict_key)
+{
+	/* Treat empty-string role names same as NULL. */
+	const char *role1 = (role_name1 && *role_name1 == '\0' ? NULL : role_name1);
+	const char *role2 = (role_name2 && *role_name2 == '\0' ? NULL : role_name2);
+	const char *role3 = (role_name3 && *role_name3 == '\0' ? NULL : role_name3);
+
+	/* Delete duplicate roles. */
+	YBDropDuplicateStr(&role2, &role3);
+	YBDropDuplicateStr(&role1, &role3);
+	YBDropDuplicateStr(&role1, &role2);
+
+	/* Exclude empty Role2. */
+	if (!role2 && role3)
+	{
+		role2 = role3;
+		role3 = NULL;
+	}
+
+	/* Exclude empty Role1. */
+	if (!role1 && role2)
+	{
+		role1 = role2;
+		role2 = NULL;
+	}
+
+	if (role1)
+	{
+		/* Expecting role1 is not NULL. */
+		ybAppendUnrestrict(result, yb_restrict_key);
+		appendPQExpBufferStr(result, "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = ");
+		appendStringLiteralConn(result, role1, conn);
+
+		if (role2)
+		{
+			appendPQExpBufferStr(result, ") AND EXISTS(SELECT 1 FROM pg_roles WHERE rolname = ");
+			appendStringLiteralConn(result, role2, conn);
+		}
+
+		if (role3)
+		{
+			appendPQExpBufferStr(result, ") AND EXISTS(SELECT 1 FROM pg_roles WHERE rolname = ");
+			appendStringLiteralConn(result, role3, conn);
+		}
+
+		appendPQExpBufferStr(result, ") AS role_exists \\gset\n"
+							 "\\if :role_exists\n");
+		ybAppendRestrict(result, yb_restrict_key);
+		appendPQExpBufferStr(result, sql->data);
+		ybAppendUnrestrict(result, yb_restrict_key);
+		appendPQExpBuffer(result, "\\else\n"
+						  "\\echo 'Skipping %s due to missing role:' ",
+						  op_name);
+		ybAppendPsqlMetaLiteral(result, role1);
+		if (role2)
+		{
+			appendPQExpBufferStr(result, " 'OR' ");
+			ybAppendPsqlMetaLiteral(result, role2);
+		}
+		if (role3)
+		{
+			appendPQExpBufferStr(result, " 'OR' ");
+			ybAppendPsqlMetaLiteral(result, role3);
+		}
+
+		appendPQExpBufferStr(result, "\n\\endif\n");
+		ybAppendRestrict(result, yb_restrict_key);
+		appendPQExpBufferChar(result, '\n');
+	}
+	else						/* NO not empty roles - skip role checks. */
+		appendPQExpBuffer(result, "%s", sql->data);
 }
 
 /*
@@ -533,7 +652,8 @@ do { \
 		CONVERT_PRIV('c', "CONNECT");
 		CONVERT_PRIV('T', "TEMPORARY");
 	}
-	else if (strcmp(type, "TABLESPACE") == 0)
+	else if (strcmp(type, "TABLESPACE") == 0 ||
+			 strcmp(type, "TABLEGROUP") == 0)	/* Yugabyte */
 		CONVERT_PRIV('C', "CREATE");
 	else if (strcmp(type, "TYPE") == 0 ||
 			 strcmp(type, "TYPES") == 0)
@@ -697,7 +817,7 @@ buildShSecLabelQuery(const char *catalog_name, Oid objectId,
  */
 void
 emitShSecLabels(PGconn *conn, PGresult *res, PQExpBuffer buffer,
-				const char *objtype, const char *objname)
+				const char *objtype, const char *objname, const char *yb_indent)
 {
 	int			i;
 
@@ -708,8 +828,8 @@ emitShSecLabels(PGconn *conn, PGresult *res, PQExpBuffer buffer,
 
 		/* must use fmtId result before calling it again */
 		appendPQExpBuffer(buffer,
-						  "SECURITY LABEL FOR %s ON %s",
-						  fmtId(provider), objtype);
+						  "%sSECURITY LABEL FOR %s ON %s",
+						  yb_indent, fmtId(provider), objtype);
 		appendPQExpBuffer(buffer,
 						  " %s IS ",
 						  fmtId(objname));
@@ -868,7 +988,8 @@ void
 makeAlterConfigCommand(PGconn *conn, const char *configitem,
 					   const char *type, const char *name,
 					   const char *type2, const char *name2,
-					   PQExpBuffer buf)
+					   bool yb_dump_role_checks, const char *yb_restrict_key,
+					   PQExpBuffer yb_outbuf)
 {
 	char	   *mine;
 	char	   *pos;
@@ -882,6 +1003,8 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 		return;
 	}
 	*pos++ = '\0';
+
+	PQExpBuffer buf = createPQExpBuffer();
 
 	/* Build the command, with suitable quoting for everything. */
 	appendPQExpBuffer(buf, "ALTER %s %s ", type, fmtId(name));
@@ -930,6 +1053,18 @@ makeAlterConfigCommand(PGconn *conn, const char *configitem,
 
 	appendPQExpBufferStr(buf, ";\n");
 
+	if (yb_dump_role_checks && strcmp(type, "ROLE") == 0)
+	{
+		YBWwrapInRoleChecks(conn, buf, "alter role",
+							name,	/* role1 */
+							NULL,	/* role2 */
+							NULL,	/* role3 */
+							yb_outbuf, yb_restrict_key);
+	}
+	else
+		appendPQExpBuffer(yb_outbuf, "%s", buf->data);
+
+	destroyPQExpBuffer(buf);
 	pg_free(mine);
 }
 
@@ -1002,4 +1137,171 @@ valid_restrict_key(const char *restrict_key)
 	return restrict_key != NULL &&
 		restrict_key[0] != '\0' &&
 		strspn(restrict_key, restrict_chars) == strlen(restrict_key);
+}
+
+/*
+ * YB: drop a trailing "\restrict <restrict_key>\n" from buf and report
+ * whether one was there.  Trailing newlines after it are blank lines in the
+ * dump rather than part of the bracket, so they are skipped over and kept.
+ */
+static bool
+ybCancelTrailingRestrict(PQExpBuffer buf, const char *restrict_key)
+{
+	size_t		keylen = strlen(restrict_key);
+	/* Length of a "\restrict KEY\n" line; -1 drops the NUL, +1 the \n. */
+	size_t		closelen = sizeof("\\restrict ") - 1 + keylen + 1;
+	size_t		end = buf->len;
+	const char *tail;
+
+	/* Two newlines in a row means the last line is blank; step over it. */
+	while (end > closelen && buf->data[end - 1] == '\n' && buf->data[end - 2] == '\n')
+		end--;
+
+	if (end < closelen)
+		return false;
+
+	/*
+	 * The candidate is exactly the last closelen bytes: the prefix, the key,
+	 * then the newline.  The start of the line is not checked, so a buffer
+	 * ending in an indented bracket line would match too; every emitter writes
+	 * the bracket at column 0, so that does not arise.
+	 */
+	tail = buf->data + end - closelen;
+	if (strncmp(tail, "\\restrict ", sizeof("\\restrict ") - 1) != 0 ||
+		strncmp(tail + sizeof("\\restrict ") - 1, restrict_key, keylen) != 0 ||
+		tail[closelen - 1] != '\n')
+		return false;
+
+	memmove(buf->data + end - closelen, buf->data + end, buf->len - end);
+	buf->len -= closelen;
+	buf->data[buf->len] = '\0';
+	return true;
+}
+
+/*
+ * YB: append a YB block that already carries its own brackets, cancelling the
+ * pair at the seam.  Callers that build a bracketed block separately and splice
+ * it in cannot get that from ybAppendUnrestrict, which only sees the brackets
+ * it emits itself.
+ */
+void
+ybAppendBracketedBlock(PQExpBuffer buf, const char *block,
+					   const char *restrict_key)
+{
+	if (restrict_key)
+	{
+		size_t		keylen = strlen(restrict_key);
+		/* Line length, as closelen in ybCancelTrailingRestrict. */
+		size_t		openlen = sizeof("\\unrestrict ") - 1 + keylen + 1;
+
+		if (strncmp(block, "\\unrestrict ", sizeof("\\unrestrict ") - 1) == 0 &&
+			strncmp(block + sizeof("\\unrestrict ") - 1, restrict_key, keylen) == 0 &&
+			block[openlen - 1] == '\n' &&
+			ybCancelTrailingRestrict(buf, restrict_key))
+		{
+			appendPQExpBufferStr(buf, block + openlen);
+			return;
+		}
+	}
+
+	appendPQExpBufferStr(buf, block);
+}
+
+/*
+ * YB: upstream (CVE-2025-8714) wraps plain-text dumps in psql restricted mode
+ * (\restrict), which rejects all backslash meta-commands. YB's own control-flow
+ * meta-commands (\if/\else/\endif/\set/\gset/\echo) must run outside
+ * restricted mode; bracket each such block with these. No-op when there is no
+ * restrict key. Shared by pg_dump and pg_dumpall.
+ *
+ * Callers may bracket adjacent blocks without checking whether the previous one
+ * just closed: ybAppendUnrestrict cancels the \restrict it would immediately
+ * undo.  That only works within one buffer, so a block that alternates SQL and
+ * meta-commands should build into a single PQExpBuffer.
+ */
+void
+ybAppendUnrestrict(PQExpBuffer buf, const char *restrict_key)
+{
+	if (!restrict_key)
+		return;
+
+	/*
+	 * Two YB blocks in a row would leave a \restrict immediately followed by a
+	 * \unrestrict for the same key: two meta-command dispatches and ~150 bytes
+	 * that put the window back exactly where it was.  Cancel the pair instead.
+	 * The result is one wider window over the same YB-generated text, so it
+	 * cannot expose anything the two separate windows did not already expose.
+	 */
+	if (ybCancelTrailingRestrict(buf, restrict_key))
+		return;
+
+	appendPQExpBuffer(buf, "\\unrestrict %s\n", restrict_key);
+}
+
+void
+ybAppendRestrict(PQExpBuffer buf, const char *restrict_key)
+{
+	if (restrict_key)
+		appendPQExpBuffer(buf, "\\restrict %s\n", restrict_key);
+}
+
+/*
+ * YB: append str as a single-quoted psql meta-command argument.
+ *
+ * psql reads a meta-command one line at a time, so an argument cannot carry a
+ * raw newline: the lexer reports an unterminated string and the rest of the
+ * name becomes top-level psql input.  Only the single-quoted argument state
+ * offers backslash escapes, so control characters are escaped and the newline
+ * never reaches the line.  That state also does not expand :variables or
+ * backquotes, so quote, backslash and control characters are the complete set.
+ * Do not use fmtId for this: psql's double-quoted state has no escapes and no
+ * "" rule.
+ */
+void
+ybAppendPsqlMetaLiteral(PQExpBuffer buf, const char *str)
+{
+	appendPQExpBufferChar(buf, '\'');
+
+	for (const char *p = str; *p; p++)
+	{
+		unsigned char c = (unsigned char) *p;
+
+		switch (c)
+		{
+			case '\'':
+				appendPQExpBufferStr(buf, "''");
+				break;
+			case '\\':
+				appendPQExpBufferStr(buf, "\\\\");
+				break;
+			case '\n':
+				appendPQExpBufferStr(buf, "\\n");
+				break;
+			case '\r':
+				appendPQExpBufferStr(buf, "\\r");
+				break;
+			case '\t':
+				appendPQExpBufferStr(buf, "\\t");
+				break;
+			case '\b':
+				appendPQExpBufferStr(buf, "\\b");
+				break;
+			case '\f':
+				appendPQExpBufferStr(buf, "\\f");
+				break;
+			default:
+
+				/*
+				 * Always two hex digits: psql's escape matches at most two, so
+				 * a following hex digit cannot be absorbed into the escape.
+				 */
+				if (c < 0x20 || c == 0x7f)
+					appendPQExpBuffer(buf, "\\x%02x", c);
+				else
+					appendPQExpBufferChar(buf, c);
+				break;
+		}
+	}
+
+	appendPQExpBufferChar(buf, '\'');
 }

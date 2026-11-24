@@ -44,6 +44,9 @@
 #include "utils/varlena.h"
 #include "varatt.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "fuzzystrmatch",
 					.version = PG_VERSION
@@ -155,6 +158,9 @@ PG_FUNCTION_INFO_V1(levenshtein_with_costs);
 Datum
 levenshtein_with_costs(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein_with_costs(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	int			ins_c = PG_GETARG_INT32(2);
@@ -181,6 +187,9 @@ PG_FUNCTION_INFO_V1(levenshtein);
 Datum
 levenshtein(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	const char *s_data;
@@ -204,6 +213,9 @@ PG_FUNCTION_INFO_V1(levenshtein_less_equal_with_costs);
 Datum
 levenshtein_less_equal_with_costs(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein_less_equal_with_costs(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	int			ins_c = PG_GETARG_INT32(2);
@@ -233,6 +245,9 @@ PG_FUNCTION_INFO_V1(levenshtein_less_equal);
 Datum
 levenshtein_less_equal(PG_FUNCTION_ARGS)
 {
+	if (YBIsEnabledInPostgresEnvVar())
+		return yb_levenshtein_less_equal(fcinfo);
+
 	text	   *src = PG_GETARG_TEXT_PP(0);
 	text	   *dst = PG_GETARG_TEXT_PP(1);
 	int			max_d = PG_GETARG_INT32(2);

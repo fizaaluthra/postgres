@@ -28,6 +28,10 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/reltrigger.h"
+
 
 typedef struct
 {
@@ -501,6 +505,12 @@ adjust_appendrel_attrs_mutator(Node *node,
 													context->nappinfos,
 													context->appinfos);
 
+		/* YB: Also adjust rinfos within yb_batched_rinfo. */
+		newinfo->yb_batched_rinfo = (List *)
+			expression_tree_mutator((Node *) oldinfo->yb_batched_rinfo,
+									adjust_appendrel_attrs_mutator,
+									context);
+
 		/*
 		 * Reset cached derivative fields, since these might need to have
 		 * different values when considering the child relation.  Note we
@@ -966,7 +976,55 @@ add_row_identity_columns(PlannerInfo *root, Index rtindex,
 
 	Assert(commandType == CMD_UPDATE || commandType == CMD_DELETE || commandType == CMD_MERGE);
 
-	if (relkind == RELKIND_RELATION ||
+	if (IsYBRelation(target_relation))
+	{
+		bool		need_wholerow;
+
+		need_wholerow = YbWholeRowAttrRequired(target_relation, NULL,
+											   commandType);
+
+		/*
+		 * If the basic check is inconclusive and this is a child relation in
+		 * an inheritance/partition hierarchy doing DELETE, also consult the
+		 * relation named in the SQL statement (e.g. B for `DELETE FROM B`
+		 * in an A->B->C->D hierarchy) for an AFTER DELETE transition-table
+		 * trigger.  No intermediate parents (A, C above) are checked because
+		 * PG only fires statement-level triggers on the relation explicitly
+		 * named in the query.  Defer the table_open() to here so the
+		 * relation isn't pinned across the syscache work
+		 * YbWholeRowAttrRequired() does in the basic check.
+		 */
+		if (!need_wholerow &&
+			rtindex != root->parse->resultRelation &&
+			commandType == CMD_DELETE)
+		{
+			RangeTblEntry *query_target_rte =
+				planner_rt_fetch(root->parse->resultRelation, root);
+			Relation	query_target_rel = table_open(query_target_rte->relid,
+													  NoLock);
+
+			need_wholerow = YbWholeRowAttrRequired(target_relation,
+												   query_target_rel,
+												   commandType);
+			table_close(query_target_rel, NoLock);
+		}
+
+		if (need_wholerow)
+		{
+			var = makeVar(rtindex, InvalidAttrNumber, RECORDOID, -1, InvalidOid,
+						  0);
+			add_row_identity_var(root, var, rtindex, "wholerow");
+		}
+
+		/*
+		 * Emit ybctid so that executor can find the row to update or delete
+		 * from YugaByte tables.
+		 */
+		var = makeVar(rtindex, YBTupleIdAttributeNumber, BYTEAOID, -1,
+					  InvalidOid, 0);
+		add_row_identity_var(root, var, rtindex, "ybctid");
+	}
+	else if (relkind == RELKIND_RELATION ||
 		relkind == RELKIND_MATVIEW ||
 		relkind == RELKIND_PARTITIONED_TABLE)
 	{

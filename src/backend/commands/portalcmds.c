@@ -36,6 +36,10 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb_dist_trace.h"
+
 
 /*
  * PerformCursorOpen
@@ -157,6 +161,13 @@ PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo pa
 	PortalStart(portal, params, 0, GetActiveSnapshot());
 
 	Assert(portal->strategy == PORTAL_ONE_SELECT);
+
+	/* Increment yb_sticky_connection if a WITH HOLD cursor is declared. */
+	if (YbIsClientYsqlConnMgr() && (cstmt->options & CURSOR_OPT_HOLD))
+	{
+		elog(LOG, "Incrementing sticky object count for cursor %s", cstmt->portalname);
+		increment_sticky_object_count();
+	}
 
 	/*
 	 * We're done; the query won't actually be run until PerformPortalFetch is
@@ -303,14 +314,43 @@ PortalCleanup(Portal portal)
 
 			/* We must make the portal's resource owner current */
 			saveResourceOwner = CurrentResourceOwner;
-			if (portal->resowner)
-				CurrentResourceOwner = portal->resowner;
+			/* YB: wrap in try-catch for transparent query retry */
+			PG_TRY();
+			{
+				if (portal->resowner)
+					CurrentResourceOwner = portal->resowner;
 
-			ExecutorFinish(queryDesc);
-			ExecutorEnd(queryDesc);
-			FreeQueryDesc(queryDesc);
+				/*
+				 * YB: portal->queryDesc is set only for PORTAL_ONE_SELECT (see
+				 * PortalStart).  Skip ExecutorFinish's session-stats capture:
+				 * for the SELECT case ExecutorFinish does no work that produces
+				 * new DocDB stats, so the capture at end of ExecutorRun is
+				 * sufficient.
+				 */
+				Assert(portal->strategy == PORTAL_ONE_SELECT);
+				queryDesc->yb_skip_finish_capture = true;
+
+				ExecutorFinish(queryDesc);
+				ExecutorEnd(queryDesc);
+				FreeQueryDesc(queryDesc);
+			}
+			PG_CATCH();
+			{
+				CurrentResourceOwner = saveResourceOwner;
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 
 			CurrentResourceOwner = saveResourceOwner;
+		}
+		else if (YBCIsDistTraceEnabled())
+		{
+			/*
+			 * YB: executor shutdown is skipped for failed portals, so
+			 * ExecEndNode never runs and node spans left open by a suspended
+			 * portal would leak.
+			 */
+			YbDistTraceEndNodeSpans(queryDesc->planstate, /* errored */ true);
 		}
 	}
 }

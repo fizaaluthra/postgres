@@ -426,19 +426,19 @@ SyncRepCancelWait(void)
 }
 
 void
-SyncRepCleanupAtProcExit(void)
+SyncRepCleanupAtProcExit(PGPROC *yb_proc)
 {
 	/*
 	 * First check if we are removed from the queue without the lock to not
 	 * slow down backend exit.
 	 */
-	if (!dlist_node_is_detached(&MyProc->syncRepLinks))
+	if (!dlist_node_is_detached(&yb_proc->syncRepLinks))
 	{
 		LWLockAcquire(SyncRepLock, LW_EXCLUSIVE);
 
 		/* maybe we have just been removed, so recheck */
-		if (!dlist_node_is_detached(&MyProc->syncRepLinks))
-			dlist_delete_thoroughly(&MyProc->syncRepLinks);
+		if (!dlist_node_is_detached(&yb_proc->syncRepLinks))
+			dlist_delete_thoroughly(&yb_proc->syncRepLinks);
 
 		LWLockRelease(SyncRepLock);
 	}

@@ -13,14 +13,22 @@
 /* enums for wait events */
 #include "utils/wait_event_types.h"
 
+/* YB includes */
+#include "yb_ash.h"
+
 extern const char *pgstat_get_wait_event(uint32 wait_event_info);
 extern const char *pgstat_get_wait_event_type(uint32 wait_event_info);
 static inline void pgstat_report_wait_start(uint32 wait_event_info);
 static inline void pgstat_report_wait_end(void);
 extern void pgstat_set_wait_event_storage(uint32 *wait_event_info);
 extern void pgstat_reset_wait_event_storage(void);
+extern void yb_pgstat_set_wait_event_storage(PGPROC *proc);
+extern void yb_pgstat_reset_wait_event_storage(void);
+
+extern bool YbIsIdleWaitEvent(uint32 wait_event_info);
 
 extern PGDLLIMPORT uint32 *my_wait_event_info;
+extern PGDLLIMPORT YbcWaitEventInfoPtr yb_my_wait_event_info;
 
 
 /*
@@ -84,6 +92,42 @@ pgstat_report_wait_end(void)
 {
 	/* see pgstat_report_wait_start() */
 	*(volatile uint32 *) my_wait_event_info = 0;
+}
+
+/* ----------
+ * yb_pgstat_report_wait_start() -
+ *
+ *	Called to get the current wait event info and set a new wait
+ *  event info.
+ *
+ * NB: this *must* be able to survive being called before MyProc has been
+ * initialized.
+ * ----------
+ */
+static inline YbcWaitEventInfo
+yb_pgstat_report_wait_start(YbcWaitEventInfo info)
+{
+	YbcWaitEventInfo prev_wait_event_info = info;
+
+	if (yb_enable_ash)
+	{
+		/*
+		 * Since this is a four-byte field which is always read and written as
+		 * four-bytes, updates are atomic.
+		 * The reader copy_pgproc_sample_fields() is aware if it's reading
+		 * inconsistent data and will retry to read the values.
+		 */
+		prev_wait_event_info = (YbcWaitEventInfo)
+		{
+			*yb_my_wait_event_info.wait_event,
+				*yb_my_wait_event_info.aux
+		};
+
+		*(volatile uint32 *) yb_my_wait_event_info.aux = info.aux;
+		*(volatile uint32 *) yb_my_wait_event_info.wait_event = info.wait_event;
+	}
+
+	return prev_wait_event_info;
 }
 
 

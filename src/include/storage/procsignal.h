@@ -16,6 +16,9 @@
 
 #include "storage/procnumber.h"
 
+/* YB includes */
+#include "storage/proc.h"
+
 
 /*
  * Reasons for signaling a Postgres child process (a backend or an auxiliary
@@ -35,6 +38,10 @@ typedef enum
 	PROCSIG_WALSND_INIT_STOPPING,	/* ask walsenders to prepare for shutdown  */
 	PROCSIG_BARRIER,			/* global barrier interrupt  */
 	PROCSIG_LOG_MEMORY_CONTEXT, /* ask backend to log the memory contexts */
+	YB_PROCSIG_LOG_CATCACHE_STATS,	/* ask backend to log the catcache stats */
+	PROCSIG_LOG_HEAP_SNAPSHOT,	/* ask backend to log the heap snapshot */
+	PROCSIG_LOG_HEAP_SNAPSHOT_PEAK, /* ask backend to log the peak heap
+									 * snapshot */
 	PROCSIG_PARALLEL_APPLY_MESSAGE, /* Message from parallel apply workers */
 	PROCSIG_SLOTSYNC_MESSAGE,	/* ask slot synchronization to stop */
 	PROCSIG_REPACK_MESSAGE,		/* Message from repack worker */
@@ -79,6 +86,9 @@ extern void WaitForProcSignalBarrier(uint64 generation);
 extern void ProcessProcSignalBarrier(void);
 
 extern void procsignal_sigusr1_handler(SIGNAL_ARGS);
+
+/* YB */
+extern void YbCleanupProcSignalStateForProc(PGPROC *proc);
 
 /* ProcSignalHeader is an opaque struct, details known only within procsignal.c */
 typedef struct ProcSignalHeader ProcSignalHeader;

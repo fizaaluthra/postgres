@@ -39,6 +39,28 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_attrdef.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_constraint_d.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_rewrite.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "fmgr.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb_internal_conn.h"
+#include <assert.h>
+
 /*---------------------------------------------------------------------------
 
 	Adding system caches:
@@ -84,6 +106,145 @@ struct cachedesc
 StaticAssertDecl(lengthof(cacheinfo) == SysCacheSize,
 				 "SysCacheSize does not match syscache.c's array");
 
+#define YB_CATCACHE_LIST \
+	YB_CATCACHE_ENTRY(AGGFNOID, 0, "pg_aggregate_fnoid_index", YbCatalogCacheTable_pg_aggregate) \
+	YB_CATCACHE_ENTRY(AMNAME, 1, "pg_am_name_index", YbCatalogCacheTable_pg_am) \
+	YB_CATCACHE_ENTRY(AMOID, 2, "pg_am_oid_index", YbCatalogCacheTable_pg_am) \
+	YB_CATCACHE_ENTRY(AMOPOPID, 3, "pg_amop_opr_fam_index", YbCatalogCacheTable_pg_amop) \
+	YB_CATCACHE_ENTRY(AMOPSTRATEGY, 4, "pg_amop_fam_strat_index", YbCatalogCacheTable_pg_amop) \
+	YB_CATCACHE_ENTRY(AMPROCNUM, 5, "pg_amproc_fam_proc_index", YbCatalogCacheTable_pg_amproc) \
+	YB_CATCACHE_ENTRY(ATTNAME, 6, "pg_attribute_relid_attnam_index", YbCatalogCacheTable_pg_attribute) \
+	YB_CATCACHE_ENTRY(ATTNUM, 7, "pg_attribute_relid_attnum_index", YbCatalogCacheTable_pg_attribute) \
+	YB_CATCACHE_ENTRY(AUTHMEMMEMROLE, 8, "pg_auth_members_member_role_index", YbCatalogCacheTable_pg_auth_members) \
+	YB_CATCACHE_ENTRY(AUTHMEMROLEMEM, 9, "pg_auth_members_role_member_index", YbCatalogCacheTable_pg_auth_members) \
+	YB_CATCACHE_ENTRY(AUTHNAME, 10, "pg_authid_rolname_index", YbCatalogCacheTable_pg_authid) \
+	YB_CATCACHE_ENTRY(AUTHOID, 11, "pg_authid_oid_index", YbCatalogCacheTable_pg_authid) \
+	YB_CATCACHE_ENTRY(CASTSOURCETARGET, 12, "pg_cast_source_target_index", YbCatalogCacheTable_pg_cast) \
+	YB_CATCACHE_ENTRY(CLAAMNAMENSP, 13, "pg_opclass_am_name_nsp_index", YbCatalogCacheTable_pg_opclass) \
+	YB_CATCACHE_ENTRY(CLAOID, 14, "pg_opclass_oid_index", YbCatalogCacheTable_pg_opclass) \
+	YB_CATCACHE_ENTRY(COLLNAMEENCNSP, 15, "pg_collation_name_enc_nsp_index", YbCatalogCacheTable_pg_collation) \
+	YB_CATCACHE_ENTRY(COLLOID, 16, "pg_collation_oid_index", YbCatalogCacheTable_pg_collation) \
+	YB_CATCACHE_ENTRY(CONDEFAULT, 17, "pg_conversion_default_index", YbCatalogCacheTable_pg_conversion) \
+	YB_CATCACHE_ENTRY(CONNAMENSP, 18, "pg_conversion_name_nsp_index", YbCatalogCacheTable_pg_conversion) \
+	YB_CATCACHE_ENTRY(CONSTROID, 19, "pg_constraint_oid_index", YbCatalogCacheTable_pg_constraint) \
+	YB_CATCACHE_ENTRY(CONVOID, 20, "pg_conversion_oid_index", YbCatalogCacheTable_pg_conversion) \
+	YB_CATCACHE_ENTRY(DATABASEOID, 21, "pg_database_oid_index", YbCatalogCacheTable_pg_database) \
+	YB_CATCACHE_ENTRY(DEFACLROLENSPOBJ, 22, "pg_default_acl_role_nsp_obj_index", YbCatalogCacheTable_pg_default_acl) \
+	YB_CATCACHE_ENTRY(ENUMOID, 23, "pg_enum_oid_index", YbCatalogCacheTable_pg_enum) \
+	YB_CATCACHE_ENTRY(ENUMTYPOIDNAME, 24, "pg_enum_typid_label_index", YbCatalogCacheTable_pg_enum) \
+	YB_CATCACHE_ENTRY(EVENTTRIGGERNAME, 25, "pg_event_trigger_evtname_index", YbCatalogCacheTable_pg_event_trigger) \
+	YB_CATCACHE_ENTRY(EVENTTRIGGEROID, 26, "pg_event_trigger_oid_index", YbCatalogCacheTable_pg_event_trigger) \
+	YB_CATCACHE_ENTRY(FOREIGNDATAWRAPPERNAME, 27, "pg_foreign_data_wrapper_name_index", YbCatalogCacheTable_pg_foreign_data_wrapper) \
+	YB_CATCACHE_ENTRY(FOREIGNDATAWRAPPEROID, 28, "pg_foreign_data_wrapper_oid_index", YbCatalogCacheTable_pg_foreign_data_wrapper) \
+	YB_CATCACHE_ENTRY(FOREIGNSERVERNAME, 29, "pg_foreign_server_name_index", YbCatalogCacheTable_pg_foreign_server) \
+	YB_CATCACHE_ENTRY(FOREIGNSERVEROID, 30, "pg_foreign_server_oid_index", YbCatalogCacheTable_pg_foreign_server) \
+	YB_CATCACHE_ENTRY(FOREIGNTABLEREL, 31, "pg_foreign_table_relid_index", YbCatalogCacheTable_pg_foreign_table) \
+	YB_CATCACHE_ENTRY(INDEXRELID, 32, "pg_index_indexrelid_index", YbCatalogCacheTable_pg_index) \
+	YB_CATCACHE_ENTRY(LANGNAME, 33, "pg_language_name_index", YbCatalogCacheTable_pg_language) \
+	YB_CATCACHE_ENTRY(LANGOID, 34, "pg_language_oid_index", YbCatalogCacheTable_pg_language) \
+	YB_CATCACHE_ENTRY(NAMESPACENAME, 35, "pg_namespace_nspname_index", YbCatalogCacheTable_pg_namespace) \
+	YB_CATCACHE_ENTRY(NAMESPACEOID, 36, "pg_namespace_oid_index", YbCatalogCacheTable_pg_namespace) \
+	YB_CATCACHE_ENTRY(OPERNAMENSP, 37, "pg_operator_oprname_l_r_n_index", YbCatalogCacheTable_pg_operator) \
+	YB_CATCACHE_ENTRY(OPEROID, 38, "pg_operator_oid_index", YbCatalogCacheTable_pg_operator) \
+	YB_CATCACHE_ENTRY(OPFAMILYAMNAMENSP, 39, "pg_opfamily_am_name_nsp_index", YbCatalogCacheTable_pg_opfamily) \
+	YB_CATCACHE_ENTRY(OPFAMILYOID, 40, "pg_opfamily_oid_index", YbCatalogCacheTable_pg_opfamily) \
+	YB_CATCACHE_ENTRY(PARAMETERACLNAME, 41, "pg_parameter_acl_parname_index", YbCatalogCacheTable_pg_parameter_acl) \
+	YB_CATCACHE_ENTRY(PARAMETERACLOID, 42, "pg_parameter_acl_oid_index", YbCatalogCacheTable_pg_parameter_acl) \
+	YB_CATCACHE_ENTRY(PARTRELID, 43, "pg_partitioned_table_partrelid_index", YbCatalogCacheTable_pg_partitioned_table) \
+	YB_CATCACHE_ENTRY(PROCNAMEARGSNSP, 44, "pg_proc_proname_args_nsp_index", YbCatalogCacheTable_pg_proc) \
+	YB_CATCACHE_ENTRY(PROCOID, 45, "pg_proc_oid_index", YbCatalogCacheTable_pg_proc) \
+	YB_CATCACHE_ENTRY(PUBLICATIONNAME, 46, "pg_publication_pubname_index", YbCatalogCacheTable_pg_publication) \
+	YB_CATCACHE_ENTRY(PUBLICATIONNAMESPACE, 47, "pg_publication_namespace_oid_index", YbCatalogCacheTable_pg_publication_namespace) \
+	YB_CATCACHE_ENTRY(PUBLICATIONNAMESPACEMAP, 48, "pg_publication_namespace_pnnspid_pnpubid_index", YbCatalogCacheTable_pg_publication_namespace) \
+	YB_CATCACHE_ENTRY(PUBLICATIONOID, 49, "pg_publication_oid_index", YbCatalogCacheTable_pg_publication) \
+	YB_CATCACHE_ENTRY(PUBLICATIONREL, 50, "pg_publication_rel_oid_index", YbCatalogCacheTable_pg_publication_rel) \
+	YB_CATCACHE_ENTRY(PUBLICATIONRELMAP, 51, "pg_publication_rel_prrelid_prpubid_index", YbCatalogCacheTable_pg_publication_rel) \
+	YB_CATCACHE_ENTRY(RANGEMULTIRANGE, 52, "pg_range_rngmultitypid_index", YbCatalogCacheTable_pg_range) \
+	YB_CATCACHE_ENTRY(RANGETYPE, 53, "pg_range_rngtypid_index", YbCatalogCacheTable_pg_range) \
+	YB_CATCACHE_ENTRY(RELNAMENSP, 54, "pg_class_relname_nsp_index", YbCatalogCacheTable_pg_class) \
+	YB_CATCACHE_ENTRY(RELOID, 55, "pg_class_oid_index", YbCatalogCacheTable_pg_class) \
+	YB_CATCACHE_ENTRY(REPLORIGIDENT, 56, "pg_replication_origin_roiident_index", YbCatalogCacheTable_pg_replication_origin) \
+	YB_CATCACHE_ENTRY(REPLORIGNAME, 57, "pg_replication_origin_roname_index", YbCatalogCacheTable_pg_replication_origin) \
+	YB_CATCACHE_ENTRY(RULERELNAME, 58, "pg_rewrite_rel_rulename_index", YbCatalogCacheTable_pg_rewrite) \
+	YB_CATCACHE_ENTRY(SEQRELID, 59, "pg_sequence_seqrelid_index", YbCatalogCacheTable_pg_sequence) \
+	YB_CATCACHE_ENTRY(STATEXTDATASTXOID, 60, "pg_statistic_ext_data_stxoid_inh_index", YbCatalogCacheTable_pg_statistic_ext_data) \
+	YB_CATCACHE_ENTRY(STATEXTNAMENSP, 61, "pg_statistic_ext_name_index", YbCatalogCacheTable_pg_statistic_ext) \
+	YB_CATCACHE_ENTRY(STATEXTOID, 62, "pg_statistic_ext_oid_index", YbCatalogCacheTable_pg_statistic_ext) \
+	YB_CATCACHE_ENTRY(STATRELATTINH, 63, "pg_statistic_relid_att_inh_index", YbCatalogCacheTable_pg_statistic) \
+	YB_CATCACHE_ENTRY(SUBSCRIPTIONNAME, 64, "pg_subscription_subname_index", YbCatalogCacheTable_pg_subscription) \
+	YB_CATCACHE_ENTRY(SUBSCRIPTIONOID, 65, "pg_subscription_oid_index", YbCatalogCacheTable_pg_subscription) \
+	YB_CATCACHE_ENTRY(SUBSCRIPTIONRELMAP, 66, "pg_subscription_rel_srrelid_srsubid_index", YbCatalogCacheTable_pg_subscription_rel) \
+	YB_CATCACHE_ENTRY(TABLESPACEOID, 67, "pg_tablespace_oid_index", YbCatalogCacheTable_pg_tablespace) \
+	YB_CATCACHE_ENTRY(TRFOID, 68, "pg_transform_oid_index", YbCatalogCacheTable_pg_transform) \
+	YB_CATCACHE_ENTRY(TRFTYPELANG, 69, "pg_transform_type_lang_index", YbCatalogCacheTable_pg_transform) \
+	YB_CATCACHE_ENTRY(TSCONFIGMAP, 70, "pg_ts_config_map_index", YbCatalogCacheTable_pg_ts_config_map) \
+	YB_CATCACHE_ENTRY(TSCONFIGNAMENSP, 71, "pg_ts_config_cfgname_index", YbCatalogCacheTable_pg_ts_config) \
+	YB_CATCACHE_ENTRY(TSCONFIGOID, 72, "pg_ts_config_oid_index", YbCatalogCacheTable_pg_ts_config) \
+	YB_CATCACHE_ENTRY(TSDICTNAMENSP, 73, "pg_ts_dict_dictname_index", YbCatalogCacheTable_pg_ts_dict) \
+	YB_CATCACHE_ENTRY(TSDICTOID, 74, "pg_ts_dict_oid_index", YbCatalogCacheTable_pg_ts_dict) \
+	YB_CATCACHE_ENTRY(TSPARSERNAMENSP, 75, "pg_ts_parser_prsname_index", YbCatalogCacheTable_pg_ts_parser) \
+	YB_CATCACHE_ENTRY(TSPARSEROID, 76, "pg_ts_parser_oid_index", YbCatalogCacheTable_pg_ts_parser) \
+	YB_CATCACHE_ENTRY(TSTEMPLATENAMENSP, 77, "pg_ts_template_tmplname_index", YbCatalogCacheTable_pg_ts_template) \
+	YB_CATCACHE_ENTRY(TSTEMPLATEOID, 78, "pg_ts_template_oid_index", YbCatalogCacheTable_pg_ts_template) \
+	YB_CATCACHE_ENTRY(TYPENAMENSP, 79, "pg_type_typname_nsp_index", YbCatalogCacheTable_pg_type) \
+	YB_CATCACHE_ENTRY(TYPEOID, 80, "pg_type_oid_index", YbCatalogCacheTable_pg_type) \
+	YB_CATCACHE_ENTRY(USERMAPPINGOID, 81, "pg_user_mapping_oid_index", YbCatalogCacheTable_pg_user_mapping) \
+	YB_CATCACHE_ENTRY(USERMAPPINGUSERSERVER, 82, "pg_user_mapping_user_server_index", YbCatalogCacheTable_pg_user_mapping) \
+	YB_CATCACHE_ENTRY(YBTABLEGROUPOID, 83, "pg_yb_tablegroup_oid_index", YbCatalogCacheTable_pg_yb_tablegroup) \
+	YB_CATCACHE_ENTRY(YBCONSTRAINTRELIDTYPIDNAME, 84, "pg_constraint_conrelid_contypid_conname_index", YbCatalogCacheTable_pg_constraint) \
+	YB_CATCACHE_ENTRY(EXTENSIONOID, 85, "pg_extension_oid_index", YbCatalogCacheTable_pg_extension) \
+	YB_CATCACHE_ENTRY(EXTENSIONNAME, 86, "pg_extension_name_index", YbCatalogCacheTable_pg_extension) \
+	YB_CATCACHE_ENTRY(PROPGRAPHELALIAS, 87, "pg_propgraph_element_alias_index", YbCatalogCacheTable_pg_propgraph_element) \
+	YB_CATCACHE_ENTRY(PROPGRAPHELEMENTLABELELEMENTLABEL, 88, "pg_propgraph_element_label_element_label_index", YbCatalogCacheTable_pg_propgraph_element_label) \
+	YB_CATCACHE_ENTRY(PROPGRAPHELOID, 89, "pg_propgraph_element_oid_index", YbCatalogCacheTable_pg_propgraph_element) \
+	YB_CATCACHE_ENTRY(PROPGRAPHLABELNAME, 90, "pg_propgraph_label_graph_name_index", YbCatalogCacheTable_pg_propgraph_label) \
+	YB_CATCACHE_ENTRY(PROPGRAPHLABELOID, 91, "pg_propgraph_label_oid_index", YbCatalogCacheTable_pg_propgraph_label) \
+	YB_CATCACHE_ENTRY(PROPGRAPHLABELPROP, 92, "pg_propgraph_label_property_label_prop_index", YbCatalogCacheTable_pg_propgraph_label_property) \
+	YB_CATCACHE_ENTRY(PROPGRAPHPROPNAME, 93, "pg_propgraph_property_name_index", YbCatalogCacheTable_pg_propgraph_property) \
+	YB_CATCACHE_ENTRY(PROPGRAPHPROPOID, 94, "pg_propgraph_property_oid_index", YbCatalogCacheTable_pg_propgraph_property)
+
+static const char *yb_cache_index_name_table[] = {
+#define YB_CATCACHE_ENTRY(name, id, idx, tbl) idx,
+	YB_CATCACHE_LIST
+#undef YB_CATCACHE_ENTRY
+};
+
+static_assert(SysCacheSize == sizeof(yb_cache_index_name_table) /
+			  sizeof(const char *), "Wrong catalog cache number");
+
+char	   *SysCacheName[] = {
+#define YB_CATCACHE_ENTRY(name, id, idx, tbl) #name,
+	YB_CATCACHE_LIST
+#undef YB_CATCACHE_ENTRY
+};
+
+static_assert(SysCacheSize == sizeof(SysCacheName) /
+			  sizeof(SysCacheName[0]), "SysCacheName array size mismatch");
+
+
+/* List of all the tables that have caches on them */
+static const char *yb_cache_table_name_table[] = {
+#define YB_CATCACHE_TABLE_ENTRY(prefix, table) #table,
+	YB_CATCACHE_TABLE_LIST
+#undef YB_CATCACHE_TABLE_ENTRY
+};
+
+static_assert(YbNumCatalogCacheTables ==
+			  sizeof(yb_cache_table_name_table) / sizeof(const char *),
+			  "yb_catalog_cache_table_name_table size mismatch");
+
+
+/* Maps cache id to the table id in yb_cache_table_name_table */
+static YbCatalogCacheTable yb_catalog_cache_tables[] = {
+#define YB_CATCACHE_ENTRY(name, id, idx, tbl) tbl,
+	YB_CATCACHE_LIST
+#undef YB_CATCACHE_ENTRY
+};
+
+static_assert(SysCacheSize ==
+			  sizeof(yb_catalog_cache_tables) / sizeof(YbCatalogCacheTable),
+			  "yb_catalog_cache_tables size mismatch");
+
 static CatCache *SysCache[SysCacheSize];
 
 static bool CacheInitialized = false;
@@ -98,6 +259,342 @@ static int	SysCacheSupportingRelOidSize;
 
 static int	oid_compare(const void *a, const void *b);
 
+/*
+ * Utility function for YugaByte mode. Is used to automatically add entries
+ * from common catalog tables to the cache immediately after they are inserted.
+ */
+void
+YbSetSysCacheTuple(Relation rel, HeapTuple tup)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+
+	switch (RelationGetRelid(rel))
+	{
+		case RelationRelationId:
+			SetCatCacheTuple(SysCache[RELOID], tup, tupdesc);
+			SetCatCacheTuple(SysCache[RELNAMENSP], tup, tupdesc);
+			break;
+		case TypeRelationId:
+			SetCatCacheTuple(SysCache[TYPEOID], tup, tupdesc);
+			SetCatCacheTuple(SysCache[TYPENAMENSP], tup, tupdesc);
+			break;
+		case ProcedureRelationId:
+			SetCatCacheTuple(SysCache[PROCOID], tup, tupdesc);
+			SetCatCacheTuple(SysCache[PROCNAMEARGSNSP], tup, tupdesc);
+			break;
+		case AttributeRelationId:
+			SetCatCacheTuple(SysCache[ATTNUM], tup, tupdesc);
+			SetCatCacheTuple(SysCache[ATTNAME], tup, tupdesc);
+			break;
+		case PartitionedRelationId:
+			SetCatCacheTuple(SysCache[PARTRELID], tup, tupdesc);
+			break;
+
+		default:
+			/* For non-critical tables/indexes nothing to do */
+			return;
+	}
+}
+
+/*
+ * Should YbPreloadCatalogCache populate the full set of catcache LIST entries?
+ *
+ * In minimal-preload mode the caller preloads only the pg_rewrite (RULERELNAME)
+ * list -- the one whose on-demand rebuild during relcache init is expensive
+ * (see YbPreloadCatalogCache). This function decides whether to additionally
+ * preload the rest.
+ *
+ * - Outside minimal-preload mode: yes, always.
+ * - In minimal-preload mode: only if the current backend's YbInternalConnKind
+ *   descriptor opts in via preload_lists_in_minimal_mode. The relcache-init
+ *   builder is the one kind that opts in -- it is transient and needs its
+ *   lists while building the relcache init file. Other minimal-preload kinds
+ *   leave the remaining lists (notably pg_proc's by-name list, which must be
+ *   complete for correctness) to be built on demand from a full
+ *   SearchCatCacheList scan.
+ */
+static bool
+YbShouldPreloadCatcacheLists(void)
+{
+	YbInternalConnKind kind;
+
+	if (!YbUseMinimalCatalogCachesPreload())
+		return true;
+
+	kind = YbLookupInternalConnKindByBackendType(MyBackendType);
+	return kind != YB_INTERNAL_CONN_KIND_NONE &&
+		YbInternalConnKindDescriptors[kind].preload_lists_in_minimal_mode;
+}
+
+/*
+ * Of the caches being preloaded, the one that gets catcache lists built from
+ * the scanned rows, if any: PROCNAMEARGSNSP by function name,
+ * YBCONSTRAINTRELIDTYPIDNAME by conrelid, RULERELNAME by relation and
+ * AMOPOPID by operator.  The lists go into that cache, so they are built only
+ * when it is filled.
+ */
+static CatCache *
+YbGetPreloadListCache(CatCache *cache, CatCache *idx_cache)
+{
+	CatCache   *caches[] = {cache, idx_cache};
+
+	for (int i = 0; i < lengthof(caches); ++i)
+	{
+		if (!caches[i])
+			continue;
+		switch (caches[i]->id)
+		{
+			case PROCNAMEARGSNSP:
+			case YBCONSTRAINTRELIDTYPIDNAME:
+			case RULERELNAME:
+			case AMOPOPID:
+				return caches[i];
+		}
+	}
+	return NULL;
+}
+
+/*
+ * In YugaByte mode preload the given cache with data from master.
+ * If no index cache is associated with the given cache (most of the time), its id should be -1.
+ */
+void
+YbPreloadCatalogCache(int cache_id, int idx_cache_id)
+{
+	/*
+	 * The scan returns each row, and the by-reference datums decoded for it,
+	 * in the current memory context, while the catcache keeps its own copy in
+	 * CacheMemoryContext.  During connection startup the caller's context
+	 * lives until the end of InitPostgres, so free the scanned rows here.
+	 */
+	MemoryContext preload_cxt = AllocSetContextCreate(CurrentMemoryContext,
+													  "YbPreloadCatalogCache",
+													  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext row_cxt = AllocSetContextCreate(preload_cxt,
+												  "YbPreloadCatalogCache row",
+												  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldcxt = MemoryContextSwitchTo(preload_cxt);
+	CatCache   *cache = SysCache[cache_id];
+	CatCache   *idx_cache = idx_cache_id != -1 ? SysCache[idx_cache_id] : NULL;
+	CatCache   *list_cache = YbGetPreloadListCache(cache, idx_cache);
+	List	   *dest_list = NIL;
+	List	   *list_of_lists = NIL;
+	HeapTuple	ntp;
+	Relation	relation = table_open(cache->cc_reloid, AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+
+	SysScanDesc scandesc = systable_beginscan(relation,
+											  InvalidOid,
+											  false /* indexOK */ ,
+											  NULL /* snapshot */ ,
+											  0 /* nkeys */ ,
+											  NULL /* key */ );
+
+	size_t		scanned = 0;
+	instr_time	start;
+
+	if (yb_debug_log_catcache_events)
+		INSTR_TIME_SET_CURRENT(start);
+
+	MemoryContextSwitchTo(row_cxt);
+	for (;;)
+	{
+		MemoryContextReset(row_cxt);
+		ntp = systable_getnext(scandesc);
+		if (!HeapTupleIsValid(ntp))
+			break;
+
+		scanned++;
+		SetCatCacheTuple(cache, ntp, RelationGetDescr(relation));
+
+		if (idx_cache)
+			SetCatCacheTuple(idx_cache, ntp, RelationGetDescr(relation));
+
+		/*
+		 * In minimal-preload mode preload only the pg_rewrite (RULERELNAME)
+		 * list, which is safe to preload because we throw it away when we
+		 * are done preloading the corresponding relcache entry. The other
+		 * catcache lists are unsafe to preload in minimal mode because they
+		 * may be incomplete.
+		 */
+		if (!list_cache ||
+			(list_cache->id != RULERELNAME && !YbShouldPreloadCatcacheLists()))
+			continue;
+
+		bool		is_add_to_list_required = true;
+
+		switch (list_cache->id)
+		{
+			case PROCNAMEARGSNSP:
+				{
+					/*
+					 * Special handling for the common case of looking up
+					 * functions (procedures) by name (i.e. partial key).
+					 * We set up the partial cache list for function by-name
+					 * lookup on initialization to avoid scanning the large
+					 * pg_proc table each time.
+					 */
+					bool		is_null = false;
+					ScanKeyData key = list_cache->cc_skey[0];
+					Datum		ndt = heap_getattr(ntp, key.sk_attno, tupdesc, &is_null);
+
+					if (is_null)
+					{
+						YBC_LOG_WARNING("Ignoring unexpected null "
+										"entry while initializing proc cache list");
+						is_add_to_list_required = false;
+						break;
+					}
+
+					dest_list = NIL;
+					/* Look for an existing list for functions with this name. */
+					ListCell   *lc;
+
+					foreach(lc, list_of_lists)
+					{
+						List	   *fnlist = lfirst(lc);
+						HeapTuple	otp = linitial(fnlist);
+						Datum		odt = heap_getattr(otp, key.sk_attno, tupdesc, &is_null);
+						Datum		key_matches = FunctionCall2Coll(&key.sk_func,
+																	key.sk_collation,
+																	ndt, odt);
+
+						if (DatumGetBool(key_matches))
+						{
+							dest_list = fnlist;
+							break;
+						}
+					}
+					break;
+				}
+			case RULERELNAME:
+				{
+					/*
+					 * Special handling for pg_rewrite: preload rules list by
+					 * relation oid. Note that rules should be ordered by name -
+					 * which is achieved using RewriteRelRulenameIndexId index.
+					 */
+					if (dest_list)
+					{
+						HeapTuple	ltp = llast(dest_list);
+						Form_pg_rewrite ltp_struct = (Form_pg_rewrite) GETSTRUCT(ltp);
+						Form_pg_rewrite ntp_struct = (Form_pg_rewrite) GETSTRUCT(ntp);
+
+						if (ntp_struct->ev_class != ltp_struct->ev_class)
+							dest_list = NIL;
+					}
+					break;
+				}
+			case AMOPOPID:
+				{
+					/*
+					 * Add a cache list for AMOPOPID for lookup by operator
+					 * only.
+					 */
+					if (dest_list)
+					{
+						HeapTuple	ltp = llast(dest_list);
+						Form_pg_amop ltp_struct = (Form_pg_amop) GETSTRUCT(ltp);
+						Form_pg_amop ntp_struct = (Form_pg_amop) GETSTRUCT(ntp);
+
+						if (ntp_struct->amopopr != ltp_struct->amopopr)
+							dest_list = NIL;
+					}
+					break;
+				}
+			case YBCONSTRAINTRELIDTYPIDNAME:
+				{
+					/*
+					 * Add a cache list for YBCONSTRAINTRELIDTYPIDNAME for lookup by conrelid only.
+					 */
+					if (!yb_enable_fkey_catcache)
+					{
+						is_add_to_list_required = false;
+						break;
+					}
+					if (dest_list)
+					{
+						HeapTuple	ltp = llast(dest_list);
+						Form_pg_constraint ltp_struct = (Form_pg_constraint) GETSTRUCT(ltp);
+						Form_pg_constraint ntp_struct = (Form_pg_constraint) GETSTRUCT(ntp);
+
+						if (ntp_struct->conrelid != ltp_struct->conrelid)
+							dest_list = NIL;
+					}
+					break;
+				}
+			default:
+				/* YbGetPreloadListCache returns only the caches above. */
+				Assert(false);
+				is_add_to_list_required = false;
+				break;
+		}
+
+		if (is_add_to_list_required)
+		{
+			/* The lists are consumed after the scan, so must outlive row_cxt. */
+			MemoryContextSwitchTo(preload_cxt);
+			ntp = heap_copytuple(ntp);
+			if (dest_list)
+			{
+				List	   *old_dest_list = dest_list;
+
+				(void) old_dest_list;
+				dest_list = lappend(dest_list, ntp);
+				Assert(dest_list == old_dest_list);
+			}
+			else
+			{
+				dest_list = list_make1(ntp);
+				list_of_lists = lappend(list_of_lists, dest_list);
+			}
+			MemoryContextSwitchTo(row_cxt);
+		}
+	}
+	MemoryContextSwitchTo(preload_cxt);
+
+	systable_endscan(scandesc);
+
+	table_close(relation, AccessShareLock);
+
+	if (list_of_lists)
+	{
+		/* Load up the lists computed above into the catalog cache. */
+		ListCell   *lc;
+
+		foreach(lc, list_of_lists)
+			SetCatCacheList(list_cache, 1, lfirst(lc));
+		list_free_deep(list_of_lists);
+	}
+
+	if (yb_debug_log_catcache_events)
+	{
+		instr_time	duration;
+
+		INSTR_TIME_SET_CURRENT(duration);
+		INSTR_TIME_SUBTRACT(duration, start);
+		elog(LOG, "YbPreloadCatalogCache: %zu entries added for "
+			 "cache id %d, index oid %d (relation %s), took " INT64_FORMAT " us",
+			 scanned, cache->id, cache->cc_indexoid, cache->cc_relname,
+			 INSTR_TIME_GET_MICROSEC(duration));
+	}
+
+	/*
+	 * Done: mark cache(s) as loaded. We can only safely set yb_cc_is_fully_loaded
+	 * if we did full preloading; minimal preloading doesn't load user objects.
+	 */
+	if (!YBCIsInitDbModeEnvVarSet() &&
+		YbNeedAdditionalCatalogTables() &&
+		!YbUseMinimalCatalogCachesPreload())
+	{
+		cache->yb_cc_is_fully_loaded = true;
+		if (idx_cache)
+			idx_cache->yb_cc_is_fully_loaded = true;
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(preload_cxt);
+}
 
 /*
  * InitCatalogCache - initialize the caches
@@ -212,6 +709,11 @@ SearchSysCache(SysCacheIdentifier cacheId,
 			   Datum key3,
 			   Datum key4)
 {
+	if (IsMultiThreadedMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("catalog cache lookup is not allowed in multithread mode"),
+				 errhint("Try to set yb_enable_expression_pushdown to false.")));
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 
 	return SearchCatCache(SysCache[cacheId], key1, key2, key3, key4);
@@ -221,6 +723,11 @@ HeapTuple
 SearchSysCache1(SysCacheIdentifier cacheId,
 				Datum key1)
 {
+	if (IsMultiThreadedMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("catalog cache lookup is not allowed in multithread mode"),
+				 errhint("Try to set yb_enable_expression_pushdown to false.")));
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 1);
 
@@ -231,6 +738,11 @@ HeapTuple
 SearchSysCache2(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2)
 {
+	if (IsMultiThreadedMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("catalog cache lookup is not allowed in multithread mode"),
+				 errhint("Try to set yb_enable_expression_pushdown to false.")));
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 2);
 
@@ -241,6 +753,11 @@ HeapTuple
 SearchSysCache3(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2, Datum key3)
 {
+	if (IsMultiThreadedMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("catalog cache lookup is not allowed in multithread mode"),
+				 errhint("Try to set yb_enable_expression_pushdown to false.")));
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 3);
 
@@ -251,6 +768,11 @@ HeapTuple
 SearchSysCache4(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2, Datum key3, Datum key4)
 {
+	if (IsMultiThreadedMode())
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("catalog cache lookup is not allowed in multithread mode"),
+				 errhint("Try to set yb_enable_expression_pushdown to false.")));
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 4);
 
@@ -286,6 +808,24 @@ SearchSysCacheLocked1(SysCacheIdentifier cacheId,
 	CatCache   *cache = SysCache[cacheId];
 	ItemPointerData tid;
 	LOCKTAG		tag;
+
+	if (YBGetObjectLockMode() != PG_OBJECT_LOCK_MODE)
+	{
+		HeapTuple tuple = SearchSysCache1(cacheId, key1);
+		if (*YBCGetGFlags()->TEST_enable_obj_tuple_locks)
+		{
+			SET_LOCKTAG_TUPLE(tag,
+							cache->cc_relisshared ? InvalidOid : MyDatabaseId,
+							cache->cc_reloid,
+							0,
+							0);
+			(void) LockAcquire(&tag, InplaceUpdateTupleLock, false, false);
+			ReleaseSysCache(tuple);
+			AcceptInvalidationMessages();
+			tuple = SearchSysCache1(cacheId, key1);
+		}
+		return tuple;
+	}
 
 	/*----------
 	 * Since inplace updates may happen just before our LockTuple(), we must
@@ -791,4 +1331,187 @@ oid_compare(const void *a, const void *b)
 	Oid			ob = *((const Oid *) b);
 
 	return pg_cmp_u32(oa, ob);
+}
+
+/*
+ * Verify the table yb_cache_index_name_table is consistent with cacheinfo.
+ * Should only be invoked when pg_class is fully loaded for SearchSysCache1
+ * to find these indexes.
+ */
+#ifndef NDEBUG
+bool
+YbCheckCatalogCacheIndexNameTable()
+{
+	/*
+	 * We can only do this verification during initdb because otherwise
+	 * during YSQL upgrade we can see assertion failure.
+	 */
+	if (!YBCIsInitDbModeEnvVarSet())
+		return true;
+	int			cache_id;
+
+	for (cache_id = 0; cache_id < SysCacheSize; cache_id++)
+	{
+		const char *index_name = yb_cache_index_name_table[cache_id];
+		Oid			indoid = cacheinfo[cache_id].indoid;
+		HeapTuple	tuple = SearchSysCache1(RELOID, indoid);
+
+		Assert(HeapTupleIsValid(tuple));
+		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+
+		if (strcmp(NameStr(classForm->relname), index_name))
+		{
+			ReleaseSysCache(tuple);
+			YBC_LOG_WARNING("Cache id %u has name mismatch: %s vs %s", cache_id,
+							NameStr(classForm->relname), index_name);
+			return false;
+		}
+		ReleaseSysCache(tuple);
+
+		const char *table_name = YbGetCatalogCacheTableNameFromCacheId(cache_id);
+		Oid			reloid = cacheinfo[cache_id].reloid;
+
+		tuple = SearchSysCache1(RELOID, reloid);
+		Assert(HeapTupleIsValid(tuple));
+		classForm = (Form_pg_class) GETSTRUCT(tuple);
+		if (strcmp(NameStr(classForm->relname), table_name))
+		{
+			ReleaseSysCache(tuple);
+			YBC_LOG_WARNING("Cache id %u has name mismatch: %s vs %s", cache_id,
+							NameStr(classForm->relname), table_name);
+			return false;
+		}
+		ReleaseSysCache(tuple);
+	}
+	return true;
+}
+
+/*
+ * Verify that the SysCacheName array is consistent with the SysCacheIdentifier enum.
+ */
+bool
+YbCheckSysCacheNames()
+{
+#define YB_CATCACHE_ENTRY(name, id, idx, tbl) \
+	if (strcmp(SysCacheName[name], #name)) return false;
+	YB_CATCACHE_LIST
+#undef YB_CATCACHE_ENTRY
+	return true;
+}
+#endif							/* NDEBUG */
+
+const char *
+YbGetCatalogCacheIndexName(int cache_id)
+{
+	return yb_cache_index_name_table[cache_id];
+}
+
+const char *
+YbGetCatalogCacheName(int cache_id)
+{
+	return SysCacheName[cache_id];
+}
+
+const char *
+YbGetCatalogCacheTableNameFromTableId(int table_id)
+{
+	Assert(table_id >= 0 && table_id < YbNumCatalogCacheTables);
+	return yb_cache_table_name_table[table_id];
+}
+
+int
+YbGetCatalogCacheTableIdFromCacheId(int cache_id)
+{
+	int			table_id = yb_catalog_cache_tables[cache_id];
+
+	Assert(table_id >= 0 && table_id < YbNumCatalogCacheTables);
+	return table_id;
+}
+
+const char *
+YbGetCatalogCacheTableNameFromCacheId(int cache_id)
+{
+	return YbGetCatalogCacheTableNameFromTableId(YbGetCatalogCacheTableIdFromCacheId(cache_id));
+}
+
+uint32
+YbSysCacheComputeHashValue(int cache_id, Datum v1, Datum v2, Datum v3, Datum v4)
+{
+	elog(LOG, "Computing hash for cache_id: %d, v1: " UINT64_FORMAT ", v2: " UINT64_FORMAT ", v3: " UINT64_FORMAT ", v4: " UINT64_FORMAT,
+		 cache_id, (uint64) v1, (uint64) v2, (uint64) v3, (uint64) v4);
+	CatCache   *cache = SysCache[cache_id];
+
+	return YbCatalogCacheComputeHashValue(cache, v1, v2, v3, v4);
+}
+
+/*
+ * See YbCatCachePrefetchList().
+ */
+void
+YbSysCachePrefetchList(int cache_id, Datum key1, int nfull_keys,
+					   const Datum *full_keys)
+{
+	Assert(cache_id >= 0 && cache_id < SysCacheSize &&
+		   SysCache[cache_id] != NULL);
+	YbCatCachePrefetchList(SysCache[cache_id], key1, nfull_keys, full_keys);
+}
+
+/*
+ * Copies data from the cacheinfo array to the supplied values array.
+ * The values array is expected to have space for at least 10 Datums.
+ */
+void
+YbCopyCacheInfoToValues(int cache_id, Datum *values)
+{
+	values[0] = Int32GetDatum(cache_id);
+	values[1] = CStringGetTextDatum(SysCacheName[cache_id]);
+	values[2] = ObjectIdGetDatum(cacheinfo[cache_id].reloid);
+	values[3] = ObjectIdGetDatum(cacheinfo[cache_id].indoid);
+	values[4] = Int32GetDatum(cacheinfo[cache_id].nkeys);
+	values[5] = Int32GetDatum(cacheinfo[cache_id].key[0]);
+	values[6] = Int32GetDatum(cacheinfo[cache_id].key[1]);
+	values[7] = Int32GetDatum(cacheinfo[cache_id].key[2]);
+	values[8] = Int32GetDatum(cacheinfo[cache_id].key[3]);
+	values[9] = Int32GetDatum(cacheinfo[cache_id].nbuckets);
+}
+
+void
+YbCheckCatalogCacheIds()
+{
+	/*
+	 * If any existing id has its integer value changed, we need to increment
+	 * YbSharedInvalCatcacheMsgVersion so that old release PG backend will not
+	 * apply the catalog cache invalidation message.
+	 *
+	 * If an existing ID is removed, interop isn't possible so we need to
+	 * bump YbSharedInvalCatcacheMsgVersion.
+	 * If new ids are added, we need to add them at the end of the above
+	 * list. This is to allow we can keep YbSharedInvalCatcacheMsgVersion
+	 * unchanged so that old release PG backend can apply messages of any
+	 * existing ids. If a message catcache id's integer value is out of bound,
+	 * it will not be applied because the corresponding catalog cache does not
+	 * exist in the old PG backend. If there is a new id appended, we need to
+	 * evaluate whether we need to bump YbSharedInvalCatcacheMsgVersion
+	 * or not:
+	 * (1) if the new id represents a new catalog table that did not exist in
+	 * in the old release, then interop is possible when the new id is not
+	 * involved, and there is no need to bump YbSharedInvalCatcacheMsgVersion.
+	 * (2) if the new id represents an existing catalog table in the old
+	 * release, then in a new PG backend the new catcache should be invalidated
+	 * but old PG backend cannot provide that message needed. In this case
+	 * interop isn't possible so we need to bump YbSharedInvalCatcacheMsgVersion.
+	 *
+	 * The ids added by the PG19 merge (86-94) were evaluated as follows:
+	 * the PROPGRAPH* caches (87-94) are case (1). EXTENSIONNAME (86) is
+	 * case (2), on pg_extension, but needs no bump: the only releases without
+	 * it are PG15-based, and during a PG15 to PG19 major upgrade the master
+	 * rejects all non-forced catalog writes until every yb-tserver runs the
+	 * new version, so no old-release backend can change pg_extension while
+	 * new-release backends are running.
+	 */
+#define YB_CATCACHE_ENTRY(name, id, idx, tbl) \
+	static_assert(name == id, \
+				  "The cache ID " #name " has changed from " #id ". You need to increment YbSharedInvalCatcacheMsgVersion");
+	YB_CATCACHE_LIST
+#undef YB_CATCACHE_ENTRY
 }

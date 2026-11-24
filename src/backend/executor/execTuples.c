@@ -70,6 +70,11 @@
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "miscadmin.h"
+#include "pg_yb_utils.h"
+
 static TupleDesc ExecTypeFromTLInternal(List *targetList,
 										bool skipjunk);
 static pg_attribute_always_inline void slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
@@ -120,6 +125,7 @@ tts_virtual_clear(TupleTableSlot *slot)
 	slot->tts_nvalid = 0;
 	slot->tts_flags |= TTS_FLAG_EMPTY;
 	ItemPointerSetInvalid(&slot->tts_tid);
+	TABLETUPLE_YBCTID(slot) = 0;
 }
 
 /*
@@ -340,6 +346,7 @@ tts_heap_clear(TupleTableSlot *slot)
 	ItemPointerSetInvalid(&slot->tts_tid);
 	hslot->off = 0;
 	hslot->tuple = NULL;
+	TABLETUPLE_YBCTID(slot) = 0;
 }
 
 static void
@@ -495,6 +502,7 @@ tts_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple, bool shouldFree)
 	hslot->off = 0;
 	slot->tts_flags &= ~(TTS_FLAG_EMPTY | TTS_FLAG_SHOULDFREE);
 	slot->tts_tid = tuple->t_self;
+	TABLETUPLE_YBCTID(slot) = HEAPTUPLE_YBCTID(tuple);
 
 	if (shouldFree)
 		slot->tts_flags |= TTS_FLAG_SHOULDFREE;
@@ -538,6 +546,7 @@ tts_minimal_clear(TupleTableSlot *slot)
 	ItemPointerSetInvalid(&slot->tts_tid);
 	mslot->off = 0;
 	mslot->mintuple = NULL;
+	TABLETUPLE_YBCTID(slot) = 0;
 }
 
 static void
@@ -745,6 +754,7 @@ tts_buffer_heap_clear(TupleTableSlot *slot)
 	bslot->base.tuple = NULL;
 	bslot->base.off = 0;
 	bslot->buffer = InvalidBuffer;
+	TABLETUPLE_YBCTID(slot) = 0;
 }
 
 static void
@@ -961,6 +971,8 @@ tts_buffer_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple,
 	bslot->base.off = 0;
 	slot->tts_tid = tuple->t_self;
 
+	/* set tts_ybctid to 0 since YB doesn't use buffer heap tuple */
+	TABLETUPLE_YBCTID(slot) = 0;
 	/*
 	 * If tuple is on a disk page, keep the page pinned as long as we hold a
 	 * pointer into it.  We assume the caller already has such a pin.  If
@@ -1690,7 +1702,9 @@ ExecStorePinnedBufferHeapTuple(HeapTuple tuple,
 	Assert(tuple != NULL);
 	Assert(slot != NULL);
 	Assert(slot->tts_tupleDescriptor != NULL);
-	Assert(BufferIsValid(buffer));
+
+	if (!IsYugaByteEnabled())
+		Assert(BufferIsValid(buffer));
 
 	if (unlikely(!TTS_IS_BUFFERTUPLE(slot)))
 		elog(ERROR, "trying to store an on-disk heap tuple into wrong type of slot");
@@ -2224,6 +2238,24 @@ ExecTypeFromTLInternal(List *targetList, bool skipjunk)
 		len = ExecCleanTargetListLength(targetList);
 	else
 		len = ExecTargetListLength(targetList);
+
+	/*
+	 * In YSQL upgrade mode, targetList might be prefixed with OID during INSERT.
+	 * System columns don't count toward nattrs.
+	 */
+	if (IsYsqlUpgrade)
+	{
+		foreach(l, targetList)
+		{
+			TargetEntry *tle = lfirst(l);
+
+			if (tle->resno < 1)
+				len--;
+			else
+				break;
+		}
+	}
+
 	typeInfo = CreateTemplateTupleDesc(len);
 
 	foreach(l, targetList)

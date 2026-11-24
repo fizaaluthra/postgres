@@ -64,9 +64,17 @@ get_db_conn(ClusterInfo *cluster, const char *db_name)
 	appendPQExpBufferStr(&conn_opts, "dbname=");
 	appendConnStrVal(&conn_opts, db_name);
 	appendPQExpBufferStr(&conn_opts, " user=");
-	appendConnStrVal(&conn_opts, os_info.user);
+	if (is_yugabyte_enabled())
+		appendConnStrVal(&conn_opts, cluster->yb_user);
+	else
+		appendConnStrVal(&conn_opts, os_info.user);
 	appendPQExpBuffer(&conn_opts, " port=%d", cluster->port);
-	if (cluster->sockdir)
+	if (is_yugabyte_enabled() && cluster->yb_hostaddr)
+	{
+		appendPQExpBufferStr(&conn_opts, " host=");
+		appendConnStrVal(&conn_opts, cluster->yb_hostaddr);
+	}
+	else if (cluster->sockdir)
 	{
 		appendPQExpBufferStr(&conn_opts, " host=");
 		appendConnStrVal(&conn_opts, cluster->sockdir);
@@ -100,14 +108,23 @@ cluster_conn_opts(ClusterInfo *cluster)
 	else
 		resetPQExpBuffer(buf);
 
-	if (cluster->sockdir)
+	if (is_yugabyte_enabled() && cluster->yb_hostaddr)
+	{
+		appendPQExpBufferStr(buf, "--host ");
+		appendShellString(buf, cluster->yb_hostaddr);
+		appendPQExpBufferChar(buf, ' ');
+	}
+	else if (cluster->sockdir)
 	{
 		appendPQExpBufferStr(buf, "--host ");
 		appendShellString(buf, cluster->sockdir);
 		appendPQExpBufferChar(buf, ' ');
 	}
 	appendPQExpBuffer(buf, "--port %d --username ", cluster->port);
-	appendShellString(buf, os_info.user);
+	if (is_yugabyte_enabled())
+		appendShellString(buf, cluster->yb_user);
+	else
+		appendShellString(buf, os_info.user);
 
 	return buf->data;
 }
@@ -348,4 +365,15 @@ check_pghost_envvar(void)
 
 	/* Free the memory that libpq allocated on our behalf */
 	PQconninfoFree(start);
+}
+
+/* YB: Set the old cluster version from the running old cluster, in get_pg_version()'s form. */
+void
+yb_get_old_cluster_version(void)
+{
+	PGconn	   *conn = connectToServer(&old_cluster, "template1");
+
+	old_cluster.major_version = PQserverVersion(conn) / 10000 * 10000;
+	old_cluster.major_version_str = psprintf("%d", old_cluster.major_version / 10000);
+	PQfinish(conn);
 }

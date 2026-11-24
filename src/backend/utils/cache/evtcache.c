@@ -30,6 +30,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 typedef enum
 {
 	ETCS_NEEDS_REBUILD,
@@ -80,7 +83,6 @@ BuildEventTriggerCache(void)
 	HASHCTL		ctl;
 	HTAB	   *cache;
 	Relation	rel;
-	Relation	irel;
 	SysScanDesc scan;
 
 	if (EventTriggerCacheContext != NULL)
@@ -124,8 +126,12 @@ BuildEventTriggerCache(void)
 	 * Prepare to scan pg_event_trigger in name order.
 	 */
 	rel = relation_open(EventTriggerRelationId, AccessShareLock);
-	irel = index_open(EventTriggerNameIndexId, AccessShareLock);
-	scan = systable_beginscan_ordered(rel, irel, NULL, 0, NULL);
+	/*
+	 * YB: use systable_beginscan instead of systable_beginscan_ordered because
+	 * systable_beginscan_ordered is (supposedly) not yet supported for YB.
+	 */
+	scan = systable_beginscan(rel, EventTriggerNameIndexId, true /* indexOK */ ,
+							  NULL, 0, NULL);
 
 	/*
 	 * Build a cache item for each pg_event_trigger tuple, and append each one
@@ -145,7 +151,8 @@ BuildEventTriggerCache(void)
 		MemoryContext oldcontext;
 
 		/* Get next tuple. */
-		tup = systable_getnext_ordered(scan, ForwardScanDirection);
+		/* YB: see above explanation for why not systable_getnext_ordered */
+		tup = systable_getnext(scan);
 		if (!HeapTupleIsValid(tup))
 			break;
 
@@ -195,8 +202,18 @@ BuildEventTriggerCache(void)
 	}
 
 	/* Done with pg_event_trigger scan. */
-	systable_endscan_ordered(scan);
-	index_close(irel, AccessShareLock);
+	/* YB: see above explanation for why not systable_endscan_ordered */
+	systable_endscan(scan);
+
+	/*
+	 * Also manually clean up the yb_memctx used for the scan.
+	 * Normally this gets destroyed when the PG memory context is deleted.
+	 * But here we are in a cache memory context which is permanent.
+	 */
+	if (EventTriggerCacheContext->yb_memctx)
+		HandleYBStatus(YBCPgDestroyMemctx(EventTriggerCacheContext->yb_memctx));
+	EventTriggerCacheContext->yb_memctx = NULL;
+
 	relation_close(rel, AccessShareLock);
 
 	/* Install new cache. */

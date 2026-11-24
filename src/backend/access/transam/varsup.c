@@ -27,9 +27,30 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/sysattr.h"
+#include "access/table.h"
+#include "access/tableam.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_namespace.h"
+#include "commands/yb_cmds.h"
+#include "utils/fmgroids.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+
 
 /* Number of OIDs to prefetch (preallocate) per XLOG write */
 #define VAR_OID_PREFETCH		8192
+
+/*
+ * Number of OIDs to prefetch (preallocate) in YugabyteDB setup.
+ * Given there are multiple Postgres nodes, each node should prefetch
+ * in smaller chunks.
+ */
+#define YB_OID_PREFETCH	        256
 
 static void VarsupShmemRequest(void *arg);
 
@@ -51,6 +72,12 @@ VarsupShmemRequest(void *arg)
 					   .ptr = (void **) &TransamVariables,
 		);
 }
+
+/* next OID to assign during YSQL upgrade */
+Oid			ysql_upgrade_next_oid = InvalidOid;
+
+/* lowest OID to assign during YSQL upgrade, set by the upgrade runner */
+Oid			yb_ysql_upgrade_min_next_oid = InvalidOid;
 
 /*
  * Allocate the next FullTransactionId for a new transaction or
@@ -539,6 +566,133 @@ ForceTransactionIdLimitUpdate(void)
 	return false;
 }
 
+/*
+ * Scan all system tables with OIDs to determine the maximum
+ * system-allocated OID.
+ * Naturally, this function is expensive.
+ */
+static Oid
+YbGetMaxAllocatedSystemOid()
+{
+	Oid			result = InvalidOid;
+
+	Relation	pg_class,
+				pg_attribute,
+				sys_rel;
+
+	ScanKeyData key[2];
+	TableScanDesc scan;
+	HeapTuple	tuple;
+
+	List	   *sys_rel_oids = NIL;
+	ListCell   *lc,
+			   *lc2;
+	List	   *attrelids = NIL;
+	List	   *attnums = NIL;
+	ArrayType  *oids_array_type;
+	SysScanDesc sys_scan;
+	bool		is_null;
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+
+	/*
+	 * SELECT * FROM pg_class
+	 * WHERE relnamespace = 'pg_catalog'::regnamespace
+	 * AND relkind = 'r';
+	 */
+	ScanKeyInit(&key[0],
+				Anum_pg_class_relnamespace,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(PG_CATALOG_NAMESPACE));
+	ScanKeyInit(&key[1],
+				Anum_pg_class_relkind,
+				BTEqualStrategyNumber, F_CHAREQ,
+				CharGetDatum(RELKIND_RELATION));
+
+	scan = table_beginscan_catalog(pg_class, 2, key);
+
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+		sys_rel_oids =
+			lappend_oid(sys_rel_oids, ((Form_pg_class) GETSTRUCT(tuple))->oid);
+
+	table_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+
+	/*
+	 * SELECT attrelid, attnum FROM pg_attribute WHERE attrelid in
+	 * <sys_rel_oids> AND attname = 'oid';
+	 */
+	Datum		oids_datum_array[list_length(sys_rel_oids)];
+	int			num_oids = 0;
+
+	foreach(lc, sys_rel_oids)
+		oids_datum_array[num_oids++] = ObjectIdGetDatum(lfirst_oid(lc));
+
+	oids_array_type = construct_array(oids_datum_array, num_oids, OIDOID,
+									  sizeof(Oid), true, TYPALIGN_INT);
+
+	ScanKeyEntryInitialize(&key[0],
+						   SK_SEARCHARRAY,
+						   Anum_pg_attribute_attrelid,
+						   BTEqualStrategyNumber, OIDOID,
+						   C_COLLATION_OID, F_OIDEQ,
+						   PointerGetDatum(oids_array_type));
+	ScanKeyInit(&key[1],
+				Anum_pg_attribute_attname,
+				BTEqualStrategyNumber, F_NAMEEQ,
+				CStringGetDatum("oid"));
+
+	pg_attribute = table_open(AttributeRelationId, AccessShareLock);
+
+	sys_scan = systable_beginscan(pg_attribute, AttributeRelidNameIndexId,
+								  true, NULL, 2, key);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(sys_scan)))
+	{
+		Form_pg_attribute pg_att = (Form_pg_attribute) GETSTRUCT(tuple);
+
+		attrelids = lappend_oid(attrelids, pg_att->attrelid);
+		attnums = lappend_int(attnums, pg_att->attnum);
+	}
+	systable_endscan(sys_scan);
+	table_close(pg_attribute, AccessShareLock);
+	pfree(oids_array_type);
+
+	forboth(lc, attrelids, lc2, attnums)
+	{
+		int			attnum = lfirst_int(lc2);
+
+		/* SELECT * FROM x WHERE oid >= 12000 AND oid < 16384 */
+		ScanKeyInit(&key[0],
+					attnum,
+					BTGreaterEqualStrategyNumber, F_OIDGE,
+					ObjectIdGetDatum((Oid) FirstUnpinnedObjectId));
+		ScanKeyInit(&key[1],
+					attnum,
+					BTLessStrategyNumber, F_OIDLT,
+					ObjectIdGetDatum((Oid) FirstNormalObjectId));
+
+		sys_rel = table_open(lfirst_oid(lc), AccessShareLock);
+		scan = table_beginscan_catalog(sys_rel, 2, key);
+
+		while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+		{
+			Oid			oid = DatumGetObjectId(heap_getattr(tuple, attnum,
+															RelationGetDescr(sys_rel),
+															&is_null));
+
+			Assert(!is_null);
+
+			if (result < oid)
+				result = oid;
+		}
+
+		table_endscan(scan);
+		table_close(sys_rel, AccessShareLock);
+	}
+
+	return result;
+}
 
 /*
  * GetNewObjectId -- allocate a new OID
@@ -560,6 +714,55 @@ GetNewObjectId(void)
 		elog(ERROR, "cannot assign OIDs during recovery");
 
 	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
+
+	/*
+	 * In YSQL upgrade mode, we continue OID sequence where initdb left off.
+	 * We don't expect concurrent upgrade, so we don't need to reserve OIDs.
+	 * The counter is reset at the end of every transaction, see
+	 * YbAtEOXact_UpgradeNextOid.
+	 */
+	if (IsYsqlUpgrade)
+	{
+		if (!OidIsValid(ysql_upgrade_next_oid))
+			ysql_upgrade_next_oid = YbGetMaxAllocatedSystemOid() + 1;
+
+		/*
+		 * The catalogs of this database are not the only ones that can hold
+		 * the OID: a migration that creates a shared relation inserts some of
+		 * its rows, with OIDs assigned here, into every database.  Before
+		 * such a migration, the upgrade runner sets the minimum above the
+		 * system OIDs of every database.
+		 */
+		if (ysql_upgrade_next_oid < yb_ysql_upgrade_min_next_oid)
+			ysql_upgrade_next_oid = yb_ysql_upgrade_min_next_oid;
+
+		result = ysql_upgrade_next_oid;
+		ysql_upgrade_next_oid++;
+
+		LWLockRelease(OidGenLock);
+		return result;
+	}
+
+	const bool	ysql_enable_pg_per_database_oid_allocator =
+		*YBCGetGFlags()->ysql_enable_pg_per_database_oid_allocator;
+
+	if (ysql_enable_pg_per_database_oid_allocator &&
+		IsYugaByteEnabled() && !YBCIsInitDbModeEnvVarSet())
+	{
+		/*
+		 * As of 2023-10-16, docdb does not allow OID wraparound so we do not
+		 * need to handle OID wraparound here.
+		 */
+		YbcStatus	status = YBCGetNewObjectId(YbDatabaseIdForNewObjectId,
+											   &result);
+
+		if (*YBCGetGFlags()->TEST_ysql_log_perdb_allocated_new_objectid)
+			YBC_LOG_INFO("allocated new object id %u in database %u",
+						 result, YbDatabaseIdForNewObjectId);
+		LWLockRelease(OidGenLock);
+		HandleYBStatus(status);
+		return result;
+	}
 
 	/*
 	 * Check for wraparound of the OID counter.  We *must* not return 0
@@ -598,8 +801,25 @@ GetNewObjectId(void)
 	/* If we run out of logged for use oids then we must log more */
 	if (TransamVariables->oidCount == 0)
 	{
-		XLogPutNextOid(TransamVariables->nextOid + VAR_OID_PREFETCH);
-		TransamVariables->oidCount = VAR_OID_PREFETCH;
+		if (IsYugaByteEnabled() &&
+			!ysql_enable_pg_per_database_oid_allocator)
+		{
+			Oid			begin_oid = InvalidOid;
+			Oid			end_oid = InvalidOid;
+
+			YBCReserveOids(MyDatabaseId,
+						   TransamVariables->nextOid,
+						   YB_OID_PREFETCH,
+						   &begin_oid,
+						   &end_oid);
+			TransamVariables->nextOid = begin_oid;
+			TransamVariables->oidCount = end_oid - begin_oid;
+		}
+		else
+		{
+			XLogPutNextOid(TransamVariables->nextOid + VAR_OID_PREFETCH);
+			TransamVariables->oidCount = VAR_OID_PREFETCH;
+		}
 	}
 
 	result = TransamVariables->nextOid;
@@ -702,3 +922,28 @@ AssertTransactionIdInAllowableRange(TransactionId xid)
 		   TransactionIdPrecedesOrEquals(xid, next_xid));
 }
 #endif
+
+/*
+ * Forget the next OID to assign during YSQL upgrade, so that the next
+ * transaction rescans the catalogs of the database for the maximum allocated
+ * system OID.
+ *
+ * Another backend may insert rows with auto-assigned OIDs into this
+ * database's catalogs between our transactions: when a YSQL upgrade
+ * migration creates a shared relation, the template1 backend inserts the
+ * relation's array type and constraints into the catalogs of every database
+ * (see YBCatalogTupleInsert).  A counter kept across transactions would not
+ * know about those OIDs and would assign them again, to rows of other
+ * catalogs.
+ *
+ * Resetting between transactions is enough.  The upgrade runner waits for
+ * each migration to finish before it starts the next one, so the template1
+ * backend never inserts rows into this database's catalogs while one of our
+ * transactions is running: its inserts are committed before our next
+ * transaction starts.
+ */
+void
+YbAtEOXact_UpgradeNextOid(void)
+{
+	ysql_upgrade_next_oid = InvalidOid;
+}

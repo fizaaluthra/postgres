@@ -771,6 +771,17 @@ typedef enum CoercionForm
 } CoercionForm;
 
 /*
+ * YbConcurrencyContext - distinguishes between different forms of concurrency
+ * specified in CREATE INDEX.
+ */
+typedef enum YbConcurrencyContext
+{
+	YB_CONCURRENCY_DISABLED,	/* CONCURRENTLY is disabled */
+	YB_CONCURRENCY_IMPLICIT_ENABLED,	/* CONCURRENTLY is implicitly enabled */
+	YB_CONCURRENCY_EXPLICIT_ENABLED /* CONCURRENTLY is explicitly enabled */
+} YbConcurrencyContext;
+
+/*
  * FuncExpr - expression node for a function call
  *
  * Collation information is irrelevant for the query jumbling, only the
@@ -925,6 +936,9 @@ typedef OpExpr NullIfExpr;
  */
 typedef struct ScalarArrayOpExpr
 {
+	/* YB: custom_read_write to conditionally skip hashfuncid/negfuncid at expression version 11 */
+	pg_node_attr(custom_read_write)
+
 	Expr		xpr;
 
 	/* PG_OPERATOR OID of the operator */
@@ -1486,6 +1500,9 @@ typedef struct RowExpr
  * A RowCompareExpr node is only generated for the < <= > >= cases;
  * the = and <> cases are translated to simple AND or OR combinations
  * of the pairwise comparisons.
+ *
+ * YB: In the execution layer, YB indexes support the = case for when
+ * the RHS is an array of rows much like an IN condition.
  */
 typedef struct RowCompareExpr
 {
@@ -1501,8 +1518,9 @@ typedef struct RowCompareExpr
 	List	   *inputcollids pg_node_attr(query_jumble_ignore);
 	/* the left-hand input arguments */
 	List	   *largs;
+	/* YB: changed rargs type from List to Node */
 	/* the right-hand input arguments */
-	List	   *rargs;
+	Node	   *rargs;
 } RowCompareExpr;
 
 /*

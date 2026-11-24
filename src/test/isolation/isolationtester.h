@@ -44,6 +44,7 @@ typedef enum
 	PSB_ONCE,					/* force step to wait once */
 	PSB_OTHER_STEP,				/* wait for another step to complete first */
 	PSB_NUM_NOTICES,			/* wait for N notices from another session */
+	PSB_YB_NEVER_WAITS,			/* YB: step never waits on another session */
 } PermutationStepBlockerType;
 
 typedef struct
@@ -89,5 +90,8 @@ extern int	spec_yyparse(void);
 
 extern int	spec_yylex(void);
 extern void spec_yyerror(const char *message);
+
+/* YB */
+extern void spec_scanner_finish(void);
 
 #endif							/* ISOLATIONTESTER_H */

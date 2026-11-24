@@ -20,6 +20,9 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Protocol message flags.
  */
@@ -35,7 +38,8 @@ static void logicalrep_write_attrs(StringInfo out, Relation rel,
 static void logicalrep_write_tuple(StringInfo out, Relation rel,
 								   TupleTableSlot *slot,
 								   bool binary, Bitmapset *columns,
-								   PublishGencolsType include_gencols_type);
+								   PublishGencolsType include_gencols_type,
+								   bool *yb_is_omitted);
 static void logicalrep_read_attrs(StringInfo in, LogicalRepRelation *rel);
 static void logicalrep_read_tuple(StringInfo in, LogicalRepTupleData *tuple);
 
@@ -414,9 +418,12 @@ logicalrep_write_insert(StringInfo out, TransactionId xid, Relation rel,
 	/* use Oid as relation identifier */
 	pq_sendint32(out, RelationGetRelid(rel));
 
+	if (IsYugaByteEnabled())
+		elog(DEBUG2, "proto: INSERT newtuple: %s", YbSlotToString(newslot));
+
 	pq_sendbyte(out, 'N');		/* new tuple follows */
 	logicalrep_write_tuple(out, rel, newslot, binary, columns,
-						   include_gencols_type);
+						   include_gencols_type, NULL /* yb_is_omitted */ );
 }
 
 /*
@@ -450,13 +457,15 @@ void
 logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 						TupleTableSlot *oldslot, TupleTableSlot *newslot,
 						bool binary, Bitmapset *columns,
-						PublishGencolsType include_gencols_type)
+						PublishGencolsType include_gencols_type,
+						bool *yb_old_is_omitted, bool *yb_new_is_omitted)
 {
 	pq_sendbyte(out, LOGICAL_REP_MSG_UPDATE);
 
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX ||
+		   (IsYugaByteEnabled() && rel->rd_rel->relreplident == YB_REPLICA_IDENTITY_CHANGE));
 
 	/* transaction ID (if not valid, we're not streaming) */
 	if (TransactionIdIsValid(xid))
@@ -471,13 +480,22 @@ logicalrep_write_update(StringInfo out, TransactionId xid, Relation rel,
 			pq_sendbyte(out, 'O');	/* old tuple follows */
 		else
 			pq_sendbyte(out, 'K');	/* old key follows */
+
+		if (IsYugaByteEnabled())
+			elog(DEBUG2, "proto: UPDATE oldtuple: %s",
+				 YbSlotToStringWithIsOmitted(oldslot, yb_old_is_omitted));
+
 		logicalrep_write_tuple(out, rel, oldslot, binary, columns,
-							   include_gencols_type);
+							   include_gencols_type, yb_old_is_omitted);
 	}
+
+	if (IsYugaByteEnabled())
+		elog(DEBUG2, "proto: UPDATE newtuple: %s",
+			 YbSlotToStringWithIsOmitted(newslot, yb_new_is_omitted));
 
 	pq_sendbyte(out, 'N');		/* new tuple follows */
 	logicalrep_write_tuple(out, rel, newslot, binary, columns,
-						   include_gencols_type);
+						   include_gencols_type, yb_new_is_omitted);
 }
 
 /*
@@ -532,7 +550,8 @@ logicalrep_write_delete(StringInfo out, TransactionId xid, Relation rel,
 {
 	Assert(rel->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
 		   rel->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
-		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX);
+		   rel->rd_rel->relreplident == REPLICA_IDENTITY_INDEX ||
+		   (IsYugaByteEnabled() && rel->rd_rel->relreplident == YB_REPLICA_IDENTITY_CHANGE));
 
 	pq_sendbyte(out, LOGICAL_REP_MSG_DELETE);
 
@@ -548,8 +567,11 @@ logicalrep_write_delete(StringInfo out, TransactionId xid, Relation rel,
 	else
 		pq_sendbyte(out, 'K');	/* old key follows */
 
+	if (IsYugaByteEnabled())
+		elog(DEBUG2, "proto: DELETE oldtuple: %s", YbSlotToString(oldslot));
+
 	logicalrep_write_tuple(out, rel, oldslot, binary, columns,
-						   include_gencols_type);
+						   include_gencols_type, NULL /* yb_is_omitted */ );
 }
 
 /*
@@ -769,7 +791,8 @@ logicalrep_read_typ(StringInfo in, LogicalRepTyp *ltyp)
 static void
 logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 					   bool binary, Bitmapset *columns,
-					   PublishGencolsType include_gencols_type)
+					   PublishGencolsType include_gencols_type,
+					   bool *yb_is_omitted)
 {
 	TupleDesc	desc;
 	Datum	   *values;
@@ -805,6 +828,16 @@ logicalrep_write_tuple(StringInfo out, Relation rel, TupleTableSlot *slot,
 		if (!logicalrep_should_publish_column(att, columns,
 											  include_gencols_type))
 			continue;
+
+		if (IsYugaByteEnabled() && yb_is_omitted && yb_is_omitted[i])
+		{
+			/*
+			 * Treat omitted column as an unchanged toast column so that the
+			 * client will ignore it.
+			 */
+			pq_sendbyte(out, 'u');	/* unchanged toast column */
+			continue;
+		}
 
 		if (isnull[i])
 		{

@@ -133,6 +133,14 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "replication/walsender.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include <assert.h>
+#include <inttypes.h>
+#include <unistd.h>
+
 
 /*
  * Pending requests are stored as ready-to-send SharedInvalidationMessages.
@@ -179,6 +187,8 @@ typedef struct InvalMessageArray
 } InvalMessageArray;
 
 static InvalMessageArray InvalMessageArrays[2];
+
+#define YB_SUBGROUP_COUNT (sizeof(InvalMessageArrays) / sizeof(InvalMessageArray))
 
 /* Control information for one logical group of messages */
 typedef struct InvalidationMsgsGroup
@@ -250,6 +260,16 @@ typedef struct TransInvalidationInfo
 
 	/* Subtransaction nesting depth */
 	int			my_level;
+
+	/*
+	 * YB: Number of invalidation messages accumulated so far in the current PG
+	 * BEGIN block transaction. If there are multiple DDL statements in
+	 * the PG transaction, each time we fetch the invalidation messages we
+	 * will get the invalidation messages of all the previous DDL statements.
+	 * We use this count to figure out the tail portion the messages for the
+	 * current DDL statement.
+	 */
+	int			YbNumInvalMsgsInTxn[YB_SUBGROUP_COUNT];
 } TransInvalidationInfo;
 
 static TransInvalidationInfo *transInvalInfo = NULL;
@@ -301,6 +321,7 @@ static struct RELSYNCCALLBACK
 
 static int	relsync_callback_count = 0;
 
+bool		yb_refresh_cache_in_progress = false;
 
 /* ----------------------------------------------------------------
  *				Invalidation subgroup support functions
@@ -320,6 +341,18 @@ static void
 AddInvalidationMessage(InvalidationMsgsGroup *group, int subgroup,
 					   const SharedInvalidationMessage *msg)
 {
+	/*
+	 * YB: T_Invalid represents single shard DML statement, or any non-DDL
+	 * statement (e.g., SET SESSION AUTHORIZATION pgcron_cront)
+	 */
+	Assert(YBGetCurrentStmtDdlNodeTag() == T_YbBackfillIndexStmt ||
+		   YBGetCurrentStmtDdlNodeTag() == T_Invalid ||
+		   yb_non_ddl_txn_for_sys_tables_allowed ||
+		   YBGetDdlNestingLevel() > 0 ||
+		   YBGetDdlUseRegularTransactionBlock());
+	if (IsYugaByteEnabled())
+		Assert(msg->id != SHAREDINVALSMGR_ID &&
+			   msg->id != SHAREDINVALRELMAP_ID);
 	InvalMessageArray *ima = &InvalMessageArrays[subgroup];
 	int			nextindex = group->nextmsg[subgroup];
 
@@ -348,7 +381,10 @@ AddInvalidationMessage(InvalidationMsgsGroup *group, int subgroup,
 		}
 	}
 	/* Okay, add message to current group */
-	ima->msgs[nextindex] = *msg;
+	SharedInvalidationMessage *dest = &ima->msgs[nextindex];
+
+	*dest = *msg;
+	dest->yb_header.yb_sender_pid = getpid();
 	group->nextmsg[subgroup]++;
 }
 
@@ -427,6 +463,12 @@ AddCatcacheInvalidationMessage(InvalidationMsgsGroup *group,
 {
 	SharedInvalidationMessage msg;
 
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.cc.yb_version = (int8) YbSharedInvalCatcacheMsgVersion;
+
 	Assert(id < CHAR_MAX);
 	msg.cc.id = (int8) id;
 	msg.cc.dbId = dbId;
@@ -455,6 +497,12 @@ AddCatalogInvalidationMessage(InvalidationMsgsGroup *group,
 {
 	SharedInvalidationMessage msg;
 
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.cat.yb_version = (int8) YbSharedInvalCatalogMsgVersion;
+
 	msg.cat.id = SHAREDINVALCATALOG_ID;
 	msg.cat.dbId = dbId;
 	msg.cat.catId = catId;
@@ -472,6 +520,12 @@ AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group,
 							   Oid dbId, Oid relId)
 {
 	SharedInvalidationMessage msg;
+
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.rc.yb_version = (int8) YbSharedInvalRelcacheMsgVersion;
 
 	/*
 	 * Don't add a duplicate item. We assume dbId need not be checked because
@@ -507,6 +561,12 @@ AddRelsyncInvalidationMessage(InvalidationMsgsGroup *group,
 {
 	SharedInvalidationMessage msg;
 
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.rs.yb_version = (int8) YbSharedInvalRelSyncMsgVersion;
+
 	/* Don't add a duplicate item. */
 	ProcessMessageSubGroup(group, RelCacheMsgs,
 						   if (msg->rc.id == SHAREDINVALRELSYNC_ID &&
@@ -534,6 +594,12 @@ AddSnapshotInvalidationMessage(InvalidationMsgsGroup *group,
 							   Oid dbId, Oid relId)
 {
 	SharedInvalidationMessage msg;
+
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.sn.yb_version = (int8) YbSharedInvalSnapshotMsgVersion;
 
 	/* Don't add a duplicate item */
 	/* We assume dbId need not be checked because it will never change */
@@ -649,6 +715,21 @@ RegisterRelcacheInvalidation(InvalidationInfo *info, Oid dbId, Oid relId)
 	 */
 	if (relId == InvalidOid || RelationIdIsInInitFile(relId))
 		info->RelcacheInitFileInval = true;
+
+	if (IsYugaByteEnabled() &&
+		YBIsDBCatalogVersionMode() &&
+		relId == InvalidOid &&
+		YBCPgIsDdlMode() &&
+		!(*YBCGetGFlags()->ysql_disable_global_impact_ddl_statements))
+	{
+		/*
+		 * YB note: A InvalidOid relId means we are invalidating whole relcache,
+		 * which includes all the shared relations. If relId isn't InvalidOid,
+		 * we detect global impact DDL at write path (see YBCExecWriteStmt).
+		 */
+		Assert(dbId == InvalidOid);
+		YbSetIsGlobalDDL();
+	}
 }
 
 /*
@@ -782,13 +863,16 @@ PrepareInplaceInvalidationState(void)
  */
 
 void
-InvalidateSystemCachesExtended(bool debug_discard)
+InvalidateSystemCachesExtended(bool debug_discard, bool yb_callback)
 {
 	int			i;
 
-	InvalidateCatalogSnapshot();
-	ResetCatalogCachesExt(debug_discard);
-	RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
+	if (!yb_callback)
+	{
+		InvalidateCatalogSnapshot();
+		ResetCatalogCachesExt(debug_discard);
+		RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
+	}
 
 	for (i = 0; i < syscache_callback_count; i++)
 	{
@@ -822,6 +906,13 @@ InvalidateSystemCachesExtended(bool debug_discard)
 void
 LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 {
+	/*
+	 * In YB mode all messages originated by other processes are silently
+	 * ignored
+	 */
+	if (IsYugaByteEnabled() && msg->yb_header.yb_sender_pid != getpid())
+		return;
+
 	if (msg->id >= 0)
 	{
 		if (msg->cc.dbId == MyDatabaseId || msg->cc.dbId == InvalidOid)
@@ -837,6 +928,15 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 	{
 		if (msg->cat.dbId == MyDatabaseId || msg->cat.dbId == InvalidOid)
 		{
+			/* Need to invalidate whole catcache for pg_class or pg_index */
+			if (YbCanTryInvalidateTableCacheEntry() &&
+				(msg->cat.catId == RELNAMENSP ||
+				 msg->cat.catId == RELOID ||
+				 msg->cat.catId == INDEXRELID))
+			{
+				elog(LOG, "need invalidate all table cache: cat.catId %u", msg->cat.catId);
+				YbSetNeedInvalidateAllTableCache();
+			}
 			InvalidateCatalogSnapshot();
 
 			CatalogCacheFlushCatalog(msg->cat.catId);
@@ -849,6 +949,38 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 		if (msg->rc.dbId == MyDatabaseId || msg->rc.dbId == InvalidOid)
 		{
 			int			i;
+
+			if (YbCanTryInvalidateTableCacheEntry())
+			{
+				if (!OidIsValid(msg->rc.relId))
+				{
+					/* Need to invalidate whole relcache */
+					elog(LOG, "need invalidate all table cache: rc.relId is 0");
+					YbSetNeedInvalidateAllTableCache();
+				}
+				else
+				{
+					Relation	rel = YbRelationIdCacheLookup(msg->rc.relId);
+
+					if (rel)
+					{
+						/* If rc.dbId is 0 it menas a shared catalog */
+						Oid			dbid = OidIsValid(msg->rc.dbId) ? MyDatabaseId : Template1DbOid;
+
+						elog(DEBUG1, "relcache removing tuple for relation %u:%u", dbid, msg->rc.relId);
+						YBCPgAlterTableInvalidateTableByOid(dbid, YbGetRelfileNodeId(rel));
+					}
+					else
+					{
+						/*
+						 * We assume the table cache entry did not exist or
+						 * was already removed.
+						 */
+						elog(DEBUG1, "relation for rc.relId %u not found, "
+							 "skipped table cache entry invalidation", msg->rc.relId);
+					}
+				}
+			}
 
 			if (msg->rc.relId == InvalidOid)
 				RelationCacheInvalidate(false);
@@ -915,8 +1047,141 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 void
 InvalidateSystemCaches(void)
 {
-	InvalidateSystemCachesExtended(false);
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * In case of YugaByte it is necessary to refresh YB caches by calling
+		 * 'YBRefreshCache'. But it can't be done here as 'YBRefreshCache'
+		 * can't be called from within the transaction. Resetting catalog
+		 * version will force cache refresh as soon as possible.
+		 */
+		elog(DEBUG1, "InvalidateSystemCaches: resetting version from %" PRIu64,
+			 YbGetCatalogCacheVersion());
+		YbResetCatalogCacheVersion();
+		return;
+	}
+
+	InvalidateSystemCachesExtended(false, false);
 }
+
+/*
+ *		CallSystemCacheCallbacks
+ *
+ *		Calls all syscache and relcache invalidation callbacks.
+ *		This is useful when the entire cache is being reloaded or
+ *		invalidated, rather than a single cache entry.
+ */
+void
+CallSystemCacheCallbacks(void)
+{
+	InvalidateSystemCachesExtended(true, true /* yb_callback */ );
+}
+
+void
+YbMaybeRefreshCache(void)
+{
+	uint64_t	shared_catalog_version = YbGetSharedCatalogVersion();
+	const uint64_t local_catalog_version = YbGetCatalogCacheVersion();
+
+	elog(DEBUG5,
+		 "YbMaybeRefreshCache: shared = %" PRIu64 " local=%" PRIu64 " in_progress=%d",
+		 shared_catalog_version, local_catalog_version,
+		 yb_refresh_cache_in_progress);
+
+	/*
+	 * YB: We only want to update the catalog cache version at a "safe
+	 * point". It is not a "safe point" if prefetching is started because we
+	 * want to ensure reading a consistent set of catalog tables. If we
+	 * refreshed here we may see some catalog tuples removed which can cause
+	 * a PANIC error if such tuples are considered critical (e.g. when this
+	 * runs from load_critical_index during backend init). Also we do not
+	 * want the local catalog version to change as a result of applying
+	 * invalidation messages because that can become inconsistent with the
+	 * set of catalog tables just read. The refresh is deferred to the next
+	 * safe point (after prefetching stops). Note we must still run
+	 * ReceiveSharedInvalidMessages() below regardless.
+	 *
+	 * A transaction that started with yb_read_time set takes no object locks
+	 * and never gets here, but a block that started with object locks and
+	 * set yb_read_time later (SET LOCAL with yb_disable_catalog_version_check,
+	 * or the walsender) does, and its catalog stays pinned too.
+	 */
+	if (YBCIsSysTablePrefetchingStarted() || yb_refresh_cache_in_progress ||
+		local_catalog_version >= shared_catalog_version ||
+		YbIsCatalogPinnedToReadTime())
+	{
+		elog(DEBUG2,
+			 "YbMaybeRefreshCache: prefetch_started=%d, shared = %" PRIu64 " local=%" PRIu64 " in_progress=%d pinned_to_read_time=%d",
+			 YBCIsSysTablePrefetchingStarted(), shared_catalog_version, local_catalog_version,
+			 yb_refresh_cache_in_progress, YbIsCatalogPinnedToReadTime());
+		return;
+	}
+
+	/*
+	 * As part of processing inval msgs, we may rebuild relcache entries.
+	 * These rebuilds may acquire further locks and trigger this code again.
+	 * In PG, this would be ok as inval msgs are processed one by one and
+	 * reentrant calls do not reprocess msgs that are already being processed.
+	 * However, in YB, we are not able to handle this situation currently.
+	 * TODO: One possible way to avoid this in YB is to add inval msgs to
+	 * the PG shared queue instead.
+	 */
+	yb_refresh_cache_in_progress = true;
+	PG_TRY();
+	{
+		if (YBCIsLegacyModeForCatalogOps())
+			YBCPgResetCatalogReadTime();
+
+		if (YBRefreshCacheUsingInvalMsgs())
+		{
+			elog(DEBUG1,
+				 "AcceptInvalidationMessages: updated via inval msgs to %" PRIu64,
+				 YbGetCatalogCacheVersion());
+		}
+		else if (!am_walsender)
+		{
+			/*
+			 * YB: We could not update to this version via inval msgs.
+			 * This can happen when there are no invalidation messages
+			 * for a catalog version bump (for example, when there are too
+			 * many inval msgs for a partition DDL).
+			 *
+			 * Perform a full PG-style cache invalidation: blow away
+			 * all catcache entries and relcache entries so they are
+			 * refilled from the master on next access. This mirrors
+			 * what PG does in ReceiveSharedInvalidMessages when the
+			 * SI queue overflows (the resetFunction callback). PG's
+			 * RelationCacheInvalidate handles positive-refcount
+			 * entries by rebuilding them and catcache entries are marked
+			 * dead if in use, so this should be safe mid-statement.
+			 *
+			 * Skip this for walsender. TODO: #31335 to investigate further.
+			 * PG logical decoding monitors relcache invalidations to output
+			 * a special relation entry when the corresponding relcache is
+			 * invalidated, which doesn't work well with this full update.
+			 */
+			elog(LOG,
+				 "YbMaybeRefreshCache: full invalidation for "
+				 "version %" PRIu64 " -> %" PRIu64
+				 ", subsequent execution may be slow until caches are re-warmed",
+				 local_catalog_version, shared_catalog_version);
+			InvalidateSystemCachesExtended(false, false);
+			YbUpdateCatalogCacheVersionNoPgStat(shared_catalog_version);
+			/* invalidate all docdb table caches */
+			HandleYBStatus(YBCPgInvalidateCache(shared_catalog_version));
+		}
+	}
+	PG_FINALLY();
+	{
+		yb_refresh_cache_in_progress = false;
+	}
+	PG_END_TRY();
+}
+
+/* ----------------------------------------------------------------
+ *					  public functions
+ * ----------------------------------------------------------------
+ */
 
 /*
  * AcceptInvalidationMessages
@@ -934,6 +1199,13 @@ AcceptInvalidationMessages(void)
 	if (IsTransactionState())
 		AssertCouldGetRelation();
 #endif
+
+	if (OidIsValid(MyDatabaseId) &&
+		YBCIsObjectLockingEnabled() &&
+		YbIsInvalidationMessageEnabled())
+	{
+		YbMaybeRefreshCache();
+	}
 
 	ReceiveSharedInvalidMessages(LocalExecuteInvalidationMessage,
 								 InvalidateSystemCaches);
@@ -970,7 +1242,7 @@ AcceptInvalidationMessages(void)
 		if (recursion_depth < debug_discard_caches)
 		{
 			recursion_depth++;
-			InvalidateSystemCachesExtended(true);
+			InvalidateSystemCachesExtended(true, false /* yb_callback */ );
 			recursion_depth--;
 		}
 	}
@@ -1025,7 +1297,10 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs,
 	}
 
 	/* Must be at top of stack */
-	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
+	if (IsYugaByteEnabled())
+		Assert(YBGetDdlNestingLevel() == 0);
+	else
+		Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
 
 	/*
 	 * Relcache init file invalidation requires processing both before and
@@ -1123,6 +1398,198 @@ inplaceGetInvalidationMessages(SharedInvalidationMessage **msgs,
 	return nmsgs;
 }
 
+int
+YbGetNumInvalMessagesInTxn(int subgroup)
+{
+	return transInvalInfo ? transInvalInfo->YbNumInvalMsgsInTxn[subgroup] : 0;
+}
+
+void
+YbAddNumInvalMessagesInTxn(int subgroup, int numMsgs)
+{
+	/*
+	 * We count the number of invalidation messages in a transaction block which
+	 * may contain more than one embedded DDL statements. We use this count
+	 * to determine the list of invalidation messages associated with each
+	 * embedded DDL statement. For example, if a BEGIN block contains two
+	 * DDL statements and each generated 10 invalidation messages, at the end of
+	 * the first DDL we get 10 messages, at the end of the second DDL we get
+	 * 20 messages which includes the 10 messages of the first DDL. We do not
+	 * want to reapply the first 10 messages so we use this counter to find
+	 * out where the second 10 messages begins.
+	 */
+	if (numMsgs == 0)
+		return;
+	Assert(transInvalInfo);
+	transInvalInfo->YbNumInvalMsgsInTxn[subgroup] += numMsgs;
+}
+
+/* This function is adapted from xactGetCommittedInvalidationMessages. */
+int
+YbGetSubGroupInvalMessages(SharedInvalidationMessage **msgs, int subgroup)
+{
+	SharedInvalidationMessage *msgarray;
+	int			nummsgs;
+	int			nmsgs;
+
+	/* Quick exit if we haven't done anything with invalidation messages. */
+	if (transInvalInfo == NULL)
+	{
+		if (msgs)
+			*msgs = NULL;
+		return 0;
+	}
+
+	nummsgs = NumMessagesInSubGroup(&transInvalInfo->PriorCmdInvalidMsgs, subgroup) +
+		NumMessagesInSubGroup(&transInvalInfo->ii.CurrentCmdInvalidMsgs, subgroup);
+
+	if (msgs == NULL)
+		return nummsgs;
+
+	*msgs = msgarray = (SharedInvalidationMessage *)
+		MemoryContextAlloc(CurTransactionContext,
+						   nummsgs * sizeof(SharedInvalidationMessage));
+
+	nmsgs = 0;
+	ProcessMessageSubGroupMulti(&transInvalInfo->PriorCmdInvalidMsgs,
+								subgroup,
+								(memcpy(msgarray + nmsgs,
+										msgs,
+										n * sizeof(SharedInvalidationMessage)),
+								 nmsgs += n));
+	ProcessMessageSubGroupMulti(&transInvalInfo->ii.CurrentCmdInvalidMsgs,
+								subgroup,
+								(memcpy(msgarray + nmsgs,
+										msgs,
+										n * sizeof(SharedInvalidationMessage)),
+								 nmsgs += n));
+	Assert(nmsgs == nummsgs);
+
+	return nmsgs;
+}
+
+void
+YbLogInvalidationMessages(const SharedInvalidationMessage *msgs, int nmsgs)
+{
+	elog(DEBUG1, "msgs=%p, nmsgs=%d", msgs, nmsgs);
+	for (int i = 0; i < nmsgs; ++i)
+		if (msgs[i].id >= 0)
+		{
+			elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d dbId=%u hashValue=%u\n",
+				 i,
+				 msgs[i].id,
+				 msgs[i].cc.yb_version,
+				 msgs[i].cc.yb_sender_pid,
+				 msgs[i].cc.dbId,
+				 msgs[i].cc.hashValue);
+		}
+		else
+		{
+			switch (msgs[i].id)
+			{
+				case SHAREDINVALCATALOG_ID: /* -1 */
+					elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d dbId=%u catId=%u\n",
+						 i,
+						 msgs[i].id,
+						 msgs[i].cat.yb_version,
+						 msgs[i].cat.yb_sender_pid,
+						 msgs[i].cat.dbId,
+						 msgs[i].cat.catId);
+					break;
+				case SHAREDINVALRELCACHE_ID:	/* -2 */
+					elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d dbId=%u relId=%u\n",
+						 i,
+						 msgs[i].id,
+						 msgs[i].rc.yb_version,
+						 msgs[i].rc.yb_sender_pid,
+						 msgs[i].rc.dbId,
+						 msgs[i].rc.relId);
+					break;
+				case SHAREDINVALSMGR_ID:	/* -3 */
+					elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d "
+						 "backend_hi=%d backend_lo=%u spcNode=%u dbNode=%u relNode=%u\n",
+						 i,
+						 msgs[i].id,
+						 msgs[i].sm.yb_version,
+						 msgs[i].sm.yb_sender_pid,
+						 msgs[i].sm.backend_hi,
+						 msgs[i].sm.backend_lo,
+						 msgs[i].sm.rlocator.spcOid,
+						 msgs[i].sm.rlocator.dbOid,
+						 msgs[i].sm.rlocator.relNumber);
+					break;
+				case SHAREDINVALRELMAP_ID:	/* -4 */
+					elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d dbId=%u\n",
+						 i,
+						 msgs[i].id,
+						 msgs[i].rm.yb_version,
+						 msgs[i].rm.yb_sender_pid,
+						 msgs[i].rm.dbId);
+					break;
+				case SHAREDINVALSNAPSHOT_ID:	/* -5 */
+					elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d dbId=%u relId=%u\n",
+						 i,
+						 msgs[i].id,
+						 msgs[i].sn.yb_version,
+						 msgs[i].sn.yb_sender_pid,
+						 msgs[i].sn.dbId,
+						 msgs[i].sn.relId);
+					break;
+				case SHAREDINVALRELSYNC_ID: /* -6 */
+					elog(DEBUG1, "msgs[%d]: id=%d yb_version=%d yb_sender_pid=%d dbId=%u relid=%u\n",
+						 i,
+						 msgs[i].id,
+						 msgs[i].rs.yb_version,
+						 msgs[i].rs.yb_sender_pid,
+						 msgs[i].rs.dbId,
+						 msgs[i].rs.relid);
+					break;
+			}
+		}
+}
+
+/*
+ * A message cannot be applied if the yb_version of the given message type
+ * does not match.
+ * We assume same id represents the same cache between different releases
+ * and this must be maintained for Yugabyte in order for the catalog
+ * cache invalidation messages to be applicable across different releases.
+ * In particular, this means same cacheid represents the same catalog cache.
+ * Let's say id X in release 123 means pg_class but in release 456 it
+ * means pg_collation, things will completely mess up when a node running
+ * release A generates an X message and sends it to a node running release B,
+ * which can happen during YSQL rolling upgrade.
+ */
+bool
+YbCanApplyMessage(const SharedInvalidationMessage *msg)
+{
+	if (msg->id >= 0)
+		return true;
+	switch (msg->id)
+	{
+		case SHAREDINVALCATALOG_ID:
+			return msg->cat.yb_version == YbSharedInvalCatalogMsgVersion;
+		case SHAREDINVALRELCACHE_ID:
+			return msg->rc.yb_version == YbSharedInvalRelcacheMsgVersion;
+		case SHAREDINVALSMGR_ID:
+			/* As of 2025-03-11 YB does not use SHAREDINVALSMGR_ID. */
+			Assert(false);
+			return msg->sm.yb_version == YbSharedInvalSmgrMsgVersion;
+		case SHAREDINVALRELMAP_ID:
+			/* As of 2025-03-11 YB does not use SHAREDINVALRELMAP_ID. */
+			Assert(false);
+			return msg->rm.yb_version == YbSharedInvalRelmapMsgVersion;
+		case SHAREDINVALSNAPSHOT_ID:
+			return msg->sn.yb_version == YbSharedInvalSnapshotMsgVersion;
+		case SHAREDINVALRELSYNC_ID:
+			return msg->rs.yb_version == YbSharedInvalRelSyncMsgVersion;
+		default:
+			/* As of PG19 the above are all the message types. */
+			Assert(false);
+			return false;
+	}
+}
+
 /*
  * ProcessCommittedInvalidationMessages is executed by xact_redo_commit() or
  * standby_redo() to process invalidation messages. Currently that happens
@@ -1188,6 +1655,11 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
  * about CurrentCmdInvalidMsgs too, since those changes haven't touched
  * the caches yet.
  *
+ * YB Note: The above message for handling not isCommit is not true for YB
+ * as we use aggressive caching. Any changes made as part of
+ * CurrentCmdInvalidMsgs would have been applied to the cache and will need to
+ * be invalidated as well.
+ *
  * In any case, reset our state to empty.  We need not physically
  * free memory here, since TopTransactionContext is about to be emptied
  * anyway.
@@ -1230,6 +1702,15 @@ AtEOXact_Inval(bool isCommit)
 	}
 	else
 	{
+		/*
+		 * Yugabyte uses aggressive caching, therefore even modifications
+		 * in CurrentCmdInvalidMsgs would have been applied to the cache.
+		 */
+		if (IsYugaByteEnabled())
+		{
+			AppendInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
+									   &transInvalInfo->ii.CurrentCmdInvalidMsgs);
+		}
 		ProcessInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
 									LocalExecuteInvalidationMessage);
 	}
@@ -1760,6 +2241,12 @@ CacheInvalidateSmgr(RelFileLocatorBackend rlocator)
 	StaticAssertDecl(MAX_BACKENDS_BITS <= 23,
 					 "MAX_BACKENDS_BITS is too big for inval.c");
 
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.sm.yb_version = (int8) YbSharedInvalSmgrMsgVersion;
+
 	msg.sm.id = SHAREDINVALSMGR_ID;
 	msg.sm.backend_hi = rlocator.backend >> 16;
 	msg.sm.backend_lo = rlocator.backend & 0xffff;
@@ -1789,6 +2276,12 @@ void
 CacheInvalidateRelmap(Oid databaseId)
 {
 	SharedInvalidationMessage msg;
+
+	if (yb_test_inval_message_portability)
+		memset(&msg, 0, sizeof(SharedInvalidationMessage));
+
+	if (IsYugaByteEnabled())
+		msg.rm.yb_version = (int8) YbSharedInvalRelmapMsgVersion;
 
 	msg.rm.id = SHAREDINVALRELMAP_ID;
 	msg.rm.dbId = databaseId;
@@ -1966,4 +2459,136 @@ LogLogicalInvalidations(void)
 													 n * sizeof(SharedInvalidationMessage)));
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
 	}
+}
+
+void
+YbCheckSharedInvalMessages()
+{
+	/*
+	 * We can remove this assertion if it turns out that we need to support big
+	 * endian machines by disabling incremental cache refresh on a big endian
+	 * machine. A big endian node will neither send nor receive the invalidation
+	 * messages but all the other little endian nodes in a cluster can still do.
+	 * We should advise users to avoid executing a DDL on a big endian node
+	 * because without sending invalidation messages all sessions need to do
+	 * full catalog cache refreshes if the catalog version is incremented.
+	 */
+	static_assert(BYTE_ORDER == LITTLE_ENDIAN, "big endian not supported");
+	static_assert(CatCacheMsgs == YB_CATCACHE_MSGS, "subgroup id mismatch");
+	static_assert(RelCacheMsgs == YB_RELCACHE_MSGS, "subgroup id mismatch");
+	static_assert(YB_SUBGROUP_COUNT == 2, "subgroup # mismatch");
+
+	static_assert(sizeof(SharedInvalCatcacheMsg) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatcacheMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatcacheMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatcacheMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatcacheMsg *) 0)->dbId) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatcacheMsg *) 0)->hashValue) == 4, "size mismatch");
+	static_assert(offsetof(SharedInvalCatcacheMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatcacheMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatcacheMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatcacheMsg, dbId) == 8, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatcacheMsg, hashValue) == 12, "offset mismatch");
+
+	static_assert(sizeof(SharedInvalCatalogMsg) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatalogMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatalogMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatalogMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatalogMsg *) 0)->dbId) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalCatalogMsg *) 0)->catId) == 4, "size mismatch");
+	static_assert(offsetof(SharedInvalCatalogMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatalogMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatalogMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatalogMsg, dbId) == 8, "offset mismatch");
+	static_assert(offsetof(SharedInvalCatalogMsg, catId) == 12, "offset mismatch");
+
+	static_assert(sizeof(SharedInvalRelcacheMsg) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelcacheMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelcacheMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelcacheMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelcacheMsg *) 0)->dbId) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelcacheMsg *) 0)->relId) == 4, "size mismatch");
+	static_assert(offsetof(SharedInvalRelcacheMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelcacheMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelcacheMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelcacheMsg, dbId) == 8, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelcacheMsg, relId) == 12, "offset mismatch");
+
+	static_assert(sizeof(SharedInvalSmgrMsg) == 24, "size mismatch");
+	static_assert(sizeof(((SharedInvalSmgrMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalSmgrMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalSmgrMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalSmgrMsg *) 0)->backend_hi) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalSmgrMsg *) 0)->backend_lo) == 2, "size mismatch");
+	static_assert(sizeof(((SharedInvalSmgrMsg *) 0)->rlocator) == 12, "size mismatch");
+	static_assert(offsetof(SharedInvalSmgrMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalSmgrMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalSmgrMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalSmgrMsg, backend_hi) == 8, "offset mismatch");
+	static_assert(offsetof(SharedInvalSmgrMsg, backend_lo) == 10, "offset mismatch");
+	static_assert(offsetof(SharedInvalSmgrMsg, rlocator) == 12, "offset mismatch");
+
+	static_assert(sizeof(SharedInvalRelmapMsg) == 12, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelmapMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelmapMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelmapMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelmapMsg *) 0)->dbId) == 4, "size mismatch");
+	static_assert(offsetof(SharedInvalRelmapMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelmapMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelmapMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelmapMsg, dbId) == 8, "offset mismatch");
+
+	static_assert(sizeof(SharedInvalSnapshotMsg) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalSnapshotMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalSnapshotMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalSnapshotMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalSnapshotMsg *) 0)->dbId) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalSnapshotMsg *) 0)->relId) == 4, "size mismatch");
+	static_assert(offsetof(SharedInvalSnapshotMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalSnapshotMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalSnapshotMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalSnapshotMsg, dbId) == 8, "offset mismatch");
+	static_assert(offsetof(SharedInvalSnapshotMsg, relId) == 12, "offset mismatch");
+
+	/*
+	 * AddRelsyncInvalidationMessage fills this message in through rc, as
+	 * upstream does, so its layout must also match SharedInvalRelcacheMsg.
+	 */
+	static_assert(sizeof(SharedInvalRelSyncMsg) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelSyncMsg *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelSyncMsg *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelSyncMsg *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelSyncMsg *) 0)->dbId) == 4, "size mismatch");
+	static_assert(sizeof(((SharedInvalRelSyncMsg *) 0)->relid) == 4, "size mismatch");
+	static_assert(offsetof(SharedInvalRelSyncMsg, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelSyncMsg, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelSyncMsg, yb_sender_pid) == 4, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelSyncMsg, dbId) == 8, "offset mismatch");
+	static_assert(offsetof(SharedInvalRelSyncMsg, relid) == 12, "offset mismatch");
+
+	static_assert(sizeof(YBSharedInvalMessageHeader) == 8, "size mismatch");
+	static_assert(sizeof(((YBSharedInvalMessageHeader *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((YBSharedInvalMessageHeader *) 0)->yb_version) == 1, "size mismatch");
+	static_assert(sizeof(((YBSharedInvalMessageHeader *) 0)->yb_sender_pid) == 4, "size mismatch");
+	static_assert(offsetof(YBSharedInvalMessageHeader, id) == 0, "offset mismatch");
+	static_assert(offsetof(YBSharedInvalMessageHeader, yb_version) == 1, "offset mismatch");
+	static_assert(offsetof(YBSharedInvalMessageHeader, yb_sender_pid) == 4, "offset mismatch");
+
+	static_assert(sizeof(SharedInvalidationMessage) == 24, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->id) == 1, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->yb_header) == 8, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->cc) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->cat) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->rc) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->sm) == 24, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->sn) == 16, "size mismatch");
+	static_assert(sizeof(((SharedInvalidationMessage *) 0)->rs) == 16, "size mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, id) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, yb_header) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, cc) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, cat) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, rc) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, sm) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, sn) == 0, "offset mismatch");
+	static_assert(offsetof(SharedInvalidationMessage, rs) == 0, "offset mismatch");
 }

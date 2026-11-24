@@ -66,6 +66,10 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/builtins.h"
+
 
 /*
  * Does att's datatype allow packing into the 1-byte-header varlena format?
@@ -487,6 +491,10 @@ heap_attisnull(HeapTuple tup, int attnum, TupleDesc tupleDesc)
 			/* these are never null */
 			break;
 
+		case YBTupleIdAttributeNumber:
+			/* If selected, virtual YB columns are never null */
+			break;
+
 		default:
 			elog(ERROR, "invalid attnum: %d", attnum);
 	}
@@ -665,6 +673,11 @@ heap_getsysattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 		case TableOidAttributeNumber:
 			result = ObjectIdGetDatum(tup->t_tableOid);
 			break;
+
+		case YBTupleIdAttributeNumber:
+			result = HEAPTUPLE_YBCTID(tup);
+			break;
+
 		default:
 			elog(ERROR, "invalid attnum: %d", attnum);
 			result = 0;			/* keep compiler quiet */
@@ -693,6 +706,7 @@ heap_copytuple(HeapTuple tuple)
 	newTuple = (HeapTuple) palloc(HEAPTUPLESIZE + tuple->t_len);
 	newTuple->t_len = tuple->t_len;
 	newTuple->t_self = tuple->t_self;
+	HEAPTUPLE_COPY_YBCTID(tuple, newTuple);
 	newTuple->t_tableOid = tuple->t_tableOid;
 	newTuple->t_data = (HeapTupleHeader) ((char *) newTuple + HEAPTUPLESIZE);
 	memcpy(newTuple->t_data, tuple->t_data, tuple->t_len);
@@ -719,9 +733,36 @@ heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest)
 
 	dest->t_len = src->t_len;
 	dest->t_self = src->t_self;
+	HEAPTUPLE_COPY_YBCTID(src, dest);
 	dest->t_tableOid = src->t_tableOid;
 	dest->t_data = (HeapTupleHeader) palloc(src->t_len);
 	memcpy(dest->t_data, src->t_data, src->t_len);
+}
+
+/* ----------------
+ *		yb_heap_copytuple_with_tuple
+ *
+ *		copy a tuple into a caller-supplied HeapTuple management struct assuming
+ *		that the dest heap tuple's t_data already has *sufficient* memory
+ *		pre-allocated.
+ *
+ * ----------------
+ */
+void
+yb_heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest)
+{
+	if (!HeapTupleIsValid(src) || src->t_data == NULL)
+	{
+		dest->t_data = NULL;
+		return;
+	}
+
+	dest->t_len = src->t_len;
+	dest->t_self = src->t_self;
+	HEAPTUPLE_COPY_YBCTID(src, dest);
+	dest->t_tableOid = src->t_tableOid;
+	/* assumes that dest->t_data is pre-allocated with enough memory. */
+	memcpy((char *) dest->t_data, (char *) src->t_data, src->t_len);
 }
 
 /*
@@ -1082,6 +1123,7 @@ heap_form_tuple(TupleDesc tupleDescriptor,
 	tuple->t_len = len;
 	ItemPointerSetInvalid(&(tuple->t_self));
 	tuple->t_tableOid = InvalidOid;
+	HEAPTUPLE_YBCTID(tuple) = 0;
 
 	HeapTupleHeaderSetDatumLength(td, len);
 	HeapTupleHeaderSetTypeId(td, tupleDescriptor->tdtypeid);
@@ -1165,6 +1207,7 @@ heap_modify_tuple(HeapTuple tuple,
 	 */
 	newTuple->t_data->t_ctid = tuple->t_data->t_ctid;
 	newTuple->t_self = tuple->t_self;
+	HEAPTUPLE_COPY_YBCTID(tuple, newTuple);
 	newTuple->t_tableOid = tuple->t_tableOid;
 
 	return newTuple;
@@ -1228,6 +1271,7 @@ heap_modify_tuple_by_cols(HeapTuple tuple,
 	 */
 	newTuple->t_data->t_ctid = tuple->t_data->t_ctid;
 	newTuple->t_self = tuple->t_self;
+	HEAPTUPLE_COPY_YBCTID(tuple, newTuple);
 	newTuple->t_tableOid = tuple->t_tableOid;
 
 	return newTuple;
@@ -1507,6 +1551,7 @@ heap_tuple_from_minimal_tuple(MinimalTuple mtup)
 	result->t_len = len;
 	ItemPointerSetInvalid(&(result->t_self));
 	result->t_tableOid = InvalidOid;
+	HEAPTUPLE_YBCTID(result) = 0;
 	result->t_data = (HeapTupleHeader) ((char *) result + HEAPTUPLESIZE);
 	memcpy((char *) result->t_data + MINIMAL_TUPLE_OFFSET, mtup, mtup->t_len);
 	memset(result->t_data, 0, offsetof(HeapTupleHeaderData, t_infomask2));

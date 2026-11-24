@@ -40,6 +40,12 @@
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "storage/procsignal.h"
+#include "utils/catcache.h"
+#include "yb_tcmalloc_utils.h"
+
 /*
  * The SIGUSR1 signal is multiplexed to support signaling multiple event
  * types. The specific reason is communicated via flags in shared memory.
@@ -224,29 +230,25 @@ ProcSignalInit(const uint8 *cancel_key, int cancel_key_len)
 }
 
 /*
- * CleanupProcSignalState
- *		Remove current process from ProcSignal mechanism
+ * YbCleanupProcSignalStateForProc
+ *		Remove the given process from ProcSignalSlots
  *
- * This function is called via on_shmem_exit() during backend shutdown.
+ * YB: This function is called via CleanupProcSignalState() during backend
+ * shutdown, and from reaper() when the parent is notified that its child died
+ * unexpectedly.
  */
-static void
-CleanupProcSignalState(int status, Datum arg)
+void
+YbCleanupProcSignalStateForProc(PGPROC *proc)
 {
+	/* YB: Derive the slot from proc rather than MyProcSignalSlot. */
+	int			pss_idx = GetNumberFromPGProc(proc);
+	ProcSignalSlot *slot = &ProcSignal->psh_slot[pss_idx];
 	pid_t		old_pid;
-	ProcSignalSlot *slot = MyProcSignalSlot;
-
-	/*
-	 * Clear MyProcSignalSlot, so that a SIGUSR1 received after this point
-	 * won't try to access it after it's no longer ours (and perhaps even
-	 * after we've unmapped the shared memory segment).
-	 */
-	Assert(MyProcSignalSlot != NULL);
-	MyProcSignalSlot = NULL;
 
 	/* sanity check */
 	SpinLockAcquire(&slot->pss_mutex);
 	old_pid = pg_atomic_read_u32(&slot->pss_pid);
-	if (old_pid != MyProcPid)
+	if (old_pid != proc->pid)
 	{
 		/*
 		 * don't ERROR here. We're exiting anyway, and don't want to get into
@@ -254,7 +256,7 @@ CleanupProcSignalState(int status, Datum arg)
 		 */
 		SpinLockRelease(&slot->pss_mutex);
 		elog(LOG, "process %d releasing ProcSignal slot %d, but it contains %d",
-			 MyProcPid, (int) (slot - ProcSignal->psh_slot), (int) old_pid);
+			 proc->pid, pss_idx, (int) old_pid);
 		return;					/* XXX better to zero the slot anyway? */
 	}
 
@@ -270,7 +272,27 @@ CleanupProcSignalState(int status, Datum arg)
 
 	SpinLockRelease(&slot->pss_mutex);
 
-	ConditionVariableBroadcast(&slot->pss_barrierCV);
+	YbConditionVariableBroadcastForProc(&slot->pss_barrierCV, proc);
+}
+
+/*
+ * CleanupProcSignalState
+ *		Remove current process from ProcSignal mechanism
+ *
+ * This function is called via on_shmem_exit() during backend shutdown.
+ */
+static void
+CleanupProcSignalState(int status, Datum arg)
+{
+	/*
+	 * Clear MyProcSignalSlot, so that a SIGUSR1 received after this point
+	 * won't try to access it after it's no longer ours (and perhaps even
+	 * after we've unmapped the shared memory segment).
+	 */
+	Assert(MyProcSignalSlot != NULL);
+	MyProcSignalSlot = NULL;
+
+	YbCleanupProcSignalStateForProc(MyProc);
 }
 
 /*
@@ -707,6 +729,15 @@ procsignal_sigusr1_handler(SIGNAL_ARGS)
 
 	if (CheckProcSignal(PROCSIG_PARALLEL_APPLY_MESSAGE))
 		HandleParallelApplyMessageInterrupt();
+
+	if (CheckProcSignal(PROCSIG_LOG_HEAP_SNAPSHOT))
+		HandleLogHeapSnapshotInterrupt();
+
+	if (CheckProcSignal(PROCSIG_LOG_HEAP_SNAPSHOT_PEAK))
+		HandleLogHeapSnapshotPeakInterrupt();
+
+	if (CheckProcSignal(YB_PROCSIG_LOG_CATCACHE_STATS))
+		YbHandleLogCatcacheStatsInterrupt();
 
 	if (CheckProcSignal(PROCSIG_REPACK_MESSAGE))
 		HandleRepackMessageInterrupt();

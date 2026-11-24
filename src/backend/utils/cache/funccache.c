@@ -32,6 +32,9 @@
 #include "utils/hsearch.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*
  * Hash table for cached functions
@@ -521,8 +524,16 @@ recheck:
 	if (function)
 	{
 		/* We have a compiled function, but is it still valid? */
-		if (function->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
-			ItemPointerEquals(&function->fn_tid, &procTup->t_self))
+		/*
+		 * YB: catalog tuples have no meaningful xmin/TID, so compare the
+		 * catalog version the function was compiled at with
+		 * YBGetActiveCatalogCacheVersion() instead.  This is coarser than
+		 * upstream: raising the version recompiles every cached function.
+		 * YB_TODO(#32095): make the cache invalidation more precise.
+		 */
+		if (IsYugaByteEnabled() ? function->yb_catalog_version == YBGetActiveCatalogCacheVersion() :
+			(function->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
+			 ItemPointerEquals(&function->fn_tid, &procTup->t_self)))
 			function_valid = true;
 		else
 		{
@@ -617,6 +628,7 @@ recheck:
 		 */
 		function->fn_xmin = HeapTupleHeaderGetRawXmin(procTup->t_data);
 		function->fn_tid = procTup->t_self;
+		function->yb_catalog_version = YBGetActiveCatalogCacheVersion();
 		function->dcallback = dcallback;
 
 		/*

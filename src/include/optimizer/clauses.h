@@ -56,4 +56,7 @@ extern Query *inline_function_in_from(PlannerInfo *root,
 
 extern Bitmapset *pull_paramids(Expr *expr);
 
+/* YB */
+extern Node *yb_get_saop_left_op(const Expr *clause);
+
 #endif							/* CLAUSES_H */

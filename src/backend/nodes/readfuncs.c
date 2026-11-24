@@ -567,6 +567,136 @@ _readExtensibleNode(void)
 	READ_DONE();
 }
 
+/* YB: custom read for ScalarArrayOpExpr to conditionally skip hashfuncid/negfuncid */
+static ScalarArrayOpExpr *
+_readScalarArrayOpExpr(void)
+{
+	READ_LOCALS(ScalarArrayOpExpr);
+
+	READ_OID_FIELD(opno);
+	READ_OID_FIELD(opfuncid);
+	if (GetYbExpressionVersion() != 11)
+	{
+		READ_OID_FIELD(hashfuncid);
+		READ_OID_FIELD(negfuncid);
+	}
+	READ_BOOL_FIELD(useOr);
+	READ_OID_FIELD(inputcollid);
+	READ_NODE_FIELD(args);
+	READ_LOCATION_FIELD(location);
+
+	READ_DONE();
+}
+
+/* YB: custom read for YbUpdateAffectedEntities due to palloc/loop logic */
+static YbUpdateAffectedEntities *
+_readYbUpdateAffectedEntities(void)
+{
+	int			nfields;
+	int			nentities;
+
+	READ_LOCALS(YbUpdateAffectedEntities);
+
+	READ_INT_FIELD(matrix.nrows);
+	READ_INT_FIELD(matrix.ncols);
+
+	nfields = local_node->matrix.nrows;
+	nentities = local_node->matrix.ncols;
+
+	local_node->entity_list = palloc0(nentities * sizeof(struct YbUpdateEntity));
+	for (int i = 0; i < nentities; i++)
+	{
+		READ_OID_FIELD(entity_list[i].oid);
+		READ_ENUM_FIELD(entity_list[i].etype, YbSkippableEntityType);
+	}
+
+	local_node->col_info_list = palloc0(nfields * sizeof(struct YbUpdateColInfo));
+	for (int i = 0; i < nfields; i++)
+	{
+		READ_INT_FIELD(col_info_list[i].attnum);
+		READ_NODE_FIELD(col_info_list[i].entity_refs);
+	}
+
+	READ_BITMAPSET_FIELD(matrix.data);
+
+	READ_DONE();
+}
+
+/* YB: custom read for YbBatchedNestLoop due to palloc/loop logic for hashClauseInfos */
+static YbBatchedNestLoop *
+_readYbBatchedNestLoop(void)
+{
+	READ_LOCALS(YbBatchedNestLoop);
+
+	READ_INT_FIELD(nl.join.plan.disabled_nodes);
+	READ_FLOAT_FIELD(nl.join.plan.startup_cost);
+	READ_FLOAT_FIELD(nl.join.plan.total_cost);
+	READ_FLOAT_FIELD(nl.join.plan.plan_rows);
+	READ_INT_FIELD(nl.join.plan.plan_width);
+	READ_BOOL_FIELD(nl.join.plan.parallel_aware);
+	READ_BOOL_FIELD(nl.join.plan.parallel_safe);
+	READ_BOOL_FIELD(nl.join.plan.async_capable);
+	READ_INT_FIELD(nl.join.plan.plan_node_id);
+	READ_NODE_FIELD(nl.join.plan.targetlist);
+	READ_NODE_FIELD(nl.join.plan.qual);
+	READ_NODE_FIELD(nl.join.plan.lefttree);
+	READ_NODE_FIELD(nl.join.plan.righttree);
+	READ_NODE_FIELD(nl.join.plan.initPlan);
+	READ_BITMAPSET_FIELD(nl.join.plan.extParam);
+	READ_BITMAPSET_FIELD(nl.join.plan.allParam);
+	READ_STRING_FIELD(nl.join.plan.ybHintAlias);
+	READ_UINT_FIELD(nl.join.plan.ybUniqueId);
+	READ_STRING_FIELD(nl.join.plan.ybInheritedHintAlias);
+	READ_BOOL_FIELD(nl.join.plan.ybIsHinted);
+	READ_BOOL_FIELD(nl.join.plan.ybHasHintedUid);
+	READ_ENUM_FIELD(nl.join.jointype, JoinType);
+	READ_BOOL_FIELD(nl.join.inner_unique);
+	READ_NODE_FIELD(nl.join.joinqual);
+	READ_NODE_FIELD(nl.nestParams);
+	READ_INT_FIELD(first_batch_size);
+	READ_INT_FIELD(num_hashClauseInfos);
+	local_node->hashClauseInfos =
+		palloc0(local_node->num_hashClauseInfos * sizeof(YbBNLHashClauseInfo));
+
+	/* Ignore :hashOps */
+	pg_strtok(&length);
+	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
+	{
+		token = pg_strtok(&length);
+		local_node->hashClauseInfos[i].hashOp = atoi(token);
+	}
+
+	/* Ignore :innerHashAttNos */
+	pg_strtok(&length);
+	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
+	{
+		token = pg_strtok(&length);
+		local_node->hashClauseInfos[i].innerHashAttNo = atoi(token);
+	}
+
+	/* Ignore :innerHashExprs */
+	pg_strtok(&length);
+	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
+		local_node->hashClauseInfos[i].innerHashExpr = nodeRead(NULL, 0);
+
+	/* Ignore :outerParamExprs */
+	pg_strtok(&length);
+	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
+		local_node->hashClauseInfos[i].outerParamExpr = nodeRead(NULL, 0);
+
+	/* Ignore :orig_expr */
+	pg_strtok(&length);
+	for (int i = 0; i < local_node->num_hashClauseInfos; i++)
+		local_node->hashClauseInfos[i].orig_expr = nodeRead(NULL, 0);
+
+	READ_INT_FIELD(numSortCols);
+	READ_ATTRNUMBER_ARRAY(sortColIdx, local_node->numSortCols);
+	READ_OID_ARRAY(sortOperators, local_node->numSortCols);
+	READ_OID_ARRAY(collations, local_node->numSortCols);
+	READ_BOOL_ARRAY(nullsFirst, local_node->numSortCols);
+	READ_DONE();
+}
+
 
 /*
  * parseNodeString

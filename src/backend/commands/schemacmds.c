@@ -10,6 +10,22 @@
  * IDENTIFICATION
  *	  src/backend/commands/schemacmds.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugabyteDB development.
+ *
+ * Portions Copyright (c) YugabyteDB, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -36,6 +52,9 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+/* YB includes */
+#include "pg_yb_utils.h"
 
 static void AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId);
 
@@ -96,7 +115,7 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 	 * superuser will always have both of these privileges a fortiori.
 	 */
 	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, saved_uid, ACL_CREATE);
-	if (aclresult != ACLCHECK_OK)
+	if (aclresult != ACLCHECK_OK && !IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
 
@@ -227,6 +246,11 @@ CreateSchemaCommand(ParseState *pstate, CreateSchemaStmt *stmt,
 					   None_Receiver,
 					   NULL);
 
+		if (IsYugaByteEnabled())
+		{
+			YBC_LOG_INFO("Creating schema %s/%s", get_database_name(MyDatabaseId), schemaName);
+		}
+
 		/* make sure later steps can see the object created here */
 		CommandCounterIncrement();
 	}
@@ -274,12 +298,19 @@ RenameSchema(const char *oldname, const char *newname)
 				 errmsg("schema \"%s\" already exists", newname)));
 
 	/* must be owner */
-	if (!object_ownercheck(NamespaceRelationId, nspOid, GetUserId()))
+	if (!object_ownercheck(NamespaceRelationId, nspOid, GetUserId()) && !IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
 					   oldname);
 
 	/* must have CREATE privilege on database */
 	aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(), ACL_CREATE);
+
+	/* yb_db_admin has superuser-like privileges */
+	if (IsYbDbAdminUser(GetUserId()))
+	{
+		aclresult = ACLCHECK_OK;
+	}
+
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
@@ -384,12 +415,21 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		AclResult	aclresult;
 
 		/* Otherwise, must be owner of the existing object */
-		if (!object_ownercheck(NamespaceRelationId, nspForm->oid, GetUserId()))
+		if (!object_ownercheck(NamespaceRelationId, nspForm->oid, GetUserId()) && !IsYbDbAdminUser(GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
 						   NameStr(nspForm->nspname));
 
 		/* Must be able to become new owner */
-		check_can_set_role(GetUserId(), newOwnerId);
+		if (IsYugaByteEnabled())
+		{
+			if (!is_member_of_role(GetUserId(), newOwnerId) && !IsYbDbAdminUser(GetUserId()))
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("must be member of role \"%s\"",
+								GetUserNameFromId(newOwnerId, false))));
+		}
+		else
+			check_can_set_role(GetUserId(), newOwnerId);
 
 		/*
 		 * must have create-schema rights
@@ -400,8 +440,16 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		 * schemas.  Because superusers will always have this right, we need
 		 * no special case for them.
 		 */
-		aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
-									ACL_CREATE);
+		if (IsYbDbAdminUser(GetUserId()))
+		{
+			aclresult = ACLCHECK_OK;
+		}
+		else
+		{
+			aclresult = object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
+										ACL_CREATE);
+		}
+
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_DATABASE,
 						   get_database_name(MyDatabaseId));

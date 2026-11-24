@@ -25,6 +25,15 @@
 #include "nodes/pg_list.h"
 #include "utils/datum.h"
 
+
+/*
+ * YB: A global variable that controls whether a node should be serialized in a
+ * format compatible with a previous version. If the value is 0, the
+ * serialization is in the latest format. The value 11 represents the PG11
+ * format.
+ */
+int			yb_serialize_expression_version = 0;
+
 /* State flag that determines how nodeToStringInternal() should treat location fields */
 static bool write_location_fields = false;
 
@@ -728,6 +737,121 @@ _outA_Const(StringInfo str, const A_Const *node)
 }
 
 
+/* YB: custom write for ScalarArrayOpExpr to conditionally skip hashfuncid/negfuncid */
+static void
+_outScalarArrayOpExpr(StringInfo str, const ScalarArrayOpExpr *node)
+{
+	WRITE_NODE_TYPE("SCALARARRAYOPEXPR");
+
+	WRITE_OID_FIELD(opno);
+	WRITE_OID_FIELD(opfuncid);
+	if (yb_serialize_expression_version != 11)
+	{
+		WRITE_OID_FIELD(hashfuncid);
+		WRITE_OID_FIELD(negfuncid);
+	}
+	WRITE_BOOL_FIELD(useOr);
+	WRITE_OID_FIELD(inputcollid);
+	WRITE_NODE_FIELD(args);
+	WRITE_LOCATION_FIELD(location);
+}
+
+/* YB: custom write for YbUpdateAffectedEntities due to loop logic */
+static void
+_outYbUpdateAffectedEntities(StringInfo str, const YbUpdateAffectedEntities *node)
+{
+	int			nfields = node->matrix.nrows;
+	int			nentities = node->matrix.ncols;
+
+	WRITE_NODE_TYPE("YBUPDATEAFFECTEDENTITIES");
+
+	WRITE_INT_FIELD(matrix.nrows);
+	WRITE_INT_FIELD(matrix.ncols);
+
+	for (int i = 0; i < nentities; i++)
+	{
+		WRITE_OID_FIELD(entity_list[i].oid);
+		WRITE_ENUM_FIELD(entity_list[i].etype, YbSkippableEntityType);
+	}
+
+	for (int i = 0; i < nfields; i++)
+	{
+		WRITE_INT_FIELD(col_info_list[i].attnum);
+		WRITE_NODE_FIELD(col_info_list[i].entity_refs);
+	}
+
+	WRITE_BITMAPSET_FIELD(matrix.data);
+}
+
+/* YB: custom write for YbBatchedNestLoop due to loop logic for hashClauseInfos */
+static void
+_outYbBatchedNestLoop(StringInfo str, const YbBatchedNestLoop *node)
+{
+	WRITE_NODE_TYPE("YBBATCHEDNESTLOOP");
+
+	WRITE_INT_FIELD(nl.join.plan.disabled_nodes);
+	WRITE_FLOAT_FIELD(nl.join.plan.startup_cost);
+	WRITE_FLOAT_FIELD(nl.join.plan.total_cost);
+	WRITE_FLOAT_FIELD(nl.join.plan.plan_rows);
+	WRITE_INT_FIELD(nl.join.plan.plan_width);
+	WRITE_BOOL_FIELD(nl.join.plan.parallel_aware);
+	WRITE_BOOL_FIELD(nl.join.plan.parallel_safe);
+	WRITE_BOOL_FIELD(nl.join.plan.async_capable);
+	WRITE_INT_FIELD(nl.join.plan.plan_node_id);
+	WRITE_NODE_FIELD(nl.join.plan.targetlist);
+	WRITE_NODE_FIELD(nl.join.plan.qual);
+	WRITE_NODE_FIELD(nl.join.plan.lefttree);
+	WRITE_NODE_FIELD(nl.join.plan.righttree);
+	WRITE_NODE_FIELD(nl.join.plan.initPlan);
+	WRITE_BITMAPSET_FIELD(nl.join.plan.extParam);
+	WRITE_BITMAPSET_FIELD(nl.join.plan.allParam);
+	WRITE_STRING_FIELD(nl.join.plan.ybHintAlias);
+	WRITE_UINT_FIELD(nl.join.plan.ybUniqueId);
+	WRITE_STRING_FIELD(nl.join.plan.ybInheritedHintAlias);
+	WRITE_BOOL_FIELD(nl.join.plan.ybIsHinted);
+	WRITE_BOOL_FIELD(nl.join.plan.ybHasHintedUid);
+	WRITE_ENUM_FIELD(nl.join.jointype, JoinType);
+	WRITE_BOOL_FIELD(nl.join.inner_unique);
+	WRITE_NODE_FIELD(nl.join.joinqual);
+	WRITE_NODE_FIELD(nl.nestParams);
+	WRITE_INT_FIELD(first_batch_size);
+	WRITE_INT_FIELD(num_hashClauseInfos);
+	appendStringInfoString(str, " :hashOps");
+	for (int i = 0; i < node->num_hashClauseInfos; i++)
+		appendStringInfo(str, " %u", node->hashClauseInfos[i].hashOp);
+
+	appendStringInfoString(str, " :innerHashAttNos");
+	for (int i = 0; i < node->num_hashClauseInfos; i++)
+		appendStringInfo(str, " %d", node->hashClauseInfos[i].innerHashAttNo);
+
+	appendStringInfoString(str, " :innerHashExprs");
+	for (int i = 0; i < node->num_hashClauseInfos; i++)
+	{
+		appendStringInfoString(str, " ");
+		outNode(str, node->hashClauseInfos[i].innerHashExpr);
+	}
+
+	appendStringInfoString(str, " :outerParamExprs");
+	for (int i = 0; i < node->num_hashClauseInfos; i++)
+	{
+		appendStringInfoString(str, " ");
+		outNode(str, node->hashClauseInfos[i].outerParamExpr);
+	}
+
+	appendStringInfoString(str, " :orig_expr");
+	for (int i = 0; i < node->num_hashClauseInfos; i++)
+	{
+		appendStringInfoString(str, " ");
+		outNode(str, node->hashClauseInfos[i].orig_expr);
+	}
+
+	WRITE_INT_FIELD(numSortCols);
+	WRITE_ATTRNUMBER_ARRAY(sortColIdx, node->numSortCols);
+	WRITE_OID_ARRAY(sortOperators, node->numSortCols);
+	WRITE_OID_ARRAY(collations, node->numSortCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numSortCols);
+}
+
 /*
  * outNode -
  *	  converts a Node into ascii string and append it to 'str'
@@ -833,4 +957,28 @@ bmsToString(const Bitmapset *bms)
 	initStringInfo(&str);
 	outBitmapset(&str, bms);
 	return str.data;
+}
+
+/*
+ * ybSerializeNode -
+ *	   calls nodeToString with yb_serialize_expression_version set appropriately
+ */
+char *
+ybSerializeNode(const void *obj)
+{
+	char	   *result;
+
+	yb_serialize_expression_version = yb_major_version_upgrade_compatibility;
+
+	PG_TRY();
+	{
+		result = nodeToString(obj);
+	}
+	PG_FINALLY();
+	{
+		yb_serialize_expression_version = 0;
+	}
+	PG_END_TRY();
+
+	return result;
 }

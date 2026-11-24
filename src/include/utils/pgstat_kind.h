@@ -58,6 +58,9 @@
  */
 #define PGSTAT_KIND_EXPERIMENTAL	24
 
+/* YB: stats for variable-numbered Yugabyte objects */
+#define PGSTAT_KIND_YB_TERMINATED_QUERIES	25
+
 static inline bool
 pgstat_is_kind_builtin(PgStat_Kind kind)
 {

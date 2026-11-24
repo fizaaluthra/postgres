@@ -39,7 +39,9 @@
  */
 #include "regcustom.h"
 
-
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_gflags.h"
 
 /*
  * Things that regcustom.h might override.
@@ -520,9 +522,11 @@ struct fns
 	int			FUNCPTR(stack_too_deep, (void));
 };
 
-#define STACK_TOO_DEEP(re)	\
-	((*((struct fns *) (re)->re_fns)->stack_too_deep) ())
+extern YB_THREAD_LOCAL int yb_regex_recursion_depth;
 
+#define STACK_TOO_DEEP(re)	(IsMultiThreadedMode() ? \
+	yb_regex_recursion_depth > *YBCGetGFlags()->yb_max_recursion_depth : \
+	(*((struct fns *) (re)->re_fns)->stack_too_deep) ())
 
 /*
  * the insides of a regex_t, hidden behind a void *

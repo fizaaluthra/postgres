@@ -32,6 +32,11 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "catalog/pg_yb_tablegroup_d.h"
+#include "pg_yb_utils.h"
+#include "utils/syscache.h"
+
 
 static bool isObjectPinned(const ObjectAddress *object);
 
@@ -144,7 +149,7 @@ recordMultipleDependencies(const ObjectAddress *depender,
 				indstate = CatalogOpenIndexes(dependDesc);
 
 			CatalogTuplesMultiInsertWithInfo(dependDesc, slot, slot_stored_count,
-											 indstate);
+											 indstate, false /* yb_shared_insert */ );
 			slot_stored_count = 0;
 		}
 	}
@@ -157,7 +162,7 @@ recordMultipleDependencies(const ObjectAddress *depender,
 			indstate = CatalogOpenIndexes(dependDesc);
 
 		CatalogTuplesMultiInsertWithInfo(dependDesc, slot, slot_stored_count,
-										 indstate);
+										 indstate, false /* yb_shared_insert */ );
 	}
 
 	if (indstate != NULL)
@@ -329,7 +334,7 @@ deleteDependencyRecordsFor(Oid classId, Oid objectId,
 			((Form_pg_depend) GETSTRUCT(tup))->deptype == DEPENDENCY_EXTENSION)
 			continue;
 
-		CatalogTupleDelete(depRel, &tup->t_self);
+		CatalogTupleDelete(depRel, tup);
 		count++;
 	}
 
@@ -338,6 +343,84 @@ deleteDependencyRecordsFor(Oid classId, Oid objectId,
 	table_close(depRel, RowExclusiveLock);
 
 	return count;
+}
+
+/*
+ * tablegroupHasDependents -- check if the specified tablegroup has any dependents
+ */
+bool
+tablegroupHasDependents(Oid tablegroupId)
+{
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	depRel = table_open(DependRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(YbTablegroupRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tablegroupId));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, 2, key);
+
+	found = HeapTupleIsValid(tup = systable_getnext(scan));
+
+	systable_endscan(scan);
+	table_close(depRel, RowExclusiveLock);
+
+	return found;
+}
+
+/*
+ * ybIsTablegroupDependent -- check if the specified relation is dependent on
+ * the specified tablegroup.
+ */
+bool
+ybIsTablegroupDependent(Oid relOid, Oid tablegroupId)
+{
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	depRel = table_open(DependRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(YbTablegroupRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tablegroupId));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, 2, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (depform->objid == relOid)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	systable_endscan(scan);
+	table_close(depRel, RowExclusiveLock);
+
+	return found;
 }
 
 /*
@@ -379,7 +462,7 @@ deleteDependencyRecordsForClass(Oid classId, Oid objectId,
 
 		if (depform->refclassid == refclassId && depform->deptype == deptype)
 		{
-			CatalogTupleDelete(depRel, &tup->t_self);
+			CatalogTupleDelete(depRel, tup);
 			count++;
 		}
 	}
@@ -428,7 +511,7 @@ deleteDependencyRecordsForSpecific(Oid classId, Oid objectId, char deptype,
 			depform->refobjid == refobjectId &&
 			depform->deptype == deptype)
 		{
-			CatalogTupleDelete(depRel, &tup->t_self);
+			CatalogTupleDelete(depRel, tup);
 			count++;
 		}
 	}
@@ -530,7 +613,7 @@ changeDependencyFor(Oid classId, Oid objectId,
 			depform->refobjid == oldRefObjectId)
 		{
 			if (newIsPinned)
-				CatalogTupleDelete(depRel, &tup->t_self);
+				CatalogTupleDelete(depRel, tup);
 			else
 			{
 				/* make a modifiable copy */
@@ -673,7 +756,7 @@ changeDependenciesOn(Oid refClassId, Oid oldRefObjectId,
 	while (HeapTupleIsValid((tup = systable_getnext(scan))))
 	{
 		if (newIsPinned)
-			CatalogTupleDelete(depRel, &tup->t_self);
+			CatalogTupleDelete(depRel, tup);
 		else
 		{
 			Form_pg_depend depform;

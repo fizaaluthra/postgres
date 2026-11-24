@@ -1,0 +1,824 @@
+/*--------------------------------------------------------------------------------------------------
+ *
+ * yb_decode.c
+ *		This module decodes YB Virtual WAL records read using yb_virtual_wal_client.h's APIs for the
+ *		purpose of logical decoding by passing information to the
+ *		reorderbuffer module (containing the actual changes).
+ *
+ * Copyright (c) YugabyteDB, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License.  You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied.  See the License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ * IDENTIFICATION
+ *        src/postgres/src/backend/replication/logical/yb_decode.c
+ *
+ *--------------------------------------------------------------------------------------------------
+ */
+
+#include "postgres.h"
+
+#include <inttypes.h>
+
+#include "access/xact.h"
+#include "pg_yb_utils.h"
+#include "replication/walsender_private.h"
+#include "replication/yb_decode.h"
+#include "replication/yb_virtual_wal_client.h"
+#include "utils/catcache.h"
+#include "utils/rel.h"
+#include "yb/yql/pggate/util/ybc_guc.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
+static void YBDecodeDDL(LogicalDecodingContext *ctx, XLogReaderState *record);
+static void YBDecodePublicationRefresh(LogicalDecodingContext *ctx,
+									   XLogReaderState *record);
+static void YBDecodeInsert(LogicalDecodingContext *ctx, XLogReaderState *record);
+static void YBDecodeUpdate(LogicalDecodingContext *ctx, XLogReaderState *record);
+static void YBDecodeDelete(LogicalDecodingContext *ctx, XLogReaderState *record);
+static void YBDecodeCommit(LogicalDecodingContext *ctx, XLogReaderState *record);
+
+static int	YBFindAttributeIndexInDescriptor(Relation relation, TupleDesc tupdesc,
+											 const YbcPgDatumMessage *col);
+static void YBHandleRelcacheRefresh(LogicalDecodingContext *ctx, XLogReaderState *record);
+static bool YbDmlHistoricalReadParams(const YbVirtualWalRecord *yb_record,
+									  uint64_t *read_time,
+									  uint64_t *in_txn_limit,
+									  const char **txn_id);
+static void YbStoreDmlHistoricalReadContext(ReorderBufferChange *change,
+											const YbVirtualWalRecord *yb_record);
+
+static void YBLogTupleDescIfRequested(const YbVirtualWalRecord *yb_record,
+									  TupleDesc tupdesc);
+
+/*
+ * Take every record received from the YB VirtualWAL and perform the actions
+ * required to decode it using the output plugin already setup in the logical
+ * decoding context.
+ *
+ * We make certain assumptions about the records received from the VirtualWAL:
+ * 1. No interleaved transactions
+ * 2. No irrelevant records other than DDL
+ *
+ * Even though there are no interleaved transactions, we still use the
+ * ReorderBuffer component as it has the logic to spill large transactions to
+ * disk.
+ */
+void
+YBLogicalDecodingProcessRecord(LogicalDecodingContext *ctx,
+							   XLogReaderState *record)
+{
+	TimestampTz start_time = GetCurrentTimestamp();
+
+	YbcPgRowMessageAction action = record->yb_virtual_wal_record->action;
+
+	elog(DEBUG4,
+		 "YBLogicalDecodingProcessRecord: Decoding record with action = %d. "
+		 "yb_read_time is set to %d",
+		 action, yb_is_read_time_ht);
+
+	/* Check if we need a relcache refresh. */
+	YBHandleRelcacheRefresh(ctx, record);
+
+	/* Now delegate to specific handlers depending on the action type. */
+	switch (action)
+	{
+		case YB_PG_ROW_MESSAGE_ACTION_DDL:
+			elog(DEBUG4,
+				 "Received DDL record for table: %d, xid: %d, commit_time_ht: "
+				 "%" PRIu64,
+				 record->yb_virtual_wal_record->table_oid,
+				 record->yb_virtual_wal_record->xid,
+				 record->yb_virtual_wal_record->commit_time_ht);
+			if (*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl)
+			{
+				YBDecodeDDL(ctx, record);
+			}
+			break;
+
+		case YB_PG_ROW_MESSAGE_ACTION_BEGIN:
+			/*
+			 * Start a transaction so that we can get the relation by oid in
+			 * case of change operations. This transaction must be aborted
+			 * after processing the corresponding commit record.
+			 *
+			 * In the pull model (SQL function API e.g.
+			 * pg_logical_slot_get_changes), we are already inside the
+			 * caller's transaction, so we must not start a new one.
+			 */
+			if (am_walsender)
+				StartTransactionCommand();
+
+			ctx->yb_inval_catalog_on_decode_commit = false;
+			break;
+
+		case YB_PG_ROW_MESSAGE_ACTION_INSERT:
+			{
+				YBDecodeInsert(ctx, record);
+				break;
+			}
+
+		case YB_PG_ROW_MESSAGE_ACTION_UPDATE:
+			{
+				YBDecodeUpdate(ctx, record);
+				break;
+			}
+
+		case YB_PG_ROW_MESSAGE_ACTION_DELETE:
+			{
+				YBDecodeDelete(ctx, record);
+				break;
+			}
+
+		case YB_PG_ROW_MESSAGE_ACTION_PUBLICATION_REFRESH:
+			{
+				YBDecodePublicationRefresh(ctx, record);
+				break;
+			}
+
+		case YB_PG_ROW_MESSAGE_ACTION_COMMIT:
+			{
+				YBDecodeCommit(ctx, record);
+
+				/*
+				 * Abort the transaction that we started upon receiving the
+				 * BEGIN message. Only done in the push model (walsender)
+				 * where we explicitly started the transaction.
+				 *
+				 * In the pull model, the caller's transaction is still
+				 * active and must not be aborted.
+				 */
+				if (am_walsender)
+				{
+					AbortCurrentTransaction();
+					Assert(!IsTransactionState());
+				}
+				break;
+			}
+
+			/* Should never happen. */
+		case YB_PG_ROW_MESSAGE_ACTION_UNKNOWN:
+			pg_unreachable();
+	}
+
+	YbWalSndTotalTimeInYBDecodeMicros +=
+		YbCalculateTimeDifferenceInMicros(start_time);
+}
+
+/*
+ * Queue a transactional DDL marker so cache invalidation and schema change
+ * are replayed in order with the transaction's DML changes.
+ */
+static void
+YBDecodeDDL(LogicalDecodingContext *ctx, XLogReaderState *record)
+{
+	const YbVirtualWalRecord *yb_record = record->yb_virtual_wal_record;
+	ReorderBufferChange *change = ReorderBufferAllocChange(ctx->reorder);
+
+	Assert(*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl);
+	Assert(ctx->reader->ReadRecPtr == yb_record->lsn);
+	Assert(yb_record->record_time_ht != 0);
+	Assert(yb_record->has_docdb_txn_id);
+
+	change->action = YB_REORDER_BUFFER_CHANGE_DDL;
+	change->origin_id = yb_record->xrepl_origin_id;
+	change->data.yb_ddl.table_oid = yb_record->table_oid;
+
+	ReorderBufferProcessXid(ctx->reorder, yb_record->xid,
+							ctx->reader->ReadRecPtr);
+	ReorderBufferQueueChange(ctx->reorder, yb_record->xid,
+							 ctx->reader->ReadRecPtr, change,
+							 false /* toast_insert */ );
+
+	/* Remember to invalidate caches before reorder-buffer replay. */
+	ctx->yb_inval_catalog_on_decode_commit = true;
+}
+
+/*
+ * Queue a publication invalidation marker, so that replay drops the output
+ * plugin's publication info at this point of the transaction and rebuilds it
+ * from the catalog as of the following changes.
+ */
+static void
+YBDecodePublicationRefresh(LogicalDecodingContext *ctx,
+						   XLogReaderState *record)
+{
+	const YbVirtualWalRecord *yb_record = record->yb_virtual_wal_record;
+	ReorderBufferChange *change = ReorderBufferAllocChange(ctx->reorder);
+
+	Assert(*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl);
+
+	change->action = YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION;
+
+	ReorderBufferProcessXid(ctx->reorder, yb_record->xid,
+							ctx->reader->ReadRecPtr);
+	ReorderBufferQueueChange(ctx->reorder, yb_record->xid,
+							 ctx->reader->ReadRecPtr, change,
+							 false /* toast_insert */ );
+
+	/* Remember to invalidate caches before reorder-buffer replay. */
+	ctx->yb_inval_catalog_on_decode_commit = true;
+}
+
+/*
+ * YB version of the DecodeInsert function from decode.c
+ */
+static void
+YBDecodeInsert(LogicalDecodingContext *ctx, XLogReaderState *record)
+{
+	const YbVirtualWalRecord *yb_record = record->yb_virtual_wal_record;
+	ReorderBufferChange *change = ReorderBufferAllocChange(ctx->reorder);
+	HeapTuple	tuple;
+	HeapTuple	tuple_buf;
+
+	Assert(ctx->reader->ReadRecPtr == yb_record->lsn);
+
+	change->action = REORDER_BUFFER_CHANGE_INSERT;
+	change->origin_id = yb_record->xrepl_origin_id;
+
+	ReorderBufferProcessXid(ctx->reorder, yb_record->xid,
+							ctx->reader->ReadRecPtr);
+
+	/*
+	 * In PG, we know the size of the tuple from the header, so they can
+	 * directly allocated the tuple_buf in the reorderbuffer and copy the tuple
+	 * contents into it. In YSQL, we don't know the size of the tuple. The only
+	 * way to do it is to first create the heap tuple itself. So we do a two
+	 * step process.
+	 *
+	 * We first create a heap tuple from the YB virtual WAL record just to know
+	 * its size. We then allocate the necessary space in the reorderbuffer and
+	 * copy the tuple contents into it. Finally, we free the first tuple
+	 * created.
+	 */
+	tuple = YBGetHeapTuplesForRecord(yb_record);
+	tuple_buf = ReorderBufferAllocTupleBuf(ctx->reorder,
+										   tuple->t_len - SizeofHeapTupleHeader);
+	yb_heap_copytuple_with_tuple(tuple, tuple_buf);
+	pfree(tuple);
+
+	change->data.tp.newtuple = tuple_buf;
+	change->data.tp.oldtuple = NULL;
+	change->data.tp.yb_table_oid = yb_record->table_oid;
+	YbStoreDmlHistoricalReadContext(change, yb_record);
+
+	change->data.tp.clear_toast_afterwards = true;
+
+	/*
+	 * YB does not support on-disk TOASTing, so toast_insert will always be
+	 * false.
+	 */
+	ReorderBufferQueueChange(ctx->reorder, yb_record->xid,
+							 ctx->reader->ReadRecPtr, change, false /* toast_insert */ );
+}
+
+/*
+ * YB version of the DecodeUpdate function from decode.c
+ */
+static void
+YBDecodeUpdate(LogicalDecodingContext *ctx, XLogReaderState *record)
+{
+	const YbVirtualWalRecord *yb_record = record->yb_virtual_wal_record;
+	ReorderBufferChange *change = ReorderBufferAllocChange(ctx->reorder);
+	Relation	relation;
+	TupleDesc	tupdesc;
+	int			nattrs;
+	HeapTuple	after_op_tuple;
+	HeapTuple	before_op_tuple;
+	HeapTuple	after_op_tuple_buf;
+	HeapTuple	before_op_tuple_buf;
+	bool	   *after_op_is_omitted = NULL;
+	bool		should_handle_omitted_case;
+
+	change->action = REORDER_BUFFER_CHANGE_UPDATE;
+	change->lsn = yb_record->lsn;
+	change->origin_id = yb_record->xrepl_origin_id;
+
+	relation =
+		YbGetRelationWithOverwrittenReplicaIdentity(yb_record->table_oid,
+													YBCGetReplicaIdentityForRelation(yb_record->table_oid));
+	tupdesc = RelationGetDescr(relation);
+	nattrs = tupdesc->natts;
+	YBLogTupleDescIfRequested(yb_record, tupdesc);
+
+	/*
+	 * Allocate the is_omitted array before so that we can directly write to it
+	 * instead of creating a temporary array and doing a memcpy.
+	 * We assume that columns are omitted by default.
+	 *
+	 * The special handling of omission vs NULL is only required
+	 * for YB specific replica identity (record type) values. Presently, it is
+	 * only CHANGE.
+	 */
+	should_handle_omitted_case =
+		YBCGetReplicaIdentityForRelation(yb_record->table_oid) ==
+		YB_REPLICA_IDENTITY_CHANGE;
+	if (should_handle_omitted_case)
+	{
+		after_op_is_omitted = YBAllocateIsOmittedArray(ctx->reorder, nattrs);
+		memset(after_op_is_omitted, 1, sizeof(bool) * nattrs);
+	}
+
+	Datum		after_op_datums[nattrs];
+	bool		after_op_is_nulls[nattrs];
+	Datum		before_op_datums[nattrs];
+	bool		before_op_is_nulls[nattrs];
+
+	memset(after_op_is_nulls, 1, sizeof(after_op_is_nulls));
+	memset(before_op_is_nulls, 1, sizeof(before_op_is_nulls));
+	for (int col_idx = 0; col_idx < yb_record->col_count; col_idx++)
+	{
+		YbcPgDatumMessage *col = &yb_record->cols[col_idx];
+		int			attr_idx = YBFindAttributeIndexInDescriptor(relation, tupdesc,
+																col);
+
+		if (attr_idx < 0)
+			continue;
+
+		if (should_handle_omitted_case)
+			after_op_is_omitted[attr_idx] = col->after_op_is_omitted;
+
+		if (!should_handle_omitted_case || !col->after_op_is_omitted)
+		{
+			after_op_datums[attr_idx] = col->after_op_datum;
+			after_op_is_nulls[attr_idx] = col->after_op_is_null;
+		}
+		if (!should_handle_omitted_case || !col->before_op_is_omitted)
+		{
+			before_op_datums[attr_idx] = col->before_op_datum;
+			before_op_is_nulls[attr_idx] = col->before_op_is_null;
+		}
+	}
+
+	/* See the comment in YBDecodeInsert on why we create tuples twice. */
+	after_op_tuple =
+		heap_form_tuple(tupdesc, after_op_datums, after_op_is_nulls);
+	after_op_tuple_buf =
+		ReorderBufferAllocTupleBuf(ctx->reorder,
+								   after_op_tuple->t_len - SizeofHeapTupleHeader);
+	yb_heap_copytuple_with_tuple(after_op_tuple, after_op_tuple_buf);
+	pfree(after_op_tuple);
+
+	/*
+	 * In YB, the primary key updates are sent as DELETE + INSERT. So the only
+	 * updates that will be streamed are for non-primary key updates. For
+	 * non-primary key updates non-null old-tuple will be sent only for replica
+	 * identity FULL to match the PG behaviour.
+	 */
+	if (relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL)
+	{
+		before_op_tuple =
+			heap_form_tuple(tupdesc, before_op_datums, before_op_is_nulls);
+		before_op_tuple_buf =
+			ReorderBufferAllocTupleBuf(ctx->reorder,
+									   before_op_tuple->t_len - SizeofHeapTupleHeader);
+		yb_heap_copytuple_with_tuple(before_op_tuple, before_op_tuple_buf);
+		pfree(before_op_tuple);
+	}
+	else
+		before_op_tuple_buf = NULL;
+
+	/* See yb_new_is_omitted in reorderbuffer.h. */
+	Assert(!(before_op_tuple_buf && should_handle_omitted_case));
+
+	if (log_min_messages[MyBackendType] <= DEBUG2)
+	{
+		const char *new_tuple_string;
+
+		new_tuple_string =
+			YbHeapTupleToStringWithIsOmitted(after_op_tuple_buf,
+											 tupdesc,
+											 after_op_is_omitted);
+
+		if (before_op_tuple_buf)
+		{
+			const char *old_tuple_string;
+
+			old_tuple_string =
+				YbHeapTupleToStringWithIsOmitted(before_op_tuple_buf,
+												 tupdesc,
+												 NULL /* is_omitted */ );
+			elog(DEBUG2,
+				 "yb_decode: before_op heap tuple: %s, after_op heap tuple: %s",
+				 old_tuple_string, new_tuple_string);
+			pfree((char *) old_tuple_string);
+		}
+		else
+			elog(DEBUG2,
+				 "yb_decode: before_op heap tuple: NULL, after_op heap tuple: %s",
+				 new_tuple_string);
+
+		pfree((char *) new_tuple_string);
+	}
+
+	change->data.tp.newtuple = after_op_tuple_buf;
+	change->data.tp.oldtuple = before_op_tuple_buf;
+	change->data.tp.yb_table_oid = yb_record->table_oid;
+	YbStoreDmlHistoricalReadContext(change, yb_record);
+	change->data.tp.yb_new_is_omitted = after_op_is_omitted;
+	change->data.tp.yb_new_is_omitted_natts =
+		should_handle_omitted_case ? nattrs : 0;
+
+	change->data.tp.clear_toast_afterwards = true;
+	ReorderBufferQueueChange(ctx->reorder, yb_record->xid,
+							 ctx->reader->ReadRecPtr, change, false /* toast_insert */ );
+
+	RelationClose(relation);
+}
+
+/*
+ * YB version of the DecodeDelete function from decode.c
+ */
+static void
+YBDecodeDelete(LogicalDecodingContext *ctx, XLogReaderState *record)
+{
+	const YbVirtualWalRecord *yb_record = record->yb_virtual_wal_record;
+	ReorderBufferChange *change = ReorderBufferAllocChange(ctx->reorder);
+	HeapTuple	tuple;
+	HeapTuple	tuple_buf;
+
+	Assert(ctx->reader->ReadRecPtr == yb_record->lsn);
+
+	change->action = REORDER_BUFFER_CHANGE_DELETE;
+	change->origin_id = yb_record->xrepl_origin_id;
+
+	ReorderBufferProcessXid(ctx->reorder, yb_record->xid,
+							ctx->reader->ReadRecPtr);
+
+	/* See the comment in YBDecodeInsert on why we create tuples twice. */
+	tuple = YBGetHeapTuplesForRecord(yb_record);
+	tuple_buf = ReorderBufferAllocTupleBuf(ctx->reorder,
+										   tuple->t_len - SizeofHeapTupleHeader);
+	yb_heap_copytuple_with_tuple(tuple, tuple_buf);
+	pfree(tuple);
+
+	change->data.tp.newtuple = NULL;
+	change->data.tp.oldtuple = tuple_buf;
+	change->data.tp.yb_table_oid = yb_record->table_oid;
+	YbStoreDmlHistoricalReadContext(change, yb_record);
+
+	change->data.tp.clear_toast_afterwards = true;
+	ReorderBufferQueueChange(ctx->reorder, yb_record->xid,
+							 ctx->reader->ReadRecPtr, change, false /* toast_insert */ );
+}
+
+/*
+ * YB version of the DecodeCommit function from decode.c
+ */
+static void
+YBDecodeCommit(LogicalDecodingContext *ctx, XLogReaderState *record)
+{
+	const YbVirtualWalRecord *yb_record = record->yb_virtual_wal_record;
+	XLogRecPtr	commit_lsn = yb_record->lsn;
+	XLogRecPtr	end_lsn = yb_record->lsn + 1;
+	XLogRecPtr	origin_lsn = yb_record->lsn;
+
+	/*
+	 * Skip the records which the client hasn't asked for. Simpler version of a
+	 * similar check done in DecodeCommit in decode.c
+	 */
+	if (commit_lsn < ctx->yb_start_decoding_at)
+	{
+		/*
+		 * ReorderBufferForget handles the cleanup of subtransactions as well.
+		 * So this is sufficient to clean up the transaction along with its
+		 * subtransactions.
+		 */
+		elog(DEBUG1,
+			 "YBDecodeCommit: Ignoring txn %d with commit_lsn = " UINT64_FORMAT " as "
+			 "yb_start_decoding_at = " UINT64_FORMAT ".",
+			 yb_record->xid, commit_lsn, ctx->yb_start_decoding_at);
+		ReorderBufferForget(ctx->reorder, yb_record->xid, commit_lsn);
+
+		/*
+		 * The client never sees this transaction, so it will never acknowledge
+		 * it. Hence, remember the filtered commit_lsn and acknowledge it before
+		 * the next GetConsistentChanges call.
+		 */
+		YBCTrackFilteredTransaction(commit_lsn);
+		ctx->yb_inval_catalog_on_decode_commit = false;
+		return;
+	}
+
+	elog(DEBUG1,
+		 "Going to stream transaction: %d with commit_lsn: " UINT64_FORMAT " and "
+		 "end_lsn: " UINT64_FORMAT "",
+		 yb_record->xid, commit_lsn, end_lsn);
+
+	/*
+	 * If this transaction block contains a DDL or a publication refresh, we
+	 * need to invalidate the caches so that the reorderbuffer replay doesn't
+	 * read future catalog entries. Publication refresh reads, for example,
+	 * cache pg_publication rows as of a point later than the changes queued
+	 * before it.
+	 */
+	if (ctx->yb_inval_catalog_on_decode_commit)
+	{
+		Assert(*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl);
+		YBCInvalidateCachesForHistoricalReadContext();
+		ResetCatalogCaches();
+	}
+
+	ReorderBufferCommit(ctx->reorder, yb_record->xid, commit_lsn, end_lsn,
+						yb_record->commit_time, yb_record->xrepl_origin_id,
+						origin_lsn);
+
+	ctx->yb_inval_catalog_on_decode_commit = false;
+
+	elog(DEBUG1,
+		 "Successfully streamed transaction: %d with commit_lsn: " UINT64_FORMAT " and "
+		 "end_lsn: " UINT64_FORMAT "",
+		 yb_record->xid, commit_lsn, end_lsn);
+}
+
+HeapTuple
+YBGetHeapTuplesForRecord(const YbVirtualWalRecord *yb_record)
+{
+	Relation	relation;
+	TupleDesc	tupdesc;
+	int			nattrs;
+	HeapTuple	tuple;
+
+	YbcPgRowMessageAction action = yb_record->action;
+
+	/*
+	 * Note that we don't strictly need to overwrite the replica identity in
+	 * yb_decode.c as this field is not read here. For correctness, we only need
+	 * to override it in the reorderbuffer. We do it here just for completeness
+	 * so that we don't end up with conflicting pieces of information about the
+	 * replica identity in two different files that can lead to confusion.
+	 */
+	relation =
+		YbGetRelationWithOverwrittenReplicaIdentity(yb_record->table_oid,
+													YBCGetReplicaIdentityForRelation(yb_record->table_oid));
+
+	tupdesc = RelationGetDescr(relation);
+	nattrs = tupdesc->natts;
+	YBLogTupleDescIfRequested(yb_record, tupdesc);
+
+	Datum		datums[nattrs];
+	bool		is_nulls[nattrs];
+
+	/* Set value to null by default so that we treat dropped columns as null. */
+	memset(is_nulls, true, sizeof(is_nulls));
+	for (int col_idx = 0; col_idx < yb_record->col_count; col_idx++)
+	{
+		const YbcPgDatumMessage *col = &yb_record->cols[col_idx];
+		int			attr_idx = YBFindAttributeIndexInDescriptor(relation, tupdesc,
+																col);
+
+		if (attr_idx < 0)
+			continue;
+
+		datums[attr_idx] = ((action == YB_PG_ROW_MESSAGE_ACTION_INSERT) ?
+							col->after_op_datum :
+							col->before_op_datum);
+		is_nulls[attr_idx] = ((action == YB_PG_ROW_MESSAGE_ACTION_INSERT) ?
+							  col->after_op_is_null :
+							  col->before_op_is_null);
+	}
+
+	tuple = heap_form_tuple(tupdesc, datums, is_nulls);
+	if (log_min_messages[MyBackendType] <= DEBUG2)
+	{
+		const char *tuple_string = YbHeapTupleToStringWithIsOmitted(tuple,
+																	tupdesc,
+																	NULL);
+
+		elog(DEBUG2,
+			 "yb_decode: The heap tuple: %s for operation: %s", tuple_string,
+			 ((action == YB_PG_ROW_MESSAGE_ACTION_INSERT) ?
+			  "INSERT" :
+			  "DELETE"));
+
+		pfree((char *) tuple_string);
+	}
+
+	RelationClose(relation);
+	return tuple;
+}
+
+/*
+ * Returns the index of the column in the descriptor, or -1 if the caller should
+ * skip it.
+ *
+ * TODO(#20726): Optimize the lookup by name via a cache. We do not need to
+ * iterate through all attributes everytime this function is called. This
+ * should be done after we have landed support for schema evolution as this
+ * logic is highly likely to change before that.
+ */
+static int
+YBFindAttributeIndexInDescriptor(Relation relation, TupleDesc tupdesc,
+								 const YbcPgDatumMessage *col)
+{
+	const char *column_name = col->column_name;
+	int			attr_idx = 0;
+
+	/*
+	 * With transactional DDL, we use attr num to find column in the tuple
+	 * descriptor.
+	 */
+	if (*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl)
+	{
+		int			attr_num = col->column_attr_num;
+
+		if (attr_num <= 0 || attr_num > tupdesc->natts ||
+			TupleDescAttr(tupdesc, attr_num - 1)->attisdropped)
+			return -1;
+		return attr_num - 1;
+	}
+
+	/*
+	 * Column name is null when both new and old values are omitted. If this
+	 * were to happen here, this would indicate that an empty column value was
+	 * sent from the CDC service which should have been caught in ybc_pggate.
+	 */
+	Assert(column_name);
+
+	/*
+	 * 'ybrowid' is an internal primary key column added by DocDB for tables
+	 * without a primary key. Skip this column.
+	 */
+	if (YBGetTablePrimaryKeyBms(relation) == NULL &&
+		strcmp(column_name, "ybrowid") == 0)
+		return -1;
+
+	for (attr_idx = 0; attr_idx < tupdesc->natts; attr_idx++)
+	{
+		if (TupleDescAttr(tupdesc, attr_idx)->attisdropped)
+			continue;
+
+		if (!strcmp(TupleDescAttr(tupdesc, attr_idx)->attname.data, column_name))
+			return attr_idx;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("could not find column with name %s in tuple"
+					" descriptor", column_name)));
+	return -1;					/* keep compiler quiet */
+}
+
+static void
+YBHandleRelcacheRefresh(LogicalDecodingContext *ctx, XLogReaderState *record)
+{
+	Oid			table_oid = record->yb_virtual_wal_record->table_oid;
+
+	switch (record->yb_virtual_wal_record->action)
+	{
+		case YB_PG_ROW_MESSAGE_ACTION_DDL:
+			{
+				if (*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl)
+					YBCInvalidateCachesForHistoricalReadContext();
+				else
+				{
+					bool		found;
+
+					/*
+					 * Mark for relcache invalidation to be done on first DML by
+					 * inserting an entry for the table_oid.
+					 */
+					hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
+								HASH_ENTER, &found);
+				}
+				break;
+			}
+
+		case YB_PG_ROW_MESSAGE_ACTION_INSERT:
+			yb_switch_fallthrough();
+		case YB_PG_ROW_MESSAGE_ACTION_UPDATE:
+			yb_switch_fallthrough();
+		case YB_PG_ROW_MESSAGE_ACTION_DELETE:
+			{
+				uint64_t	read_time;
+				uint64_t	in_txn_limit;
+				const char *txn_id;
+				bool		needs_invalidation = false;
+
+				if (YbDmlHistoricalReadParams(record->yb_virtual_wal_record,
+											  &read_time, &in_txn_limit,
+											  &txn_id))
+				{
+					const uint32_t *aborted_subtxn_set;
+					int			aborted_subtxn_set_size;
+
+					aborted_subtxn_set =
+						YBCGetAbortedSubtxnSet(txn_id, &aborted_subtxn_set_size);
+					YBCSetHistoricalReadContext(read_time, in_txn_limit, txn_id,
+												aborted_subtxn_set,
+												aborted_subtxn_set_size);
+					break;
+				}
+
+				hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
+							HASH_FIND, &needs_invalidation);
+
+				if (needs_invalidation)
+				{
+					uint64_t	read_time_ht;
+
+					/* Use the commit_time_ht of the DML. */
+					read_time_ht = record->yb_virtual_wal_record->commit_time_ht;
+
+					elog(DEBUG2,
+						 "Setting yb_read_time to record's commit_time_ht: %" PRIu64,
+						 read_time_ht);
+					YBCUpdateYbReadTimeAndInvalidateRelcache(read_time_ht);
+
+					/*
+					 * Let the plugin know that the schema for this table has
+					 * changed, so it must send the new relation object to the
+					 * client.
+					 */
+					YBReorderBufferSchemaChange(ctx->reorder, table_oid);
+
+					bool		found;
+
+					hash_search(ctx->yb_needs_relcache_invalidation, &table_oid,
+								HASH_REMOVE, &found);
+					Assert(found);
+				}
+				break;
+			}
+
+			/* Nothing to handle for these types. */
+		case YB_PG_ROW_MESSAGE_ACTION_UNKNOWN:
+			yb_switch_fallthrough();
+		case YB_PG_ROW_MESSAGE_ACTION_BEGIN:
+			yb_switch_fallthrough();
+		case YB_PG_ROW_MESSAGE_ACTION_COMMIT:
+			yb_switch_fallthrough();
+		case YB_PG_ROW_MESSAGE_ACTION_PUBLICATION_REFRESH:
+			return;
+	}
+}
+
+static bool
+YbDmlHistoricalReadParams(const YbVirtualWalRecord *yb_record,
+						  uint64_t *read_time, uint64_t *in_txn_limit,
+						  const char **txn_id)
+{
+	if (!*YBCGetGFlags()->TEST_ysql_yb_enable_replication_slot_transactional_ddl)
+		return false;
+
+	if (yb_record->has_docdb_txn_id)
+	{
+		Assert(yb_record->record_time_ht != 0);
+		*read_time = yb_record->commit_time_ht - 1;
+		*in_txn_limit = yb_record->record_time_ht;
+		*txn_id = yb_record->docdb_txn_id;
+	}
+	else
+	{
+		*read_time = yb_record->commit_time_ht;
+		*in_txn_limit = PG_UINT64_MAX;
+		*txn_id = "";
+	}
+
+	return true;
+}
+
+static void
+YbStoreDmlHistoricalReadContext(ReorderBufferChange *change,
+								const YbVirtualWalRecord *yb_record)
+{
+	uint64_t	read_time;
+	uint64_t	in_txn_limit;
+	const char *txn_id;
+
+	if (!YbDmlHistoricalReadParams(yb_record, &read_time, &in_txn_limit,
+								   &txn_id))
+		return;
+
+	change->data.tp.yb_read_time = read_time;
+	change->data.tp.yb_in_txn_limit = in_txn_limit;
+	strlcpy(change->data.tp.yb_txn_id, txn_id,
+			sizeof(change->data.tp.yb_txn_id));
+}
+
+static void
+YBLogTupleDescIfRequested(const YbVirtualWalRecord *yb_record,
+						  TupleDesc tupdesc)
+{
+	/* Log tuple descriptor for DEBUG2 onwards. */
+	if (log_min_messages[MyBackendType] <= DEBUG2)
+	{
+		elog(DEBUG2, "Printing tuple descriptor for relation %d\n",
+			 yb_record->table_oid);
+		for (int attr_idx = 0; attr_idx < tupdesc->natts; attr_idx++)
+		{
+			elog(DEBUG2, "Col %d: name = %s, dropped = %d, type = %d\n",
+				 attr_idx, TupleDescAttr(tupdesc, attr_idx)->attname.data,
+				 TupleDescAttr(tupdesc, attr_idx)->attisdropped,
+				 TupleDescAttr(tupdesc, attr_idx)->atttypid);
+		}
+	}
+}

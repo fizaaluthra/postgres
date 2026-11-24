@@ -12,6 +12,9 @@ subdir = src
 top_builddir = ..
 include Makefile.global
 
+# YB: TODO(#25892): YB currently has a single way of building postgres, so any
+# non-default subdirs we want to build are added here.  YB should be more
+# flexible and be able to build subdirs at will.
 SUBDIRS = \
 	common \
 	port \

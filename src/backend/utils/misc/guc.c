@@ -52,6 +52,34 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "access/heaptoast.h"
+#include "access/parallel.h"
+#include "access/yb_cost.h"
+#include "catalog/index.h"
+#include "commands/copy.h"
+#include "common/ip.h"
+#include "common/pg_yb_conn_mgr_protocol.h"
+#include "common/string.h"
+#include "executor/ybModifyTable.h"
+#include "libpq/libpq-be.h"
+#include "optimizer/cost.h"
+#include "optimizer/yb_merge_scan.h"
+#include "pg_yb_utils.h"
+#include "postmaster/postmaster.h"
+#include "replication/walsender.h"
+#include "tcop/cmdtag.h"
+#include "tcop/pquery.h"
+#include "utils/backend_status.h"
+#include "utils/spccache.h"
+#include "utils/syscache.h"
+#include "utils/varlena.h"
+#include "yb/util/debug/leak_annotations.h"
+#include "yb_ash.h"
+#include "yb_qpm.h"
+#include "yb_query_diagnostics.h"
+#include "yb_tcmalloc_utils.h"
+#include <netdb.h>
 
 #define CONFIG_FILENAME "postgresql.conf"
 #define HBA_FILENAME	"pg_hba.conf"
@@ -75,6 +103,28 @@
  */
 #define GUC_SAFE_SEARCH_PATH "pg_catalog, pg_temp"
 
+/*
+ * YB: defined in guc_tables.c next to the generated table; extern'd here because
+ * the transaction-priority bound check hooks below cross-read the two bounds.
+ */
+extern double yb_transaction_priority_lower_bound;
+extern double yb_transaction_priority_upper_bound;
+
+/* YB: ConnMgr variables used to track SIGHUP */
+uint64_t	yb_conn_mgr_sighup_logical_client_version = 0;
+bool		yb_conn_mgr_sighup_had_backend_guc_change = false;
+
+extern bool yb_conn_mgr_modifying_defaults;
+
+/*
+ * YB: GUC storage variables for CM logical-client metadata.
+ * Written by Odyssey on every client attach via the 'G' packet; read back
+ * by pg_stat_activity through the PgBackendStatus shared memory entry.
+ */
+char	   *yb_ycm_internal_client_addr;
+int			yb_ycm_internal_client_port;
+char	   *yb_conn_mgr_client_hostname;
+
 static int	GUC_check_errcode_value;
 
 static List *reserved_class_prefix = NIL;
@@ -84,6 +134,15 @@ char	   *GUC_check_errmsg_string;
 char	   *GUC_check_errdetail_string;
 char	   *GUC_check_errhint_string;
 
+/* YB functions */
+extern YbcTxnPriorityRequirement YBCGetTransactionPriorityType();
+extern double YBCGetTransactionPriority();
+extern void YBCAssignTransactionPriorityLowerBound(double newval, void *extra);
+extern void YBCAssignTransactionPriorityUpperBound(double newval, void *extra);
+static bool call_oid_check_hook(const struct config_generic *conf, Oid *newval,
+								void **extra, GucSource source, int elevel);
+extern const char *yb_show_maxconnections(void);
+static void check_reserved_prefixes(const char *varName);
 
 /*
  * Unit conversion tables.
@@ -193,9 +252,12 @@ static const char *const map_old_guc_names[] = {
 	"sort_mem", "work_mem",
 	"vacuum_mem", "maintenance_work_mem",
 	"ssl_ecdh_curve", "ssl_groups",
+	"yb_enable_parallel_append", "enable_parallel_append",
+	"yb_max_saop_merge_streams", "yb_max_merge_scan_streams",
+	"yb_is_client_ysqlconnmgr", YB_YCM_IS_CLIENT_YSQLCONNMGR,
+	"yb_use_tserver_key_auth", YB_YCM_USE_TSERVER_KEY_AUTH,
 	NULL
 };
-
 
 /* Memory context holding all GUC-related data */
 static MemoryContext GUCMemoryContext;
@@ -273,6 +335,11 @@ static bool call_string_check_hook(const struct config_generic *conf, char **new
 static bool call_enum_check_hook(const struct config_generic *conf, int *newval,
 								 void **extra, GucSource source, int elevel);
 
+/* YB declarations */
+
+static const char *YbFormatConfigValue(const struct config_generic *record,
+									   const union config_var_val *val,
+									   char *buffer, size_t bufsize);
 
 /*
  * This function handles both actual config file (re)loads and execution of
@@ -281,8 +348,16 @@ static bool call_enum_check_hook(const struct config_generic *conf, int *newval,
  * checks, and we return the ConfigVariable list so that it can be printed out
  * by show_all_file_settings().
  */
+
+/*
+ * YB: When yb_config_file is set, we are in validation mode only. This is
+ * similar to show_all_file_settings above, except that errors are reported via
+ * elog(ERROR) so that we have the detailed GUC failure message to show the
+ * user.
+ */
 ConfigVariable *
-ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
+ProcessConfigFileInternal(const char *yb_config_file, GucContext context,
+						  bool applySettings, int elevel)
 {
 	bool		error = false;
 	bool		applying = false;
@@ -292,12 +367,30 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 	HASH_SEQ_STATUS status;
 	GUCHashEntry *hentry;
 
+	/* YB declarations */
+	bool		yb_validating = (yb_config_file != NULL);
+	int			yb_parse_elevel;
+
+	/* Checking a file must never change the settings the server is running. */
+	Assert(!yb_validating || !applySettings);
+
+	if (!yb_validating)
+		yb_config_file = ConfigFileName;
+
+	/*
+	 * Never let the parser throw. It frees its buffer only when it returns
+	 * normally, so an error thrown from inside it leaks that memory. Ask it to
+	 * log problems instead: it writes each one into the entry list, and the
+	 * caller reports them from there.
+	 */
+	yb_parse_elevel = yb_validating ? LOG : elevel;
+
 	/* Parse the main config file into a list of option names and values */
-	ConfFileWithError = ConfigFileName;
+	ConfFileWithError = yb_config_file;
 	head = tail = NULL;
 
-	if (!ParseConfigFile(ConfigFileName, true,
-						 NULL, 0, CONF_FILE_START_DEPTH, elevel,
+	if (!ParseConfigFile(yb_config_file, true,
+						 NULL, 0, CONF_FILE_START_DEPTH, yb_parse_elevel,
 						 &head, &tail))
 	{
 		/* Syntax error(s) detected in the file, so bail out */
@@ -314,7 +407,7 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 	if (DataDir)
 	{
 		if (!ParseConfigFile(PG_AUTOCONF_FILENAME, false,
-							 NULL, 0, CONF_FILE_START_DEPTH, elevel,
+							 NULL, 0, CONF_FILE_START_DEPTH, yb_parse_elevel,
 							 &head, &tail))
 		{
 			/* Syntax error(s) detected in the file, so bail out */
@@ -475,6 +568,8 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 		}
 
 		/* No more to do if we're just doing show_all_file_settings() */
+
+		/* YB: This also keeps us safe when using this code for validation. */
 		if (!applySettings)
 			continue;
 
@@ -553,7 +648,8 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 
 		scres = set_config_option(item->name, item->value,
 								  context, PGC_S_FILE,
-								  GUC_ACTION_SET, applySettings, 0, false);
+								  GUC_ACTION_SET, applySettings,
+								  yb_validating ? elevel : 0, false);
 		if (scres > 0)
 		{
 			/* variable was updated, so log the change if appropriate */
@@ -681,6 +777,7 @@ guc_strdup(int elevel, const char *src)
 	data = guc_malloc(elevel, len);
 	if (likely(data != NULL))
 		memcpy(data, src, len);
+	__lsan_ignore_object(data);
 	return data;
 }
 
@@ -710,6 +807,12 @@ string_field_used(struct config_generic *conf, char *strval)
 		strval == conf->_string.reset_val ||
 		strval == conf->_string.boot_val)
 		return true;
+
+	/* YB: also check if value has been saved by connection manager */
+	if (conf->ysql_conn_mgr_saved_default &&
+		strval == conf->ysql_conn_mgr_saved_default->prior.val.stringval)
+		return true;
+
 	for (GucStack *stack = conf->stack; stack; stack = stack->prev)
 	{
 		if (strval == stack->prior.val.stringval ||
@@ -745,8 +848,15 @@ extra_field_used(struct config_generic *gconf, void *extra)
 {
 	if (extra == gconf->extra)
 		return true;
+
+	/* YB: Check if extra field has been used by conn mgr to save default */
+	if (gconf->ysql_conn_mgr_saved_default &&
+		extra == gconf->ysql_conn_mgr_saved_default->prior.extra)
+		return true;
+
 	if (extra == gconf->reset_extra)
 		return true;
+
 	for (GucStack *stack = gconf->stack; stack; stack = stack->prev)
 	{
 		if (extra == stack->prior.extra ||
@@ -793,6 +903,9 @@ set_stack_value(struct config_generic *gconf, config_var_value *val)
 		case PGC_INT:
 			val->val.intval = *gconf->_int.variable;
 			break;
+		case PGC_OID:
+			val->val.oidval = *gconf->_oid.variable;
+			break;
 		case PGC_REAL:
 			val->val.realval = *gconf->_real.variable;
 			break;
@@ -817,6 +930,7 @@ discard_stack_value(struct config_generic *gconf, config_var_value *val)
 	{
 		case PGC_BOOL:
 		case PGC_INT:
+		case PGC_OID:
 		case PGC_REAL:
 		case PGC_ENUM:
 			/* no need to do anything */
@@ -1340,6 +1454,18 @@ check_GUC_init(const struct config_generic *gconf)
 				}
 				break;
 			}
+		case PGC_OID:
+			{
+				const struct yb_config_oid *conf = &gconf->_oid;
+
+				if (*conf->variable != InvalidOid && *conf->variable != conf->boot_val)
+				{
+					elog(LOG, "GUC (PGC_OID) %s, boot_val=%u, C-var=%u",
+						 gconf->name, conf->boot_val, *conf->variable);
+					return false;
+				}
+				break;
+			}
 		case PGC_REAL:
 			{
 				const struct config_real *conf = &gconf->_real;
@@ -1482,6 +1608,15 @@ InitializeGUCOptionsFromEnvironment(void)
 		SetConfigOption("client_encoding", env, PGC_POSTMASTER, PGC_S_ENV_VAR);
 
 	/*
+	* YB: For backwards compatibility, set the value of yb_fetch_row_limit
+	* to the value of ysql_prefetch_limit (which is deprecated).
+	*/
+	env = getenv("FLAGS_ysql_prefetch_limit");
+	if (env != NULL)
+		SetConfigOption("yb_fetch_row_limit", env,
+						PGC_POSTMASTER, PGC_S_ENV_VAR);
+
+	/*
 	 * rlimit isn't exactly an "environment variable", but it behaves about
 	 * the same.  If we can identify the platform stack depth rlimit, increase
 	 * default stack depth setting up to whatever is safe (but at most 2MB).
@@ -1562,6 +1697,22 @@ InitializeOneGUCOption(struct config_generic *gconf)
 				if (!call_int_check_hook(gconf, &newval, &extra,
 										 PGC_S_DEFAULT, LOG))
 					elog(FATAL, "failed to initialize %s to %d",
+						 gconf->name, newval);
+				if (conf->assign_hook)
+					conf->assign_hook(newval, extra);
+				*conf->variable = conf->reset_val = newval;
+				break;
+			}
+		case PGC_OID:
+			{
+				struct yb_config_oid *conf = &gconf->_oid;
+				Oid			newval = conf->boot_val;
+
+				Assert(newval >= conf->min);
+				Assert(newval <= conf->max);
+				if (!call_oid_check_hook(gconf, &newval, &extra,
+										 PGC_S_DEFAULT, LOG))
+					elog(FATAL, "failed to initialize %s to %u",
 						 gconf->name, newval);
 				if (conf->assign_hook)
 					conf->assign_hook(newval, extra);
@@ -1902,9 +2053,102 @@ pg_timezone_abbrev_initialize(void)
 					PGC_POSTMASTER, PGC_S_DYNAMIC_DEFAULT);
 }
 
+static bool
+yb_should_report_guc(struct config_generic *record)
+{
+	bool		shouldReportGUC = record->flags & GUC_REPORT;
+
+	if (YbIsClientYsqlConnMgr())
+	{
+		if (record->flags & GUC_YB_NO_CONN_MGR_REPORT)
+			return false;
+
+		shouldReportGUC =
+			shouldReportGUC ||
+			(record->status & (YB_GUC_VALUE_RESET | YB_GUC_DEFAULT_RESET)) ||
+			(record->context >= PGC_SU_BACKEND &&
+			 (record->source == PGC_S_CLIENT ||
+			  record->source == PGC_S_SESSION));
+		/*
+		 * A special case has been added here for auth passthrough mode where we do
+		 * not want to report GUC variables to connection manager in case auth
+		 * passthrough has failed or during post auth GUC rollback.
+		 * Specifically, we do not want to send back ParameterStatus packets for
+		 * GUCs like session_authorization, client_encoding that are set during the
+		 * authentication phase of Auth Passthrough as this causes certain
+		 * sync issues due to the final RFQ sent by the server to conn mgr.
+		 */
+		shouldReportGUC =
+			shouldReportGUC &&
+			(MyProcPort == NULL || !MyProcPort->yb_has_auth_passthrough_finished);
+	}
+	return shouldReportGUC;
+}
+
+/*
+ * YB: Clear default value of GUC set by connection manager and restore
+ * the original reset value
+ */
+static void
+yb_reset_conn_mgr_default(struct config_generic *gconf)
+{
+	/* Early return in case there's no default saved by conn mgr */
+	if (!gconf->ysql_conn_mgr_saved_default)
+		return;
+
+	GucStack   *stack = gconf->ysql_conn_mgr_saved_default;
+
+	gconf->reset_source = stack->source;
+	gconf->reset_scontext = stack->scontext;
+	gconf->reset_srole = stack->srole;
+
+	switch (gconf->vartype)
+	{
+		case PGC_BOOL:
+			gconf->_bool.reset_val = stack->prior.val.boolval;
+			set_extra_field(gconf, &gconf->reset_extra, stack->prior.extra);
+			break;
+		case PGC_INT:
+			gconf->_int.reset_val = stack->prior.val.intval;
+			set_extra_field(gconf, &gconf->reset_extra, stack->prior.extra);
+			break;
+		case PGC_OID:
+			gconf->_oid.reset_val = stack->prior.val.oidval;
+			set_extra_field(gconf, &gconf->reset_extra, stack->prior.extra);
+			break;
+		case PGC_REAL:
+			gconf->_real.reset_val = stack->prior.val.realval;
+			set_extra_field(gconf, &gconf->reset_extra, stack->prior.extra);
+			break;
+		case PGC_STRING:
+			set_string_field(gconf, &gconf->_string.reset_val, stack->prior.val.stringval);
+			set_extra_field(gconf, &gconf->reset_extra, stack->prior.extra);
+			break;
+		case PGC_ENUM:
+			gconf->_enum.reset_val = stack->prior.val.enumval;
+			set_extra_field(gconf, &gconf->reset_extra, stack->prior.extra);
+			break;
+	}
+
+	discard_stack_value(gconf, &stack->prior);
+
+	/*
+	 * Note: we don't set the actual value of the variable since that will
+	 * be done by the caller
+	 */
+
+	gconf->status |= YB_GUC_DEFAULT_RESET;
+
+	pfree(stack);
+	gconf->ysql_conn_mgr_saved_default = NULL;
+}
 
 /*
  * Reset all options to their saved default values (implements RESET ALL)
+ *
+ * YB: When yb_conn_mgr_modifying_defaults is true, it will also reset the
+ * default values saved by connection manager and then proceed to restore
+ * the actual default values.
  */
 void
 ResetAllOptions(void)
@@ -1919,14 +2163,45 @@ ResetAllOptions(void)
 
 		/* Don't reset non-SET-able values */
 		if (gconf->context != PGC_SUSET &&
-			gconf->context != PGC_USERSET)
+			gconf->context != PGC_USERSET &&
+			/*
+			 * YB: The conn mgr reset undoes everything its 'G' set, i.e. every
+			 * GUC with a conn mgr saved default. set_config_option() only lets
+			 * 'G' (context PGC_BACKEND / PGC_SU_BACKEND) set PGC_USERSET,
+			 * PGC_SUSET, PGC_BACKEND and PGC_SU_BACKEND GUCs, so this only
+			 * extends the reset to the BACKEND contexts. The backend's own
+			 * startup settings (e.g. yb_ycm_internal_is_client_ysqlconnmgr)
+			 * were not set by 'G', have no saved default, and are left alone.
+			 */
+			!(yb_conn_mgr_modifying_defaults &&
+			  gconf->ysql_conn_mgr_saved_default))
 			continue;
-		/* Don't reset if special exclusion from RESET ALL */
-		if (gconf->flags & GUC_NO_RESET_ALL)
-			continue;
-		/* No need to reset if wasn't SET */
-		if (gconf->source <= PGC_S_OVERRIDE)
-			continue;
+
+		/* YB: Reset defaults set by connection manager */
+		if (yb_conn_mgr_modifying_defaults)
+			yb_reset_conn_mgr_default(gconf);
+
+		/*
+		 * YB: When conn mgr is attempting to reset the default values it had
+		 * saved, allow it bypass RESET ALL restriction. Also, source check
+		 * needs to be changed since conn mgr sets PGC_S_CLIENT sources as
+		 * well in a session
+		 */
+		if (yb_conn_mgr_modifying_defaults)
+		{
+			if (gconf->source <= PGC_S_OVERRIDE &&
+				gconf->source != PGC_S_CLIENT)
+				continue;
+		}
+		else
+		{
+			/* Don't reset if special exclusion from RESET ALL */
+			if (gconf->flags & GUC_NO_RESET_ALL)
+				continue;
+			/* No need to reset if wasn't SET */
+			if (gconf->source <= PGC_S_OVERRIDE)
+				continue;
+		}
 
 		/* Save old value to support transaction abort */
 		push_old_value(gconf, GUC_ACTION_SET);
@@ -1957,6 +2232,18 @@ ResetAllOptions(void)
 									gconf->reset_extra);
 					break;
 				}
+			case PGC_OID:
+				{
+					struct yb_config_oid *conf = &gconf->_oid;
+
+					if (conf->assign_hook)
+						conf->assign_hook(conf->reset_val,
+										  gconf->reset_extra);
+					*conf->variable = conf->reset_val;
+					set_extra_field(gconf, &gconf->extra,
+									gconf->reset_extra);
+					break;
+				}
 			case PGC_REAL:
 				{
 					struct config_real *conf = &gconf->_real;
@@ -1972,6 +2259,11 @@ ResetAllOptions(void)
 			case PGC_STRING:
 				{
 					struct config_string *conf = &gconf->_string;
+
+					/* YB: the check hook isn't called for the reset value. */
+					if (IsYugaByteEnabled() &&
+						strcmp(gconf->name, "yb_read_time") == 0)
+						(void) YbCanResetYbReadTime(conf->reset_val, ERROR);
 
 					if (conf->assign_hook)
 						conf->assign_hook(conf->reset_val,
@@ -1998,8 +2290,12 @@ ResetAllOptions(void)
 		set_guc_source(gconf, gconf->reset_source);
 		gconf->scontext = gconf->reset_scontext;
 		gconf->srole = gconf->reset_srole;
+		/* YB: Add YB_GUC_VALUE_RESET for relaying back to Connection Manager */
+		if (YbIsClientYsqlConnMgr())
+			gconf->status |= YB_GUC_VALUE_RESET;
 
-		if ((gconf->flags & GUC_REPORT) && !(gconf->status & GUC_NEEDS_REPORT))
+		/* YB: also queue the GUCs conn mgr tracks, not just GUC_REPORT */
+		if (yb_should_report_guc(gconf) && !(gconf->status & GUC_NEEDS_REPORT))
 		{
 			gconf->status |= GUC_NEEDS_REPORT;
 			slist_push_head(&guc_report_list, &gconf->report_link);
@@ -2007,6 +2303,76 @@ ResetAllOptions(void)
 	}
 }
 
+/* YB: Set GUC variables using same source as startup packet */
+void
+YbSetYsqlConnMgrGucDefaults(const char *data, int len)
+{
+	const char *ptr = data;
+	const char *end = data + len;
+
+	while (ptr < end)
+	{
+		const char *name;
+		const char *value;
+
+		/* Get the key (GUC name) */
+		name = ptr;
+		while (ptr < end && *ptr != '\0')
+			ptr++;
+		if (ptr >= end)
+			break;
+		ptr++;					/* skip null terminator */
+
+		/* Get the value */
+		value = ptr;
+		while (ptr < end && *ptr != '\0')
+			ptr++;
+		if (ptr >= end)
+			break;
+		ptr++;					/* skip null terminator */
+
+		GucContext	gucctx = superuser() ? PGC_SU_BACKEND : PGC_BACKEND;
+
+		/*
+		 * Wrap in try/finally so that yb_conn_mgr_modifying_defaults can be reset
+		 * even in the case of an error
+		 */
+		PG_TRY();
+		{
+			yb_conn_mgr_modifying_defaults = true;
+			SetConfigOption(name, value, gucctx, PGC_S_CLIENT);
+		}
+		PG_FINALLY();
+		{
+			yb_conn_mgr_modifying_defaults = false;
+		}
+		PG_END_TRY();
+	}
+}
+
+/*
+ * YB: Reset GUC defaults that were overridden by YSQL Connection Manager and
+ * also reset all GUC variables to their defaults. Basically does a RESET of GUC
+ * defaults to backend defaults and then performs RESET ALL
+ */
+void
+YbResetYsqlConnMgrGucDefaults(void)
+{
+	/*
+	 * Wrap in try/finally so that yb_conn_mgr_modifying_defaults can be reset
+	 * even in the case of an error
+	 */
+	PG_TRY();
+	{
+		yb_conn_mgr_modifying_defaults = true;
+		ResetAllOptions();
+	}
+	PG_FINALLY();
+	{
+		yb_conn_mgr_modifying_defaults = false;
+	}
+	PG_END_TRY();
+}
 
 /*
  * Apply a change to a GUC variable's "source" field.
@@ -2200,6 +2566,7 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 			bool		restorePrior = false;
 			bool		restoreMasked = false;
 			bool		changed;
+			bool		yb_needs_report;
 
 			/*
 			 * In this next bit, if we don't set either restorePrior or
@@ -2282,6 +2649,7 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 			}
 
 			changed = false;
+			yb_needs_report = false;
 
 			if (restorePrior || restoreMasked)
 			{
@@ -2330,6 +2698,24 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 						{
 							struct config_int *conf = &gconf->_int;
 							int			newval = newvalue.val.intval;
+							void	   *newextra = newvalue.extra;
+
+							if (*conf->variable != newval ||
+								gconf->extra != newextra)
+							{
+								if (conf->assign_hook)
+									conf->assign_hook(newval, newextra);
+								*conf->variable = newval;
+								set_extra_field(gconf, &gconf->extra,
+												newextra);
+								changed = true;
+							}
+							break;
+						}
+					case PGC_OID:
+						{
+							struct yb_config_oid *conf = &gconf->_oid;
+							Oid			newval = newvalue.val.oidval;
 							void	   *newextra = newvalue.extra;
 
 							if (*conf->variable != newval ||
@@ -2415,6 +2801,20 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 				set_extra_field(gconf, &(stack->prior.extra), NULL);
 				set_extra_field(gconf, &(stack->masked.extra), NULL);
 
+				/*
+				 * YB: Connection manager needs to be informed if any variable
+				 * set by the user is rolled back
+				 */
+				if (YbIsClientYsqlConnMgr() && changed &&
+					!(gconf->flags & GUC_YB_NO_CONN_MGR_REPORT) &&
+					(gconf->context == PGC_SUSET ||
+					 gconf->context == PGC_USERSET) &&
+					gconf->source == PGC_S_SESSION)
+				{
+					gconf->status |= YB_GUC_VALUE_RESET;
+					yb_needs_report = true;
+				}
+
 				/* And restore source information */
 				set_guc_source(gconf, newsource);
 				gconf->scontext = newscontext;
@@ -2431,7 +2831,11 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 			pfree(stack);
 
 			/* Report new value if we changed it */
-			if (changed && (gconf->flags & GUC_REPORT) &&
+			/*
+			 * YB: also report a rolled-back session value (yb_needs_report) and
+			 * the GUCs conn mgr tracks, not just GUC_REPORT.
+			 */
+			if (changed && (yb_needs_report || yb_should_report_guc(gconf)) &&
 				!(gconf->status & GUC_NEEDS_REPORT))
 			{
 				gconf->status |= GUC_NEEDS_REPORT;
@@ -2481,8 +2885,30 @@ BeginReportingGUCOptions(void)
 	{
 		struct config_generic *conf = hentry->gucvar;
 
-		if (conf->flags & GUC_REPORT)
+		if (yb_should_report_guc(conf))
+		{
 			ReportGUCOption(conf);
+
+			/*
+			 * YB: values set before reporting began (e.g. startup options) are
+			 * already queued on guc_report_list. Upstream reports them again in
+			 * ReportChangedGUCOptions and relies on last_reported to suppress the
+			 * duplicate, which ReportGUCOption bypasses for connection manager. In
+			 * auth passthrough the second report would even carry the value the
+			 * post-auth rollback restored, not the client's. So dequeue them here,
+			 * as master did by clearing GUC_NEEDS_REPORT in ReportGUCOption, and
+			 * consume the reset flags as ReportChangedGUCOptions does.
+			 */
+			if (YbIsClientYsqlConnMgr())
+			{
+				if (conf->status & GUC_NEEDS_REPORT)
+				{
+					slist_delete(&guc_report_list, &conf->report_link);
+					conf->status &= ~GUC_NEEDS_REPORT;
+				}
+				conf->status &= ~(YB_GUC_VALUE_RESET | YB_GUC_DEFAULT_RESET);
+			}
+		}
 	}
 }
 
@@ -2524,10 +2950,19 @@ ReportChangedGUCOptions(void)
 		struct config_generic *conf = slist_container(struct config_generic,
 													  report_link, iter.cur);
 
-		Assert((conf->flags & GUC_REPORT) && (conf->status & GUC_NEEDS_REPORT));
+		Assert(((conf->flags & GUC_REPORT) || YbIsClientYsqlConnMgr()) &&
+			   (conf->status & GUC_NEEDS_REPORT));
 		ReportGUCOption(conf);
 		conf->status &= ~GUC_NEEDS_REPORT;
 		slist_delete_current(&iter);
+
+		/*
+		 * YB: The reset flags describe a single transition (a RESET/rollback
+		 * that conn mgr must mirror in its cached variable lists), not durable
+		 * state, so they have to be consumed by the report that carried them.
+		 */
+		if (YbIsClientYsqlConnMgr())
+			conf->status &= ~(YB_GUC_VALUE_RESET | YB_GUC_DEFAULT_RESET);
 	}
 }
 
@@ -2536,21 +2971,85 @@ ReportChangedGUCOptions(void)
  *
  * We need not transmit the value if it's the same as what we last
  * transmitted.
+ *
+ * YB: Always send back a ParameterStatus packet back, atleast to
+ * Connection Manager for full correctness. If the value is the same
+ * as what was previously transmitted, do not send the packet to the
+ * client from Connection Manager.
  */
 static void
 ReportGUCOption(struct config_generic *record)
 {
 	char	   *val = ShowGUCOption(record, false);
 
-	if (record->last_reported == NULL ||
+	/*
+	 * YB: record->last_reported doesn't make sense for connection manager
+	 * since the backend can be attached to another client which would need
+	 * ParameterStatus of a variable it sets
+	 */
+	if (YbIsClientYsqlConnMgr() ||
+		record->last_reported == NULL ||
 		strcmp(val, record->last_reported) != 0)
 	{
 		StringInfoData msgbuf;
 
-		pq_beginmessage(&msgbuf, PqMsg_ParameterStatus);
-		pq_sendstring(&msgbuf, record->name);
-		pq_sendstring(&msgbuf, val);
-		pq_endmessage(&msgbuf);
+		if (YbIsClientYsqlConnMgr())
+		{
+			uint8		flags = 0;
+
+			if (record->flags & GUC_REPORT)
+				flags |= YB_PARAM_STATUS_REPORT_ENABLED;
+
+			if (record->status & YB_GUC_VALUE_RESET)
+				flags |= YB_PARAM_STATUS_SESSION_VAL_RESET;
+
+			if (record->status & YB_GUC_DEFAULT_RESET)
+				flags |= YB_PARAM_STATUS_DEFAULT_VAL_RESET;
+
+			switch (record->context)
+			{
+				case PGC_INTERNAL:
+				case PGC_POSTMASTER:
+				case PGC_SIGHUP:
+					/*
+					 * These can never be set by an external client, so
+					 * connection manager doesn't care about these
+					 */
+					break;
+				case PGC_SU_BACKEND:
+				case PGC_BACKEND:
+					/*
+					 * Connection Manager only cares if the external client set
+					 * this variable. That can only happen through the startup
+					 * packet i.e. PGC_S_CLIENT source
+					 */
+
+					if (record->source == PGC_S_CLIENT)
+						flags |= YB_PARAM_STATUS_SOURCE_STARTUP;
+					break;
+				case PGC_SUSET:
+				case PGC_USERSET:
+					if (record->source == PGC_S_CLIENT)
+						flags |= YB_PARAM_STATUS_SOURCE_STARTUP;
+					else if (record->source == PGC_S_SESSION)
+						flags |=
+							YB_PARAM_STATUS_USERSET_OR_SUSET_SOURCE_SESSION;
+					break;
+			}
+
+			pq_beginmessage(&msgbuf, 'r');
+			pq_sendstring(&msgbuf, record->name);
+			pq_sendstring(&msgbuf, val);
+			pq_sendbyte(&msgbuf, flags);
+			pq_endmessage(&msgbuf);
+		}
+		else
+		{
+			pq_beginmessage(&msgbuf, PqMsg_ParameterStatus);
+			pq_sendstring(&msgbuf, record->name);
+			pq_sendstring(&msgbuf, val);
+			pq_endmessage(&msgbuf);
+		}
 
 		/*
 		 * We need a long-lifespan copy.  If guc_strdup() fails due to OOM,
@@ -2852,6 +3351,58 @@ parse_int(const char *value, int *result, int flags, const char **hintmsg)
 }
 
 /*
+ * Try to parse value as an Oid, only accepts a decimal format.
+ *
+ * If the string parses okay, return true, else false.
+ * If okay and result is not NULL, return the value in *result.
+ * If not okay and hintmsg is not NULL, *hintmsg is set to a suitable
+ *	HINT message, or NULL if no hint provided.
+ *
+ * YB note: This is adapted from parse_int, with unit input removed.
+ */
+bool
+parse_oid(const char *value, Oid *result, const char **hintmsg)
+{
+	int64		val;
+	char	   *endptr;
+
+	/* To suppress compiler warnings, always set output params */
+	if (result)
+		*result = InvalidOid;
+	if (hintmsg)
+		*hintmsg = NULL;
+
+	/* We assume here that int64 is at least as wide as long */
+	errno = 0;
+	val = strtol(value, &endptr, 0);
+
+	if (endptr == value)
+		return false;			/* no HINT for integer syntax error */
+
+	/* allow trailing whitespaces */
+	while (isspace((unsigned char) *endptr))
+		endptr++;
+
+	/* OID has no units; reject anything after the number. */
+	if (*endptr != '\0')
+		return false;			/* no hint needed */
+
+	if (errno == ERANGE || val != (int64) ((Oid) val))
+	{
+		if (hintmsg)
+			*hintmsg = (val < 0 ?
+						gettext_noop("Value cannot be negative.") :
+						gettext_noop("Value exceeds Oid range."));
+		return false;
+	}
+
+	if (result)
+		*result = (Oid) val;
+	return true;
+}
+
+
+/*
  * Try to parse value as a floating point number in the usual format.
  * Optionally, the value can be followed by a unit name if "flags" indicates
  * a unit is allowed.
@@ -3089,6 +3640,36 @@ parse_and_validate_value(const struct config_generic *record,
 					return false;
 			}
 			break;
+		case PGC_OID:
+			{
+				const struct yb_config_oid *conf = &record->_oid;
+				const char *hintmsg;
+
+				if (!parse_oid(value, &newval->oidval, &hintmsg))
+				{
+					ereport(elevel,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("invalid value for parameter \"%s\": \"%s\"",
+									record->name, value),
+							 hintmsg ? errhint("%s", _(hintmsg)) : 0));
+					return false;
+				}
+
+				if (newval->oidval < conf->min || newval->oidval > conf->max)
+				{
+					ereport(elevel,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("%u is outside the valid range for parameter \"%s\" (%u .. %u)",
+									newval->oidval, record->name,
+									conf->min, conf->max)));
+					return false;
+				}
+
+				if (!call_oid_check_hook(record, &newval->oidval, newextra,
+										 source, elevel))
+					return false;
+			}
+			break;
 		case PGC_REAL:
 			{
 				const struct config_real *conf = &record->_real;
@@ -3202,6 +3783,68 @@ parse_and_validate_value(const struct config_generic *record,
 	return true;
 }
 
+static void
+yb_conn_mgr_save_default_value(struct config_generic *gconf)
+{
+	if (gconf->ysql_conn_mgr_saved_default)
+	{
+		elog(WARNING,
+			 "ysql_conn_mgr_saved_default already set for GUC \"%s\", not "
+			 "clearing it. This is a bug",
+			 gconf->name);
+		return;
+	}
+
+	/* TODO: Might be better to have a separate context here? */
+	GucStack   *stack =
+		MemoryContextAllocZero(TopMemoryContext, sizeof(GucStack));
+
+	stack->source = gconf->reset_source;
+	stack->scontext = gconf->reset_scontext;
+	stack->srole = gconf->reset_srole;
+
+	/*
+	 * This is copied from set_stack_value, except we are using reset_val and
+	 * reset_extra from the record
+	 */
+	switch (gconf->vartype)
+	{
+		case PGC_BOOL:
+			stack->prior.val.boolval = gconf->_bool.reset_val;
+			set_extra_field(gconf, &(stack->prior.extra),
+							gconf->reset_extra);
+			break;
+		case PGC_INT:
+			stack->prior.val.intval = gconf->_int.reset_val;
+			set_extra_field(gconf, &(stack->prior.extra),
+							gconf->reset_extra);
+			break;
+		case PGC_OID:
+			stack->prior.val.oidval = gconf->_oid.reset_val;
+			set_extra_field(gconf, &(stack->prior.extra),
+							gconf->reset_extra);
+			break;
+		case PGC_REAL:
+			stack->prior.val.realval = gconf->_real.reset_val;
+			set_extra_field(gconf, &(stack->prior.extra),
+							gconf->reset_extra);
+			break;
+		case PGC_STRING:
+			set_string_field(gconf,
+							 &(stack->prior.val.stringval),
+							 gconf->_string.reset_val);
+			set_extra_field(gconf, &(stack->prior.extra),
+							gconf->reset_extra);
+			break;
+		case PGC_ENUM:
+			stack->prior.val.enumval = gconf->_enum.reset_val;
+			set_extra_field(gconf, &(stack->prior.extra),
+							gconf->reset_extra);
+			break;
+	}
+
+	gconf->ysql_conn_mgr_saved_default = stack;
+}
 
 /*
  * set_config_option: sets option `name' to given value.
@@ -3319,6 +3962,24 @@ set_config_with_handle(const char *name, config_handle *handle,
 	void	   *newextra = NULL;
 	bool		prohibitValueChange = false;
 	bool		makeDefault;
+	bool		gucReset = value == NULL && source == PGC_S_SESSION;
+
+	if (source == YSQL_CONN_MGR)
+		Assert(YbIsClientYsqlConnMgr());
+
+	/*
+	 * YB: For session_authorization and role, only make the connection sticky
+	 * if the value is modified by a client-issued SET statement. We cannot use
+	 * the assign hook to do so, as postgres utilizes it at connection startup.
+	 */
+	if (source == PGC_S_SESSION &&
+		YbIsClientYsqlConnMgr() &&
+		((strncmp(name, "session_authorization", strlen("session_authorization")) == 0) ||
+		 (strncmp(name, "role", strlen("role")) == 0)))
+	{
+		elog(LOG, "Making connection sticky for setting %s", name);
+		yb_ysql_conn_mgr_sticky_guc = true;
+	}
 
 	if (elevel == 0)
 	{
@@ -3335,6 +3996,18 @@ set_config_with_handle(const char *name, config_handle *handle,
 				 source == PGC_S_USER ||
 				 source == PGC_S_DATABASE_USER)
 			elevel = WARNING;
+		else if (MyProcPort != NULL && MyProcPort->yb_is_auth_passthrough_req)
+			/*
+			 * YB: In the Auth Passthrough mode of Connection Manager, we want
+			 * to abort auth in case of error while setting GUC values. Ideally,
+			 * we should forward a FatalForLogicalConnection Packet, but
+			 * forwarding a FATAL would also stop auth.
+			 *
+			 * TODO (vikram.damle) (#29818): Add a mechanism to forward a
+			 * FatalForLogicalConection to preserve this backend instead of
+			 * forwarding a FATAL directly and terminating the backend.
+			 */
+			elevel = FATAL;
 		else
 			elevel = ERROR;
 	}
@@ -3458,6 +4131,22 @@ set_config_with_handle(const char *name, config_handle *handle,
 			if (context == PGC_SIGHUP)
 			{
 				/*
+				 * YB: We need to increment local LCV for ConnMgr here since
+				 * this change will only take effect in new backends.
+				 * This will fire even if the variable value in config is not
+				 * changed, which is acceptable since config reloads are rare.
+				 *
+				 * Record PGC_BACKEND change for LCV increment.
+				 * Fires for the postmaster (!IsUnderPostmaster) and for
+				 * CM control backends. Must precede the early return below so
+				 * control backends set the flag before skipping the GUC apply.
+				 */
+				if (YbIsYsqlConnMgrEnabled() &&
+					(!IsUnderPostmaster || YbIsAuthPassthroughControlBackend()) &&
+					changeVal && !is_reload)
+					yb_conn_mgr_sighup_had_backend_guc_change = true;
+
+				/*
 				 * If a PGC_BACKEND or PGC_SU_BACKEND parameter is changed in
 				 * the config file, we want to accept the new value in the
 				 * postmaster (whence it will propagate to
@@ -3562,6 +4251,15 @@ set_config_with_handle(const char *name, config_handle *handle,
 		}
 	}
 
+	/*
+	 * YB: the check hook isn't called for the reset value. GUC_NO_RESET below
+	 * rejects every reset, so it can't replace this conditional check.
+	 */
+	if (IsYugaByteEnabled() && value == NULL && source != PGC_S_DEFAULT &&
+		strcmp(record->name, "yb_read_time") == 0 &&
+		!YbCanResetYbReadTime(record->_string.reset_val, elevel))
+		return 0;
+
 	/* Disallow resetting and saving GUC_NO_RESET values */
 	if (record->flags & GUC_NO_RESET)
 	{
@@ -3592,13 +4290,40 @@ set_config_with_handle(const char *name, config_handle *handle,
 		((value != NULL) || source == PGC_S_DEFAULT);
 
 	/*
+	 * YB: When in Auth Passthrough mode of conn mgr, avoid setting defaults on
+	 * the control backend (auth_passthrough_req == true) when parsing startup
+	 * packet GUC opts (source >= PGC_S_CLIENT) and when applying settings from
+	 * pg_db_role_setting (source >= PGC_S_GLOBAL).
+	 * We do not wish to set defaults in this case as GUCs on the control
+	 * backend need to be reverted to their original defaults in preparation for
+	 * the next authentication attempt. Changes made via makeDefault are
+	 * non-transactional in nature and cannot be uniformly reverted. The setting
+	 * of defaults serves no purpose during authentication either as conn mgr is
+	 * responsible for tracking client session defaults during the deploy phase
+	 * on txn backends.
+	 *
+	 * We use PGC_S_GLOBAL as the threshold because sources below it (e.g.
+	 * PGC_S_DYNAMIC_DEFAULT, PGC_S_FILE) are used in assign hooks and related
+	 * automatic GUC mutations triggered by changing session_authorization and
+	 * we do not want to change their behaviour during auth passthrough.
+	 */
+	if (MyProcPort != NULL && MyProcPort->yb_is_auth_passthrough_req &&
+		source >= PGC_S_GLOBAL)
+		makeDefault = false;
+
+	/*
 	 * Ignore attempted set if overridden by previously processed setting.
 	 * However, if changeVal is false then plow ahead anyway since we are
 	 * trying to find out if the value is potentially good, not actually use
 	 * it. Also keep going if makeDefault is true, since we may want to set
 	 * the reset/stacked values even if we can't set the variable itself.
+	 *
+	 * If the previous source was YSQL_CONN_MGR and current source is
+	 * PGC_S_SESSION, then don't ignore the set attempt.
+	 *
+	 * Also, YSQL_CONN_MGR is given highest priority.
 	 */
-	if (record->source > source)
+	if (record->source > source && record->source != YSQL_CONN_MGR)
 	{
 		if (changeVal && !makeDefault)
 		{
@@ -3608,6 +4333,10 @@ set_config_with_handle(const char *name, config_handle *handle,
 		}
 		changeVal = false;
 	}
+
+	/* YB: Save default value if connection manager is trying to set defaults */
+	if (YbIsClientYsqlConnMgr() && yb_conn_mgr_modifying_defaults)
+		yb_conn_mgr_save_default_value(record);
 
 	/*
 	 * Evaluate value and set variable.
@@ -3676,6 +4405,9 @@ set_config_with_handle(const char *name, config_handle *handle,
 					set_guc_source(record, source);
 					record->scontext = context;
 					record->srole = srole;
+					/* YB: Mark value as been reset for connection manager */
+					if (gucReset)
+						record->status |= YB_GUC_VALUE_RESET;
 				}
 				if (makeDefault)
 				{
@@ -3772,6 +4504,9 @@ set_config_with_handle(const char *name, config_handle *handle,
 					set_guc_source(record, source);
 					record->scontext = context;
 					record->srole = srole;
+					/* YB: Mark value as been reset for connection manager */
+					if (gucReset)
+						record->status |= YB_GUC_VALUE_RESET;
 				}
 				if (makeDefault)
 				{
@@ -3789,6 +4524,107 @@ set_config_with_handle(const char *name, config_handle *handle,
 						if (stack->source <= source)
 						{
 							stack->prior.val.intval = newval;
+							set_extra_field(record, &stack->prior.extra,
+											newextra);
+							stack->source = source;
+							stack->scontext = context;
+							stack->srole = srole;
+						}
+					}
+				}
+
+				/* Perhaps we didn't install newextra anywhere */
+				if (newextra && !extra_field_used(record, newextra))
+					guc_free(newextra);
+				break;
+
+#undef newval
+			}
+
+		case PGC_OID:
+			{
+				struct yb_config_oid *conf = &record->_oid;
+
+#define newval (newval_union.oidval)
+
+				if (value)
+				{
+					if (!parse_and_validate_value(record, value,
+												  source, elevel,
+												  &newval_union, &newextra))
+						return 0;
+				}
+				else if (source == PGC_S_DEFAULT)
+				{
+					newval = conf->boot_val;
+					if (!call_oid_check_hook(record, &newval, &newextra,
+											 source, elevel))
+						return 0;
+				}
+				else
+				{
+					newval = conf->reset_val;
+					newextra = record->reset_extra;
+					source = record->reset_source;
+					context = record->reset_scontext;
+					srole = record->reset_srole;
+				}
+
+				if (prohibitValueChange)
+				{
+					/* Release newextra, unless it's reset_extra */
+					if (newextra && !extra_field_used(record, newextra))
+						guc_free(newextra);
+
+					if (*conf->variable != newval)
+					{
+						record->status |= GUC_PENDING_RESTART;
+						ereport(elevel,
+								(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+								 errmsg("parameter \"%s\" cannot be changed without restarting the server",
+										record->name)));
+						return 0;
+					}
+					record->status &= ~GUC_PENDING_RESTART;
+					return -1;
+				}
+
+				if (changeVal)
+				{
+					/* Save old value to support transaction abort */
+					if (!makeDefault)
+						push_old_value(record, action);
+
+					if (conf->assign_hook)
+						conf->assign_hook(newval, newextra);
+					*conf->variable = newval;
+					set_extra_field(record, &record->extra,
+									newextra);
+					set_guc_source(record, source);
+					record->scontext = context;
+					record->srole = srole;
+					/* YB: Mark value as been reset for connection manager */
+					if (gucReset)
+						record->status |= YB_GUC_VALUE_RESET;
+				}
+				if (makeDefault)
+				{
+					GucStack   *stack;
+
+					if (record->reset_source <= source)
+					{
+						conf->reset_val = newval;
+						set_extra_field(record, &record->reset_extra,
+										newextra);
+						record->reset_source = source;
+						record->reset_scontext = context;
+						record->reset_srole = srole;
+					}
+					for (stack = record->stack; stack; stack = stack->prev)
+					{
+						if (stack->source <= source)
+						{
+							stack->prior.val.oidval = newval;
 							set_extra_field(record, &stack->prior.extra,
 											newextra);
 							stack->source = source;
@@ -3868,6 +4704,9 @@ set_config_with_handle(const char *name, config_handle *handle,
 					set_guc_source(record, source);
 					record->scontext = context;
 					record->srole = srole;
+					/* YB: Mark value as been reset for connection manager */
+					if (gucReset)
+						record->status |= YB_GUC_VALUE_RESET;
 				}
 				if (makeDefault)
 				{
@@ -3993,6 +4832,9 @@ set_config_with_handle(const char *name, config_handle *handle,
 					set_guc_source(record, source);
 					record->scontext = context;
 					record->srole = srole;
+					/* YB: Mark value as been reset for connection manager */
+					if (gucReset)
+						record->status |= YB_GUC_VALUE_RESET;
 
 					/*
 					 * Ugly hack: during SET session_authorization, forcibly
@@ -4132,6 +4974,9 @@ set_config_with_handle(const char *name, config_handle *handle,
 					set_guc_source(record, source);
 					record->scontext = context;
 					record->srole = srole;
+					/* YB: Mark value as been reset for connection manager */
+					if (gucReset)
+						record->status |= YB_GUC_VALUE_RESET;
 				}
 				if (makeDefault)
 				{
@@ -4167,11 +5012,75 @@ set_config_with_handle(const char *name, config_handle *handle,
 			}
 	}
 
-	if (changeVal && (record->flags & GUC_REPORT) &&
+	if (changeVal && yb_should_report_guc(record) &&
 		!(record->status & GUC_NEEDS_REPORT))
 	{
 		record->status |= GUC_NEEDS_REPORT;
 		slist_push_head(&guc_report_list, &record->report_link);
+	}
+
+	/*
+	 * YB: Session parameter set by any source will be allowed to be stored in
+	 * the shared memory. But the context must be a `SET STATEMENT` (i.e.
+	 * PGC_SUSET or PGC_USERSET).
+	 *
+	 * Limitation:
+	 * While PGC_INTERNAL, PGC_POSTMASTER and PGC_SIGHUP will be common to all
+	 * the users and thus need not be changed. If logical connection uses
+	 * PGC_SU_BACKEND, PGC_BACKEND context to set a session parameter, (i.e. via
+	 * the use startup packet to set a session parameter) then it won't be
+	 * supported.
+	 *
+	 * TODO (janand) #18884 Support the setting of session parameter via startup
+	 * packet.
+	 *
+	 * TODO (janand) #18885 For RESET command add an identifier,
+	 * 		for better memory management in shared memory.
+	 *
+	 * PGC_SUSET is used in case of a super user use a SET statement.
+	 */
+	if (changeVal &&			/* Add only if the parameter value is changed */
+		source != YSQL_CONN_MGR &&	/* Don't add the parameter to the changed
+									 * list, if it is set from YSQL CONN MGR */
+		(context == PGC_SUSET || context == PGC_USERSET ||	/* SET statement */
+		 value == NULL))		/* RESET statement */
+	{
+		YbAddToChangedSessionParametersList(name);
+	}
+
+	/*
+	 * YB: Make the connection sticky when a PGC_SUSET GUC is set while running
+	 * as a user other than the session user (e.g. a SECURITY DEFINER function).
+	 * Conn Mgr replays the GUC as the session user, which can fail with a
+	 * permission error.
+	 */
+	if (changeVal &&
+		YbIsClientYsqlConnMgr() &&
+		record->context == PGC_SUSET &&
+		source == PGC_S_SESSION &&
+		action == GUC_ACTION_SET &&
+		GetUserId() != GetSessionUserId())
+	{
+		elog(LOG, "Making connection sticky for setting %s as a user other than the session user",
+			 name);
+		yb_ysql_conn_mgr_sticky_guc = true;
+	}
+
+	/*
+	 * YB: Only a session-level SET or a startup-packet value of a
+	 * GUC_YB_CONN_MGR_STICKY variable is replayed by ConnMgr, so only those
+	 * make the connection sticky. SET LOCAL and function-level SET don't
+	 * outlive the transaction or call.
+	 */
+	if (changeVal &&
+		(record->flags & GUC_YB_CONN_MGR_STICKY) &&
+		(source == PGC_S_SESSION || source == PGC_S_CLIENT) &&
+		action == GUC_ACTION_SET &&
+		YbIsClientYsqlConnMgr())
+	{
+		elog(LOG, "Making connection sticky for setting %s, which is marked GUC_YB_CONN_MGR_STICKY",
+			 name);
+		yb_ysql_conn_mgr_sticky_guc = true;
 	}
 
 	return changeVal ? 1 : -1;
@@ -4269,31 +5178,8 @@ GetConfigOption(const char *name, bool missing_ok, bool restrict_privileged)
 				 errmsg("permission denied to examine \"%s\"", name),
 				 errdetail("Only roles with privileges of the \"%s\" role may examine this parameter.",
 						   "pg_read_all_settings")));
-
-	switch (record->vartype)
-	{
-		case PGC_BOOL:
-			return *record->_bool.variable ? "on" : "off";
-
-		case PGC_INT:
-			snprintf(buffer, sizeof(buffer), "%d",
-					 *record->_int.variable);
-			return buffer;
-
-		case PGC_REAL:
-			snprintf(buffer, sizeof(buffer), "%g",
-					 *record->_real.variable);
-			return buffer;
-
-		case PGC_STRING:
-			return *record->_string.variable ?
-				*record->_string.variable : "";
-
-		case PGC_ENUM:
-			return config_enum_lookup_by_value(record,
-											   *record->_enum.variable);
-	}
-	return NULL;
+	/* YB: Format the value for the given option */
+	return YbFormatConfigValue(record, NULL /* val */ , buffer, sizeof(buffer));
 }
 
 /*
@@ -4326,6 +5212,11 @@ GetConfigOptionResetString(const char *name)
 		case PGC_INT:
 			snprintf(buffer, sizeof(buffer), "%d",
 					 record->_int.reset_val);
+			return buffer;
+
+		case PGC_OID:
+			snprintf(buffer, sizeof(buffer), "%u",
+					 record->_oid.reset_val);
 			return buffer;
 
 		case PGC_REAL:
@@ -4768,7 +5659,6 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 	LWLockRelease(AutoFileLock);
 }
 
-
 /*
  * Common code for DefineCustomXXXVariable subroutines: allocate the
  * new variable's config struct and fill in generic fields.
@@ -5098,6 +5988,34 @@ DefineCustomIntVariable(const char *name,
 }
 
 void
+DefineCustomOidVariable(const char *name,
+						const char *short_desc,
+						const char *long_desc,
+						Oid *valueAddr,
+						Oid bootValue,
+						Oid minValue,
+						Oid maxValue,
+						GucContext context,
+						int flags,
+						YbGucOidCheckHook check_hook,
+						YbGucOidAssignHook assign_hook,
+						GucShowHook show_hook)
+{
+	struct config_generic *var;
+
+	var = init_custom_variable(name, short_desc, long_desc, context, flags, PGC_OID);
+	var->_oid.variable = valueAddr;
+	var->_oid.boot_val = bootValue;
+	var->_oid.reset_val = bootValue;
+	var->_oid.min = minValue;
+	var->_oid.max = maxValue;
+	var->_oid.check_hook = check_hook;
+	var->_oid.assign_hook = assign_hook;
+	var->_oid.show_hook = show_hook;
+	define_custom_variable(var);
+}
+
+void
 DefineCustomRealVariable(const char *name,
 						 const char *short_desc,
 						 const char *long_desc,
@@ -5146,6 +6064,9 @@ DefineCustomStringVariable(const char *name,
 	var->_string.assign_hook = assign_hook;
 	var->_string.show_hook = show_hook;
 	define_custom_variable(var);
+
+	/* YB: make custom string variables sticky for connection manager */
+	var->flags |= GUC_YB_CONN_MGR_STICKY;
 }
 
 void
@@ -5227,6 +6148,47 @@ MarkGUCPrefixReserved(const char *className)
 	MemoryContextSwitchTo(oldcontext);
 }
 
+/*
+ * Check a setting name against prefixes previously reserved by
+ * EmitWarningsOnPlaceholders() and throw a warning if matching.
+ */
+pg_attribute_unused()
+static void
+check_reserved_prefixes(const char *varName)
+{
+	char	   *sep = strchr(varName, GUC_QUALIFIER_SEPARATOR);
+
+	if (sep)
+	{
+		size_t		classLen = sep - varName;
+		ListCell   *lc;
+
+		foreach(lc, reserved_class_prefix)
+		{
+			char	   *rcprefix = lfirst(lc);
+
+			if (strncmp(varName, rcprefix, classLen) == 0)
+			{
+				int			num_vars;
+				struct config_generic **var_arr = get_guc_variables(&num_vars);
+
+				for (int i = 0; i < num_vars; i++)
+				{
+					struct config_generic *var = var_arr[i];
+
+					if ((var->flags & GUC_CUSTOM_PLACEHOLDER) != 0 &&
+						strcmp(varName, var->name) == 0)
+					{
+						ereport(WARNING,
+								(errcode(ERRCODE_UNDEFINED_OBJECT),
+								 errmsg("unrecognized configuration parameter \"%s\"", var->name),
+								 errdetail("\"%.*s\" is a reserved prefix.", (int) classLen, var->name)));
+					}
+				}
+			}
+		}
+	}
+}
 
 /*
  * Return an array of modified GUC options to show in EXPLAIN.
@@ -5279,6 +6241,14 @@ get_explain_guc_options(int *num)
 			case PGC_INT:
 				{
 					struct config_int *lconf = &conf->_int;
+
+					modified = (lconf->boot_val != *(lconf->variable));
+				}
+				break;
+
+			case PGC_OID:
+				{
+					struct yb_config_oid *lconf = &conf->_oid;
 
 					modified = (lconf->boot_val != *(lconf->variable));
 				}
@@ -5416,6 +6386,20 @@ ShowGUCOption(const struct config_generic *record, bool use_units)
 			}
 			break;
 
+		case PGC_OID:
+			{
+				const struct yb_config_oid *conf = &record->_oid;
+
+				if (conf->show_hook)
+					val = conf->show_hook();
+				else
+				{
+					snprintf(buffer, sizeof(buffer), "%u", *conf->variable);
+					val = buffer;
+				}
+			}
+			break;
+
 		case PGC_REAL:
 			{
 				const struct config_real *conf = &record->_real;
@@ -5515,6 +6499,14 @@ write_one_nondefault_variable(FILE *fp, struct config_generic *gconf)
 				struct config_int *conf = &gconf->_int;
 
 				fprintf(fp, "%d", *conf->variable);
+			}
+			break;
+
+		case PGC_OID:
+			{
+				struct yb_config_oid *conf = &gconf->_oid;
+
+				fprintf(fp, "%u", *conf->variable);
 			}
 			break;
 
@@ -5790,6 +6782,22 @@ estimate_variable_size(struct config_generic *gconf)
 			}
 			break;
 
+		case PGC_OID:
+			{
+				struct yb_config_oid *conf = &gconf->_oid;
+
+				/*
+				 * Instead of getting the exact display length, use max
+				 * length.  Also reduce the max length for typical ranges of
+				 * small values.  Maximum value is 4294967295, i.e. 10 chars.
+				 */
+				if ((*conf->variable) < 1000)
+					valsize = 3;
+				else
+					valsize = 10;
+			}
+			break;
+
 		case PGC_REAL:
 			{
 				/*
@@ -5956,6 +6964,14 @@ serialize_variable(char **destptr, Size *maxbytes,
 			}
 			break;
 
+		case PGC_OID:
+			{
+				struct yb_config_oid *conf = &gconf->_oid;
+
+				do_serialize(destptr, maxbytes, "%u", *conf->variable);
+			}
+			break;
+
 		case PGC_REAL:
 			{
 				struct config_real *conf = &gconf->_real;
@@ -6070,6 +7086,13 @@ read_gucstate_binary(char **srcptr, char *srcend, void *dest, Size size)
 	*srcptr += size;
 }
 
+void
+YbSetParallelWorker()
+{
+	yb_is_parallel_worker = true;
+	elog(LOG, "yb_is_parallel_worker has been set to true");
+}
+
 /*
  * Callback used to add a context message when reporting errors that occur
  * while trying to restore GUCs in parallel workers.
@@ -6159,6 +7182,7 @@ RestoreGUCState(void *gucstate)
 		{
 			case PGC_BOOL:
 			case PGC_INT:
+			case PGC_OID:
 			case PGC_REAL:
 			case PGC_ENUM:
 				/* no need to do anything */
@@ -6743,6 +7767,41 @@ call_int_check_hook(const struct config_generic *conf, int *newval, void **extra
 	return true;
 }
 
+/* YB: call the check hook for a PGC_OID GUC */
+static bool
+call_oid_check_hook(const struct config_generic *conf, Oid *newval, void **extra,
+					GucSource source, int elevel)
+{
+	/* Quick success if no hook */
+	if (!conf->_oid.check_hook)
+		return true;
+
+	/* Reset variables that might be set by hook */
+	GUC_check_errcode_value = ERRCODE_INVALID_PARAMETER_VALUE;
+	GUC_check_errmsg_string = NULL;
+	GUC_check_errdetail_string = NULL;
+	GUC_check_errhint_string = NULL;
+
+	if (!conf->_oid.check_hook(newval, extra, source))
+	{
+		ereport(elevel,
+				(errcode(GUC_check_errcode_value),
+				 GUC_check_errmsg_string ?
+				 errmsg_internal("%s", GUC_check_errmsg_string) :
+				 errmsg("invalid value for parameter \"%s\": %u",
+						conf->name, *newval),
+				 GUC_check_errdetail_string ?
+				 errdetail_internal("%s", GUC_check_errdetail_string) : 0,
+				 GUC_check_errhint_string ?
+				 errhint("%s", GUC_check_errhint_string) : 0));
+		/* Flush any strings created in ErrorContext */
+		FlushErrorState();
+		return false;
+	}
+
+	return true;
+}
+
 static bool
 call_real_check_hook(const struct config_generic *conf, double *newval, void **extra,
 					 GucSource source, int elevel)
@@ -6860,4 +7919,1121 @@ call_enum_check_hook(const struct config_generic *conf, int *newval, void **extr
 	}
 
 	return true;
+}
+
+/*
+ * YB_TODO_PG19MERGE: Move these YB GUC hooks into the appropriate subsystem
+ * files, like PG does.
+ */
+bool
+check_default_replica_identity(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	bool		is_valid;
+
+	rawstring = pstrdup(*newval);
+	is_valid = (strcmp(rawstring, "FULL") == 0 ||
+				strcmp(rawstring, "DEFAULT") == 0 ||
+				strcmp(rawstring, "NOTHING") == 0 ||
+				strcmp(rawstring, "CHANGE") == 0);
+
+	pfree(rawstring);
+	return is_valid;
+}
+
+bool
+check_yb_explicit_row_locking_batch_size(int *newval, void **extra, GucSource source)
+{
+	return *newval > 0;
+}
+
+/*
+ * For YB-managed (cloud), the cloud user won't be aware of superuser.
+ * When YB shows max_connections, the connections reserved for superusers (and
+ * other backends) are hidden from cloud users.
+ * The reference of the relations can be found in postmaster.c.
+ */
+const char *
+yb_show_maxconnections(void)
+{
+	static char buf[32];
+
+	int64		yb_adj_max_con = MaxConnections;
+
+	if (IsYugaByteEnabled() && !superuser())
+	{
+		yb_adj_max_con -= (SuperuserReservedConnections + max_wal_senders);
+	}
+
+	snprintf(buf, sizeof(buf), INT64_FORMAT, yb_adj_max_con);
+	return buf;
+}
+
+bool
+check_transaction_priority_lower_bound(double *newval, void **extra, GucSource source)
+{
+	if (*newval > yb_transaction_priority_upper_bound)
+	{
+		GUC_check_errdetail("must be less than or equal to yb_transaction_priority_upper_bound (%f).",
+							yb_transaction_priority_upper_bound);
+		return false;
+	}
+
+	if (IsYBReadCommitted() || YBIsWaitQueueEnabled())
+	{
+		ereport(NOTICE,
+				(errmsg("priorities don't exist for read committed isolation transations, the "
+						"transaction will wait for conflicting transactions to commit before "
+						"proceeding"),
+				 errdetail("This also applies to other isolation levels if using Wait-on-Conflict "
+						   "concurrency control.")));
+	}
+	return true;
+}
+
+bool
+check_transaction_priority_upper_bound(double *newval, void **extra, GucSource source)
+{
+	if (*newval < yb_transaction_priority_lower_bound)
+	{
+		GUC_check_errdetail("must be greater than or equal to yb_transaction_priority_lower_bound (%f).",
+							yb_transaction_priority_lower_bound);
+		return false;
+	}
+
+	if (IsYBReadCommitted() || YBIsWaitQueueEnabled())
+	{
+		ereport(NOTICE,
+				(errmsg("priorities don't exist for read committed isolation transations, the "
+						"transaction will wait for conflicting transactions to commit before "
+						"proceeding"),
+				 errdetail("This also applies to other isolation levels if using Wait-on-Conflict "
+						   "concurrency control.")));
+	}
+	return true;
+}
+
+void
+assign_yb_pg_batch_detection_mechanism(int new_value, void *extra)
+{
+	yb_pg_batch_detection_mechanism = new_value;
+}
+
+void
+assign_ysql_upgrade_mode(bool newval, void *extra)
+{
+	/*
+	 * YSQL upgrade mode also enables/disables allowSystemTableMods.
+	 * Note that PG doesn't allow user to change it at runtime.
+	 *
+	 * While we reuse allowSystemTableMods to cut some corners for
+	 * YSQL upgrade, we do alter the semantics of it to imitate tables
+	 * created by initdb rather than by user.
+	 */
+	allowSystemTableMods = newval;
+}
+
+void
+assign_yb_enable_cbo(int new_value, void *extra)
+{
+	yb_enable_base_scans_cost_model = false;
+	yb_enable_optimizer_statistics = false;
+	yb_ignore_stats = false;
+	yb_legacy_bnl_cost = false;
+	yb_use_cluster_config_for_geolocation_costing = false;
+
+	switch (new_value)
+	{
+		case YB_COST_MODEL_OFF:
+			yb_ignore_stats = true;
+			break;
+
+		case YB_COST_MODEL_ON:
+			yb_enable_base_scans_cost_model = true;
+			break;
+
+		case YB_COST_MODEL_LEGACY:
+			break;
+
+		case YB_COST_MODEL_LEGACY_STATS:
+			yb_enable_optimizer_statistics = true;
+			break;
+
+		case YB_COST_MODEL_LEGACY_BNL:
+			yb_legacy_bnl_cost = true;
+			break;
+
+		case YB_COST_MODEL_LEGACY_STATS_BNL:
+			yb_enable_optimizer_statistics = true;
+			yb_legacy_bnl_cost = true;
+			break;
+
+		case YB_COST_MODEL_LEGACY_IGNORE_STATS_BNL:
+			yb_legacy_bnl_cost = true;
+			yb_ignore_stats = true;
+			break;
+	}
+
+	/*
+	 * When enabling CBO, also set:
+	 *  - yb_enable_bitmapscan to on
+	 *  - yb_parallel_range_rows to 10000
+	 *  - yb_enable_update_reltuples_after_create_index to on
+	 *  - yb_use_cluster_config_for_geolocation_costing to on
+	 */
+	if (new_value == YB_COST_MODEL_ON)
+	{
+		SetConfigOption("yb_enable_bitmapscan", "on",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_parallel_range_rows", "10000",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_enable_update_reltuples_after_create_index", "on",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_use_cluster_config_for_geolocation_costing", "on",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+	}
+	/*
+	 * When disabling CBO, also reset:
+	 *  - yb_enable_bitmapscan
+	 *  - yb_parallel_range_rows
+	 *  - yb_enable_update_reltuples_after_create_index
+	 *  - yb_use_cluster_config_for_geolocation_costing
+	 */
+	else
+	{
+		SetConfigOption("yb_enable_bitmapscan", "off",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_parallel_range_rows", "0",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_enable_update_reltuples_after_create_index", "off",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_use_cluster_config_for_geolocation_costing", "off",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+	}
+}
+
+void
+assign_yb_enable_optimizer_statistics(bool new_value, void *extra)
+{
+	yb_enable_optimizer_statistics = new_value;
+
+	yb_enable_cbo = (yb_enable_base_scans_cost_model ? YB_COST_MODEL_ON :
+					 (new_value ?
+					  YB_COST_MODEL_LEGACY_STATS : YB_COST_MODEL_LEGACY));
+
+	yb_ignore_stats = false;
+	yb_legacy_bnl_cost = false;
+}
+
+void
+assign_yb_enable_base_scans_cost_model(bool new_value, void *extra)
+{
+	yb_enable_base_scans_cost_model = new_value;
+	yb_enable_cbo = (new_value ? YB_COST_MODEL_ON :
+					 (yb_enable_optimizer_statistics ?
+					  YB_COST_MODEL_LEGACY_STATS :
+					  YB_COST_MODEL_LEGACY));
+	yb_ignore_stats = false;
+	yb_legacy_bnl_cost = false;
+}
+
+bool
+check_max_backoff(int *max_backoff_msecs, void **extra, GucSource source)
+{
+	if (*max_backoff_msecs < 0)
+	{
+		GUC_check_errdetail("must be greater than or equal to 0.");
+		return false;
+	}
+
+	return true;
+}
+
+bool
+check_min_backoff(int *min_backoff_msecs, void **extra, GucSource source)
+{
+	if (*min_backoff_msecs < 0)
+	{
+		GUC_check_errdetail("must be greater than or equal to 0.");
+		return false;
+	}
+
+	return true;
+}
+
+bool
+check_backoff_multiplier(double *multiplier, void **extra, GucSource source)
+{
+	if (*multiplier < 1)
+	{
+		GUC_check_errdetail("must be greater than or equal to 1.");
+		return false;
+	}
+
+	return true;
+}
+
+bool
+yb_check_toast_catcache_threshold(int *newVal, void **extra, GucSource source)
+{
+	if (*newVal != -1 && *newVal < 128)
+	{
+		GUC_check_errdetail("must greater than or equal to 128 bytes, or -1 to disable.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * yb_allow_prehashed_passwords is a cluster switch. It may be set from the
+ * configuration file, for every role (ALTER ROLE ALL SET, applied as
+ * PGC_S_GLOBAL), or by a superuser SET (PGC_S_SESSION). YSQL_CONN_MGR is the
+ * same SET restored by the connection manager. PGC_S_TEST is the validation
+ * pass; it does not say whether the target is one role or all roles, so
+ * AlterSetting rejects the per-role and per-database forms.
+ */
+static bool
+yb_prehashed_password_source_allowed(GucSource source)
+{
+	switch (source)
+	{
+		case PGC_S_DEFAULT:
+		case PGC_S_FILE:
+		case PGC_S_ARGV:
+		case PGC_S_GLOBAL:
+		case PGC_S_TEST:
+		case PGC_S_SESSION:
+		case YSQL_CONN_MGR:
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool
+check_yb_allow_prehashed_passwords(bool *newVal, void **extra, GucSource source)
+{
+	if (!yb_prehashed_password_source_allowed(source))
+	{
+		GUC_check_errdetail("This parameter can only be set via ysql_pg_conf_csv "
+							"(config file), ALTER ROLE ALL SET, or SET.");
+		return false;
+	}
+
+	/*
+	 * ysql_pg_conf_csv is applied in file order, as PGC_S_FILE and the other
+	 * sources below PGC_S_CLIENT. Rejecting a conflicting pair there keeps the
+	 * postmaster from starting. CREATE and ALTER ROLE still refuse it, as do
+	 * SET and the ALTER ROLE validation pass.
+	 */
+	if (*newVal &&
+		source >= PGC_S_CLIENT &&
+		(yb_password_reuse_history > 0 || yb_password_reuse_interval > 0))
+	{
+		GUC_check_errdetail("Pre-hashed passwords cannot be accepted while a password reuse "
+							"policy is in force.");
+		GUC_check_errhint("Set yb_password_reuse_history and yb_password_reuse_interval to 0 first.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Password policy GUCs may be set for one role (ALTER ROLE ... SET, applied
+ * as PGC_S_USER) or for every role (ALTER ROLE ALL SET, applied as
+ * PGC_S_GLOBAL), and from the configuration file (ysql_pg_conf_csv,
+ * PGC_S_FILE). Session, connection, and per-database sources are rejected.
+ * PGC_S_TEST is the validation pass of ALTER ROLE ... SET.
+ */
+static bool
+yb_password_policy_source_allowed(GucSource source)
+{
+	switch (source)
+	{
+		case PGC_S_DEFAULT:
+		case PGC_S_FILE:
+		case PGC_S_ARGV:
+		case PGC_S_TEST:
+		case PGC_S_USER:
+		case PGC_S_GLOBAL:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * Mutual exclusion with yb_allow_prehashed_passwords is enforced on the
+ * ALTER ROLE validation pass. A conflicting value in the configuration file
+ * is not rejected here, so it cannot keep a backend from starting;
+ * CREATE/ALTER ROLE still refuses the combination.
+ */
+bool
+check_yb_password_reuse(int *newVal, void **extra, GucSource source)
+{
+	if (!yb_password_policy_source_allowed(source))
+	{
+		GUC_check_errdetail("This parameter can only be set via ysql_pg_conf_csv "
+							"(config file), ALTER ROLE ... SET, or ALTER ROLE ALL SET.");
+		return false;
+	}
+
+	if (source == PGC_S_TEST &&
+		*newVal > 0 && yb_allow_prehashed_passwords)
+	{
+		GUC_check_errdetail("A password reuse policy cannot be enforced while pre-hashed "
+							"passwords are accepted.");
+		GUC_check_errhint("Set yb_allow_prehashed_passwords to off first.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * YB: yb_check_no_txn
+ *
+ * Do not allow users to set yb_read_after_commit_visibility
+ * from within a txn block.
+ */
+bool
+yb_check_no_txn(int *newVal, void **extra, GucSource source)
+{
+	/* Just accept the value when restoring state in a parallel worker */
+	if (InitializingParallelWorker)
+		return true;
+
+	if (IsTransactionBlock())
+	{
+		GUC_check_errdetail("Cannot be set within a txn block.");
+		return false;
+	}
+
+	/*
+	 * If YSQL Connection Manager is enabled, make the connection sticky
+	 * for any variables that can only be set outside the context of an
+	 * explicit transaction block.
+	 */
+	if (YbIsClientYsqlConnMgr())
+	{
+		elog(LOG, "Making connection sticky for non-transactional GUC variable");
+		yb_ysql_conn_mgr_sticky_guc = true;
+	}
+	return true;
+}
+
+const char *
+show_tcmalloc_sample_period(void)
+{
+	static char nbuf[32];
+
+	snprintf(nbuf, sizeof(nbuf), "%" PRId64, YBCGetTCMallocSamplingPeriod());
+	return nbuf;
+}
+
+void
+assign_tcmalloc_sample_period(int newval, void *extra)
+{
+	YBCSetTCMallocSamplingPeriod(newval);
+}
+
+bool
+yb_disable_auto_analyze_check_hook(bool *newval, void **extra, GucSource source)
+{
+	/*
+	 * PGC_S_DEFAULT means that GUCs are being initialized during startup. PGC_S_TEST will be seen
+	 * when GUCs are being tested for their setting when applying the setting on a per-database
+	 * level. In both cases, we want to allow the setting to be changed.
+	 */
+	if (source == PGC_S_DEFAULT || source == PGC_S_TEST)
+		return true;
+
+	/*
+	 * YB: This GUC is set by restore scripts generated via ysql_dump. It is used by the auto
+	 * analyze service. However, when using connection manager, the GUC can become part of the
+	 * deploy phase query (SET stmts are executed). So, we throw a warning instead of an error
+	 * if the source is not PGC_S_DATABASE.
+	 */
+
+	if (source != PGC_S_DATABASE)
+	{
+		ereport(WARNING,
+				(errmsg("can only be set on a database level using ALTER DATABASE SET. Current source: %s",
+						GucSource_Names[source])));
+	}
+	return true;
+}
+
+
+static List *
+yb_neg_catcache_ids_to_list(const char *cache_ids_str)
+{
+	char	   *rawstring = pstrdup(cache_ids_str);
+	List	   *elemlist = NIL;
+
+	if (!SplitIdentifierString(rawstring, ',', &elemlist) ||
+		list_length(elemlist) == 0)
+	{
+		/* syntax error in list */
+		GUC_check_errdetail("Expecting a comma separated string of syscache ids.");
+		list_free(elemlist);
+		pfree(rawstring);
+		return NIL;
+	}
+
+	List	   *neg_cache_ids_list = NIL;
+	ListCell   *l;
+
+	foreach(l, elemlist)
+	{
+		char	   *endptr;
+		long		cache_id = strtol((char *) lfirst(l), &endptr, 10);
+
+		if (*endptr != '\0' || cache_id < 0 || cache_id > SysCacheSize)
+		{
+			GUC_check_errdetail("Expecting a comma separated string of syscache ids.");
+			list_free(elemlist);
+			pfree(rawstring);
+			list_free(neg_cache_ids_list);
+			return NIL;
+		}
+		neg_cache_ids_list = lappend_int(neg_cache_ids_list, cache_id);
+	}
+	list_free(elemlist);
+	pfree(rawstring);
+	return neg_cache_ids_list;
+}
+
+bool
+yb_check_neg_catcache_ids(char **newval, void **extra, GucSource source)
+{
+	if (newval == NULL || *newval == NULL || strlen(*newval) == 0)
+		return true;
+	List	   *neg_cache_ids_list = yb_neg_catcache_ids_to_list(*newval);
+
+	if (neg_cache_ids_list == NIL)
+		return false;
+	list_free(neg_cache_ids_list);
+	return true;
+}
+
+void
+yb_set_neg_catcache_ids(const char *newval, void *extra)
+{
+	List	   *neg_cache_ids_list = yb_neg_catcache_ids_to_list(newval);
+
+	if (neg_cache_ids_list != NIL)
+	{
+		YbSetAdditionalNegCacheIds(neg_cache_ids_list);
+		list_free(neg_cache_ids_list);
+	}
+}
+
+/*
+ * YB: Parse a comma-separated list of command tag names into a bool array
+ * indexed by CommandTag. Used by yb_extra_commands_to_retry[_in_proc] check
+ * hooks. On success, the caller-supplied *extra receives a guc_malloc'd bool
+ * array with one entry per CommandTag which the assign hook later moves into
+ * the runtime variable.
+ *
+ * Empty input is allowed (yields an all-false array). Embedded spaces within
+ * tag names ("CREATE TABLE") are supported via SplitDirectoriesString. Tag
+ * lookup is case-insensitive (GetCommandTagEnum). Unknown tags cause the
+ * check to fail.
+ *
+ * Validates the whole list before any allocation, so error paths don't have
+ * to free anything.
+ */
+static bool
+yb_parse_command_tag_list(const char *list_str, void **extra)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *l;
+	bool	   *arr;
+	int			ntags = YbGetCommandTagCount();
+
+	rawstring = pstrdup(list_str);
+
+	if (!SplitDirectoriesString(rawstring, ',', &elemlist))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		pfree(rawstring);
+		list_free_deep(elemlist);
+		return false;
+	}
+
+	/* First pass: validate every tag name before allocating anything. */
+	foreach(l, elemlist)
+	{
+		char	   *tok = (char *) lfirst(l);
+		CommandTag	tag = GetCommandTagEnum(tok);
+
+		if (tag == CMDTAG_UNKNOWN)
+		{
+			GUC_check_errdetail("Unrecognized command tag: \"%s\".", tok);
+			pfree(rawstring);
+			list_free_deep(elemlist);
+			return false;
+		}
+
+		/*
+		 * COPY/COPY FROM/ANALYZE are never safe to retry: re-executing
+		 * COPY can double-apply rows, and ANALYZE errors out on retry.
+		 * Reject the setting outright.
+		 */
+		if (tag == CMDTAG_COPY || tag == CMDTAG_COPY_FROM ||
+			tag == CMDTAG_ANALYZE)
+		{
+			GUC_check_errdetail("\"%s\" cannot be retried "
+								"(COPY may double-apply rows; "
+								"ANALYZE errors out on retry).", tok);
+			pfree(rawstring);
+			list_free_deep(elemlist);
+			return false;
+		}
+	}
+
+	/* Second pass: allocate and populate the array now that all tags are known good. */
+	arr = guc_malloc(ERROR, ntags * sizeof(bool));
+	MemSet(arr, 0, ntags * sizeof(bool));
+	foreach(l, elemlist)
+		arr[GetCommandTagEnum((char *) lfirst(l))] = true;
+
+	pfree(rawstring);
+	list_free_deep(elemlist);
+
+	*extra = arr;
+	return true;
+}
+
+bool
+yb_check_extra_commands_to_retry(char **newval, void **extra, GucSource source)
+{
+	return yb_parse_command_tag_list(*newval, extra);
+}
+
+void
+yb_assign_extra_commands_to_retry(const char *newval, void *extra)
+{
+	yb_extra_commands_to_retry = (bool *) extra;
+}
+
+bool
+yb_check_extra_commands_to_retry_in_proc(char **newval, void **extra,
+										 GucSource source)
+{
+	return yb_parse_command_tag_list(*newval, extra);
+}
+
+void
+yb_assign_extra_commands_to_retry_in_proc(const char *newval, void *extra)
+{
+	yb_extra_commands_to_retry_in_proc = (bool *) extra;
+}
+
+void
+yb_assign_conn_mgr_replication_origin_permanent_sticky(bool newval, void *extra)
+{
+	if (newval && YbHasReplicationOriginSetup())
+		yb_ysql_conn_mgr_sticky_replication_origin = true;
+}
+
+bool
+check_yb_disable_pg_snapshot_mgmt_in_repeatable_read(bool *newval, void **extra, GucSource source)
+{
+	ereport(WARNING,
+			(errmsg("the parameter \"yb_disable_pg_snapshot_mgmt_in_repeatable_read\" is deprecated, "
+					"remove it from your configuration.")));
+	return true;				/* still allow usage, but warn */
+}
+
+bool
+check_yb_enable_advisory_locks(bool *newval, void **extra, GucSource source)
+{
+	ereport(WARNING,
+			(errmsg("the parameter \"yb_enable_advisory_locks\" is deprecated, "
+					"toggle the runtime flag \"ysql_yb_enable_advisory_locks\" instead.")));
+	return true;				/* still allow usage, but warn */
+}
+
+bool
+check_yb_silence_advisory_locks_not_supported_error(bool *newval, void **extra,
+													GucSource source)
+{
+	ereport(WARNING,
+			(errmsg("the parameter \"yb_silence_advisory_locks_not_supported_error\" is "
+					"deprecated and has no effect. ")));
+	return true;
+}
+
+void
+assign_yb_enable_pg_stat_statements_rpc_stats(bool newval, void *extra)
+{
+	YbToggleSessionStatsTimer(newval);
+}
+
+bool
+check_yb_dist_tracecontext(char **newval, void **extra, GucSource source)
+{
+	if (newval == NULL || *newval == NULL)
+	{
+		*extra = NULL;
+		return true;
+	}
+
+	if (!YBCIsDistTraceEnabled())
+	{
+		GUC_check_errdetail("distributed tracing is not enabled. " \
+							"Set otel_collector_traces_endpoint flag to enable " \
+							"distributed tracing.");
+		return false;
+	}
+
+	if ((*newval)[0] == '\0')
+	{
+		GUC_check_errdetail("yb_dist_tracecontext must not be empty");
+		return false;
+	}
+
+	char		traceparent[YB_TRACEPARENT_VALUE_LEN + 1] = {0};
+	YbTraceparentResult tp_result =
+		YbGetTraceparentFromTraceContext(*newval, strlen(*newval), traceparent);
+
+	if (tp_result != YB_TRACEPARENT_OK)
+	{
+		GUC_check_errdetail("%s", YbGetTraceparentResultErrmsg(tp_result));
+		return false;
+	}
+
+	bool		is_valid_and_remote = YBCIsTraceParentValidAndRemote(traceparent);
+
+	if (!is_valid_and_remote)
+	{
+		GUC_check_errdetail("traceparent format is invalid");
+		return false;
+	}
+
+	char	   *myextra = (char *) guc_malloc(ERROR, YB_TRACEPARENT_VALUE_LEN + 1);
+	memcpy(myextra, traceparent, YB_TRACEPARENT_VALUE_LEN + 1);
+	*extra = (void *) myextra;
+
+	return true;
+}
+
+void
+assign_yb_dist_tracecontext(const char *newval, void *extra)
+{
+	if (yb_guc_remote_span_ctx)
+	{
+		YBCDestroySpanContext(yb_guc_remote_span_ctx);
+		yb_guc_remote_span_ctx = NULL;
+	}
+
+	if (extra == NULL)
+		return;
+
+	/* YB: Storing span context in TopMemoryContext to ensure it persists across query executions */
+	MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	yb_guc_remote_span_ctx = YBCGetValidSpanContext((const char *) extra);
+	MemoryContextSwitchTo(oldcontext);
+}
+
+bool
+check_yb_conn_mgr_client_addr(char **newval, void **extra, GucSource source)
+{
+	char	   *clean;
+	char	   *ret;
+
+	/* Always allow reset to empty string */
+	if ((*newval)[0] == '\0')
+		return true;
+
+	/*
+	 * Parallel workers are background processes and don't have any client_addr.
+	 * Postgres keeps it NULL so does connection manager too.
+	 * yb_is_client_ysqlconnmgr may get set before/after yb_ycm_internal_client_addr,
+	 * therefore explicitly check for parallel workers.
+	 */
+	if (!YbIsClientYsqlConnMgr() && !yb_is_parallel_worker)
+	{
+		GUC_check_errmsg("yb_ycm_internal_client_addr can only be set by "
+						 "YSQL Connection Manager");
+		return false;
+	}
+
+	/* Basic sanity: clean the string of non-ASCII bytes */
+	clean = pg_clean_ascii(*newval, MCXT_ALLOC_NO_OOM);
+	if (!clean)
+		return false;
+
+	ret = guc_strdup(LOG, clean);
+	if (!ret)
+	{
+		pfree(clean);
+		return false;
+	}
+
+	guc_free(*newval);
+
+	pfree(clean);
+	*newval = ret;
+	return true;
+}
+
+void
+assign_yb_conn_mgr_client_addr(const char *newval, void *extra)
+{
+	/* See comment in check_yb_conn_mgr_client_addr() about parallel workers. */
+	if (!YbIsClientYsqlConnMgr() || yb_is_parallel_worker)
+		return;
+
+	if (YbIsAuthBackend() || YbIsAuthPassthroughInProgress(MyProcPort))
+	{
+		/*
+		 * Resolve the logical-client hostname once during authentication.
+		 */
+		if (newval[0] != '\0' && log_hostname)
+		{
+			struct addrinfo hints;
+			struct addrinfo *gai_result;
+
+			MemSet(&hints, 0, sizeof(hints));
+			hints.ai_flags = AI_NUMERICHOST;
+			hints.ai_socktype = SOCK_STREAM;
+
+			if (getaddrinfo(newval, NULL, &hints, &gai_result) == 0)
+			{
+				char		remote_hostname[NI_MAXHOST];
+				int			ret;
+
+				ret = pg_getnameinfo_all((const struct sockaddr_storage *) gai_result->ai_addr,
+										 gai_result->ai_addrlen,
+										 remote_hostname, sizeof(remote_hostname),
+										 NULL, 0,
+										 NI_NAMEREQD);
+				freeaddrinfo(gai_result);
+
+				if (ret != 0)
+					ereport(WARNING,
+							(errmsg_internal("pg_getnameinfo_all() failed: %s",
+											 gai_strerror(ret))));
+				else
+					SetConfigOption("yb_conn_mgr_client_hostname",
+									remote_hostname,
+									PGC_USERSET, PGC_S_CLIENT);
+			}
+		}
+	}
+
+	yb_pgstat_set_ycm_client_info(newval,
+								  NULL,
+								  newval[0] == '\0' ? "" : NULL);
+}
+
+bool
+check_yb_conn_mgr_client_hostname(char **newval, void **extra, GucSource source)
+{
+	char	   *clean;
+	char	   *ret;
+
+	/* Always allow reset to empty string */
+	if ((*newval)[0] == '\0')
+		return true;
+
+	/*
+	 * Parallel workers are background processes and don't have any client_port.
+	 * Postgres keeps it NULL so does connection manager too.
+	 * yb_is_client_ysqlconnmgr may get set before/after yb_ycm_internal_client_port,
+	 * therefore explicitly check for parallel workers.
+	 */
+	if (!YbIsClientYsqlConnMgr() && !yb_is_parallel_worker)
+	{
+		GUC_check_errmsg("yb_conn_mgr_client_hostname can only be set by "
+						 "YSQL Connection Manager");
+		return false;
+	}
+
+	/* Only allow clean ASCII chars in the hostname */
+	clean = pg_clean_ascii(*newval, MCXT_ALLOC_NO_OOM);
+	if (!clean)
+		return false;
+
+	ret = guc_strdup(LOG, clean);
+	if (!ret)
+	{
+		pfree(clean);
+		return false;
+	}
+
+	guc_free(*newval);
+
+	pfree(clean);
+	*newval = ret;
+	return true;
+}
+
+void
+assign_yb_conn_mgr_client_hostname(const char *newval, void *extra)
+{
+	/* See comment in check_yb_conn_mgr_client_hostname() about parallel workers. */
+	if (!YbIsClientYsqlConnMgr() || yb_is_parallel_worker)
+		return;
+
+	yb_pgstat_set_ycm_client_info(NULL, NULL, newval);
+}
+
+bool
+check_yb_conn_mgr_client_port(int *newval, void **extra, GucSource source)
+{
+	/* Always allow reset to -1 */
+	if (*newval == -1)
+		return true;
+
+	/*
+	 * Parallel workers are background processes and don't have any client_hostname.
+	 * Postgres keeps it NULL so does connection manager too.
+	 * yb_is_client_ysqlconnmgr may get set before/after yb_conn_mgr_client_hostname,
+	 * therefore explicitly check for parallel workers.
+	 */
+	if (!YbIsClientYsqlConnMgr() && !yb_is_parallel_worker)
+	{
+		GUC_check_errmsg("yb_ycm_internal_client_port can only be set by "
+						 "YSQL Connection Manager");
+		return false;
+	}
+
+	return true;
+}
+
+void
+assign_yb_conn_mgr_client_port(int newval, void *extra)
+{
+	/* See comment in check_yb_conn_mgr_client_port() about parallel workers. */
+	if (!YbIsClientYsqlConnMgr() || yb_is_parallel_worker)
+		return;
+
+	yb_pgstat_set_ycm_client_info(NULL, &newval, NULL);
+}
+
+/*
+ * YB: check_skip_intents_internal
+ * Common logic for skip-intent GUCs to handle transaction block restrictions.
+ */
+static bool
+check_skip_intents_internal(const char *guc_name, bool *newval, GucSource source)
+{
+	/* Just accept the value when restoring state in a parallel worker */
+	if (InitializingParallelWorker)
+		return true;
+
+	if (IsTransactionBlock() || FirstSnapshotSet)
+	{
+		GUC_check_errdetail("%s cannot be changed inside a transaction block or "
+							"after any query has been run in the transaction.", guc_name);
+		return false;
+	}
+
+	return true;
+}
+
+bool
+check_yb_enable_new_relation_fastpath_write(bool *newval, void **extra, GucSource source)
+{
+	return check_skip_intents_internal("yb_enable_new_relation_fastpath_write", newval, source);
+}
+
+bool
+check_yb_enable_new_relation_fastpath_write_in_txn_blocks(bool *newval, void **extra,
+														  GucSource source)
+{
+	/*
+	 * yb_enable_new_relation_fastpath_write gates the optimization as a whole,
+	 * and this GUC only widens it to transaction blocks, so a value of on while
+	 * the parent is off is inert rather than unsafe.
+	 *
+	 * Only values supplied once the postmaster has read its configuration are
+	 * rejected, as in the yb_ddl_transaction_block_enabled check below.
+	 * pg_wrapper generates ysql_pg.conf in the data directory, writing the
+	 * ysql_pg_conf_csv entries ahead of the block it derives from the PG gflags,
+	 * and postgres assigns the parameters in the order they appear in that file.
+	 * A cluster that turns the parent off - through ysql_pg_conf_csv, or through
+	 * the ysql_yb_enable_new_relation_fastpath_write gflag, which is the kill
+	 * switch for the optimization as a whole - therefore has the parent assigned
+	 * off before this GUC is assigned on, and rejecting that pair here would
+	 * leave the postmaster refusing to start.
+	 */
+	if (*newval && !yb_enable_new_relation_fastpath_write && source >= PGC_S_CLIENT)
+	{
+		GUC_check_errdetail("Cannot enable yb_enable_new_relation_fastpath_write_in_txn_blocks "
+							"when yb_enable_new_relation_fastpath_write is disabled.");
+		return false;
+	}
+
+	/*
+	 * A DDL inside a transaction block can only use the fastpath if it runs in
+	 * the enclosing transaction, which requires transactional DDL. Otherwise
+	 * this GUC would be silently ineffective.
+	 *
+	 * Only values supplied once the postmaster has read its configuration are
+	 * checked: SET, the validation pass of ALTER ROLE/DATABASE ... SET, and
+	 * connection request options. The configuration file is applied in file
+	 * order, and yb_ddl_transaction_block_enabled may be assigned after this
+	 * GUC - pg_wrapper writes ysql_pg_conf_csv entries ahead of the block it
+	 * generates from the PG gflags - so checking there would reject a
+	 * configuration whose final values are valid. The validator on the
+	 * ysql_yb_enable_new_relation_fastpath_write_in_txn_blocks gflag rejects the
+	 * cluster-level combination instead, order-independently; a GUC enabled only
+	 * through ysql_pg_conf_csv is left to no-op silently.
+	 */
+	if (*newval && !yb_ddl_transaction_block_enabled && source >= PGC_S_CLIENT)
+	{
+		GUC_check_errdetail("Cannot enable yb_enable_new_relation_fastpath_write_in_txn_blocks "
+							"when yb_ddl_transaction_block_enabled is disabled.");
+		return false;
+	}
+
+	return check_skip_intents_internal("yb_enable_new_relation_fastpath_write_in_txn_blocks", newval, source);
+}
+
+bool
+yb_check_password_validity_source(int *newVal, void **extra, GucSource source)
+{
+	if (!yb_password_policy_source_allowed(source))
+	{
+		GUC_check_errdetail("yb_password_validity can only be set via "
+							"ysql_pg_conf_csv (config file), or for a "
+							"specific role via ALTER ROLE ... SET.");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * YB: Render a GUC's value as a string.
+ *
+ * val supplies a value that was parsed but not assigned; NULL reads the
+ * variable's current value.  Integers, reals and OIDs are written into buffer;
+ * the other types return a pointer the caller does not own, and PGC_STRING may
+ * return NULL for a supplied val.
+ */
+static const char *
+YbFormatConfigValue(const struct config_generic *record,
+					const union config_var_val *val,
+					char *buffer, size_t bufsize)
+{
+	switch (record->vartype)
+	{
+		case PGC_BOOL:
+			if (val)
+				return val->boolval ? "on" : "off";
+			return *record->_bool.variable ? "on" : "off";
+
+		case PGC_INT:
+			snprintf(buffer, bufsize, "%d",
+					 val ? val->intval : *record->_int.variable);
+			return buffer;
+
+		case PGC_OID:
+			snprintf(buffer, bufsize, "%u",
+					 val ? val->oidval : *record->_oid.variable);
+			return buffer;
+
+		case PGC_REAL:
+			snprintf(buffer, bufsize, "%g",
+					 val ? val->realval : *record->_real.variable);
+			return buffer;
+
+		case PGC_STRING:
+			if (val)
+				return val->stringval;
+			return *record->_string.variable ?
+				*record->_string.variable : "";
+
+		case PGC_ENUM:
+			return config_enum_lookup_by_value(record,
+											   val ? val->enumval :
+											   *record->_enum.variable);
+	}
+	return NULL;
+}
+
+/*
+ * YB: Resolve a raw configuration value and return its canonical spelling.
+ *
+ * A NULL value returns the GUC's boot_val.  The value is validated but never
+ * assigned, so only its check hook runs.  The caller must have run
+ * build_guc_variables().
+ *
+ * The result is palloc'd in the current memory context.
+ */
+char *
+YbResolveGucValue(const char *name, const char *value)
+{
+	struct config_generic *record;
+	union config_var_val newval;
+	void	   *newextra = NULL;
+	char	   *result = NULL;
+	const char *formatted;
+	char		buffer[256];
+
+	record = find_option(name, false, false, ERROR);
+	if (record == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("unrecognized configuration parameter \"%s\"", name)));
+
+	if (value == NULL)
+	{
+		switch (record->vartype)
+		{
+			case PGC_BOOL:
+				newval.boolval = record->_bool.boot_val;
+				break;
+			case PGC_INT:
+				newval.intval = record->_int.boot_val;
+				break;
+			case PGC_OID:
+				newval.oidval = record->_oid.boot_val;
+				break;
+			case PGC_REAL:
+				newval.realval = record->_real.boot_val;
+				break;
+			case PGC_STRING:
+				/* Not guc_strdup'd, hence the "value != NULL" guard on the free below. */
+				newval.stringval = (char *) record->_string.boot_val;
+				break;
+			case PGC_ENUM:
+				newval.enumval = record->_enum.boot_val;
+				break;
+		}
+	}
+	else if (!parse_and_validate_value(record, value, PGC_S_FILE, ERROR,
+									   &newval, &newextra))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid value for parameter \"%s\": \"%s\"",
+						name, value)));
+
+	formatted = YbFormatConfigValue(record, &newval, buffer, sizeof(buffer));
+	result = pstrdup(formatted ? formatted : "");
+
+	if (record->vartype == PGC_STRING && value != NULL)
+		guc_free(newval.stringval);
+
+	if (newextra)
+		guc_free(newextra);
+
+	return result;
+}
+
+/*
+ * YB: Whether a config file may name this parameter: the same test
+ * ProcessConfigFileInternal() applies before accepting a file.  The caller must
+ * have run build_guc_variables().
+ */
+bool
+YbIsValidConfigFileName(const char *name)
+{
+	return find_option(name, false, true, LOG) != NULL ||
+		valid_custom_variable_name(name);
 }

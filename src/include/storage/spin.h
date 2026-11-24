@@ -14,6 +14,7 @@
  *		Acquire a spinlock, waiting if necessary.
  *		Time out and abort() if unable to acquire the lock in a
  *		"reasonable" amount of time --- typically ~ 1 minute.
+ *		YB note: instead of 1 minute, it's roughly 15 seconds.
  *
  *	void SpinLockRelease(volatile slock_t *lock)
  *		Unlock a previously acquired lock.
@@ -46,6 +47,9 @@
 
 #include "storage/s_lock.h"
 
+/* YB includes */
+#include "storage/yb_proc_state.h"
+
 static inline void
 SpinLockInit(volatile slock_t *lock)
 {
@@ -55,6 +59,7 @@ SpinLockInit(volatile slock_t *lock)
 static inline void
 SpinLockAcquire(volatile slock_t *lock)
 {
+	YbMyProcState->spinlocks_acquired++;
 	S_LOCK(lock);
 }
 
@@ -62,6 +67,8 @@ static inline void
 SpinLockRelease(volatile slock_t *lock)
 {
 	S_UNLOCK(lock);
+	if (YbMyProcState->spinlocks_acquired >= 1)
+		YbMyProcState->spinlocks_acquired--;
 }
 
 #endif							/* SPIN_H */

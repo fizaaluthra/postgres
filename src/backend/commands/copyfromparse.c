@@ -253,7 +253,11 @@ CopyGetData(CopyFromState cstate, void *databuf, int minread, int maxread)
 	switch (cstate->copy_src)
 	{
 		case COPY_FILE:
-			pgstat_report_wait_start(WAIT_EVENT_COPY_FROM_READ);
+			/* YB: report YB's COPY wait event instead, as documented for ASH */
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_start(WAIT_EVENT_YB_COPY_COMMAND_STREAM_READ);
+			else
+				pgstat_report_wait_start(WAIT_EVENT_COPY_FROM_READ);
 			bytesread = fread(databuf, 1, maxread, cstate->copy_file);
 			pgstat_report_wait_end();
 			if (ferror(cstate->copy_file))
@@ -637,7 +641,6 @@ CopyLoadRawBuf(CopyFromState cstate)
 	cstate->raw_buf_len = nbytes;
 
 	cstate->bytes_processed += inbytes;
-	pgstat_progress_update_param(PROGRESS_COPY_BYTES_PROCESSED, cstate->bytes_processed);
 
 	if (inbytes == 0)
 		cstate->raw_reached_eof = true;
@@ -882,10 +885,14 @@ NextCopyFromRawFieldsInternal(CopyFromState cstate, char ***fields, int *nfields
  *
  * 'values' and 'nulls' arrays must be the same length as columns of the
  * relation passed to BeginCopyFrom. This function fills the arrays.
+ *
+ * 'yb_skip_row' is used to specify whether we should skip format checking for
+ * this row. In particular, if 'yb_skip_row' is true, we will not raise error
+ * upon reading an invalid row.
  */
 bool
 NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
-			 Datum *values, bool *nulls)
+			 Datum *values, bool *nulls, bool yb_skip_row)
 {
 	TupleDesc	tupDesc;
 	AttrNumber	num_phys_attrs,
@@ -894,12 +901,24 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 	int		   *defmap = cstate->defmap;
 	ExprState **defexprs = cstate->defexprs;
 
+	/* YB: skipped rows pass NULL values/nulls; binary falls through */
+	if (yb_skip_row && cstate->opts.format != COPY_FORMAT_BINARY)
+	{
+		char	  **field_strings;
+		int			fldct;
+
+		return NextCopyFromRawFields(cstate, &field_strings, &fldct);
+	}
+
 	tupDesc = RelationGetDescr(cstate->rel);
 	num_phys_attrs = tupDesc->natts;
 
 	/* Initialize all values for row to NULL */
-	MemSet(values, 0, num_phys_attrs * sizeof(Datum));
-	MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+	if (!yb_skip_row)			/* YB: they are NULL for a skipped row */
+	{
+		MemSet(values, 0, num_phys_attrs * sizeof(Datum));
+		MemSet(nulls, true, num_phys_attrs * sizeof(bool));
+	}							/* YB */
 	MemSet(cstate->defaults, false, num_phys_attrs * sizeof(bool));
 
 	/* Get one row from source */

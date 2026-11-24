@@ -210,4 +210,11 @@ extern Bitmapset *pub_collist_to_bitmapset(Bitmapset *columns, Datum pubcols,
 extern Bitmapset *pub_form_cols_map(Relation relation,
 									PublishGencolsType include_gencols_type);
 
+/* YB */
+extern List *YBGetPublicationsByNames(List *pubnames, bool missing_ok);
+extern Oid *YBGetPublicationOidsByNames(List *pubnames);
+extern List *yb_pg_get_publications_tables(List *publications, bool *yb_is_pub_all_tables);
+extern bool yb_is_publishable_relation(Relation rel);
+extern void yb_log_unsupported_publication_relations();
+
 #endif							/* PG_PUBLICATION_H */

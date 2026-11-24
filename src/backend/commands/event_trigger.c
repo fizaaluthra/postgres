@@ -60,6 +60,12 @@
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
 
+/* YB includes */
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "pg_yb_utils.h"
+
 typedef struct EventTriggerQueryState
 {
 	/* memory context for this state's objects */
@@ -137,12 +143,13 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 	 * this, but there are obvious privilege escalation risks which would have
 	 * to somehow be plugged first.
 	 */
-	if (!superuser())
+	if (!superuser() && !IsYbDbAdminUser(evtowner))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create event trigger \"%s\"",
 						stmt->trigname),
-				 errhint("Must be superuser to create an event trigger.")));
+				 errhint("Must be superuser or a member of the yb_db_admin "
+						 "role to create an event trigger.")));
 
 	/* Validate event name. */
 	if (strcmp(stmt->eventname, "ddl_command_start") != 0 &&
@@ -551,13 +558,14 @@ AlterEventTriggerOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EVENT_TRIGGER,
 					   NameStr(form->evtname));
 
-	/* New owner must be a superuser */
-	if (!superuser_arg(newOwnerId))
+	/* New owner must be a superuser or yb_db_admin */
+	if (!superuser_arg(newOwnerId) && !IsYbDbAdminUser(newOwnerId))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to change owner of event trigger \"%s\"",
 						NameStr(form->evtname)),
-				 errhint("The owner of an event trigger must be a superuser.")));
+				 errhint("The owner of an event trigger must be a superuser "
+						 "or a member of the yb_db_admin role.")));
 
 	form->evtowner = newOwnerId;
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
@@ -615,6 +623,13 @@ filter_event_trigger(CommandTag tag, EventTriggerCacheItem *item)
 	}
 
 	/* Filter by tags, if any were specified. */
+	/*
+	 * In Yugabyte we support ddl trigger on TRUNCATE TABLE, but only if it has
+	 * been explicitly specified as a trigger filter. This ensures backwards
+	 * compatibility with Postgres.
+	 */
+	if (IsYugaByteEnabled() && tag == CMDTAG_TRUNCATE_TABLE && !bms_is_member(tag, item->tagset))
+		return false;
 	if (!bms_is_empty(item->tagset) && !bms_is_member(tag, item->tagset))
 		return false;
 
@@ -751,6 +766,15 @@ EventTriggerDDLCommandStart(Node *parsetree)
 	if (!IsUnderPostmaster || !event_triggers)
 		return;
 
+	/*
+	 * Disable event triggers while YSQL upgrade scripts or pg_upgrade replay
+	 * DDL. This replay is an internal catalog operation, so invoking user
+	 * triggers could cause unintended side effects. During a major upgrade,
+	 * those side effects could also access tservers running the old version.
+	 */
+	if (IsYsqlUpgrade || IsBinaryUpgrade)
+		return;
+
 	runlist = EventTriggerCommonSetup(parsetree,
 									  EVT_DDLCommandStart,
 									  "ddl_command_start",
@@ -785,6 +809,10 @@ EventTriggerDDLCommandEnd(Node *parsetree)
 	 * triggers are disabled in single user mode or via GUC.
 	 */
 	if (!IsUnderPostmaster || !event_triggers)
+		return;
+
+	/* See EventTriggerDDLCommandStart for why upgrade DDL must not fire user triggers. */
+	if (IsYsqlUpgrade || IsBinaryUpgrade)
 		return;
 
 	/*
@@ -833,6 +861,10 @@ EventTriggerSQLDrop(Node *parsetree)
 	 * triggers are disabled in single user mode or via a GUC.
 	 */
 	if (!IsUnderPostmaster || !event_triggers)
+		return;
+
+	/* See EventTriggerDDLCommandStart for why upgrade DDL must not fire user triggers. */
+	if (IsYsqlUpgrade || IsBinaryUpgrade)
 		return;
 
 	/*
@@ -982,7 +1014,8 @@ EventTriggerOnLogin(void)
 				 * that avoids possible waiting on the row-level lock. Second,
 				 * that avoids dealing with TOAST.
 				 */
-				systable_inplace_update_finish(state, tuple);
+				systable_inplace_update_finish(state, tuple,
+											   false /* yb_shared_update */ );
 			}
 			else
 				systable_inplace_update_cancel(state);
@@ -1012,6 +1045,10 @@ EventTriggerTableRewrite(Node *parsetree, Oid tableOid, int reason)
 	 * triggers are disabled in single user mode or via a GUC.
 	 */
 	if (!IsUnderPostmaster || !event_triggers)
+		return;
+
+	/* See EventTriggerDDLCommandStart for why upgrade DDL must not fire user triggers. */
+	if (IsYsqlUpgrade || IsBinaryUpgrade)
 		return;
 
 	/*
@@ -1145,6 +1182,14 @@ EventTriggerSupportsObjectType(ObjectType obtype)
 		case OBJECT_EVENT_TRIGGER:
 			/* no support for event triggers on event triggers */
 			return false;
+
+			/* YB cases */
+		case OBJECT_YBPROFILE:
+			/* no support for event triggers on profiles */
+			return false;
+		case OBJECT_YBTABLEGROUP:
+			/* no support for event triggers on tablegroups */
+			return false;
 		default:
 			return true;
 	}
@@ -1169,6 +1214,15 @@ EventTriggerSupportsObject(const ObjectAddress *object)
 			return false;
 		case EventTriggerRelationId:
 			/* no support for event triggers on event triggers */
+			return false;
+
+			/* YB cases */
+		case YbTablegroupRelationId:
+			/* no support for event triggers on tablegroups */
+			return false;
+		case YbProfileRelationId:
+		case YbRoleProfileRelationId:
+			/* no support for event triggers on profiles */
 			return false;
 		default:
 			return true;
@@ -2011,6 +2065,9 @@ EventTriggerCollectAlterTSConfig(const AlterTSConfigurationStmt *stmt, Oid cfgId
 		command->d.atscfg.dictIds = palloc_array(Oid, ndicts);
 		memcpy(command->d.atscfg.dictIds, dictIds, sizeof(Oid) * ndicts);
 	}
+	else
+		command->d.atscfg.dictIds = NULL;
+
 	command->d.atscfg.ndicts = ndicts;
 	command->parsetree = (Node *) copyObject(stmt);
 
@@ -2325,6 +2382,12 @@ stringify_grant_objtype(ObjectType objtype)
 		case OBJECT_USER_MAPPING:
 		case OBJECT_VIEW:
 			elog(ERROR, "unsupported object type: %d", (int) objtype);
+
+			/* YB cases */
+		case OBJECT_YBPROFILE:
+			return "PROFILE";
+		case OBJECT_YBTABLEGROUP:
+			return "TABLEGROUP";
 	}
 
 	return "???";				/* keep compiler quiet */
@@ -2410,6 +2473,12 @@ stringify_adefprivs_objtype(ObjectType objtype)
 		case OBJECT_USER_MAPPING:
 		case OBJECT_VIEW:
 			elog(ERROR, "unsupported object type: %d", (int) objtype);
+
+			/* YB cases */
+		case OBJECT_YBPROFILE:
+			return "PROFILES";
+		case OBJECT_YBTABLEGROUP:
+			return "TABLEGROUPS";
 	}
 
 	return "???";				/* keep compiler quiet */

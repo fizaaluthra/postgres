@@ -46,6 +46,11 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "executor/ybModifyTable.h"
+#include "miscadmin.h"
+#include "pg_yb_utils.h"
+
 
 /* We use a list of these to detect recursion in RewriteQuery */
 typedef struct rewrite_event
@@ -96,7 +101,8 @@ static void markQueryForLocking(Query *qry, Node *jtnode,
 static List *matchLocks(CmdType event, Relation relation,
 						int varno, Query *parsetree, bool *hasUpdate);
 static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
-static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
+static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist,
+										 Relation view_rel, Oid base_relid);
 static Node *expand_generated_columns_internal(Node *node, Relation rel, int rt_index,
 											   RangeTblEntry *rte, int result_relation);
 
@@ -3044,7 +3050,9 @@ relation_is_updatable(Oid reloid,
 				outer_reloids = lappend_oid(outer_reloids,
 											RelationGetRelid(rel));
 				include_cols = adjust_view_column_set(updatable_cols,
-													  viewquery->targetList);
+													  viewquery->targetList,
+													  rel,
+													  base_rte->relid);
 				auto_events &= relation_is_updatable(baseoid,
 													 outer_reloids,
 													 include_triggers,
@@ -3070,16 +3078,19 @@ relation_is_updatable(Oid reloid,
  * relation (as per the checks above in view_query_is_auto_updatable).
  */
 static Bitmapset *
-adjust_view_column_set(Bitmapset *cols, List *targetlist)
+adjust_view_column_set(Bitmapset *cols, List *targetlist,
+					   Relation view_rel, Oid base_relid)
 {
 	Bitmapset  *result = NULL;
 	int			col;
+	AttrNumber	view_lowattrno = YBGetFirstLowInvalidAttributeNumber(view_rel);
+	AttrNumber	base_lowattrno = YBGetFirstLowInvalidAttributeNumberFromOid(base_relid);
 
 	col = -1;
 	while ((col = bms_next_member(cols, col)) >= 0)
 	{
 		/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
-		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+		AttrNumber	attno = col + view_lowattrno;
 
 		if (attno == InvalidAttrNumber)
 		{
@@ -3101,7 +3112,7 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 					continue;
 				var = castNode(Var, tle->expr);
 				result = bms_add_member(result,
-										var->varattno - FirstLowInvalidHeapAttributeNumber);
+										var->varattno - base_lowattrno);
 			}
 		}
 		else
@@ -3118,7 +3129,7 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 				Var		   *var = (Var *) tle->expr;
 
 				result = bms_add_member(result,
-										var->varattno - FirstLowInvalidHeapAttributeNumber);
+										var->varattno - base_lowattrno);
 			}
 			else
 				elog(ERROR, "attribute number %d not found in view targetlist",
@@ -3576,10 +3587,12 @@ rewriteTargetView(Query *parsetree, Relation view)
 	new_perminfo->selectedCols = base_perminfo->selectedCols;
 
 	new_perminfo->insertedCols =
-		adjust_view_column_set(view_perminfo->insertedCols, view_targetlist);
+		adjust_view_column_set(view_perminfo->insertedCols, view_targetlist,
+							   view, new_perminfo->relid);
 
 	new_perminfo->updatedCols =
-		adjust_view_column_set(view_perminfo->updatedCols, view_targetlist);
+		adjust_view_column_set(view_perminfo->updatedCols, view_targetlist,
+							   view, new_perminfo->relid);
 
 	/*
 	 * Move any security barrier quals from the view RTE onto the new target

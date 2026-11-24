@@ -732,6 +732,12 @@ HeapTupleHasNulls(const HeapTupleData *tuple)
 }
 
 static inline bool
+HeapTupleHeaderHasNulls(HeapTupleHeader tuple)
+{
+	return (tuple->t_infomask & HEAP_HASNULL) != 0;
+}
+
+static inline bool
 HeapTupleNoNulls(const HeapTupleData *tuple)
 {
 	return !HeapTupleHasNulls(tuple);
@@ -905,5 +911,7 @@ heap_getattr(HeapTuple tup, int attnum, TupleDesc tupleDesc, bool *isnull)
 		return heap_getsysattr(tup, attnum, tupleDesc, isnull);
 }
 #endif							/* FRONTEND */
+
+extern void yb_heap_copytuple_with_tuple(HeapTuple src, HeapTuple dest);
 
 #endif							/* HTUP_DETAILS_H */

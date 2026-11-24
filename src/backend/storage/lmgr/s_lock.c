@@ -36,6 +36,8 @@
  * the probability of unintended failure) than to fix the total time
  * spent.
  *
+ * YB: change 2 or so minutes to 30 seconds.
+ *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -56,7 +58,11 @@
 
 #define MIN_SPINS_PER_DELAY 10
 #define MAX_SPINS_PER_DELAY 1000
-#define NUM_DELAYS			1000
+/*
+ * YB: NUM_DELAYS has been changed from 1000 to communicate spinlock issues
+ * to the client sooner.
+ */
+#define NUM_DELAYS			250
 #define MIN_DELAY_USEC		1000L
 #define MAX_DELAY_USEC		1000000L
 
