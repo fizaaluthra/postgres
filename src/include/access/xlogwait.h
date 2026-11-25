@@ -106,4 +106,7 @@ extern void WaitLSNCleanup(void);
 extern WaitLSNResult WaitForLSN(WaitLSNType lsnType, XLogRecPtr targetLSN,
 								int timeout);
 
+/* YB declarations */
+extern void YbWaitLSNCleanupForProc(ProcNumber procno);
+
 #endif							/* XLOG_WAIT_H */

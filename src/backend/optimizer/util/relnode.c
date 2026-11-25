@@ -40,6 +40,10 @@
 #include "utils/selfuncs.h"
 #include "utils/typcache.h"
 
+/* YB includes */
+#include "partitioning/partbounds.h"
+#include "pg_yb_utils.h"
+
 
 typedef struct JoinHashEntry
 {
@@ -104,6 +108,14 @@ static bool is_var_in_aggref_only(PlannerInfo *root, Var *var);
 static bool is_var_needed_by_join(PlannerInfo *root, Var *var, RelOptInfo *rel);
 static Index get_expression_sortgroupref(PlannerInfo *root, Expr *expr);
 
+/* YB declarations */
+static List *yb_add_batched_groups(List *groups, List *more,
+								   Relids batchedrelids);
+static List *yb_groups_within(List *groups, Relids relids);
+static ParamPathInfo *yb_ppi_add_batched_groups(ParamPathInfo *ppi,
+											   List *groups,
+											   Relids batchedrelids);
+
 
 /*
  * setup_simple_rel_arrays
@@ -116,6 +128,14 @@ setup_simple_rel_arrays(PlannerInfo *root)
 	int			size;
 	Index		rti;
 	ListCell   *lc;
+
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * In a new block so bump the block count.
+		 */
+		root->ybBlockId = ++(root->glob->ybBlockCnt);
+	}
 
 	/* Arrays are accessed using RT indexes (1..N) */
 	size = list_length(root->parse->rtable) + 1;
@@ -201,7 +221,44 @@ expand_planner_arrays(PlannerInfo *root, int add_size)
 		root->append_rel_array =
 			palloc0_array(AppendRelInfo *, new_size);
 
+	/*
+	 * YB: The yb_tserver_uuids array is lazily allocated by
+	 * YbAddFederatedPartitionTserverUuid(); only grow it if it already exists,
+	 * so non-federated queries pay nothing for it.
+	 */
+	if (root->yb_tserver_uuids)
+	{
+		root->yb_tserver_uuids = (const char **)
+			repalloc(root->yb_tserver_uuids,
+					 sizeof(const char *) * new_size);
+		MemSet(root->yb_tserver_uuids + root->simple_rel_array_size,
+			   0, sizeof(const char *) * add_size);
+	}
+
 	root->simple_rel_array_size = new_size;
+}
+
+/*
+ * See if the name pointed to by 'hintAlias' appears in the list.
+ */
+bool
+ybFindHintAlias(List *ybPlanHintsAliasMapping, char *hintAlias)
+{
+	ListCell   *lc;
+	bool		found = false;
+
+	foreach(lc, ybPlanHintsAliasMapping)
+	{
+		char	   *existingAlias = (char *) lfirst(lc);
+
+		if (existingAlias != NULL && strcmp(hintAlias, existingAlias) == 0)
+		{
+			found = true;
+			break;
+		}
+	}
+
+	return found;
 }
 
 /*
@@ -239,6 +296,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->cheapest_startup_path = NULL;
 	rel->cheapest_total_path = NULL;
 	rel->cheapest_parameterized_paths = NIL;
+	rel->yb_forced_gather_path = NULL;
 	rel->relid = relid;
 	rel->rtekind = rte->rtekind;
 	/* min_attr, max_attr, attr_needed, attr_widths are set below */
@@ -311,6 +369,11 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->all_partrels = NULL;
 	rel->partexprs = NULL;
 	rel->nullable_partexprs = NULL;
+	rel->ybUniqueBaseId = 0;
+	rel->ybHintAlias = NULL;
+	rel->ybBlockId = 0;
+	rel->ybRoot = root;
+	rel->ybRelationName = NULL;
 
 	/*
 	 * Pass assorted information down the inheritance hierarchy.
@@ -398,6 +461,128 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	}
 
 	/*
+	 * YB: Assign uniquified hint aliases before build_simple_rel_hook.
+	 * PG19 pg_hint_plan applies scan hints in that hook via find_scan_hint,
+	 * which looks up ybAliasForHinting (ybUniqueBaseId / ybPlanHintsAliasMapping).
+	 * If this runs after the hook, duplicate RTEs still have the raw eref
+	 * alias (e.g. both copies of t10 named "t10"), so generated hints such as
+	 * SeqScan(t10_1) stay HINT_STATE_NOTUSED even though EXPLAIN shows that
+	 * alias.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		rte->ybScannedObjectName = rel->ybRelationName;
+		if (rte->ybHintAlias != NULL && rel->reloptkind != RELOPT_OTHER_MEMBER_REL)
+		{
+			/*
+			 * This code path is taken when we have an INSERT, UPDATE, DELETE, or MERGE statement
+			 * and have already processed the target RTE (when PlannerGlobal instance was allocated
+			 * standard_planner()). Just place the information on 'rel'.
+			 *
+			 * However, for rels the are of kind RELOPT_OTHER_MEMBER_REL, e.g. children in an inheritance
+			 * hierarchy, or an individual partition of a partitioned table, we do not want to take
+			 * this path and use the hint alias but rather generate a unique one. For these cases,
+			 * PG assigns the same alias to the children as the one used for the parent, which makes
+			 * hint generation incorrect and makes hinting individual partitions/children impossible.
+			 */
+			rel->ybHintAlias = rte->ybHintAlias;
+			rel->ybBlockId = root->ybBlockId;
+			rel->ybUniqueBaseId = rte->ybUniqueBaseId;
+
+			if (yb_enable_planner_trace)
+			{
+				ereport(DEBUG1,
+						(errmsg("\nblock %d : table %s (unique base id = %d, relid = %d) -> Hint alias %s",
+								rel->ybBlockId, rte->eref->aliasname, rel->ybUniqueBaseId, relid, rel->ybHintAlias)));
+			}
+		}
+		else if (rte->eref != NULL && rte->eref->aliasname != NULL)
+		{
+			PlannerGlobal *glob = root->glob;
+
+			/*
+			 * Assign a unique id to the rel.
+			 */
+			rel->ybUniqueBaseId = ++(glob->ybBaseRelCnt);
+			rte->ybUniqueBaseId = rel->ybUniqueBaseId;
+
+			/*
+			 * Start with the existing rel alias.
+			 */
+			char	   *hintAlias = rte->eref->aliasname;
+
+			int			aliasSuffix = 1;
+			StringInfo	buf = NULL;
+
+			/*
+			 * Loop as long as the alias is found in the global list (across all blocks).
+			 */
+			while (ybFindHintAlias(glob->ybPlanHintsAliasMapping, hintAlias))
+			{
+				if (buf == NULL)
+				{
+					buf = makeStringInfo();
+				}
+				else
+				{
+					resetStringInfo(buf);
+				}
+
+				/*
+				 * Append the next numeric suffix.
+				 */
+				appendStringInfoString(buf, rte->eref->aliasname);
+				appendStringInfoString(buf, "_");
+				appendStringInfo(buf, "%d", aliasSuffix);
+				hintAlias = pstrdup(buf->data);
+				++aliasSuffix;
+			}
+
+			if (buf != NULL)
+			{
+				pfree(buf->data);
+				pfree(buf);
+			}
+
+			if (glob->ybPlanHintsAliasMapping == NIL)
+			{
+				/*
+				 * Insert a NULL at position 0 since we start in position 1 for convenience and numbering/indexing
+				 * begins at 1 for relations when planning.
+				 */
+				glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, 0, NULL);
+			}
+
+			/*
+			 * Insert the alias we decided upon into the global list at position corresponding to rel's unique base relation id.
+			 */
+			glob->ybPlanHintsAliasMapping = list_insert_nth(glob->ybPlanHintsAliasMapping, rel->ybUniqueBaseId, hintAlias);
+
+			/*
+			 * Store the info on the RTE and RelOptInfo.
+			 */
+			rte->ybHintAlias = hintAlias;
+			rel->ybHintAlias = hintAlias;
+			rel->ybBlockId = root->ybBlockId;
+
+			if (yb_enable_planner_trace)
+			{
+				ereport(DEBUG1,
+						(errmsg("\nblock %d : table %s (unique base id = %d, relid = %d) -> Hint alias %s",
+								rel->ybBlockId, rte->eref->aliasname, rel->ybUniqueBaseId, relid, rel->ybHintAlias)));
+			}
+		}
+	}
+
+	/*
+	 * YB: Publish this RelOptInfo before build_simple_rel_hook. PG19
+	 * pg_hint_plan's find_scan_hint re-fetches the rel from simple_rel_array
+	 * (CHECK_RELATION_FOR_HINT). If the slot is still NULL it falls back to
+	 * rte->eref->aliasname and never matches uniquified names like t10_1.
+	 */
+	root->simple_rel_array[relid] = rel;
+
+	/*
 	 * Allow a plugin to editorialize on the new RelOptInfo. This could
 	 * involve editorializing on the information which get_relation_info
 	 * obtained from the catalogs, such as altering the assumed relation size,
@@ -432,9 +617,6 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 			mark_dummy_rel(rel);
 		}
 	}
-
-	/* Save the finished struct in the query's simple_rel_array */
-	root->simple_rel_array[relid] = rel;
 
 	return rel;
 }
@@ -910,6 +1092,11 @@ build_join_rel(PlannerInfo *root,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
+	joinrel->ybUniqueBaseId = 0;
+	joinrel->ybHintAlias = NULL;
+	joinrel->ybBlockId = 0;
+	joinrel->ybRoot = root;
+	joinrel->ybRelationName = NULL;
 
 	/* Compute information relevant to the foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -1108,6 +1295,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
+	joinrel->ybRoot = root;
 
 	/* Compute information relevant to foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -1656,6 +1844,11 @@ fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
 	upperrel->cheapest_startup_path = NULL;
 	upperrel->cheapest_total_path = NULL;
 	upperrel->cheapest_parameterized_paths = NIL;
+	upperrel->ybUniqueBaseId = 0;
+	upperrel->ybHintAlias = NULL;
+	upperrel->ybBlockId = 0;
+	upperrel->ybRoot = root;
+	upperrel->ybRelationName = NULL;
 
 	root->upper_rels[kind] = lappend(root->upper_rels[kind], upperrel);
 
@@ -1718,6 +1911,8 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	Bitmapset  *pserials;
 	double		rows;
 	ListCell   *lc;
+	Relids		batchedrelids = root->yb_cur_batched_relids;
+	List	   *yb_relegated_clauses = NIL;
 
 	/* If rel has LATERAL refs, every path for it should account for them */
 	Assert(bms_is_subset(baserel->lateral_relids, required_outer));
@@ -1728,9 +1923,25 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 
 	Assert(!bms_overlap(baserel->relids, required_outer));
 
-	/* If we already have a PPI for this parameterization, just return it */
-	if ((ppi = find_param_path_info(baserel, required_outer)))
-		return ppi;
+	if (IsYugaByteEnabled())
+	{
+		if ((ppi =
+			 yb_find_batched_param_path_info(baserel,
+											 required_outer,
+											 batchedrelids)))
+		{
+			List	   *groups = yb_groups_within(root->yb_cur_batched_groups,
+											  required_outer);
+
+			return yb_ppi_add_batched_groups(ppi, groups, batchedrelids);
+		}
+	}
+	else
+	{
+		/* If we already have a PPI for this parameterization, just return it */
+		if ((ppi = find_param_path_info(baserel, required_outer)))
+			return ppi;
+	}
 
 	/*
 	 * Identify all joinclauses that are movable to this base rel given this
@@ -1803,8 +2014,61 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	}
 	pclauses = list_concat(pclauses, eqclauses);
 
+	/*
+	 * YB: When this parameterized path batches one or more outer relations,
+	 * withhold any movable clause that references a batched relation but cannot
+	 * be batched.  Pushing it into this scan would reference the batched
+	 * relation with a scalar parameter while the same relation is referenced
+	 * with a batched array elsewhere in the scan.  The withheld clauses are
+	 * recorded in the ParamPathInfo so that the join directly above re-applies
+	 * them as a join filter (get_joinrel_parampathinfo); a clause that the
+	 * stock movability rules consider enforced here would otherwise be
+	 * enforced nowhere.
+	 */
+	if (yb_enable_base_scans_cost_model && !bms_is_empty(batchedrelids))
+	{
+		List	   *kept_clauses = NIL;
+
+		foreach(lc, pclauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			if (bms_overlap(rinfo->clause_relids, batchedrelids) &&
+				!yb_get_batched_restrictinfo(rinfo, batchedrelids,
+											 baserel->relids))
+			{
+				yb_relegated_clauses = lappend(yb_relegated_clauses, rinfo);
+				continue;
+			}
+
+			kept_clauses = lappend(kept_clauses, rinfo);
+		}
+		pclauses = kept_clauses;
+	}
+
+	List	   *sel_clauses = pclauses;
+
+	if (!bms_is_empty(batchedrelids) && yb_enable_base_scans_cost_model)
+	{
+		List	   *new_pclauses = NIL;
+
+		foreach(lc, pclauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+			RestrictInfo *batched = yb_get_batched_restrictinfo(rinfo,
+																batchedrelids,
+																baserel->relids);
+
+			if (batched)
+				rinfo = batched;
+
+			new_pclauses = lappend(new_pclauses, rinfo);
+		}
+		sel_clauses = new_pclauses;
+	}
+
 	/* Estimate the number of rows returned by the parameterized scan */
-	rows = get_parameterized_baserel_size(root, baserel, pclauses);
+	rows = get_parameterized_baserel_size(root, baserel, sel_clauses);
 
 	/* And now we can build the ParamPathInfo */
 	ppi = makeNode(ParamPathInfo);
@@ -1812,6 +2076,31 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	ppi->ppi_rows = rows;
 	ppi->ppi_clauses = pclauses;
 	ppi->ppi_serials = pserials;
+	ppi->yb_ppi_req_outer_batched = batchedrelids;
+	ppi->yb_ppi_relegated_clauses = yb_relegated_clauses;
+
+	/*
+	 * Two sources, because neither sees every batched clause.  pclauses covers
+	 * clauses that never become an index condition, but it can miss one that
+	 * does: generate_join_implied_equalities emits one clause per equivalence
+	 * class and scores a plain Var above an expression, while the index path
+	 * may batch on the expression.  yb_cur_batched_groups carries what the path
+	 * being built does batch: the index clauses indxpath.c batched, or the
+	 * children's groups when create_append_path builds a partitioned rel's
+	 * Append.  Those can span more than this parameterization, so keep only the
+	 * ones it supplies.
+	 * What remains over-approximates in the same direction as the ppi_clauses
+	 * rule in yb_has_non_evaluable_bnl_clauses: a path may carry a group it
+	 * does not need, which costs that join order its batching, never
+	 * correctness.
+	 */
+	ppi->yb_ppi_batched_groups =
+		yb_add_batched_groups(yb_clause_batched_groups(pclauses, batchedrelids,
+													   baserel->relids),
+							  yb_groups_within(root->yb_cur_batched_groups,
+											   required_outer),
+							  batchedrelids);
+
 	baserel->ppilist = lappend(baserel->ppilist, ppi);
 
 	return ppi;
@@ -1864,6 +2153,8 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	double		rows;
 	ListCell   *lc;
 
+	List	   *yb_groups = NIL;
+
 	/* If rel has LATERAL refs, every path for it should account for them */
 	Assert(bms_is_subset(joinrel->lateral_relids, required_outer));
 
@@ -1872,6 +2163,17 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 		return NULL;
 
 	Assert(!bms_overlap(joinrel->relids, required_outer));
+
+	/* YB: Compute batched and unbatched relids. */
+	Relids		req_batchedids = bms_union(YB_PATH_REQ_OUTER_BATCHED(outer_path),
+										   YB_PATH_REQ_OUTER_BATCHED(inner_path));
+
+	Relids		req_unbatchedids = bms_union(YB_PATH_REQ_OUTER_UNBATCHED(outer_path),
+											 YB_PATH_REQ_OUTER_UNBATCHED(inner_path));
+
+	req_batchedids = bms_difference(req_batchedids,
+									req_unbatchedids);
+	req_batchedids = bms_difference(req_batchedids, outer_path->parent->relids);
 
 	/*
 	 * Identify all joinclauses that are movable to this join rel given this
@@ -1922,6 +2224,30 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 
 		pclauses = lappend(pclauses, rinfo);
 		pserials = bms_add_member(pserials, rinfo->rinfo_serial);
+	}
+
+	/*
+	 * YB: The inner path may have withheld clauses that are movable into it
+	 * but reference a batched outer relation without a batched form
+	 * (get_baserel_parampathinfo).  The stock rule above treats any clause
+	 * movable into the inner path as enforced there, so it would skip them
+	 * here as well and they would be enforced nowhere.  Re-add them so this
+	 * join applies them: it is the nearest join at which the batched relation's
+	 * values are available per tuple.  A withheld clause whose relids lie
+	 * within this join already arrives through restrict_clauses.
+	 */
+	if (IsYugaByteEnabled() && inner_path->param_info)
+	{
+		foreach(lc, inner_path->param_info->yb_ppi_relegated_clauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			if (list_member_ptr(pclauses, rinfo) ||
+				list_member_ptr(*restrict_clauses, rinfo))
+				continue;
+
+			pclauses = lappend(pclauses, rinfo);
+		}
 	}
 
 	/* Consider joinclauses generated by EquivalenceClasses, too */
@@ -2020,6 +2346,101 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 		}
 	}
 
+	List	   *yb_relegated = NIL;
+
+	if (IsYugaByteEnabled() && !bms_is_empty(req_batchedids))
+	{
+		/*
+		 * YB: A moved-down clause that references a batched outer relation
+		 * outside this join cannot be enforced here while that relation stays
+		 * batched: the batched value is not available until the batched nested
+		 * loop join above un-batches it.  Consider a join (X (Y Z)) with a
+		 * filter between X and Y where X is batched.
+		 *
+		 * - When CBO is enabled, relegate it to that batched nested loop join:
+		 *   drop it here so it is applied above, provided every relation it
+		 *   references is in this join or a batched outer relation so the join
+		 *   can evaluate it.  Such a clause spans both join inputs (otherwise it
+		 *   would have been pushed into one of them), so its batched form, if
+		 *   any, could not be enforced as a single-relation index condition
+		 *   here anyway.
+		 * - Otherwise the external relations it touches must be unbatched (a
+		 *   batchable join filter would have to become an IN clause, which is
+		 *   not supported).
+		 *
+		 * Relegating or unbatching one clause can change another's
+		 * eligibility, so resolve to a fixed point.
+		 */
+		List	   *candidates = NIL;
+
+		foreach(lc, pclauses)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+			if (bms_is_subset(rinfo->clause_relids, joinrel->relids))
+				continue;
+
+			if (!bms_overlap(rinfo->clause_relids, req_batchedids))
+				continue;
+
+			if (yb_enable_base_scans_cost_model)
+				candidates = lappend(candidates, rinfo);
+			else
+				req_unbatchedids =
+					bms_union(req_unbatchedids,
+							  bms_difference(rinfo->clause_relids,
+											 joinrel->relids));
+		}
+
+		if (candidates != NIL)
+		{
+			bool		changed;
+
+			do
+			{
+				Relids		relegatable_rels =
+					bms_union(joinrel->relids,
+							  bms_difference(req_batchedids, req_unbatchedids));
+
+				changed = false;
+				foreach(lc, candidates)
+				{
+					RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+					if (rinfo == NULL)
+						continue;
+
+					if (bms_is_subset(rinfo->clause_relids, relegatable_rels))
+						continue;
+
+					/* Not relegatable: unbatch the external rels it touches. */
+					req_unbatchedids =
+						bms_union(req_unbatchedids,
+								  bms_difference(rinfo->clause_relids,
+												 joinrel->relids));
+					lfirst(lc) = NULL;
+					changed = true;
+				}
+				bms_free(relegatable_rels);
+			} while (changed);
+
+			foreach(lc, candidates)
+			{
+				if (lfirst(lc) != NULL)
+					yb_relegated = lappend(yb_relegated, lfirst(lc));
+			}
+		}
+	}
+
+	req_batchedids = bms_difference(req_batchedids, req_unbatchedids);
+
+	/*
+	 * YB: Drop relegated clauses from this join; the batched nested loop join
+	 * above is responsible for evaluating them.
+	 */
+	foreach(lc, yb_relegated)
+		pclauses = list_delete_ptr(pclauses, lfirst(lc));
+
 	/*
 	 * Now, attach the identified moved-down clauses to the caller's
 	 * restrict_clauses list.  By using list_concat in this order, we leave
@@ -2027,9 +2448,31 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	 */
 	*restrict_clauses = list_concat(pclauses, *restrict_clauses);
 
+	/*
+	 * YB: Carry the batched groups of both inputs, trimmed to the relations
+	 * this join still needs batched.  The outer input matters as much as the
+	 * inner one: the scan carrying such a group can sit on either side of an
+	 * intervening join, and on the outer side nothing else records it.  A
+	 * group that loses a member here is satisfied -- either the member is
+	 * supplied by this join, which had to supply the whole group to pass
+	 * yb_batched_clause_final_check, or it became unbatched and now
+	 * contributes a scalar parameter.
+	 */
+	if (IsYugaByteEnabled() && !bms_is_empty(req_batchedids))
+	{
+		yb_groups = yb_add_batched_groups(yb_groups,
+										  YB_PATH_BATCHED_GROUPS(outer_path),
+										  req_batchedids);
+		yb_groups = yb_add_batched_groups(yb_groups,
+										  YB_PATH_BATCHED_GROUPS(inner_path),
+										  req_batchedids);
+	}
+
 	/* If we already have a PPI for this parameterization, just return it */
-	if ((ppi = find_param_path_info(joinrel, required_outer)))
-		return ppi;
+	if ((ppi = yb_find_batched_param_path_info(joinrel,
+											   required_outer,
+											   req_batchedids)))
+		return yb_ppi_add_batched_groups(ppi, yb_groups, req_batchedids);
 
 	/* Estimate the number of rows returned by the parameterized join */
 	rows = get_parameterized_joinrel_size(root, joinrel,
@@ -2050,9 +2493,34 @@ get_joinrel_parampathinfo(PlannerInfo *root, RelOptInfo *joinrel,
 	ppi->ppi_rows = rows;
 	ppi->ppi_clauses = NIL;
 	ppi->ppi_serials = NULL;
+	ppi->yb_ppi_req_outer_batched = req_batchedids;
+	ppi->yb_ppi_batched_groups = yb_groups;
+
 	joinrel->ppilist = lappend(joinrel->ppilist, ppi);
 
 	return ppi;
+}
+
+bool
+yb_has_same_batching_reqs(List *paths)
+{
+	Path	   *first_path = (Path *) linitial(paths);
+	Relids		first_req_outer_batch = YB_PATH_REQ_OUTER_BATCHED(first_path);
+	Relids		first_req_outer = PATH_REQ_OUTER(first_path);
+	ListCell   *lc;
+
+	foreach(lc, paths)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (!bms_equal(first_req_outer_batch, YB_PATH_REQ_OUTER_BATCHED(path)))
+			return false;
+
+		if (!bms_equal(first_req_outer, PATH_REQ_OUTER(path)))
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -2080,7 +2548,15 @@ get_appendrel_parampathinfo(RelOptInfo *appendrel, Relids required_outer)
 	Assert(!bms_overlap(appendrel->relids, required_outer));
 
 	/* If we already have a PPI for this parameterization, just return it */
-	if ((ppi = find_param_path_info(appendrel, required_outer)))
+	/*
+	 * YB: Under the cost-based optimizer, only an unbatched one, as built
+	 * below.  get_baserel_parampathinfo and get_joinrel_parampathinfo can
+	 * add batched ones to appendrel->ppilist.
+	 */
+	if ((ppi = (yb_enable_base_scans_cost_model ?
+				yb_find_batched_param_path_info(appendrel, required_outer,
+												NULL) :
+				find_param_path_info(appendrel, required_outer))))
 		return ppi;
 
 	/* Else build the ParamPathInfo */
@@ -2092,6 +2568,25 @@ get_appendrel_parampathinfo(RelOptInfo *appendrel, Relids required_outer)
 	appendrel->ppilist = lappend(appendrel->ppilist, ppi);
 
 	return ppi;
+}
+
+ParamPathInfo *
+yb_find_batched_param_path_info(RelOptInfo *rel, Relids required_outer,
+								Relids yb_required_batched_outer)
+{
+	ListCell   *lc;
+
+	foreach(lc, rel->ppilist)
+	{
+		ParamPathInfo *ppi = (ParamPathInfo *) lfirst(lc);
+
+		if (bms_equal(ppi->ppi_req_outer, required_outer) &&
+			bms_equal(ppi->yb_ppi_req_outer_batched,
+					  yb_required_batched_outer))
+			return ppi;
+	}
+
+	return NULL;
 }
 
 /*
@@ -3376,4 +3871,126 @@ get_expression_sortgroupref(PlannerInfo *root, Expr *expr)
 
 	/* no match is found */
 	return 0;
+}
+
+/*
+ * yb_clause_batched_groups
+ *	  Sets of batched outer relations that a single batched clause of a base
+ *	  relation scan references together.
+ *
+ * Only relations that are batched here take part.  An unbatched relation in
+ * the same expression supplies a scalar nestloop param that stays fixed for a
+ * whole rescan of this scan, and the array is rebuilt on each rescan, so its
+ * owner may sit at any level without breaking the cross product.  Two batched
+ * relations cannot: each advances on its own batch loop.
+ */
+List *
+yb_clause_batched_groups(List *pclauses, Relids batchedrelids,
+						 Relids inner_relids)
+{
+	List	   *candidates = NIL;
+	ListCell   *lc;
+
+	if (bms_is_empty(batchedrelids))
+		return NIL;
+
+	foreach(lc, pclauses)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+		RestrictInfo *batched = yb_get_batched_restrictinfo(rinfo,
+														   batchedrelids,
+														   inner_relids);
+
+		if (batched != NULL)
+			candidates = lappend(candidates, batched->right_relids);
+	}
+
+	return yb_add_batched_groups(NIL, candidates, batchedrelids);
+}
+
+/*
+ * yb_ppi_add_batched_groups
+ *	  Add groups to a cached ParamPathInfo and return it.
+ *
+ * The groups depend on which input paths a path is built from, while the
+ * ParamPathInfo is shared by every path of its parameterization, so they are
+ * accumulated rather than left to whichever path came first.  That is the safe
+ * direction -- a path carrying a group it does not need only loses batching, a
+ * missing one loses rows -- and it keeps the groups out of the cache identity,
+ * where a second ParamPathInfo per parameterization would break the shared
+ * ppi_rows the cache exists for.
+ */
+static ParamPathInfo *
+yb_ppi_add_batched_groups(ParamPathInfo *ppi, List *groups,
+						  Relids batchedrelids)
+{
+	ppi->yb_ppi_batched_groups =
+		yb_add_batched_groups(ppi->yb_ppi_batched_groups, groups,
+							  batchedrelids);
+	return ppi;
+}
+
+/*
+ * yb_groups_within
+ *	  The groups in groups whose relations all lie in relids.
+ *
+ * A group names every batched relation one batched expression reads, so a
+ * path that is not parameterized by all of them cannot be evaluating that
+ * expression, and the group does not constrain it.
+ */
+static List *
+yb_groups_within(List *groups, Relids relids)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, groups)
+	{
+		if (bms_is_subset((Relids) lfirst(lc), relids))
+			result = lappend(result, lfirst(lc));
+	}
+
+	return result;
+}
+
+/*
+ * yb_add_batched_groups
+ *	  Append each group in more to groups, trimmed to batchedrelids, skipping
+ *	  the ones that no longer constrain anything or are already listed.
+ *
+ * De-duplicating keeps the list from growing once per join level per input.
+ */
+static List *
+yb_add_batched_groups(List *groups, List *more, Relids batchedrelids)
+{
+	ListCell   *lc;
+
+	foreach(lc, more)
+	{
+		Relids		group = bms_intersect((Relids) lfirst(lc), batchedrelids);
+		ListCell   *lc2;
+		bool		found = false;
+
+		if (bms_membership(group) != BMS_MULTIPLE)
+		{
+			bms_free(group);
+			continue;
+		}
+
+		foreach(lc2, groups)
+		{
+			if (bms_equal((Relids) lfirst(lc2), group))
+			{
+				found = true;
+				break;
+			}
+		}
+
+		if (found)
+			bms_free(group);
+		else
+			groups = lappend(groups, group);
+	}
+
+	return groups;
 }

@@ -34,7 +34,6 @@
 #include "utils/syscache.h"
 
 
-static void RelationBuildPartitionKey(Relation relation);
 static List *generate_partition_qual(Relation rel);
 
 /*
@@ -74,7 +73,7 @@ RelationGetPartitionKey(Relation rel)
  * that some of our callees allocate memory on their own which would be leaked
  * permanently.
  */
-static void
+void
 RelationBuildPartitionKey(Relation relation)
 {
 	Form_pg_partitioned_table form;

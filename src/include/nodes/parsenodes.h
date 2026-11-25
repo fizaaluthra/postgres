@@ -47,6 +47,7 @@ typedef enum SortByDir
 	SORTBY_ASC,
 	SORTBY_DESC,
 	SORTBY_USING,				/* not allowed in CREATE INDEX ... */
+	SORTBY_HASH
 } SortByDir;
 
 typedef enum SortByNulls
@@ -783,6 +784,9 @@ typedef struct TableLikeClause
 	RangeVar   *relation;
 	uint32		options;		/* OR of TableLikeOption flags */
 	Oid			relationOid;	/* If table has been looked up, its OID */
+
+	/* YB */
+	Oid			yb_tablespaceOid;	/* Yugabyte also needs info on where it is */
 } TableLikeClause;
 
 typedef enum TableLikeOption
@@ -805,6 +809,12 @@ typedef enum TableLikeOption
  * For a plain index attribute, 'name' is the name of the table column to
  * index, and 'expr' is NULL.  For an index expression, 'name' is NULL and
  * 'expr' is the expression tree.
+ *
+ * When a YugaByte LSM primary key or index declaration contains an attribute
+ * group like "create table (... primary key ((h1, h2, ...) hash, ...))",
+ * the attribute group is first represented as an IndexElem with 'h1', 'h2',
+ * ... in 'yb_yname_list'. The attribute group is then flattened as a list of
+ * IndexElem's the relevant the grammar rules.
  */
 typedef struct IndexElem
 {
@@ -1280,6 +1290,14 @@ typedef struct RangeTblEntry
 	bool		inFromCl pg_node_attr(query_jumble_ignore);
 	/* security barrier quals to apply, if any */
 	List	   *securityQuals pg_node_attr(query_jumble_ignore);
+
+	/* YB */
+	/* alias to use for hinting - unique across a query */
+	char	   *ybHintAlias pg_node_attr(query_jumble_ignore);
+	/* unique identifer (across all blocks) for a base rel - starting at '1' */
+	uint32		ybUniqueBaseId pg_node_attr(query_jumble_ignore);
+	char	   *ybScannedObjectName pg_node_attr(query_jumble_ignore);
+	char	   *ybSchemaName pg_node_attr(query_jumble_ignore);
 } RangeTblEntry;
 
 /*
@@ -2367,6 +2385,7 @@ typedef enum ObjectType
 	OBJECT_STATISTIC_EXT,
 	OBJECT_TABCONSTRAINT,
 	OBJECT_TABLE,
+	OBJECT_YBTABLEGROUP,
 	OBJECT_TABLESPACE,
 	OBJECT_TRANSFORM,
 	OBJECT_TRIGGER,
@@ -2377,6 +2396,7 @@ typedef enum ObjectType
 	OBJECT_TYPE,
 	OBJECT_USER_MAPPING,
 	OBJECT_VIEW,
+	OBJECT_YBPROFILE,
 } ObjectType;
 
 /* ----------------------
@@ -2483,6 +2503,8 @@ typedef enum AlterTableType
 	AT_SetIdentity,				/* SET identity column options */
 	AT_DropIdentity,			/* DROP IDENTITY */
 	AT_ReAddStatistics,			/* internal to commands/tablecmds.c */
+	AT_YbAlterIndexAttributeType, /* YB: update index pg_attribute entries
+								   * in place for ALTER TYPE, when possible */
 } AlterTableType;
 
 typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
@@ -2499,6 +2521,14 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	DropBehavior behavior;		/* RESTRICT or CASCADE for DROP cases */
 	bool		missing_ok;		/* skip error if missing? */
 	bool		recurse;		/* exec-time recursion */
+
+	/* YB */
+	bool		yb_is_add_primary_key;	/* checks if adding primary key */
+	bool		yb_cascade;		/* to restrict movement of single table in
+								 * colocated tablespace */
+	Oid			yb_old_index_oid; /* OID of old index; used to identify the
+								   * index for in-place pg_attribute update
+								   * during ALTER TYPE */
 } AlterTableCmd;
 
 /* Ad-hoc node for AT_AlterConstraint */
@@ -2764,6 +2794,10 @@ typedef struct CreateStmt
 	char	   *tablespacename; /* table space to use, or NULL */
 	char	   *accessMethod;	/* table access method */
 	bool		if_not_exists;	/* just do nothing if it already exists? */
+
+	/* YB */
+	char	   *tablegroupname; /* tablegroup to use, or NULL */
+	struct YbOptSplit *split_options;	/* SPLIT statement options */
 } CreateStmt;
 
 /* ----------
@@ -2878,7 +2912,80 @@ typedef struct Constraint
 									 * self */
 
 	ParseLoc	location;		/* token location, or -1 if unknown */
+
+	/*
+	 * For YugaByte LSM primary or unique key defined inline with the table
+	 * definition, we allow the key definition to include the sorting info
+	 * like "create table (... primary key (h hash, r1 asc, r2 desc))". We
+	 * save the IndexElem of the attributes in 'yb_index_params' to access the
+	 * full definition of the key attributes.
+	 */
+	List	   *yb_index_params pg_node_attr(query_jumble_ignore);	/* IndexElem nodes of UNIQUE or PRIMARY KEY constraint */
 } Constraint;
+
+/* ----------
+ * YugaByte split parameters in CreateStmt
+ *
+ * In YugaByte, tables are split into a certain number of tablets.
+ * This normally happens automatically behind the scenes, but there is
+ * a SPLIT extension that allows the user to specify the number of tablets
+ * (in the case of a HASH-partitioned table) or explicit split points
+ * (in the case of a range-partitioned table).
+ * ----------
+ */
+
+typedef enum YbSplitType
+{
+	NUM_TABLETS = 0,
+	SPLIT_POINTS = 1
+} YbSplitType;
+
+typedef struct YbOptSplit
+{
+	NodeTag		type;
+
+	YbSplitType split_type;
+	int			num_tablets;
+	List	   *split_points;
+} YbOptSplit;
+
+/* ----------------------
+ *		Create/Drop Profile Statements
+ * ----------------------
+ */
+
+typedef struct YbCreateProfileStmt
+{
+	NodeTag		type;
+	char	   *prfname;
+	Integer    *prffailedloginattempts;
+} YbCreateProfileStmt;
+
+typedef struct YbDropProfileStmt
+{
+	NodeTag		type;
+	char	   *prfname;
+	bool		missing_ok;		/* skip error if missing? */
+} YbDropProfileStmt;
+
+/* ----------------------
+ *		Create/Drop Tablegroup Statements
+ * ----------------------
+ */
+
+typedef struct YbCreateTableGroupStmt
+{
+	NodeTag		type;
+	char	   *tablegroupname;
+	RoleSpec   *owner;
+	List	   *options;
+	char	   *tablespacename;
+	/*
+	 * Whether this tablegroup is created implicitly by YB
+	 * or created explicitly by users.
+	 */
+	bool		implicit;
+} YbCreateTableGroupStmt;
 
 /* ----------------------
  *		Create/Drop Table Space Statements
@@ -2917,6 +3024,8 @@ typedef struct AlterTableMoveAllStmt
 	List	   *roles;			/* List of roles to move objects of */
 	char	   *new_tablespacename;
 	bool		nowait;
+	RangeVar   *yb_relation;
+	bool		yb_cascade;
 } AlterTableMoveAllStmt;
 
 /* ----------------------
@@ -3509,10 +3618,16 @@ typedef struct IndexStmt
 	bool		deferrable;		/* is the constraint DEFERRABLE? */
 	bool		initdeferred;	/* is the constraint INITIALLY DEFERRED? */
 	bool		transformed;	/* true when transformIndexStmt is finished */
-	bool		concurrent;		/* should this be a concurrent index build? */
+	YbConcurrencyContext concurrent;	/* is this a concurrent index build? */
 	bool		if_not_exists;	/* just do nothing if index already exists? */
 	bool		reset_default_tblspc;	/* reset default_tablespace prior to
 										 * executing */
+
+	/* YB */
+	YbOptSplit *split_options;	/* SPLIT statement options */
+	Oid			yb_index_old_relfilenode;	/* relfilenode of the dropped index
+											 * this stmt recreates (ALTER
+											 * COLUMN TYPE), if any */
 } IndexStmt;
 
 /* ----------------------
@@ -4128,6 +4243,37 @@ typedef struct ReindexStmt
 	const char *name;			/* name of database to reindex */
 	List	   *params;			/* list of DefElem nodes */
 } ReindexStmt;
+
+/* ----------------------
+ *		BACKFILL INDEX Statement
+ * ----------------------
+ */
+
+/*
+ * YbRowBounds - row bounds for BACKFILL INDEX statement
+ */
+typedef struct YbRowBounds
+{
+	NodeTag		type;
+	const char *partition_key;	/* Partition key of tablet containing bound */
+	const char *row_key_start;	/* Starting row of bound (inclusive) */
+	const char *row_key_end;	/* Ending row of bound (exclusive) */
+} YbRowBounds;
+
+typedef struct YbBackfillInfo
+{
+	NodeTag		type;
+	const char *bfinstr;		/* Backfill instruction */
+	uint64		read_time;		/* Read time for backfill */
+	YbRowBounds *row_bounds;	/* Rows to backfill */
+} YbBackfillInfo;
+
+typedef struct YbBackfillIndexStmt
+{
+	NodeTag		type;
+	List	   *oid_list;		/* Oids of indexes to backfill */
+	YbBackfillInfo *bfinfo;
+} YbBackfillIndexStmt;
 
 /* ----------------------
  *		CREATE CONVERSION Statement

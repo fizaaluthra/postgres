@@ -19,6 +19,9 @@
 #include "pg_upgrade.h"
 #include "common/unicode_version.h"
 
+/* YB includes */
+#include "lib/stringinfo.h"
+
 static void check_new_cluster_is_empty(void);
 static void check_is_install_user(ClusterInfo *cluster);
 static void check_for_unsupported_encodings(ClusterInfo *cluster);
@@ -40,6 +43,24 @@ static void check_old_cluster_for_valid_slots(void);
 static void check_old_cluster_subscription_state(void);
 static void check_old_cluster_global_names(ClusterInfo *cluster);
 static void check_for_oldestxid_consistency(ClusterInfo *cluster);
+
+/* YB functions */
+static void yb_check_upgrade_compatibility_guc(PGconn *old_cluster_conn);
+static void yb_check_system_databases_exist(PGconn *old_cluster_conn);
+static void yb_check_user_attributes(PGconn *old_cluster_conn,
+									 const char *user_name,
+									 const char **role_attrs);
+static void yb_check_yugabyte_user(PGconn *old_cluster_conn);
+static void yb_check_old_cluster_user(PGconn *old_cluster_conn);
+static void yb_check_invalid_indexes();
+static void yb_check_installed_extensions();
+static void yb_check_pgcrypto_schema();
+static void yb_check_yb_role_prefix();
+static void yb_check_removed_renamed_catalog_acls();
+static void yb_check_stale_acl_grantors();
+static void yb_check_pg_stat_monitor(void);
+
+#define YB_SUPERUSER  "yb_superuser"
 
 /*
  * DataTypesUsageChecks - definitions of data type checks for the old cluster
@@ -437,13 +458,13 @@ process_data_type_check(DbInfo *dbinfo, PGresult *res, void *arg)
 	if ((script = fopen_priv(output_path, "a")) == NULL)
 		pg_fatal("could not open file \"%s\": %m", output_path);
 
-	fprintf(script, "In database: %s\n", dbinfo->db_name);
+	yb_fprintf_and_log(script, "In database: %s\n", dbinfo->db_name);
 
 	for (int rowno = 0; rowno < ntups; rowno++)
-		fprintf(script, "  %s.%s.%s\n",
-				PQgetvalue(res, rowno, i_nspname),
-				PQgetvalue(res, rowno, i_relname),
-				PQgetvalue(res, rowno, i_attname));
+		yb_fprintf_and_log(script, "  %s.%s.%s\n",
+						   PQgetvalue(res, rowno, i_nspname),
+						   PQgetvalue(res, rowno, i_relname),
+						   PQgetvalue(res, rowno, i_attname));
 
 	fclose(script);
 }
@@ -531,8 +552,13 @@ check_for_data_types_usage(ClusterInfo *cluster)
 
 	if (report)
 	{
-		pg_fatal("Data type checks failed: %s", report->data);
+		yb_fatal("Data type checks failed: %s", report->data);
 		destroyPQExpBuffer(report);
+	}
+	else
+	{
+		/* YB: yb_fatal() returns in --check mode, so report ok only here. */
+		check_ok();
 	}
 
 	for (int i = 0; i < n_data_types_usage_checks; i++)
@@ -542,8 +568,6 @@ check_for_data_types_usage(ClusterInfo *cluster)
 	}
 	pg_free(queries);
 	pg_free(states);
-
-	check_ok();
 }
 
 /*
@@ -597,8 +621,26 @@ check_and_dump_old_cluster(void)
 {
 	/* -- OLD -- */
 
-	if (!user_opts.live_check)
+	if (!is_yugabyte_enabled() && !user_opts.live_check)
 		start_postmaster(&old_cluster, true);
+
+	if (is_yugabyte_enabled())
+	{
+		PGconn	   *old_cluster_conn = connectToServer(&old_cluster, "template1");
+
+		/*
+		 * --check can be run any time before the upgrade. Upgrade Compatibility
+		 * GUC is only required to be set during the actual upgrade.
+		 */
+		if (!user_opts.check)
+			yb_check_upgrade_compatibility_guc(old_cluster_conn);
+
+		yb_check_old_cluster_user(old_cluster_conn);
+		yb_check_yugabyte_user(old_cluster_conn);
+		yb_check_system_databases_exist(old_cluster_conn);
+
+		PQfinish(old_cluster_conn);
+	}
 
 	/*
 	 * First check that all databases allow connections since we'll otherwise
@@ -625,7 +667,10 @@ check_and_dump_old_cluster(void)
 	 */
 	get_db_rel_and_slot_infos(&old_cluster);
 
-	init_tablespaces();
+	/* YB: Enable these checks and other functions to initialize new node */
+	if (!is_yugabyte_enabled())
+		/* Yugabyte does not support tablespace directories */
+		init_tablespaces();
 
 	get_loadable_libraries();
 
@@ -633,10 +678,18 @@ check_and_dump_old_cluster(void)
 	/*
 	 * Check for various failure cases
 	 */
-	check_is_install_user(&old_cluster);
-	check_for_prepared_transactions(&old_cluster);
-	check_for_oldestxid_consistency(&old_cluster);
-	check_for_isn_and_int8_passing_mismatch(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* In Yugabyte this is handled by yb_check_yugabyte_user */
+		check_is_install_user(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* Yugabyte does not support prepared transactions, see #1125 */
+		check_for_prepared_transactions(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* YB: there is no clog or multixact data to protect */
+		check_for_oldestxid_consistency(&old_cluster);
+	if (!is_yugabyte_enabled())
+		/* YB: See comment above call to check_cluster_compatibility */
+		check_for_isn_and_int8_passing_mismatch(&old_cluster);
 
 	if (GET_MAJOR_VERSION(old_cluster.major_version) >= 1700)
 	{
@@ -669,7 +722,11 @@ check_and_dump_old_cluster(void)
 	 * because the user-defined functions used by the encoding conversions
 	 * need to be changed to match the new signature.
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1300)
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 1300)
+		/*
+		 * CREATE CONVERSION is not supported by YB,
+		 * cannot have user-defined encoding conversions.
+		 */
 		check_for_user_defined_encoding_conversions(&old_cluster);
 
 	/*
@@ -689,8 +746,9 @@ check_and_dump_old_cluster(void)
 	/*
 	 * Pre-PG 12 allowed tables to be declared WITH OIDS, which is not
 	 * supported anymore. Verify there are none, iff applicable.
+	 * In Yugabyte, this was not allowed.
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 1100)
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 1100)
 		check_for_tables_with_oids(&old_cluster);
 
 	/*
@@ -720,15 +778,27 @@ check_and_dump_old_cluster(void)
 	 * Pre-PG 10 allowed tables with 'unknown' type columns and non WAL logged
 	 * hash indexes
 	 */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 906)
+	/* These checks are irrelevant for Yugabyte (Pre-PG11 checks) */
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 906)
 	{
 		if (user_opts.check)
 			old_9_6_invalidate_hash_indexes(&old_cluster, true);
 	}
 
 	/* 9.5 and below should not have roles starting with pg_ */
-	if (GET_MAJOR_VERSION(old_cluster.major_version) <= 905)
+	if (!is_yugabyte_enabled() && GET_MAJOR_VERSION(old_cluster.major_version) <= 905)
 		check_for_pg_role_prefix(&old_cluster);
+
+	yb_check_invalid_indexes();
+	yb_check_pg_stat_monitor();
+	yb_check_installed_extensions();
+	yb_check_pgcrypto_schema();
+	yb_check_yb_role_prefix();
+	yb_check_removed_renamed_catalog_acls();
+	yb_check_stale_acl_grantors();
+
+	if (yb_has_check_fatal)
+		pg_fatal("%s", "");
 
 	/*
 	 * While not a check option, we do this now because this is the only time
@@ -737,7 +807,7 @@ check_and_dump_old_cluster(void)
 	if (!user_opts.check)
 		generate_old_dump();
 
-	if (!user_opts.live_check)
+	if (!is_yugabyte_enabled() && !user_opts.live_check)
 		stop_postmaster(false);
 }
 
@@ -936,6 +1006,24 @@ check_cluster_versions(void)
 	check_ok();
 }
 
+void
+yb_check_cluster_versions(void)
+{
+	if (!user_opts.check)
+		return;
+
+	prep_status("Checking cluster versions");
+
+	/* cluster versions should already have been obtained */
+	Assert(old_cluster.major_version != 0);
+
+	if (GET_MAJOR_VERSION(old_cluster.major_version) != 1500)
+		pg_fatal("This version of the utility can only be used for checking "
+				 "YSQL version 15. The cluster is currently on YSQL version %s",
+				 old_cluster.major_version_str);
+
+	check_ok();
+}
 
 void
 check_cluster_compatibility(void)
@@ -1224,7 +1312,7 @@ check_for_connection_status(ClusterInfo *cluster)
 				if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
 					pg_fatal("could not open file \"%s\": %m", output_path);
 
-				fprintf(script, "%s\n", datname);
+				yb_fprintf_and_log(script, "%s\n", datname);
 			}
 		}
 	}
@@ -1236,8 +1324,9 @@ check_for_connection_status(ClusterInfo *cluster)
 	if (script)
 	{
 		fclose(script);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("All non-template0 databases must allow connections, i.e. their\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("All non-template0 databases must allow connections, i.e. their\n"
 				 "pg_database.datallowconn must be true and pg_database.datconnlimit\n"
 				 "must not be -2.  Your installation contains non-template0 databases\n"
 				 "which cannot be connected to.  Consider allowing connection for all\n"
@@ -1288,7 +1377,7 @@ check_for_unsupported_encodings(ClusterInfo *cluster)
 			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
 				pg_fatal("could not open file \"%s\": %m", output_path);
 
-			fprintf(script, "%s\n", datname);
+			yb_fprintf_and_log(script, "%s\n", datname);
 		}
 	}
 	PQclear(res);
@@ -1297,8 +1386,9 @@ check_for_unsupported_encodings(ClusterInfo *cluster)
 	if (script)
 	{
 		fclose(script);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains databases using encodings that are\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains databases using encodings that are\n"
 				 "no longer supported.  Consider dumping and restoring with UTF8.\n"
 				 "A list of databases with unsupported encodings is in the file:\n"
 				 "    %s", output_path);
@@ -1505,8 +1595,9 @@ check_for_user_defined_postfix_ops(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains user-defined postfix operators, which are not\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains user-defined postfix operators, which are not\n"
 				 "supported anymore.  Consider dropping the postfix operators and replacing\n"
 				 "them with prefix operators or function calls.\n"
 				 "A list of user-defined postfix operators is in the file:\n"
@@ -1630,8 +1721,9 @@ check_for_incompatible_polymorphics(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains user-defined objects that refer to internal\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains user-defined objects that refer to internal\n"
 				 "polymorphic functions with arguments of type \"anyarray\" or \"anyelement\".\n"
 				 "These user-defined objects must be dropped before upgrading and restored\n"
 				 "afterwards, changing them to refer to the new corresponding functions with\n"
@@ -1735,14 +1827,14 @@ process_inconsistent_notnull(DbInfo *dbinfo, PGresult *res, void *arg)
 		(report->file = fopen_priv(report->path, "w")) == NULL)
 		pg_fatal("could not open file \"%s\": %m", report->path);
 
-	fprintf(report->file, "In database: %s\n", dbinfo->db_name);
+	yb_fprintf_and_log(report->file, "In database: %s\n", dbinfo->db_name);
 
 	for (int rowno = 0; rowno < ntups; rowno++)
 	{
-		fprintf(report->file, "  %s.%s.%s\n",
-				PQgetvalue(res, rowno, i_nspname),
-				PQgetvalue(res, rowno, i_relname),
-				PQgetvalue(res, rowno, i_attname));
+		yb_fprintf_and_log(report->file, "  %s.%s.%s\n",
+						   PQgetvalue(res, rowno, i_nspname),
+						   PQgetvalue(res, rowno, i_relname),
+						   PQgetvalue(res, rowno, i_attname));
 	}
 }
 
@@ -1787,8 +1879,9 @@ check_for_not_null_inheritance(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains inconsistent NOT NULL constraints.\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains inconsistent NOT NULL constraints.\n"
 				 "If the parent column(s) are NOT NULL, then the child column must\n"
 				 "also be marked NOT NULL, or the upgrade will fail.\n"
 				 "You can fix this by running\n"
@@ -1820,12 +1913,12 @@ process_gist_inet_ops_check(DbInfo *dbinfo, PGresult *res, void *arg)
 		(report->file = fopen_priv(report->path, "w")) == NULL)
 		pg_fatal("could not open file \"%s\": %m", report->path);
 
-	fprintf(report->file, "In database: %s\n", dbinfo->db_name);
+	yb_fprintf_and_log(report->file, "In database: %s\n", dbinfo->db_name);
 
 	for (int rowno = 0; rowno < ntups; rowno++)
-		fprintf(report->file, "  %s.%s\n",
-				PQgetvalue(res, rowno, i_nspname),
-				PQgetvalue(res, rowno, i_relname));
+		yb_fprintf_and_log(report->file, "  %s.%s\n",
+						   PQgetvalue(res, rowno, i_nspname),
+						   PQgetvalue(res, rowno, i_relname));
 }
 
 /*
@@ -1862,8 +1955,9 @@ check_for_gist_inet_ops(ClusterInfo *cluster)
 	if (report.file)
 	{
 		fclose(report.file);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains indexes that use the btree_gist extension's\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains indexes that use the btree_gist extension's\n"
 				 "gist_inet_ops or gist_cidr_ops operator classes, which cannot be\n"
 				 "binary-upgraded.  Replace them with indexes that use the built-in GiST\n"
 				 "inet_ops operator class.\n"
@@ -2707,7 +2801,7 @@ check_old_cluster_global_names(ClusterInfo *cluster)
 			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
 				pg_fatal("could not open file \"%s\": %m", output_path);
 
-			fprintf(script, "%d : %s name = \"%s\"\n", ++count, objtype, objname);
+			yb_fprintf_and_log(script, "%d : %s name = \"%s\"\n", ++count, objtype, objname);
 		}
 	}
 
@@ -2717,8 +2811,9 @@ check_old_cluster_global_names(ClusterInfo *cluster)
 	if (script)
 	{
 		fclose(script);
-		pg_log(PG_REPORT, "fatal");
-		pg_fatal("Your installation contains databases, roles, or tablespaces with names\n"
+		if (!is_yugabyte_enabled())
+			pg_log(PG_REPORT, "fatal");
+		yb_fatal("Your installation contains databases, roles, or tablespaces with names\n"
 				 "with invalid characters (newline or carriage return).  To fix this,\n"
 				 "rename these objects.\n"
 				 "A list of all objects with invalid names is in the file:\n"
@@ -2802,4 +2897,1107 @@ check_for_oldestxid_consistency(ClusterInfo *cluster)
 	PQfinish(conn_template1);
 
 	check_ok();
+}
+
+/*
+ * yb_check_upgrade_compatibility_guc()
+ *
+ * Make sure the yb_major_version_upgrade_compatibility GUC is set to the
+ * correct value.
+ */
+static void
+yb_check_upgrade_compatibility_guc(PGconn *old_cluster_conn)
+{
+	PGresult   *res;
+
+	prep_status("Checking expression pushdown is disabled");
+
+	res = executeQueryOrDie(old_cluster_conn, "SHOW yb_major_version_upgrade_compatibility");
+
+	if (strcmp(PQgetvalue(res, 0, 0), "15"))
+		pg_fatal("yb_major_version_upgrade_compatibility must be set to 15");
+
+	PQclear(res);
+
+	check_ok();
+}
+
+/*
+ * yb_check_system_databases_exist()
+ *
+ *	All the 3 system database should exist before upgrading
+ */
+static void
+yb_check_system_databases_exist(PGconn *old_cluster_conn)
+{
+	PGresult   *res;
+
+	prep_status("Checking for all 3 system databases");
+
+	res = executeQueryOrDie(old_cluster_conn,
+							"VALUES ('template0'), ('template1'), ('yugabyte') EXCEPT SELECT datname FROM pg_database;");
+
+	if (PQntuples(res) != 0)
+		pg_fatal("Missing system database '%s'", PQgetvalue(res, 0, 0));
+
+	PQclear(res);
+
+	check_ok();
+}
+
+/*
+ * yb_check_user_attributes()
+ *
+ *	Make sure the user have the required attributes.
+ */
+static void
+yb_check_user_attributes(PGconn *old_cluster_conn, const char *user_name,
+						 const char **role_attrs)
+{
+	PQExpBufferData buf;
+	PGresult   *res;
+	const char **role_attr;
+	bool		first_attribute = true;
+
+	initPQExpBuffer(&buf);
+	for (role_attr = role_attrs; *role_attr != NULL; role_attr++)
+	{
+		if (!first_attribute)
+			appendPQExpBufferStr(&buf, ", ");
+		first_attribute = false;
+		appendPQExpBufferStr(&buf, *role_attr);
+	}
+
+	res = executeQueryOrDie(old_cluster_conn,
+							"SELECT %s FROM pg_catalog.pg_roles WHERE rolname = '%s'",
+							buf.data, user_name);
+
+	if (PQntuples(res) != 1)
+		pg_fatal("The '%s' user is missing", user_name);
+
+	for (role_attr = role_attrs; *role_attr != NULL; role_attr++)
+	{
+		if (strcmp(PQgetvalue(res, 0, PQfnumber(res, *role_attr)), "f") == 0)
+			pg_fatal("The '%s' user is missing the '%s' attribute", user_name,
+					 *role_attr);
+	}
+
+	termPQExpBuffer(&buf);
+	PQclear(res);
+}
+
+/*
+ * yb_check_yugabyte_user()
+ *
+ *	Make sure yugabyte user has the required attributes.
+ */
+static void
+yb_check_yugabyte_user(PGconn *old_cluster_conn)
+{
+	static const char *role_attrs[] = {
+		"rolsuper",
+		"rolinherit",
+		"rolcreaterole",
+		"rolcreatedb",
+		"rolcanlogin",
+		"rolreplication",
+		"rolbypassrls",
+		NULL,
+	};
+
+	prep_status("Checking attributes of the 'yugabyte' user");
+	yb_check_user_attributes(old_cluster_conn, "yugabyte", role_attrs);
+	check_ok();
+}
+
+/*
+ * yb_check_old_cluster_user()
+ *
+ *	Make sure user used to dump the old cluster has required attributes.
+ */
+static void
+yb_check_old_cluster_user(PGconn *old_cluster_conn)
+{
+	static const char *role_attributes[] = {"rolsuper", "rolcanlogin", NULL};
+
+	/* yugabyte user is checked in yb_check_yugabyte_user */
+	if (strcmp(old_cluster.yb_user, "yugabyte") == 0)
+		return;
+
+	prep_status("Checking attributes of the '%s' user", old_cluster.yb_user);
+	yb_check_user_attributes(old_cluster_conn, old_cluster.yb_user,
+							 role_attributes);
+	check_ok();
+}
+
+static void
+yb_check_invalid_indexes()
+{
+	int			dbnum;
+	bool		found = false;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "invalid_indexes.txt");
+
+	prep_status("Checking for invalid indexes");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_schemaname;
+		int			i_indexname;
+		int			i_indexrelid;
+		bool		db_used = false;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/*
+		 * Query to find invalid indexes that would be excluded by pg_dump.
+		 * pg_dump includes indexes WHERE (indisvalid OR relkind='p') AND indisready
+		 * So we find the negation, which is:
+		 * (NOT indisvalid AND relkind!='p') OR NOT indisready
+		 */
+		res = executeQueryOrDie(conn,
+								"SELECT n.nspname AS schemaname, "
+								"       c.relname AS tablename, "
+								"       i.relname AS indexname, "
+								"       indexrelid "
+								"FROM pg_catalog.pg_index x "
+								"JOIN pg_catalog.pg_class c ON c.oid = x.indrelid "
+								"JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid "
+								"JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+								"WHERE (NOT x.indisvalid AND c.relkind != 'p') OR NOT x.indisready "
+								"ORDER BY n.nspname, c.relname, i.relname");
+
+		ntups = PQntuples(res);
+		i_schemaname = PQfnumber(res, "schemaname");
+		i_indexname = PQfnumber(res, "indexname");
+		i_indexrelid = PQfnumber(res, "indexrelid");
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			const char *schemaname = PQgetvalue(res, rowno, i_schemaname);
+			const char *indexname = PQgetvalue(res, rowno, i_indexname);
+
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s", output_path,
+						 strerror(errno));
+			if (!db_used)
+			{
+				yb_fprintf_and_log(script, "In database: %s\n",
+								   active_db->db_name);
+				db_used = true;
+			}
+			yb_fprintf_and_log(script, "  %s.%s (oid=%s)\n",
+							   PQgetvalue(res, rowno, i_schemaname),
+							   PQgetvalue(res, rowno, i_indexname),
+							   PQgetvalue(res, rowno, i_indexrelid));
+			yb_fprintf_and_log(script, "    \\c %s\n", active_db->db_name);
+			yb_fprintf_and_log(script, "    DROP INDEX %s.%s;\n", schemaname, indexname);
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (found)
+	{
+		yb_fatal("Your installation contains invalid indexes that must be fixed\n"
+				 "before upgrading. Invalid indexes are typically created when\n"
+				 "CREATE INDEX CONCURRENTLY fails or is interrupted. You can fix\n"
+				 "this by dropping the invalid indexes and recreating them if needed.\n"
+				 "To find invalid indexes, run\n"
+				 "  SELECT i.indexrelid::regclass FROM pg_index i\n"
+				 "  JOIN pg_class c ON c.oid = i.indrelid\n"
+				 "  WHERE (NOT i.indisvalid AND c.relkind != 'p') OR NOT i.indisready;\n"
+				 "in all databases.\n"
+				 "A list of invalid indexes and DROP commands is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+static void
+yb_check_installed_extensions()
+{
+	int			dbnum;
+	bool		found = false;
+	StringInfoData error_msg;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+
+	initStringInfo(&error_msg);
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "unsupported_extensions.txt");
+
+	prep_status("Checking installed extensions");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_name;
+		bool		db_used = false;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/* Find installed extensions not in the allowed list */
+		res = executeQueryOrDie(conn,
+								"SELECT extname FROM pg_extension WHERE extname NOT IN "
+								"('auto_explain',"
+								"'file_fdw',"
+								"'fuzzystrmatch',"
+								"'hstore',"
+								"'passwordcheck',"
+								"'pgcrypto',"
+								"'pg_stat_statements',"
+								"'pg_trgm',"
+								"'postgres_fdw',"
+								"'autoinc',"
+								"'insert_username',"
+								"'moddatetime',"
+								"'refint',"
+								"'sslinfo',"
+								"'tablefunc',"
+								"'uuid-ossp',"
+								"'hypopg',"
+								"'orafce',"
+								"'pgaudit',"
+								"'pg_hint_plan',"
+								"'hll',"
+								"'pg_cron',"
+								"'pg_partman',"
+								"'plpgsql',"
+								"'anon',"
+								"'cube',"
+								"'earthdistance',"
+								"'yb_ycql_utils') "
+								"AND extname != 'pg_stat_monitor'");
+		ntups = PQntuples(res);
+		i_name = PQfnumber(res, "extname");
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			const char *extension_name = PQgetvalue(res, rowno, i_name);
+
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s", output_path,
+						 strerror(errno));
+			if (!db_used)
+			{
+				yb_fprintf_and_log(script, "In database: %s\n",
+								   active_db->db_name);
+				db_used = true;
+			}
+			yb_fprintf_and_log(script, "  %s\n", extension_name);
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (found)
+	{
+		yb_fatal("Your installation contains extensions that are not compatible\n"
+				 "with YSQL major version upgrade. Please uninstall the extensions\n"
+				 "using DROP EXTENSION, and reinstall them after the upgrade. A list of\n"
+				 "extensions with problems is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+/*
+ * yb_check_pgcrypto_schema()
+ *
+ * Check that pgcrypto is not installed in the pg_catalog schema.
+ * TODO(#37781): remove once pg19 is master; PG15 sources cannot have it.
+ */
+static void
+yb_check_pgcrypto_schema()
+{
+	int			dbnum;
+	bool		found = false;
+
+	prep_status("Checking for extensions in conflicting schemas");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_extname;
+		int			i_nspname;
+		bool		db_used = false;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		/* Find pgcrypto extension installed in pg_catalog schema */
+		res = executeQueryOrDie(conn,
+								"SELECT e.extname, n.nspname "
+								"FROM pg_extension e "
+								"JOIN pg_namespace n ON e.extnamespace = n.oid "
+								"WHERE e.extname = 'pgcrypto' "
+								"AND n.nspname = 'pg_catalog'");
+		ntups = PQntuples(res);
+		i_extname = PQfnumber(res, "extname");
+		i_nspname = PQfnumber(res, "nspname");
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			found = true;
+			if (!db_used)
+			{
+				pg_log(PG_REPORT, "In database: %s", active_db->db_name);
+				db_used = true;
+			}
+			pg_log(PG_REPORT, "  %s installed in %s schema",
+					PQgetvalue(res, rowno, i_extname),
+					PQgetvalue(res, rowno, i_nspname));
+		}
+
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (found)
+	{
+		yb_fatal("Your installation contains the 'pgcrypto' extension in the\n"
+				"conflicting 'pg_catalog' schema. To proceed with the upgrade, please\n"
+				"uninstall the extension using DROP EXTENSION, and reinstall it into\n"
+				"a different schema (e.g. public).");
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+/*
+ * yb_check_for_yb_role_prefix()
+ *
+ * Check that no roles start with "yb_" prefix which is reserved for system use
+ */
+static void
+yb_check_yb_role_prefix()
+{
+	PGresult   *res;
+	PGconn	   *conn = connectToServer(&old_cluster, "template1");
+	int			ntups;
+	int			i_rolname;
+	FILE	   *script = NULL;
+	char		output_path[MAXPGPATH];
+	bool		found = false;
+
+	prep_status("Checking for roles starting with \"yb_\"");
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "roles_with_yb_prefix.txt");
+
+	/*
+	 * Like in the PG code in this file, the query below hardcodes
+	 * FirstNormalObjectId as 16384 rather than using that C #define
+	 * in the query because, if that #define is ever changed, the cutoff we
+	 * want to use is the value used by old version servers, not that of
+	 * some future version.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT rolname "
+							"FROM pg_catalog.pg_roles "
+							"WHERE rolname ~ '^yb_' "
+							"AND oid >= 16384 "
+							"AND rolname != '%s' "
+							"ORDER BY rolname",
+							YB_SUPERUSER);
+	ntups = PQntuples(res);
+	i_rolname = PQfnumber(res, "rolname");
+
+	if (ntups > 0)
+	{
+		found = true;
+		if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+			pg_fatal("could not open file \"%s\": %s",
+					 output_path, strerror(errno));
+
+		yb_fprintf_and_log(script, "Roles with \"yb_\" prefix:\n");
+		for (int rowno = 0; rowno < ntups; rowno++)
+		{
+			yb_fprintf_and_log(script, "  %s\n",
+							   PQgetvalue(res, rowno, i_rolname));
+		}
+		fclose(script);
+	}
+
+	PQclear(res);
+	PQfinish(conn);
+
+	if (found)
+	{
+		yb_fatal("Your installation contains roles starting with \"yb_\".\n"
+				 "The \"yb_\" prefix is reserved for system use and these roles must be\n"
+				 "dropped or renamed before upgrading. A list of the problematic roles\n"
+				 "is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+		check_ok();
+}
+
+/*
+ * yb_check_stale_acl_grantors()
+ *
+ * Check for ACL entries whose grantor is not the current object owner.
+ */
+static void
+yb_check_stale_acl_grantors()
+{
+	int			dbnum;
+	bool		found = false;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "stale_acl_grantors.txt");
+
+	prep_status("Checking for privileges with stale grantors");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_script;
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+
+		res = executeQueryOrDie(conn,
+			"WITH stale AS ( "
+			"  SELECT p.oid AS oid, "
+			"         '\"' || replace(n.nspname, '\"', '\"\"') || '\".\"' || "
+			"         replace(p.proname, '\"', '\"\"') || '\"(' || "
+			"         pg_get_function_identity_arguments(p.oid) || ')' AS func, "
+			"         '\"' || replace(pg_get_userbyid(p.proowner), '\"', '\"\"') || '\"' AS owner, "
+			"         '\"' || replace(pg_get_userbyid(a.grantor), '\"', '\"\"') || '\"' AS grantor, "
+			"         CASE WHEN a.grantee = 0 THEN 'PUBLIC' "
+			"              ELSE '\"' || replace(pg_get_userbyid(a.grantee), '\"', '\"\"') || '\"' "
+			"         END AS grantee, "
+			"         a.privilege_type AS priv "
+			"  FROM pg_proc p "
+			"  JOIN pg_namespace n ON n.oid = p.pronamespace "
+			"  CROSS JOIN LATERAL aclexplode(p.proacl) a "
+			"  WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') "
+			"    AND a.grantor <> p.proowner "
+			"), "
+			"steps AS ( "
+
+			/* stage 1a: become each stale grantor so we can revoke its grants */
+			"  SELECT oid, func, 1 AS stage, grantor AS grp, 0 AS seq, grantor AS tie, "
+			"         'ALTER FUNCTION ' || func || ' OWNER TO ' || grantor || ';' AS stmt "
+			"    FROM stale GROUP BY oid, func, grantor "
+
+			"  UNION ALL "
+
+			/* stage 1b: revoke what that grantor granted (owner is now the grantor) */
+			"  SELECT oid, func, 1, grantor, 1, grantee, "
+			"         'REVOKE ALL ON FUNCTION ' || func || ' FROM ' || grantee || ';' "
+			"    FROM stale GROUP BY oid, func, grantor, grantee "
+
+			"  UNION ALL "
+
+			/* stage 2: restore the real owner */
+			"  SELECT DISTINCT oid, func, 2, '', 0, '', "
+			"         'ALTER FUNCTION ' || func || ' OWNER TO ' || owner || ';' "
+			"    FROM stale "
+
+			"  UNION ALL "
+
+			/* stage 3: re-grant the preserved privileges from the real owner */
+			"  SELECT oid, func, 3, '', 1, grantee || ' ' || priv, "
+			"         'GRANT ' || priv || ' ON FUNCTION ' || func || ' TO ' || grantee || ';' "
+			"    FROM stale GROUP BY oid, func, grantee, priv "
+			") "
+
+			"SELECT string_agg('    ' || stmt, E'\\n' "
+			"                  ORDER BY stage, grp, seq, tie) AS script "
+			"  FROM steps "
+			" GROUP BY oid, func "
+			" ORDER BY func"
+		);
+		ntups = PQntuples(res);
+		if (ntups > 0)
+		{
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s", output_path,
+						strerror(errno));
+
+			i_script = PQfnumber(res, "script");
+
+			yb_fprintf_and_log(script, "In database: %s\n", active_db->db_name);
+			yb_fprintf_and_log(script, "    \\c %s\n", active_db->db_name);
+
+			for (rowno = 0; rowno < ntups; rowno++)
+				yb_fprintf_and_log(script, "%s\n\n",
+								PQgetvalue(res, rowno, i_script));
+
+		}
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	if (script)
+		fclose(script);
+
+	if (found)
+	{
+		yb_fatal("Your installation contains function privileges whose grantor is not\n"
+				 "the current owner. This can happen when function ownership is changed\n"
+				 "after privileges were granted (for example, ALTER FUNCTION ... OWNER\n"
+				 "TO). These stale ACL entries cause major version upgrade to fail.\n"
+				 "To fix, connect to each database listed below and run the commands\n"
+				 "printed for each affected function.\n"
+				 "A list of affected functions and fix commands is printed above and in\n"
+				 "the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+	{
+		check_ok();
+	}
+}
+
+/* Closes a parenthesis the caller opens. */
+#define YB_ACL_INIT_PRIVS(classoid, objid, objsubid) \
+	"      SELECT initprivs FROM pg_init_privs pip\n" \
+	"      WHERE pip.objoid = " objid "\n" \
+	"        AND pip.classoid = '" classoid "'::regclass\n" \
+	"        AND pip.objsubid = " objsubid ")\n"
+
+/* Shared by the detection query and the mitigation UPDATE of every kind. */
+#define YB_ACL_SKIP_EXTENSION_OWNED(catalog, objid) \
+	"  AND NOT EXISTS (\n" \
+	"      SELECT 1 FROM pg_depend d\n" \
+	"      WHERE d.classid = '" catalog "'::regclass\n" \
+	"        AND d.objid = " objid "\n" \
+	"        AND d.objsubid = 0\n" \
+	"        AND d.deptype = 'e')\n"
+
+#define YB_ACL_SKIP_IF_INIT_PRIVS_MATCH(aclcol, classoid, objid, objsubid) \
+	"  AND " aclcol " IS DISTINCT FROM (\n" \
+	YB_ACL_INIT_PRIVS(classoid, objid, objsubid)
+
+/* Both halves for a kind named by a column of its own catalog. %s is the list. */
+#define YB_ACL_DETECT_SQL(objexpr, aclcol, catalog, scope, objid, objsubid) \
+	"SELECT " objexpr " AS obj,\n" \
+	"       array_to_string(" aclcol ", ', ') AS acl\n" \
+	"FROM " catalog "\n" \
+	"WHERE " scope "\n" \
+	"  AND " objexpr " = ANY(%s::text[])\n" \
+	YB_ACL_SKIP_EXTENSION_OWNED(catalog, objid) \
+	YB_ACL_SKIP_IF_INIT_PRIVS_MATCH(aclcol, catalog, objid, objsubid) \
+	"ORDER BY obj"
+
+#define YB_ACL_FIX_SQL(objexpr, aclcol, catalog, scope, objid, objsubid) \
+	"    UPDATE " catalog " SET " aclcol " = (\n" \
+	YB_ACL_INIT_PRIVS(catalog, objid, objsubid) \
+	"    WHERE " scope "\n" \
+	"      AND " objexpr " = ANY(%s::text[])\n" \
+	YB_ACL_SKIP_EXTENSION_OWNED(catalog, objid) \
+	YB_ACL_SKIP_IF_INIT_PRIVS_MATCH(aclcol, catalog, objid, objsubid) \
+	"    ;\n"
+
+/* Every function's identity, built once by joining pg_type instead of rendering per row. */
+#define YB_ACL_FUNCTION_IDENTS \
+	"WITH idents AS (\n" \
+	"  SELECT p.oid AS oid,\n" \
+	"         p.proname || '(' ||\n" \
+	"         coalesce(string_agg(t.typname::text, ', ' ORDER BY a.ord), '') || ')' AS obj\n" \
+	"  FROM pg_proc p\n" \
+	"  LEFT JOIN LATERAL unnest(p.proargtypes) WITH ORDINALITY AS a(typid, ord) ON true\n" \
+	"  LEFT JOIN pg_type t ON t.oid = a.typid\n" \
+	"  WHERE p.pronamespace = 'pg_catalog'::regnamespace\n" \
+	"  GROUP BY p.oid, p.proname)\n"
+
+/* PG15 objects gone in PG19, keyed on the identity the source renders. */
+#define YB_REMOVED_FUNCTIONS \
+	/* PG16 made pg_get_publication_tables VARIADIC text[]. */ \
+	"\"pg_get_publication_tables(text)\"," \
+	/* PG17 moved checkpoint and backend write counters out of pg_stat_bgwriter. */ \
+	"\"pg_stat_get_bgwriter_buf_written_checkpoints()\"," \
+	"\"pg_stat_get_bgwriter_requested_checkpoints()\"," \
+	"\"pg_stat_get_bgwriter_timed_checkpoints()\"," \
+	"\"pg_stat_get_buf_fsync_backend()\"," \
+	"\"pg_stat_get_buf_written_backend()\"," \
+	"\"pg_stat_get_checkpoint_sync_time()\"," \
+	"\"pg_stat_get_checkpoint_write_time()\"," \
+	/* PG17 changed the interval avg/sum transition state to internal. */ \
+	"\"interval_accum(_interval, interval)\"," \
+	"\"interval_accum_inv(_interval, interval)\"," \
+	"\"interval_avg(_interval)\"," \
+	"\"interval_combine(_interval, _interval)\"," \
+	/* PG17 added a flush argument to pg_logical_emit_message. */ \
+	"\"pg_logical_emit_message(bool, text, bytea)\"," \
+	"\"pg_logical_emit_message(bool, text, text)\"," \
+	/* PG17 removed adminpack and its compatibility functions. */ \
+	"\"pg_read_file_old(text, int8, int8)\"," \
+	"\"pg_rotate_logfile_old()\"," \
+	/* PG17 added a failover argument before the YB lsn type and ordering mode. */ \
+	"\"pg_create_logical_replication_slot(name, name, bool, bool, name, name)\"," \
+	/* PG18 added strip_in_arrays to json_strip_nulls and jsonb_strip_nulls. */ \
+	"\"json_strip_nulls(json)\"," \
+	"\"jsonb_strip_nulls(jsonb)\"," \
+	/* PG18 widened the pg_stat_have_stats objid argument to int8. */ \
+	"\"pg_stat_have_stats(text, oid, oid)\"," \
+	/* PG18 split pg_timezone_abbrevs() into _zone() and _abbrevs(). */ \
+	"\"pg_timezone_abbrevs()\"," \
+	/* PG19 removed the MULE_INTERNAL encoding and its conversion functions. */ \
+	"\"big5_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"euc_cn_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"euc_jp_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"euc_kr_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"euc_tw_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"iso_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"koi8r_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"latin1_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"latin2_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"latin3_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"latin4_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_big5(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_euc_cn(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_euc_jp(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_euc_kr(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_euc_tw(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_iso(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_koi8r(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_latin1(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_latin2(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_latin3(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_latin4(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_sjis(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_win1250(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_win1251(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"mic_to_win866(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"sjis_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"win1250_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"win1251_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	"\"win866_to_mic(int4, int4, cstring, internal, int4, bool)\"," \
+	/* PG19 added a pid argument to pg_replication_origin_session_setup. */ \
+	"\"pg_replication_origin_session_setup(text)\"" \
+
+/* No PG15 pg_catalog relation is gone in PG19. */
+#define YB_REMOVED_RELATIONS \
+	/* empty: every PG15 relation also exists in PG19 */
+
+/* No PG15 pg_catalog type is gone in PG19, since no relation is gone. */
+#define YB_REMOVED_TYPES \
+	/* empty: every PG15 type also exists in PG19 */
+
+/* A column grant sets attacl only, so these are not covered by the relation entry. */
+#define YB_REMOVED_COLUMNS \
+	/* PG17 renamed the ICU locale columns to colllocale and datlocale. */ \
+	"\"pg_collation.colliculocale\"," \
+	"\"pg_database.daticulocale\"," \
+	/* PG17 moved checkpoint and backend write counters out of pg_stat_bgwriter. */ \
+	"\"pg_stat_bgwriter.buffers_backend\"," \
+	"\"pg_stat_bgwriter.buffers_backend_fsync\"," \
+	"\"pg_stat_bgwriter.buffers_checkpoint\"," \
+	"\"pg_stat_bgwriter.checkpoint_sync_time\"," \
+	"\"pg_stat_bgwriter.checkpoint_write_time\"," \
+	"\"pg_stat_bgwriter.checkpoints_req\"," \
+	"\"pg_stat_bgwriter.checkpoints_timed\"," \
+	/* PG17 renamed the dead tuple counters of pg_stat_progress_vacuum. */ \
+	"\"pg_stat_progress_vacuum.max_dead_tuples\"," \
+	"\"pg_stat_progress_vacuum.num_dead_tuples\"," \
+	/* PG18 removed pg_attribute.attcacheoff. */ \
+	"\"pg_attribute.attcacheoff\"," \
+	/* PG18 replaced pg_backend_memory_contexts.parent with path. */ \
+	"\"pg_backend_memory_contexts.parent\"," \
+	/* PG18 moved WAL write and sync counters from pg_stat_wal to pg_stat_io. */ \
+	"\"pg_stat_wal.wal_sync\"," \
+	"\"pg_stat_wal.wal_sync_time\"," \
+	"\"pg_stat_wal.wal_write\"," \
+	"\"pg_stat_wal.wal_write_time\"," \
+	/* PG19 renamed sync_error_count to sync_table_error_count. */ \
+	"\"pg_stat_subscription_stats.sync_error_count\"," \
+	/* pg_stat_statements 1.11 (PG17) renamed blk_*_time; YB global views copy those columns. */ \
+	"\"gv$pg_stat_statements.blk_read_time\"," \
+	"\"gv$pg_stat_statements.blk_write_time\"," \
+	"\"pg_stat_statements_with_server_uuid.blk_read_time\"," \
+	"\"pg_stat_statements_with_server_uuid.blk_write_time\"" \
+
+typedef struct YbRemovedAclKind
+{
+	const char *label;			/* printed for each affected object */
+	const char *detect_sql;
+	const char *fix_sql;
+	const char *objects;
+} YbRemovedAclKind;
+
+static const YbRemovedAclKind yb_removed_acl_kinds[] = {
+	{
+		"Function",
+		YB_ACL_FUNCTION_IDENTS
+		"SELECT i.obj AS obj, array_to_string(p.proacl, ', ') AS acl\n"
+		"FROM idents i JOIN pg_proc p ON p.oid = i.oid\n"
+		"WHERE i.obj = ANY(%s::text[])\n"
+		YB_ACL_SKIP_EXTENSION_OWNED("pg_proc", "p.oid")
+		YB_ACL_SKIP_IF_INIT_PRIVS_MATCH("p.proacl", "pg_proc", "p.oid", "0")
+		"ORDER BY i.obj",
+
+		"    " YB_ACL_FUNCTION_IDENTS
+		"    UPDATE pg_proc SET proacl = (\n"
+		YB_ACL_INIT_PRIVS("pg_proc", "pg_proc.oid", "0")
+		"    WHERE pg_proc.oid IN (SELECT oid FROM idents WHERE obj = ANY(%s::text[]))\n"
+		YB_ACL_SKIP_EXTENSION_OWNED("pg_proc", "pg_proc.oid")
+		YB_ACL_SKIP_IF_INIT_PRIVS_MATCH("proacl", "pg_proc", "pg_proc.oid", "0")
+		"    ;\n",
+		"'{" YB_REMOVED_FUNCTIONS "}'"
+	},
+	{
+		"Relation",
+		YB_ACL_DETECT_SQL("relname", "relacl", "pg_class",
+						  "relnamespace = 'pg_catalog'::regnamespace",
+						  "pg_class.oid", "0"),
+		YB_ACL_FIX_SQL("relname", "relacl", "pg_class",
+					   "relnamespace = 'pg_catalog'::regnamespace",
+					   "pg_class.oid", "0"),
+		"'{" YB_REMOVED_RELATIONS "}'"
+	},
+	{
+		"Type",
+		YB_ACL_DETECT_SQL("typname", "typacl", "pg_type",
+						  "typnamespace = 'pg_catalog'::regnamespace",
+						  "pg_type.oid", "0"),
+		YB_ACL_FIX_SQL("typname", "typacl", "pg_type",
+					   "typnamespace = 'pg_catalog'::regnamespace",
+					   "pg_type.oid", "0"),
+		"'{" YB_REMOVED_TYPES "}'"
+	},
+
+	/* Named from pg_class, so this one cannot use the assembly above. */
+	{
+		"Column",
+		"SELECT c.relname || '.' || a.attname AS obj,\n"
+		"       array_to_string(a.attacl, ', ') AS acl\n"
+		"FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid\n"
+		"WHERE c.relnamespace = 'pg_catalog'::regnamespace\n"
+		"  AND a.attnum > 0 AND NOT a.attisdropped\n"
+		"  AND c.relname || '.' || a.attname = ANY(%s::text[])\n"
+		YB_ACL_SKIP_EXTENSION_OWNED("pg_class", "a.attrelid")
+		YB_ACL_SKIP_IF_INIT_PRIVS_MATCH("a.attacl", "pg_class", "a.attrelid",
+										"a.attnum")
+		"ORDER BY obj",
+
+		"    UPDATE pg_attribute a SET attacl = (\n"
+		YB_ACL_INIT_PRIVS("pg_class", "a.attrelid", "a.attnum")
+		"    WHERE a.attrelid IN (\n"
+		"          SELECT c.oid FROM pg_class c\n"
+		"          WHERE c.relnamespace = 'pg_catalog'::regnamespace)\n"
+		"      AND a.attnum > 0 AND NOT a.attisdropped\n"
+		"      AND (SELECT c.relname FROM pg_class c WHERE c.oid = a.attrelid)\n"
+		"          || '.' || a.attname = ANY(%s::text[])\n"
+		YB_ACL_SKIP_EXTENSION_OWNED("pg_class", "a.attrelid")
+		YB_ACL_SKIP_IF_INIT_PRIVS_MATCH("a.attacl", "pg_class", "a.attrelid",
+										"a.attnum")
+		"    ;\n",
+
+		"'{" YB_REMOVED_COLUMNS "}'"
+	}
+};
+
+/*
+ * yb_check_removed_renamed_catalog_acls()
+ *
+ * Check for modified ACLs on pg_catalog objects removed or renamed in PG16 to PG19.
+ */
+static void
+yb_check_removed_renamed_catalog_acls()
+{
+	int			dbnum;
+	bool		found = false;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "pg_catalog_removed_object_acls.txt");
+
+	prep_status("Checking for modified ACLs on removed catalog objects");
+
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+		bool		db_header_printed = false;
+		bool		affected[lengthof(yb_removed_acl_kinds)];
+		int			kindno;
+
+		for (kindno = 0; kindno < lengthof(yb_removed_acl_kinds); kindno++)
+		{
+			const YbRemovedAclKind *kind = &yb_removed_acl_kinds[kindno];
+			PGresult   *res;
+			int			ntups;
+			int			rowno;
+			int			i_obj;
+			int			i_acl;
+
+			affected[kindno] = false;
+
+			res = executeQueryOrDie(conn, kind->detect_sql, kind->objects);
+
+			ntups = PQntuples(res);
+			if (ntups > 0)
+			{
+				found = true;
+				affected[kindno] = true;
+
+				if (script == NULL &&
+					(script = fopen_priv(output_path, "w")) == NULL)
+					pg_fatal("could not open file \"%s\": %s", output_path,
+							 strerror(errno));
+
+				if (!db_header_printed)
+				{
+					yb_fprintf_and_log(script, "In database: %s\n",
+									   active_db->db_name);
+					db_header_printed = true;
+				}
+
+				i_obj = PQfnumber(res, "obj");
+				i_acl = PQfnumber(res, "acl");
+
+				for (rowno = 0; rowno < ntups; rowno++)
+					yb_fprintf_and_log(script,
+									   "    %s: pg_catalog.%s  ACL: %s\n",
+									   kind->label,
+									   PQgetvalue(res, rowno, i_obj),
+									   PQgetvalue(res, rowno, i_acl));
+			}
+
+			PQclear(res);
+		}
+
+		if (db_header_printed)
+		{
+			yb_fprintf_and_log(script, "    \\c %s\n", active_db->db_name);
+			yb_fprintf_and_log(script, "    SET search_path = pg_catalog;\n");
+			yb_fprintf_and_log(script,
+							   "    SET yb_non_ddl_txn_for_sys_tables_allowed TO on;\n");
+
+			for (kindno = 0; kindno < lengthof(yb_removed_acl_kinds); kindno++)
+			{
+				const YbRemovedAclKind *kind = &yb_removed_acl_kinds[kindno];
+
+				if (!affected[kindno])
+					continue;
+				yb_fprintf_and_log(script, kind->fix_sql, kind->objects);
+			}
+
+			yb_fprintf_and_log(script,
+							   "    RESET yb_non_ddl_txn_for_sys_tables_allowed;\n");
+			yb_fprintf_and_log(script, "    RESET search_path;\n");
+			yb_fprintf_and_log(script, "\n");
+		}
+
+		PQfinish(conn);
+	}
+
+	if (script)
+		fclose(script);
+
+	if (found)
+	{
+		yb_fatal("Your installation contains modified ACL entries on pg_catalog\n"
+				 "objects that are removed or renamed in PostgreSQL 19. This can\n"
+				 "happen when privileges on those objects are changed (for example,\n"
+				 "REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pg_catalog FROM <role>).\n"
+				 "These ACL entries cause major version upgrade to fail.\n"
+				 "To fix, connect to each database listed below and run the commands\n"
+				 "printed for each affected database.\n"
+				 "A list of affected objects and fix commands is printed above and in\n"
+				 "the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+		check_ok();
+}
+
+/*
+ * yb_check_pg_stat_monitor()
+ *
+ * YugabyteDB releases based on PG19 or later do not include pg_stat_monitor.
+ * Refuse to upgrade if the old cluster uses it in any of three ways:
+ *  1. Installed in a database (pg_extension, checked in each database).
+ *  2. Named in shared_preload_libraries or session_preload_libraries in the
+ *     server settings, which the YB-TServer writes from its ysql_pg_conf_csv
+ *     flag.  If we upgrade anyway, that YB-TServer's postgres does not start
+ *     (shared_preload_libraries) or refuses every login
+ *     (session_preload_libraries).
+ *  3. Named in session_preload_libraries set with ALTER ROLE or ALTER
+ *     DATABASE (pg_db_role_setting).  If we upgrade anyway, every login the
+ *     setting applies to fails, and the catalog upgrade fails if its own
+ *     connections are among them.
+ */
+static void
+yb_check_pg_stat_monitor(void)
+{
+	int			dbnum;
+	int			ntups;
+	int			rowno;
+	bool		found = false;
+	char		output_path[MAXPGPATH];
+	FILE	   *script = NULL;
+	PGconn	   *conn;
+	PGresult   *res;
+
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir,
+			 "pg_stat_monitor.txt");
+
+	prep_status("Checking for pg_stat_monitor");
+
+	/*
+	 * 1. Find the database(s) where pg_stat_monitor is installed.  Each
+	 * database has its own pg_extension catalog, so connect to each one and
+	 * ask there.
+	 */
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
+
+		conn = connectToServer(&old_cluster, active_db->db_name);
+		res = executeQueryOrDie(conn,
+								"SELECT 1 FROM pg_catalog.pg_extension "
+								"WHERE extname = 'pg_stat_monitor'");
+		if (PQntuples(res) > 0)
+		{
+			found = true;
+			if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+				pg_fatal("could not open file \"%s\": %s", output_path,
+						 strerror(errno));
+			yb_fprintf_and_log(script, "Installed in database: %s\n",
+							   active_db->db_name);
+		}
+		PQclear(res);
+		PQfinish(conn);
+	}
+
+	conn = connectToServer(&old_cluster, "template1");
+
+	/*
+	 * 2. Find pg_stat_monitor in shared_preload_libraries or
+	 * session_preload_libraries in the server settings.  DROP EXTENSION does
+	 * not remove it from these settings, so check them too:
+	 *  - ysql_pg.conf (pg_file_settings), which the YB-TServer writes from its
+	 *    ysql_pg_conf_csv flag;
+	 *  - the shared_preload_libraries that postgres loaded when it started
+	 *    (current_setting), which can differ from ysql_pg.conf after a flag
+	 *    change at runtime.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT lower(name), setting "
+							"FROM pg_catalog.pg_file_settings "
+							"WHERE lower(name) IN ('shared_preload_libraries', "
+							"'session_preload_libraries') "
+							"AND setting LIKE '%%pg_stat_monitor%%' "
+							"UNION "
+							"SELECT 'shared_preload_libraries', "
+							"current_setting('shared_preload_libraries') "
+							"WHERE current_setting('shared_preload_libraries') "
+							"LIKE '%%pg_stat_monitor%%' "
+							"ORDER BY 1");
+	ntups = PQntuples(res);
+	for (rowno = 0; rowno < ntups; rowno++)
+	{
+		found = true;
+		if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+			pg_fatal("could not open file \"%s\": %s", output_path,
+					 strerror(errno));
+		yb_fprintf_and_log(script, "Server setting: %s = '%s'\n",
+						   PQgetvalue(res, rowno, 0),
+						   PQgetvalue(res, rowno, 1));
+	}
+	PQclear(res);
+
+	/*
+	 * 3. Find pg_stat_monitor in session_preload_libraries set for a role or
+	 * a database.  For example,
+	 *     ALTER ROLE alice SET session_preload_libraries = 'pg_stat_monitor';
+	 * makes every login of alice load pg_stat_monitor, and ALTER DATABASE
+	 * does the same for every connection to one database.
+	 */
+	res = executeQueryOrDie(conn,
+							"SELECT CASE "
+							"WHEN s.setrole = 0 AND s.setdatabase = 0 THEN 'all roles' "
+							"WHEN s.setrole = 0 THEN 'database ' || quote_ident(d.datname) "
+							"WHEN s.setdatabase = 0 THEN 'role ' || quote_ident(r.rolname) "
+							"ELSE 'role ' || quote_ident(r.rolname) || "
+							"' in database ' || quote_ident(d.datname) END, "
+							"substr(c.cfg, strpos(c.cfg, '=') + 1) "
+							"FROM pg_catalog.pg_db_role_setting s "
+							"LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.setrole "
+							"LEFT JOIN pg_catalog.pg_database d ON d.oid = s.setdatabase, "
+							"unnest(s.setconfig) AS c(cfg) "
+							"WHERE lower(split_part(c.cfg, '=', 1)) = 'session_preload_libraries' "
+							"AND c.cfg LIKE '%%pg_stat_monitor%%' "
+							"ORDER BY 1");
+	ntups = PQntuples(res);
+	for (rowno = 0; rowno < ntups; rowno++)
+	{
+		found = true;
+		if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
+			pg_fatal("could not open file \"%s\": %s", output_path,
+					 strerror(errno));
+		yb_fprintf_and_log(script,
+						   "Setting for %s: session_preload_libraries = '%s'\n",
+						   PQgetvalue(res, rowno, 0),
+						   PQgetvalue(res, rowno, 1));
+	}
+	PQclear(res);
+	PQfinish(conn);
+
+	if (script)
+		fclose(script);
+
+	if (found)
+	{
+		yb_fatal("Your installation uses the pg_stat_monitor extension, which the new\n"
+				 "version does not include, so it cannot be reinstalled after the\n"
+				 "upgrade. Before upgrading, remove every use listed above:\n"
+				 "  - Installed in database: run DROP EXTENSION pg_stat_monitor in that\n"
+				 "    database.\n"
+				 "  - Server setting: in the ysql_pg_conf_csv flag (or the deprecated\n"
+				 "    ysql_pg_conf flag) of all YB-TServers and YB-Masters:\n"
+				 "      - remove pg_stat_monitor from that setting, or the whole setting\n"
+				 "        if pg_stat_monitor is its only library;\n"
+				 "      - change the flag where it is stored: the universe's flags in\n"
+				 "        YugabyteDB Anywhere, or else, for example, the flagfile. A\n"
+				 "        change made only at runtime, or only on the nodes of a\n"
+				 "        YugabyteDB Anywhere universe, is lost during the upgrade;\n"
+				 "      - restart them.\n"
+				 "  - Setting for a role or database: remove pg_stat_monitor from it with\n"
+				 "    ALTER ROLE or ALTER DATABASE. If pg_stat_monitor is its only\n"
+				 "    library, use RESET: an empty value makes logins fail.\n"
+				 "The list is printed above and in the file:\n"
+				 "    %s\n\n", output_path);
+	}
+	else
+		check_ok();
 }

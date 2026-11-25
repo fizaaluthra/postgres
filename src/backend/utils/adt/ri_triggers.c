@@ -63,6 +63,16 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/tupconvert.h"
+#include "catalog/catalog.h"
+#include "catalog/yb_type.h"
+#include "executor/execPartition.h"
+#include "executor/ybModifyTable.h"
+#include "fmgr.h"
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 /*
  * Local definitions
  */
@@ -154,11 +164,41 @@ typedef struct RI_ConstraintInfo
 										 * multiranges) */
 	dlist_node	valid_link;		/* Link in list of valid entries */
 
-	Oid			conindid;
+	Oid			conindid;		/* index supporting this constraint */
 	bool		pk_is_partitioned;
 	RI_FastPathState fastpath_state;	/* populated lazily under lock */
 
 	FastPathMeta *fpmeta;
+
+	/*
+	 * The following three fields apply ONLY to foreign key constraints.
+	 *
+	 * yb_is_fk_to_pk_cache_populated is true once yb_cast_paths_valid
+	 * and yb_fk_to_pk_castfinfo are both populated. This avoids repeated
+	 * lookups into pg_cast and pg_proc, if any.
+	 *
+	 * yb_cast_paths_valid is false if the batched DocDB lookup path is not
+	 * possible for this constraint because FK to PK coercion is not possible
+	 * or not supported or disabled by the GUC
+	 * yb_enable_fkey_batched_docdb_lookup_when_types_mismatch when types
+	 * mismatch.
+	 *
+	 * If the batched DocDB lookup path is possible, yb_cast_paths_valid is
+	 * set to true and yb_fk_to_pk_castfinfo[i] caches the cast function
+	 * information for FK->PK coercion for attribute i after looking up the
+	 * pg_cast and pg_proc tables by calling find_coercion_pathway and
+	 * fmgr_info_cxt respectively.
+	 *
+	 * If the coercion is COERCION_PATH_RELABELTYPE, then
+	 * yb_fk_to_pk_castfinfo[i].fn_oid is InvalidOid.
+	 *
+	 * If the coercion is COERCION_PATH_FUNC, then
+	 * yb_fk_to_pk_castfinfo[i].fn_oid is the cast function OID.
+	 */
+	bool		yb_is_fk_to_pk_cache_populated;
+	bool		yb_cast_paths_valid;
+	FmgrInfo	yb_fk_to_pk_castfinfo[RI_MAX_NUMKEYS];	/* The pg_cast & pg_proc
+														 * Cache */
 } RI_ConstraintInfo;
 
 /* Fast-path metadata for RI checks on foreign key referencing tables */
@@ -280,6 +320,8 @@ static bool ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
 static void ri_InitHashTables(void);
 static void InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 											  uint32 hashvalue);
+static void YbInvalidateRIFkPkCastCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
+												uint32 hashvalue);
 static SPIPlanPtr ri_FetchPreparedPlan(RI_QueryKey *key);
 static void ri_HashPreparedPlan(RI_QueryKey *key, SPIPlanPtr plan);
 static int	ri_PushExecutingPlan(SPIPlanPtr plan);
@@ -332,7 +374,313 @@ pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 										   Relation pk_rel, Relation fk_rel,
 										   TupleTableSlot *violatorslot, TupleDesc tupdesc,
 										   int queryno, bool is_restrict, bool partgone);
+static bool YbFkToPkTypePairWhitelisted(Oid pk_typid, Oid fk_typid);
+static bool YbFkColToPkColCoercionPath(Oid pk_typid, Oid fk_typid,
+									   CoercionPathType *pathtype, Oid *castfunc);
+static void YbResetFkToPkCoercionCache(RI_ConstraintInfo *riinfo);
+static void YbPopulateFkToPkCoercionCache(RI_ConstraintInfo *riinfo,
+										  TupleDesc pkdesc, TupleDesc fkdesc);
+static bool YbGetPkDatumFromFkDatum(Datum fk_datum, bool fk_isnull, Oid pk_collation,
+									const FmgrInfo *cast_finfo, Datum *pk_datum, bool *pk_isnull);
 
+static bool
+YbFillPKFromFKSlot(const RI_ConstraintInfo *riinfo, TupleTableSlot *fkslot,
+				   TupleTableSlot *pkslot)
+{
+	Assert(riinfo->yb_is_fk_to_pk_cache_populated);
+	Assert(riinfo->yb_cast_paths_valid);
+
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		const int	fk_attnum = riinfo->fk_attnums[i];
+		const int	pk_attnum = riinfo->pk_attnums[i];
+		Form_pg_attribute pk_attr = TupleDescAttr(pkslot->tts_tupleDescriptor, pk_attnum - 1);
+		bool		fk_isnull;
+		bool		pk_isnull;
+		Datum		fk_datum;
+
+		fk_datum = slot_getattr(fkslot, fk_attnum, &fk_isnull);
+
+		if (!YbGetPkDatumFromFkDatum(fk_datum, fk_isnull, pk_attr->attcollation,
+									 &riinfo->yb_fk_to_pk_castfinfo[i],
+									 &pkslot->tts_values[pk_attnum - 1], &pk_isnull))
+			return false;
+		pkslot->tts_isnull[pk_attnum - 1] = pk_isnull;
+	}
+	ExecStoreVirtualTuple(pkslot);
+	return true;
+}
+
+static Relation
+YbFindIndexRelation(ResultRelInfo *resultRelInfo, Oid indexid)
+{
+	RelationPtr desc = resultRelInfo->ri_IndexRelationDescs;
+	RelationPtr end = desc + resultRelInfo->ri_NumIndices;
+
+	for (; desc != end; ++desc)
+		if (*desc && RelationGetRelid(*desc) == indexid)
+			return *desc;
+
+	/* Should never reach here. */
+	Assert(false);
+	return NULL;
+}
+
+static PartitionTupleRouting *
+YbGetProute(EState *estate, Relation pk_root_rel)
+{
+	ListCell   *lc;
+
+	foreach(lc, estate->yb_es_pk_proutes)
+	{
+		PartitionTupleRouting *proute = lfirst(lc);
+
+		if (YbPartitionTupleRoutingRootRelid(proute) ==
+			RelationGetRelid(pk_root_rel))
+			return proute;
+	}
+
+	/* Could not find proute for pk_root_rel, create one. */
+	MemoryContext oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+	PartitionTupleRouting *proute = ExecSetupPartitionTupleRouting(estate,
+																   pk_root_rel);
+
+	estate->yb_es_pk_proutes = lappend(estate->yb_es_pk_proutes, proute);
+	MemoryContextSwitchTo(oldcxt);
+
+	return proute;
+}
+
+static Relation
+YbFindReferencedPartition(EState *estate, const RI_ConstraintInfo *riinfo,
+						  TupleTableSlot *fkslot, Relation pk_root_rel,
+						  TupleTableSlot *pkslot, bool using_index,
+						  TupleConversionMap **leaf_root_conversion_map)
+{
+	Assert(pk_root_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+	/* Fetch or create PartitionTupleRouting object corresponding to PK. */
+	PartitionTupleRouting *proute = YbGetProute(estate, pk_root_rel);
+
+	/*
+	 * Populate PK slot from FK slot. This should contain
+	 * enough information to perform routing because
+	 *  1. keys of PK's referenced index can be derived from FK slot.
+	 *  2. partition key of PK is a subset of all its unique indexes.
+	 */
+	if (!YbFillPKFromFKSlot(riinfo, fkslot, pkslot))
+		return NULL;
+
+	/* Create ResultRelInfo for pk_rel. */
+	ResultRelInfo pk_root_rri = {0};
+
+	pk_root_rri.ri_RelationDesc = pk_root_rel;
+
+	/* Create dummy ModifyTableState object. */
+	ModifyTableState mtstate = {0};
+
+	mtstate.ps.plan = NULL;
+	mtstate.ps.state = estate;
+	mtstate.mt_nrels = 1;
+	mtstate.resultRelInfo = &pk_root_rri;
+	mtstate.rootResultRelInfo = &pk_root_rri;
+
+	Relation	referenced_rel = NULL;
+
+	/* Get current context, will be helpful during error recovery. */
+	MemoryContext cur_context = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		ResultRelInfo *pk_part_rri = ExecFindPartition(&mtstate, &pk_root_rri,
+													   proute, pkslot, estate);
+
+		MemoryContext oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+
+		*leaf_root_conversion_map = ExecGetChildToRootMap(pk_part_rri);
+		MemoryContextSwitchTo(oldcxt);
+
+		if (!using_index)
+			referenced_rel = pk_part_rri->ri_RelationDesc;
+		else
+		{
+			/* Find the partition's index supporting the FK constraint. */
+			ListCell   *lc;
+
+			foreach(lc, YbRelationGetFKeyReferencedByList(pk_part_rri->ri_RelationDesc))
+			{
+				ForeignKeyCacheInfo *info = lfirst_node(ForeignKeyCacheInfo,
+														lc);
+
+				if (get_ri_constraint_root(info->conoid) !=
+					riinfo->constraint_root_id)
+					continue;
+
+				referenced_rel =
+					YbFindIndexRelation(pk_part_rri, info->ybconindid);
+				break;
+			}
+		}
+		Assert(referenced_rel);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Got an error when trying to find partition. Switch to the original
+		 * context and reset the error state.
+		 */
+		MemoryContextSwitchTo(cur_context);
+		FlushErrorState();
+	}
+	PG_END_TRY();
+
+	return referenced_rel;
+}
+
+/* ----------
+ * YBCBuildYBTupleIdDescriptor -
+ *
+ *	Creates ybctid descriptor for row in referenced relation from tuple in
+ *	referencing relation. Returns NULL if the batched DocDB lookup cannot
+ *	be used (e.g. no implicit/assignment coercion pathway exists, or
+ *	partition routing failed).
+ * ----------
+ */
+static YbcPgYBTupleIdDescriptor *
+YBCBuildYBTupleIdDescriptor(const RI_ConstraintInfo *riinfo,
+							TupleTableSlot *fkslot, EState *estate)
+{
+	if (!riinfo->yb_cast_paths_valid)
+		return NULL;
+
+	Relation	pk_rel = RelationIdGetRelation(riinfo->pk_relid);
+	Relation	pk_idx_rel = RelationIdGetRelation(riinfo->conindid);
+	bool		using_index = (pk_idx_rel->rd_index != NULL &&
+							   !pk_idx_rel->rd_index->indisprimary);
+	Relation	referenced_rel = using_index ? pk_idx_rel : pk_rel;
+
+	/* If PK is partitioned, set referenced_rel to the leaf relation/index. */
+	TupleConversionMap *leaf_root_conversion_map = NULL;
+	TupleTableSlot *pkslot = NULL;
+
+	if (pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		pkslot = MakeTupleTableSlot(RelationGetDescr(pk_rel), &TTSOpsVirtual, 0);
+
+		if (!(referenced_rel = YbFindReferencedPartition(estate, riinfo,
+														 fkslot, pk_rel,
+														 pkslot, using_index,
+														 &leaf_root_conversion_map)))
+		{
+			/*
+			 * Could not find partition. It is best to not use the batched
+			 * lookup optimization. Return NULL.
+			 */
+			ExecDropSingleTupleTableSlot(pkslot);
+			RelationClose(pk_rel);
+			RelationClose(pk_idx_rel);
+			return NULL;
+		}
+	}
+
+	Assert(!using_index ||
+		   IndexRelationGetNumberOfKeyAttributes(referenced_rel) == riinfo->nkeys);
+
+	Oid			referenced_rel_relfilenode_oid = YbGetRelfileNodeId(referenced_rel);
+	Oid			referenced_dboid = YBCGetDatabaseOid(referenced_rel);
+	YbcPgYBTupleIdDescriptor *result;
+
+	result =
+		YBCCreateYBTupleIdDescriptor(referenced_dboid,
+									 referenced_rel_relfilenode_oid,
+									 riinfo->nkeys + (using_index ? 1 : 0));
+	YbcPgAttrValueDescriptor *next_attr = result->attrs;
+
+	YbcPgTableDesc ybc_referenced_table_desc = NULL;
+
+	HandleYBStatus(YBCPgGetTableDesc(referenced_dboid,
+									 referenced_rel_relfilenode_oid,
+									 &ybc_referenced_table_desc));
+
+	TupleDesc	referenced_tupdesc = referenced_rel->rd_att;
+
+	for (int i = 0; i < riinfo->nkeys; ++i, ++next_attr)
+	{
+		int			pk_attnum = riinfo->pk_attnums[i];
+
+		/* If PK relation is partitioned, find partititon's attnum. */
+		if (leaf_root_conversion_map)
+			pk_attnum = leaf_root_conversion_map->attrMap->attnums[pk_attnum - 1];
+		Assert(pk_attnum > 0);
+
+		next_attr->attr_num = (using_index ?
+							   YbGetIndexAttnum(referenced_rel, pk_attnum) :
+							   pk_attnum);
+
+		const FormData_pg_attribute *referenced_attr = TupleDescAttr(referenced_tupdesc,
+																	 next_attr->attr_num - 1);
+
+		next_attr->type_entity = YbDataTypeFromOidMod(next_attr->attr_num,
+													  referenced_attr->atttypid);
+
+		/*
+		 * The foreign key search will happen on referenced_rel so we need to
+		 * use the collation from the referenced_rel column, not from fk_rel
+		 * column.
+		 */
+		next_attr->collation_id = referenced_attr->attcollation;
+
+		if (pkslot)
+		{
+			next_attr->datum = pkslot->tts_values[riinfo->pk_attnums[i] - 1];
+			next_attr->is_null = pkslot->tts_isnull[riinfo->pk_attnums[i] - 1];
+		}
+		else
+		{
+			bool		fk_isnull;
+			Datum		fk_datum;
+			Datum		pk_datum;
+
+			fk_datum = slot_getattr(fkslot, riinfo->fk_attnums[i], &fk_isnull);
+
+			if (!YbGetPkDatumFromFkDatum(fk_datum, fk_isnull, referenced_attr->attcollation,
+										 &riinfo->yb_fk_to_pk_castfinfo[i],
+										 &pk_datum, &next_attr->is_null))
+			{
+				/*
+				 * YB: FK value cannot be coerced to PK type (e.g. int4 32769
+				 * into smallint). Fall back to the SPI FK check so we report
+				 * a foreign key violation like PostgreSQL, not a cast error.
+				 */
+				if (pkslot)
+					ExecDropSingleTupleTableSlot(pkslot);
+				RelationClose(pk_rel);
+				RelationClose(pk_idx_rel);
+				pfree(result);
+				return NULL;
+			}
+			next_attr->datum = pk_datum;
+		}
+
+		YbcPgColumnInfo column_info = {0};
+
+		HandleYBTableDescStatus(YBCPgGetColumnInfo(ybc_referenced_table_desc,
+												   next_attr->attr_num,
+												   &column_info),
+								ybc_referenced_table_desc);
+		YBSetupAttrCollationInfo(next_attr, &column_info);
+	}
+
+	if (using_index)
+		YBCFillUniqueIndexNullAttribute(result);
+
+	if (pkslot)
+		ExecDropSingleTupleTableSlot(pkslot);
+
+	RelationClose(pk_rel);
+	RelationClose(pk_idx_rel);
+	return result;
+}
 
 /*
  * RI_FKey_check -
@@ -357,16 +705,20 @@ RI_FKey_check(TriggerData *trigdata)
 	else
 		newslot = trigdata->tg_trigslot;
 
-	/*
-	 * We should not even consider checking the row if it is no longer valid,
-	 * since it was either deleted (so the deferred check should be skipped)
-	 * or updated (in which case only the latest version of the row should be
-	 * checked).  Test its liveness according to SnapshotSelf.  We need pin
-	 * and lock on the buffer to call HeapTupleSatisfiesVisibility.  Caller
-	 * should be holding pin, but not lock.
-	 */
-	if (!table_tuple_satisfies_snapshot(trigdata->tg_relation, newslot, SnapshotSelf))
-		return PointerGetDatum(NULL);
+	/* For YB relations visibility will be handled by DocDB (storage layer). */
+	if (!IsYBRelation(trigdata->tg_relation))
+	{
+		/*
+		 * We should not even consider checking the row if it is no longer valid,
+		 * since it was either deleted (so the deferred check should be skipped)
+		 * or updated (in which case only the latest version of the row should be
+		 * checked).  Test its liveness according to SnapshotSelf.  We need pin
+		 * and lock on the buffer to call HeapTupleSatisfiesVisibility.  Caller
+		 * should be holding pin, but not lock.
+		 */
+		if (!table_tuple_satisfies_snapshot(trigdata->tg_relation, newslot, SnapshotSelf))
+			return PointerGetDatum(NULL);
+	}
 
 	fk_rel = trigdata->tg_relation;
 
@@ -447,17 +799,48 @@ RI_FKey_check(TriggerData *trigdata)
 	 * relations, on the index and on whether the FK values need a coercion to
 	 * reach the equality operator's input type, require a SPI fallback.
 	 */
-	if (ri_fastpath_is_applicable(riinfo) &&
+	if (!IsYBRelation(fk_rel) && ri_fastpath_is_applicable(riinfo) &&
 		ri_FastPathCheck(riinfo, fk_rel, newslot))
 		return PointerGetDatum(NULL);
-
-	SPI_connect();
 
 	/*
 	 * pk_rel is opened in RowShareLock mode since that's what our eventual
 	 * SELECT FOR KEY SHARE will get on it.
 	 */
 	pk_rel = table_open(riinfo->pk_relid, RowShareLock);
+
+	if (IsYBRelation(pk_rel))
+	{
+		/*
+		 * YB: Use batched DocDB lookup path for FK check in case ybctid for
+		 * row in referenced relation can be built from referencing table
+		 * tuple.
+		 */
+		Assert(trigdata->estate);
+		YbcPgYBTupleIdDescriptor *descr = YBCBuildYBTupleIdDescriptor(riinfo,
+																	  newslot,
+																	  trigdata->estate);
+
+		if (descr)
+		{
+			bool		found = false;
+
+			HandleYBStatus(YBCForeignKeyReferenceExists(descr, YbBuildTableLocalityInfo(fk_rel),
+														&found));
+			pfree(descr);
+			if (!found)
+			{
+				ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CHECK_LOOKUPPK);
+				ri_ReportViolation(riinfo, pk_rel, fk_rel, newslot, NULL, qkey.constr_queryno,
+								   false /* is_restrict */ ,
+								   false /* partgone */ );
+			}
+			table_close(pk_rel, RowShareLock);
+			return PointerGetDatum(NULL);
+		}
+	}
+
+	SPI_connect();
 
 	/* Fetch or prepare a saved plan for the real check */
 	ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CHECK_LOOKUPPK);
@@ -1490,8 +1873,19 @@ ri_set(TriggerData *trigdata, bool is_set_null, int tgkind)
  */
 bool
 RI_FKey_pk_upd_check_required(Trigger *trigger, Relation pk_rel,
-							  TupleTableSlot *oldslot, TupleTableSlot *newslot)
+							  TupleTableSlot *oldslot, TupleTableSlot *newslot,
+							  const YbSkippableEntities *yb_skip_entities)
 {
+
+	/* YB: Check if this trigger is already marked as not needing an update */
+	if (yb_skip_entities && yb_skip_entities->referenced_fkey_list &&
+		list_member_oid(yb_skip_entities->referenced_fkey_list,
+						trigger->tgconstraint))
+	{
+		elog(DEBUG2, "YB: Skipping trigger constraint %s", trigger->tgname);
+		return false;
+	}
+
 	const RI_ConstraintInfo *riinfo;
 
 	riinfo = ri_FetchConstraintInfo(trigger, pk_rel, true);
@@ -1522,8 +1916,18 @@ RI_FKey_pk_upd_check_required(Trigger *trigger, Relation pk_rel,
  */
 bool
 RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
-							  TupleTableSlot *oldslot, TupleTableSlot *newslot)
+							  TupleTableSlot *oldslot, TupleTableSlot *newslot,
+							  const YbSkippableEntities *yb_skip_entities)
 {
+	/* YB: Check if this trigger is marked as not needing an update */
+	if (yb_skip_entities && yb_skip_entities->referencing_fkey_list &&
+		list_member_oid(yb_skip_entities->referencing_fkey_list,
+						trigger->tgconstraint))
+	{
+		elog(DEBUG2, "YB: Skipping trigger constraint %s", trigger->tgname);
+		return false;
+	}
+
 	const RI_ConstraintInfo *riinfo;
 	int			ri_nullcheck;
 
@@ -1680,10 +2084,10 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	{
 		int			attno;
 
-		attno = riinfo->pk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
+		attno = riinfo->pk_attnums[i] - YBGetFirstLowInvalidAttributeNumber(pk_rel);
 		pk_perminfo->selectedCols = bms_add_member(pk_perminfo->selectedCols, attno);
 
-		attno = riinfo->fk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
+		attno = riinfo->fk_attnums[i] - YBGetFirstLowInvalidAttributeNumber(fk_rel);
 		fk_perminfo->selectedCols = bms_add_member(fk_perminfo->selectedCols, attno);
 	}
 
@@ -2364,11 +2768,33 @@ ri_FetchConstraintInfo(Trigger *trigger, Relation trig_rel, bool rel_is_pk)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("MATCH PARTIAL not yet implemented")));
 
+	/*
+	 * YB: On the FK (referencing) table, lazily populate FK->PK coercion
+	 * metadata for the batched DocDB path. Skip on PK-side fetches.
+	 */
+	if (RelationGetRelid(trig_rel) == riinfo->fk_relid &&
+		!riinfo->yb_is_fk_to_pk_cache_populated)
+	{
+		Relation	pk_rel = RelationIdGetRelation(riinfo->pk_relid);
+
+		if (pk_rel != NULL)
+		{
+			if (IsYBRelation(pk_rel))
+				YbPopulateFkToPkCoercionCache(riinfo, RelationGetDescr(pk_rel),
+											  RelationGetDescr(trig_rel));
+
+			RelationClose(pk_rel);
+		}
+	}
+
 	return riinfo;
 }
 
 /*
  * Fetch or create the RI_ConstraintInfo struct for an FK constraint.
+ *
+ * YB: Returns non-const pointer so that we can populate the coercion
+ * cache in ri_FetchConstraintInfo.
  */
 static RI_ConstraintInfo *
 ri_LoadConstraintInfo(Oid constraintOid)
@@ -2458,6 +2884,12 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	riinfo->fastpath_state = RI_FASTPATH_UNKNOWN;
 
 	ReleaseSysCache(tup);
+
+	/*
+	 * YB: reset the FK-to-PK coercion cache. ri_FetchConstraintInfo on the
+	 * FK table repopulates it. Until then, do not read yb_fk_to_pk_castfinfo.
+	 */
+	YbResetFkToPkCoercionCache(riinfo);
 
 	/*
 	 * For efficient processing of invalidation messages below, we keep a
@@ -2589,6 +3021,37 @@ InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 	}
 }
 
+/*
+ * YB: On pg_cast / pg_proc syscache flush, drop all cached FK->PK cast fmgr
+ * state so the next ri_FetchConstraintInfo on the FK table recomputes it.
+ */
+static void
+YbInvalidateRIFkPkCastCacheCallBack(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
+{
+	dlist_iter	iter;
+
+	(void) arg;
+	(void) hashvalue;
+	Assert(cacheid == CASTSOURCETARGET || cacheid == PROCOID);
+	(void) cacheid;
+
+	Assert(ri_constraint_cache != NULL);
+
+	dclist_foreach(iter, &ri_constraint_cache_valid_list)
+	{
+		RI_ConstraintInfo *riinfo = dlist_container(RI_ConstraintInfo,
+													valid_link, iter.cur);
+
+		/*
+		 * YB: invalidate the cache if the cache is populated and the cast
+		 * paths are valid. If the cast paths are not valid, there is no
+		 * need to invalidate the cache because we are not using the pg_cast
+		 * table for this constraint.
+		 */
+		if (riinfo->yb_is_fk_to_pk_cache_populated && riinfo->yb_cast_paths_valid)
+			YbResetFkToPkCoercionCache(riinfo);
+	}
+}
 
 /*
  * Prepare execution plan for a query to enforce an RI restriction
@@ -2765,6 +3228,9 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	{
 		/* Pop qplan, whether the query returned normally or threw an error. */
 		ri_executing_depth = exec_depth;
+
+		/* YB: Restore UID and security context in case of execution failure */
+		SetUserIdAndSecContext(save_userid, save_sec_context);
 	}
 	PG_END_TRY();
 
@@ -3684,6 +4150,26 @@ ri_InitHashTables(void)
 								  InvalidateConstraintCacheCallBack,
 								  (Datum) 0);
 
+
+	if (yb_enable_fkey_batched_docdb_lookup_when_types_mismatch)
+	{
+		/* YB: invalidate cached FK->PK cast paths when pg_cast changes */
+		CacheRegisterSyscacheCallback(CASTSOURCETARGET,
+									  YbInvalidateRIFkPkCastCacheCallBack,
+									  (Datum) 0);
+
+		/*
+		 * YB: invalidate cached FK->PK cast paths when pg_proc changes. However,
+		 * we do not need to invalidate the cache when pg_proc changes because for
+		 * the whitelisted pairs for FK -> PK coercion, all the functions are
+		 * builtin functions or the casts are binary-compatible.
+		 * TODO(aman.mangal): uncomment this when we expand the FK->PK whitelist.
+		 * CacheRegisterSyscacheCallback(PROCOID,
+		 * 							     YbInvalidateRIFkPkCastCacheCallBack,
+		 * 							     (Datum) 0);
+		 */
+	}
+
 	ctl.keysize = sizeof(RI_QueryKey);
 	ctl.entrysize = sizeof(RI_QueryHashEntry);
 	ri_query_cache = hash_create("RI query cache",
@@ -4128,6 +4614,210 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 	return entry;
 }
 
+/*
+ * Whitelist of (FK type -> PK type) pairs allowed for the
+ * batched DocDB lookup path when types do not match.
+ *
+ * Includes: INT2 -> INT4, INT2 -> INT8, INT4 -> INT8
+ *           VARCHAR -> TEXT, TEXT -> VARCHAR
+ *           INT4 -> INT2, INT8 -> INT2, INT8 -> INT4
+ *
+ * SMALLSERIAL, SERIAL, BIGSERIAL have underlying
+ * INT2, INT4, INT8 types respectively.
+ */
+static bool
+YbFkToPkTypePairWhitelisted(Oid pk_typid, Oid fk_typid)
+{
+	switch (pk_typid)
+	{
+		case INT4OID:
+			/* YB: int2->int4 widening; int8->int4 narrowing. */
+			return fk_typid == INT2OID || fk_typid == INT8OID;
+
+		case INT8OID:
+			/* YB: int2/int4->int8 widening. */
+			return fk_typid == INT2OID || fk_typid == INT4OID;
+
+		case INT2OID:
+			/* YB: int4/int8->int2 narrowing. */
+			return fk_typid == INT4OID || fk_typid == INT8OID;
+
+		case VARCHAROID:
+			/* YB: text->varchar implicit cast. */
+			return fk_typid == TEXTOID;
+
+		case TEXTOID:
+			/* YB: varchar->text implicit cast. */
+			return fk_typid == VARCHAROID;
+
+		default:
+			return false;
+	}
+}
+
+/*
+ * Returns whether FK key values can be coerced to PK column types for the YB
+ * batched DocDB lookup path, using the same implicit/assignment rules as ADD FOREIGN
+ * KEY (find_coercion_pathway / pg_cast). On success sets *pathtype and *castfunc
+ * (InvalidOid when no function is required).
+ */
+static bool
+YbFkColToPkColCoercionPath(Oid pk_typid, Oid fk_typid,
+						   CoercionPathType *pathtype, Oid *castfunc)
+{
+	*castfunc = InvalidOid;
+
+	if (pk_typid == fk_typid)
+	{
+		*pathtype = COERCION_PATH_RELABELTYPE;
+		return true;
+	}
+
+	/*
+	 * YB: okay to check the GUC here because it has context PGC_BACKEND and does
+	 * not change once the backend has been created.
+	 */
+	if (!yb_enable_fkey_batched_docdb_lookup_when_types_mismatch)
+		return false;
+
+	if (!YbFkToPkTypePairWhitelisted(pk_typid, fk_typid))
+		return false;
+
+	/*
+	 * In the context of foreign key constraint and for the whitelisted pair
+	 * of types, both implicit and assignment coercion are acceptable.
+	 * We pass COERCION_ASSIGNMENT below because find_coercion_pathway returns
+	 * implicit or assignment path when COERCION_ASSIGNMENT is provided.
+	 */
+	*pathtype = find_coercion_pathway(pk_typid, fk_typid, COERCION_ASSIGNMENT, castfunc);
+
+	return *pathtype == COERCION_PATH_RELABELTYPE || *pathtype == COERCION_PATH_FUNC;
+}
+
+static void
+YbResetFkToPkCoercionCache(RI_ConstraintInfo *riinfo)
+{
+	riinfo->yb_is_fk_to_pk_cache_populated = false;
+	riinfo->yb_cast_paths_valid = false;
+	MemSet(riinfo->yb_fk_to_pk_castfinfo, 0, sizeof(riinfo->yb_fk_to_pk_castfinfo));
+}
+
+/*
+ * Populate yb_fk_to_pk_castfinfo for the RI constraint, using
+ * YbFkColToPkColCoercionPath. On failure, sets yb_cast_paths_valid to
+ * false. The yb_fk_to_pk_castfinfo array is not used when
+ * yb_cast_paths_valid is false. yb_is_fk_to_pk_cache_populated is set
+ * to true in all cases. Callers inspect yb_cast_paths_valid after return.
+ */
+static void
+YbPopulateFkToPkCoercionCache(RI_ConstraintInfo *riinfo, TupleDesc pkdesc, TupleDesc fkdesc)
+{
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		AttrNumber	pk_attnum = riinfo->pk_attnums[i];
+		AttrNumber	fk_attnum = riinfo->fk_attnums[i];
+		Oid			pk_typid;
+		Oid			fk_typid;
+		CoercionPathType pathtype;
+		Oid			castfunc;
+
+		pk_typid = TupleDescAttr(pkdesc, pk_attnum - 1)->atttypid;
+		fk_typid = TupleDescAttr(fkdesc, fk_attnum - 1)->atttypid;
+
+		if (!YbFkColToPkColCoercionPath(pk_typid, fk_typid, &pathtype, &castfunc))
+		{
+			YbResetFkToPkCoercionCache(riinfo);
+
+			/*
+			 * YB: FK -> PK Cast is not possible. Hence, set the yb_cast_paths_valid to false.
+			 * Cache is now populated, there is no need to call YbPopulateFkToPkCoercionCache
+			 * again until it gets invalidated when pg_constraint changes.
+			 */
+			riinfo->yb_is_fk_to_pk_cache_populated = true;
+			riinfo->yb_cast_paths_valid = false;
+			return;
+		}
+
+		/*
+		 * For COERCION_PATH_RELABELTYPE, fmgr_info is not used;
+		 * yb_fk_to_pk_castfinfo[i].fn_oid stays InvalidOid.
+		 */
+		if (pathtype == COERCION_PATH_FUNC)
+		{
+			Assert(OidIsValid(castfunc));
+			fmgr_info_cxt(castfunc, &riinfo->yb_fk_to_pk_castfinfo[i], TopMemoryContext);
+		}
+		else
+			Assert(pathtype == COERCION_PATH_RELABELTYPE);
+	}
+
+	riinfo->yb_cast_paths_valid = true;
+	riinfo->yb_is_fk_to_pk_cache_populated = true;
+}
+
+/*
+ * Get the PK column datum from the FK column datum for DocDB lookup / partition
+ * routing, using a cached fmgr or relabel. On success, sets *pk_datum and
+ * *pk_isnull and returns true. Returns false when the cast would error (e.g.
+ * int4 32769 into smallint); callers should fall back to the standard SPI FK
+ * check path so error messages match PostgreSQL.
+ *
+ * When a cast is required, a new datum is returned in the caller's current
+ * memory context. When a cast is not required, *pk_datum is the same as
+ * fk_datum. The caller cannot free fk_datum after calling this function.
+ *
+ * fk_isnull is going to be false ALWAYS for the case when MATCH is
+ * MATCH_SIMPLE or MATCH_FULL for a foreign key constraint. We currently
+ * do not implement MATCH_PARTIAL. But when we do, fk_isnull can be true for
+ * the case when MATCH is MATCH_PARTIAL for a foreign key constraint.
+ */
+static bool
+YbGetPkDatumFromFkDatum(Datum fk_datum, bool fk_isnull, Oid pk_collation,
+						const FmgrInfo *cast_finfo, Datum *pk_datum, bool *pk_isnull)
+{
+	/* If FK is NULL, PK column is NULL. */
+	if (fk_isnull)
+	{
+		*pk_isnull = true;
+		*pk_datum = (Datum) 0;
+		return true;
+	}
+
+	*pk_isnull = false;
+
+	if (!OidIsValid(cast_finfo->fn_oid))
+	{
+		*pk_datum = fk_datum;
+		return true;
+	}
+
+	MemoryContext cur_context = CurrentMemoryContext;
+	PG_TRY();
+	{
+		/* The caller has already set the right memory context */
+		*pk_datum = DirectFunctionCall1Coll(cast_finfo->fn_addr, pk_collation, fk_datum);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *errdata;
+
+		/*
+		 * ereport(ERROR) leaves CurrentMemoryContext set to ErrorContext.
+		 * Restore the caller's context before continuing.
+		 */
+		MemoryContextSwitchTo(cur_context);
+		errdata = CopyErrorData();
+		elog(DEBUG2,
+			 "YB: FK to PK cast failed during batched DocDB lookup, falling back to SPI FK check: %s",
+			 errdata->message);
+		FreeErrorData(errdata);
+		FlushErrorState();
+		return false;
+	}
+	PG_END_TRY();
+
+	return true;
+}
 
 /*
  * Given a trigger function OID, determine whether it is an RI trigger,
@@ -4206,4 +4896,70 @@ AtEOXact_RI(bool isCommit)
 	ri_executing_depth = 0;
 	if (ri_plan_dead_list != NIL)
 		ri_FreeDeadPlans();
+}
+
+void
+YbAddTriggerFKReferenceIntent(Trigger *trigger, Relation fk_rel,
+							  TupleTableSlot *new_slot, EState *estate,
+							  bool is_deferred)
+{
+	YbcPgYBTupleIdDescriptor *descr;
+
+	/*
+	 * Everything allocated while building and recording the intent, such as
+	 * collation sort keys, is garbage once this returns, so do that work in a
+	 * temporary context. This keeps memory use independent of how often each
+	 * caller resets its memory contexts. State that must outlive the call,
+	 * such as partition routing, must be allocated in a longer-lived context
+	 * explicitly.
+	 */
+	MemoryContext tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+												 "YbAddTriggerFKReferenceIntent",
+												 ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldcxt = MemoryContextSwitchTo(tmpcxt);
+
+	descr =
+		YBCBuildYBTupleIdDescriptor(ri_FetchConstraintInfo(trigger,
+														   fk_rel,
+														   false /* rel_is_pk */ ),
+									new_slot, estate);
+	/*
+	 * Check that ybctid for row in source table can be built from referenced
+	 * table tuple (i.e. the batched DocDB lookup can be used).
+	 */
+	if (descr)
+	{
+		/*
+		 * Foreign key with at least one null value of real (non system) column
+		 * will not be checked, no need to add it into the cache.
+		 */
+		bool		null_found = false;
+
+		for (YbcPgAttrValueDescriptor *attr = descr->attrs,
+			 *end = descr->attrs + descr->nattrs;
+			 attr != end && !null_found; ++attr)
+			null_found = attr->is_null && (attr->attr_num > 0);
+
+		if (!null_found)
+			HandleYBStatus(YBCAddForeignKeyReferenceIntent(descr,
+														   YbBuildTableLocalityInfo(fk_rel),
+														   is_deferred));
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(tmpcxt);
+}
+
+/*
+ * YB: Check if a trigger description contains any non RI trigger.
+ */
+bool
+HasNonRITrigger(const TriggerDesc *trigDesc)
+{
+	for (int i = trigDesc ? trigDesc->numtriggers : 0; i > 0; i--)
+	{
+		if (RI_FKey_trigger_type(trigDesc->triggers[i - 1].tgfoid) == RI_TRIGGER_NONE)
+			return true;
+	}
+	return false;
 }

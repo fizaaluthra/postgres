@@ -25,6 +25,9 @@
 #include "executor/nodeLimit.h"
 #include "miscadmin.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 static void recompute_limits(LimitState *node);
 static int64 compute_tuples_needed(LimitState *node);
 
@@ -85,6 +88,20 @@ ExecLimit(PlanState *pstate)
 			{
 				node->lstate = LIMIT_EMPTY;
 				return NULL;
+			}
+
+			/*
+			 * YB: If the limit is invalid (i.e. noCount = true), we need to
+			 * use the default limit in yb. Otherwise, we use the one
+			 * prescribed by this node.
+			 * The value of the LIMIT clause is captured to be used as the
+			 * limit by pgvector extension if there are any vector index scans.
+			 */
+			if (IsYugaByteEnabled())
+			{
+				pstate->state->yb_exec_params.plan_limit =
+					node->noCount ? 0 : node->count + node->offset;
+				pstate->state->yb_exec_params.vector_limit = node->count;
 			}
 
 			/*

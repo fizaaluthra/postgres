@@ -214,6 +214,18 @@ _equalList(const List *a, const List *b)
 	return true;
 }
 
+/* YB: custom equal for YbUpdateAffectedEntities due to COMPARE_POINTER_FIELD with computed sizes */
+static bool
+_equalYbUpdateAffectedEntities(const YbUpdateAffectedEntities *a,
+							   const YbUpdateAffectedEntities *b)
+{
+	COMPARE_SCALAR_FIELD(matrix.nrows);
+	COMPARE_SCALAR_FIELD(matrix.ncols);
+	COMPARE_POINTER_FIELD(entity_list, a->matrix.ncols * sizeof(struct YbUpdateEntity));
+	COMPARE_POINTER_FIELD(col_info_list, a->matrix.nrows * sizeof(struct YbUpdateColInfo));
+	COMPARE_BITMAPSET_FIELD(matrix.data);
+	return true;
+}
 
 /*
  * equal

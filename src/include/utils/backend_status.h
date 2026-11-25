@@ -17,6 +17,14 @@
 #include "utils/backend_progress.h"
 
 
+/*
+ * YB: The number of attempts to read a BEEntry before proceeding with
+ * inconsistent results. This must be a multiple of YB_BEENTRY_LOGGING_INTERVAL
+ */
+#define YB_MAX_BEENTRIES_ATTEMPTS 1000
+/* YB: How often to log BEEntry read failures */
+#define YB_BEENTRY_LOGGING_INTERVAL 100
+
 /* ----------
  * Backend states
  * ----------
@@ -82,6 +90,31 @@ typedef struct PgBackendGSSStatus
 
 } PgBackendGSSStatus;
 
+
+/*
+ * YbPgBackendCatalogVersionStatus
+ *
+ * Each live backend maintains a YbPgBackendCatalogVersionStatus struct in
+ * shared memory indicating what catalog version it is at.  A backend in the
+ * middle of a query or transaction uses a consistent snapshot of the system
+ * catalog (technically, only the cache does, not direct reads/writes to/from
+ * system catalog).  The catalog version indicates that snapshot.  has_version
+ * is false for backends that are idle (and not in txn) or non-client backends.
+ * catalog_pinned_to_historical_read_time is true while the backend's catalog
+ * is pinned to yb_read_time (YbIsCatalogPinnedToReadTime). Such a backend is
+ * reported as having no version, so DDLs don't wait for it to catch up and the
+ * invalidation messages it never applies don't stay pinned for it. That is
+ * safe because it can't write while yb_read_time is set (pggate rejects write
+ * DML and DDL), so it can't act on a stale catalog.
+ */
+typedef struct YbPgBackendCatalogVersionStatus
+{
+	bool		has_version;	/* whether the backend is using the following
+								 * version */
+	uint64_t	version;		/* if has_version, catalog version that the
+								 * backend is on */
+	bool		catalog_pinned_to_historical_read_time;
+} YbPgBackendCatalogVersionStatus;
 
 /* ----------
  * PgBackendStatus
@@ -174,6 +207,45 @@ typedef struct PgBackendStatus
 
 	/* plan identifier, optionally computed using planner_hook */
 	int64		st_plan_id;
+
+	/* Yugabyte attributes */
+	char	   *st_databasename;	/* Used in YB Mode */
+
+	/*
+	 * YB: Memory usage of backend from TCMalloc, including PostgreSQL memory
+	 * usage + pggate memory usage + cached memory - memory that was freed but
+	 * not recycled
+	 */
+	int64_t		yb_st_allocated_mem_bytes;
+
+	/* YB catalog version */
+	YbPgBackendCatalogVersionStatus yb_st_catalog_version;
+
+	/* YB (pg_client <--> tserver) Session ID */
+	uint64_t	yb_session_id;
+
+	/*
+	 * YB: Logical client connection info provided by YSQL Connection Manager.
+	 *
+	 * When this backend is a CM worker (backend type YB_YSQL_CONN_MGR),
+	 * st_clientaddr is always an AF_UNIX socket and therefore exposes no real
+	 * client IP/port.  These fields carry the per-attach logical-client values
+	 * that Odyssey forwards via the internal yb_conn_mgr_client_* GUCs.
+	 *
+	 * yb_st_cm_client_addr     - IP address string (NUL-terminated), empty
+	 *                            when no client is attached (Option A reset).
+	 * yb_st_cm_client_port     - TCP port (1-65535), or -1 when none.
+	 * yb_st_cm_client_hostname - reverse-DNS hostname (NUL-terminated), empty
+	 *                            when not available.
+	 *
+	 * These fields are only meaningful when yb_st_cm_client_addr[0] != '\0'.
+	 * They are updated atomically (under st_changecount) by the GUC assign
+	 * hooks via yb_pgstat_set_ycm_client_info().
+	 */
+	char		yb_st_cm_client_addr[NI_MAXHOST];
+	int			yb_st_cm_client_port;
+	char		yb_st_cm_client_hostname[NAMEDATALEN];
+
 } PgBackendStatus;
 
 
@@ -191,7 +263,8 @@ typedef struct PgBackendStatus
  *
  * Reader logic should follow this sketch:
  *
- *		for (;;)
+ *		int attempt = 1;
+ *		while (yb_pgstat_log_read_activity(beentry, ++attempt))
  *		{
  *			int before_ct, after_ct;
  *
@@ -280,6 +353,10 @@ typedef struct LocalPgBackendStatus
 	 * cached subtransaction limit.
 	 */
 	bool		backend_subxact_overflowed;
+
+	/* YB: Backend's memory usage */
+	int64_t		yb_backend_rss_mem_bytes;
+	int64_t		yb_backend_pss_mem_bytes;
 } LocalPgBackendStatus;
 
 
@@ -318,6 +395,8 @@ extern void pgstat_report_plan_id(int64 plan_id, bool force);
 extern void pgstat_report_tempfile(size_t filesize);
 extern void pgstat_report_appname(const char *appname);
 extern void pgstat_report_xact_timestamp(TimestampTz tstamp);
+extern void yb_pgstat_set_ycm_client_info(const char *addr, const int *port,
+									   const char *hostname);
 extern const char *pgstat_get_backend_current_activity(int pid, bool checkUser);
 extern const char *pgstat_get_crashed_backend_activity(int pid, char *buffer,
 													   int buflen);
@@ -335,6 +414,16 @@ extern PgBackendStatus *pgstat_get_beentry_by_proc_number(ProcNumber procNumber)
 extern LocalPgBackendStatus *pgstat_get_local_beentry_by_proc_number(ProcNumber procNumber);
 extern LocalPgBackendStatus *pgstat_get_local_beentry_by_index(int idx);
 extern char *pgstat_clip_activity(const char *raw_activity);
+
+/* ----------
+ * YB functions called from backends
+ * ----------
+ */
+extern void yb_pgstat_add_session_info(uint64_t session_id);
+
+extern bool yb_pgstat_log_read_activity(volatile PgBackendStatus *beentry, int attempt);
+
+extern PgBackendStatus *getBackendStatusArray(void);
 
 
 #endif							/* BACKEND_STATUS_H */

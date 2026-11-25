@@ -55,6 +55,8 @@ extern int	compare_path_costs(Path *path1, Path *path2,
 extern int	compare_fractional_path_costs(Path *path1, Path *path2,
 										  double fraction);
 extern void set_cheapest(RelOptInfo *parent_rel);
+extern bool yb_path_contains_gather(Path *path);
+extern bool yb_path_contains_parallel_hash(Path *path);
 extern void add_path(RelOptInfo *parent_rel, Path *new_path);
 extern bool add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 							  Cost startup_cost, Cost total_cost,
@@ -71,6 +73,7 @@ extern Path *create_samplescan_path(PlannerInfo *root, RelOptInfo *rel,
 extern IndexPath *create_index_path(PlannerInfo *root,
 									IndexOptInfo *index,
 									List *indexclauses,
+									List *yb_bitmap_idx_pushdowns,
 									List *indexorderbys,
 									List *indexorderbycols,
 									List *pathkeys,
@@ -78,13 +81,20 @@ extern IndexPath *create_index_path(PlannerInfo *root,
 									bool indexonly,
 									Relids required_outer,
 									double loop_count,
-									bool partial_path);
+									bool partial_path,
+									List *yb_merge_scan_stream_cols);
 extern BitmapHeapPath *create_bitmap_heap_path(PlannerInfo *root,
 											   RelOptInfo *rel,
 											   Path *bitmapqual,
 											   Relids required_outer,
 											   double loop_count,
 											   int parallel_degree);
+extern YbBitmapTablePath *create_yb_bitmap_table_path(PlannerInfo *root,
+													  RelOptInfo *rel,
+													  Path *bitmapqual,
+													  Relids required_outer,
+													  double loop_count,
+													  int parallel_degree);
 extern BitmapAndPath *create_bitmap_and_path(PlannerInfo *root,
 											 RelOptInfo *rel,
 											 List *bitmapquals);
@@ -388,4 +398,22 @@ extern RelOptInfo *build_child_join_rel(PlannerInfo *root,
 
 extern RelAggInfo *create_rel_agg_info(PlannerInfo *root, RelOptInfo *rel,
 									   bool calculate_grouped_rows);
+
+/* YB */
+extern bool yb_has_same_batching_reqs(List *paths);
+extern ParamPathInfo *yb_find_batched_param_path_info(RelOptInfo *rel,
+													  Relids required_outer,
+													  Relids yb_required_batched_outer);
+extern List *yb_clause_batched_groups(List *pclauses,
+									 Relids batchedrelids,
+									 Relids inner_relids);
+extern Path *yb_create_distinct_index_path(PlannerInfo *root,
+										   IndexOptInfo *index,
+										   IndexPath *basepath,
+										   int yb_distinct_prefixlen,
+										   int yb_distinct_nkeys,
+										   double loop_count);
+extern bool ybfindHintAlias(List *ybfindHintAlias, char *hintAlias);
+extern void yb_assign_unique_path_node_id(PlannerInfo *root, Path *path);
+
 #endif							/* PATHNODE_H */

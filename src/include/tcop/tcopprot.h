@@ -74,6 +74,7 @@ extern void die(SIGNAL_ARGS);
 pg_noreturn extern void quickdie(SIGNAL_ARGS);
 extern void StatementCancelHandler(SIGNAL_ARGS);
 pg_noreturn extern void FloatExceptionHandler(SIGNAL_ARGS);
+extern void YbCriticalSignalHandler(SIGNAL_ARGS);
 extern void HandleRecoveryConflictInterrupt(void);
 extern void ProcessClientReadInterrupt(bool blocked);
 extern void ProcessClientWriteInterrupt(bool blocked);
@@ -92,5 +93,9 @@ extern void set_debug_options(int debug_flag,
 extern bool set_plan_disabling_options(const char *arg,
 									   GucContext context, GucSource source);
 extern const char *get_stats_option_name(const char *arg);
+
+/* YB declarations */
+extern bool YBRefreshCacheUsingInvalMsgs();
+extern bool YbIsStatementTransactionStarted(void);
 
 #endif							/* TCOPPROT_H */

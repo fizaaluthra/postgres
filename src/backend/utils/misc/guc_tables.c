@@ -111,6 +111,24 @@
 #include "access/syncscan.h"
 #endif
 
+/* YB includes */
+#include "access/yb_cost.h"
+#include "access/yb_scan_core.h"
+#include "commands/copy.h"
+#include "commands/explain.h"
+#include "commands/explain_state.h"
+#include "commands/yb_analyze.h"
+#include "executor/ybModifyTable.h"
+#include "optimizer/yb_merge_scan.h"
+#include "pg_yb_utils.h"
+#include "replication/walsender.h"
+#include "tcop/pquery.h"
+#include "yb_ash.h"
+#include "yb_qpm.h"
+#include "yb_query_diagnostics.h"
+#include "yb_tcmalloc_utils.h"
+#include "yb_ysql_conn_mgr_helper.h"
+
 /* This value is normally passed in from the Makefile */
 #ifndef PG_KRB_SRVTAB
 #define PG_KRB_SRVTAB ""
@@ -438,6 +456,12 @@ static const struct config_enum_entry password_encryption_options[] = {
 	{NULL, 0, false}
 };
 
+/*
+ * YB: Conn Mgr mirrors these name to enum mappings in
+ * src/odyssey/third_party/machinarium/sources/yb_pg_tls_link_support.h
+ * (yb_mm_tls_protocol_to_pg_enum).  Keep that copy in sync if this table
+ * or enum ssl_protocol_versions in libpq.h changes.
+ */
 static const struct config_enum_entry ssl_protocol_versions_info[] = {
 	{"", PG_TLS_ANY, false},
 	{"TLSv1", PG_TLS1_VERSION, false},
@@ -520,6 +544,82 @@ static const struct config_enum_entry file_extend_method_options[] = {
 	{NULL, 0, false}
 };
 
+/* YB enum-options arrays */
+const struct config_enum_entry yb_batch_detection_mechanism_options[] = {
+	{"detect_by_peeking", DETECT_BY_PEEKING, false},
+	{"assume_all_batch_executions", ASSUME_ALL_BATCH_EXECUTIONS, false},
+	{"ignore_batch_delete_and_update_may_fail", IGNORE_BATCH_DELETE_AND_UPDATE_MAY_FAIL, false},
+	{NULL, 0, false}
+};
+
+const struct config_enum_entry yb_db_history_retention_pin_mode_options[] = {
+	{"none", YB_DB_HISTORY_RETENTION_PIN_MODE_NONE, false},
+	{"ddl_only", YB_DB_HISTORY_RETENTION_PIN_MODE_DDL_ONLY, false},
+	{"all", YB_DB_HISTORY_RETENTION_PIN_MODE_ALL, false},
+	{NULL, 0, false}
+};
+
+const struct config_enum_entry yb_read_after_commit_visibility_options[] = {
+	{"strict", YB_STRICT_READ_AFTER_COMMIT_VISIBILITY, false},
+	{"relaxed", YB_RELAXED_READ_AFTER_COMMIT_VISIBILITY, false},
+	{"deferred", YB_DEFERRED_READ_AFTER_COMMIT_VISIBILITY, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_test_force_parallel_options[] = {
+	{"off", YB_FORCE_PARALLEL_OFF, false},
+	{"prefer", YB_FORCE_PARALLEL_PREFER, false},
+	{"force", YB_FORCE_PARALLEL_FORCE, false},
+	{NULL, 0, false}
+};
+
+const struct config_enum_entry yb_sampling_algorithm_options[] = {
+	{"full_table_scan", YB_SAMPLING_ALGORITHM_FULL_TABLE_SCAN, false},
+	{"block_based_sampling", YB_SAMPLING_ALGORITHM_BLOCK_BASED_SAMPLING, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_cost_model_options[] = {
+	{"off", YB_COST_MODEL_OFF, false},
+	{"on", YB_COST_MODEL_ON, false},
+	{"legacy_mode", YB_COST_MODEL_LEGACY, false},
+	{"legacy_stats_mode", YB_COST_MODEL_LEGACY_STATS, false},
+	{"legacy_bnl_mode", YB_COST_MODEL_LEGACY_BNL, false},
+	{"legacy_stats_bnl_mode", YB_COST_MODEL_LEGACY_STATS_BNL, false},
+	{"legacy_ignore_stats_bnl_mode", YB_COST_MODEL_LEGACY_IGNORE_STATS_BNL, false},
+	{"true", YB_COST_MODEL_ON, true},
+	{"false", YB_COST_MODEL_OFF, true},
+	{"yes", YB_COST_MODEL_ON, true},
+	{"no", YB_COST_MODEL_OFF, true},
+	{"1", YB_COST_MODEL_ON, true},
+	{"0", YB_COST_MODEL_OFF, true},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_qpm_track_options[] =
+{
+	{"none", YB_QPM_TRACK_NONE, false},
+	{"top", YB_QPM_TRACK_TOP, false},
+	{"all", YB_QPM_TRACK_ALL, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_cache_replacement_algorithm_options[] =
+{
+	{"simple_clock_lru", YB_QPM_SIMPLE_CLOCK_LRU, false},
+	{"true_lru", YB_QPM_TRUE_LRU, false},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry yb_qpm_plan_format_options[] =
+{
+	{"text", EXPLAIN_FORMAT_TEXT, false},
+	{"xml", EXPLAIN_FORMAT_XML, false},
+	{"json", EXPLAIN_FORMAT_JSON, false},
+	{"yaml", EXPLAIN_FORMAT_YAML, false},
+	{NULL, 0, false}
+};
+
 /*
  * Options for enum values stored in other modules
  */
@@ -576,7 +676,7 @@ double		log_statement_sample_rate = 1.0;
 double		log_xact_sample_rate = 0;
 char	   *backtrace_functions;
 
-int			temp_file_limit = -1;
+int			temp_file_limit = 1024 * 1024; /* YB: changed default */
 
 int			num_temp_buffers = 1024;
 
@@ -676,6 +776,27 @@ char	   *role_string;
 
 /* should be static, but guc.c needs to get at this */
 bool		in_hot_standby_guc;
+
+int			yb_log_min_backtraces = FATAL;
+bool		yb_enable_memory_tracking = true;
+bool		yb_conn_mgr_modifying_defaults = false;
+bool		yb_test_skip_binding_scan_keys;
+double		yb_transaction_priority_lower_bound = 0.0;
+double		yb_transaction_priority_upper_bound = 1.0;
+static double yb_transaction_priority = 0.0;
+static int	yb_tcmalloc_sample_period = 1024 * 1024;	/* 1MB */
+static char *yb_effective_transaction_isolation_level_string;
+static char *yb_xcluster_consistency_level_string;
+static char *yb_read_time_string;
+static char *yb_origination_time_override_string;
+static char *yb_neg_catcache_ids_string;
+static char *yb_test_catalog_preload_cache_list_string;
+static bool yb_conn_mgr_selective_deallocate;
+static bool yb_disable_ddl_transaction_block_for_read_committed;
+static bool yb_bypass_cond_recheck;
+static bool yb_deprecated_enable_object_locking_infra;
+static bool yb_pushdown_is_not_null;
+static bool yb_pushdown_strict_inequality;
 
 /*
  * set default log_min_messages to WARNING for all process types
@@ -800,6 +921,7 @@ const char *const config_type_names[] =
 {
 	[PGC_BOOL] = "bool",
 	[PGC_INT] = "integer",
+	[PGC_OID] = "oid",			/* YB added */
 	[PGC_REAL] = "real",
 	[PGC_STRING] = "string",
 	[PGC_ENUM] = "enum",
@@ -808,5 +930,6 @@ const char *const config_type_names[] =
 StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 				 "array length mismatch");
 
+extern bool yb_non_ddl_txn_for_sys_tables_allowed;
 
 #include "utils/guc_tables.inc.c"

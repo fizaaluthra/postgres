@@ -59,6 +59,9 @@ typedef struct PartitionPruneContext
 	PlanState  *planstate;
 	ExprContext *exprcontext;
 	ExprState **exprstates;
+
+	/* Yugabyte attributes */
+	Oid		   *partrelids;
 } PartitionPruneContext;
 
 /*
@@ -74,7 +77,8 @@ extern int	make_partition_pruneinfo(PlannerInfo *root,
 									 RelOptInfo *parentrel,
 									 List *subpaths,
 									 List *prunequal);
-extern Bitmapset *prune_append_rel_partitions(RelOptInfo *rel);
+extern Bitmapset *prune_append_rel_partitions(RelOptInfo *rel,
+											  Oid *yb_oids);
 extern Bitmapset *get_matching_partitions(PartitionPruneContext *context,
 										  List *pruning_steps);
 

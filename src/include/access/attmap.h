@@ -43,7 +43,8 @@ extern void free_attrmap(AttrMap *map);
 /* Conversion routines to build mappings */
 extern AttrMap *build_attrmap_by_name(TupleDesc indesc,
 									  TupleDesc outdesc,
-									  bool missing_ok);
+									  bool missing_ok,
+									  bool yb_ignore_type_mismatch);
 extern AttrMap *build_attrmap_by_name_if_req(TupleDesc indesc,
 											 TupleDesc outdesc,
 											 bool missing_ok);

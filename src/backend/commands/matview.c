@@ -41,6 +41,12 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "commands/dbcommands.h"
+#include "commands/yb_cmds.h"
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+
 
 typedef struct
 {
@@ -51,6 +57,7 @@ typedef struct
 	CommandId	output_cid;		/* cmin to insert in output tuples */
 	uint32		ti_options;		/* table_tuple_insert performance options */
 	BulkInsertState bistate;	/* bulk insert state */
+	MemoryContext yb_per_tuple_context; /* YB: per-tuple context to avoid unbounded memory growth */
 } DR_transientrel;
 
 static int	matview_maintenance_depth = 0;
@@ -68,6 +75,8 @@ static bool is_usable_unique_index(Relation indexRel);
 static void OpenMatViewIncrementalMaintenance(void);
 static void CloseMatViewIncrementalMaintenance(void);
 
+static void yb_refresh_in_place_update(Relation matviewRel, Oid tempOid);
+
 /*
  * SetMatViewPopulatedState
  *		Mark a materialized view as populated, or not.
@@ -75,7 +84,8 @@ static void CloseMatViewIncrementalMaintenance(void);
  * NOTE: caller must be holding an appropriate lock on the relation.
  */
 void
-SetMatViewPopulatedState(Relation relation, bool newstate)
+SetMatViewPopulatedState(Relation relation, bool newstate,
+						 bool yb_in_place_refresh)
 {
 	Relation	pgrel;
 	HeapTuple	tuple;
@@ -93,6 +103,17 @@ SetMatViewPopulatedState(Relation relation, bool newstate)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for relation %u",
 			 RelationGetRelid(relation));
+
+	if (yb_in_place_refresh)
+	{
+		if (((Form_pg_class) GETSTRUCT(tuple))->relispopulated != newstate)
+			elog(ERROR, "Cannot change the populated state of a materialized "
+				 "view when in place refresh is enabled");
+
+		heap_freetuple(tuple);
+		table_close(pgrel, RowExclusiveLock);
+		return;
+	}
 
 	((Form_pg_class) GETSTRUCT(tuple))->relispopulated = newstate;
 
@@ -178,9 +199,36 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	int			save_sec_context;
 	int			save_nestlevel;
 	ObjectAddress address;
+	bool		yb_in_place_refresh = !is_create && YbRefreshMatviewInPlace();
+	bool		yb_fill_matview_directly;
 
 	matviewRel = table_open(matviewOid, NoLock);
 	relowner = matviewRel->rd_rel->relowner;
+
+
+	if (yb_xcluster_automatic_mode_target_ddl)
+	{
+		/*
+		 * YB: On an xCluster automatic-mode target, a concurrent or in-place
+		 * refresh was already replicated as DML on the materialized view, so
+		 * there is nothing to do.
+		 */
+		if (concurrent || yb_refresh_matview_in_place)
+		{
+			table_close(matviewRel, NoLock);
+			ObjectAddressSet(address, RelationRelationId, matviewOid);
+			return address;
+		}
+		/*
+		 * Otherwise proceed with the table rewrite version of REFRESH.
+		 * One exception is if we are upgrading, then rewrites are disallowed.
+		 */
+		if (yb_in_place_refresh)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot rewrite materialized view \"%s\" during a YSQL major version upgrade",
+							RelationGetRelationName(matviewRel))));
+	}
 
 	/*
 	 * Switch to the owner's userid, so that any functions are run as that
@@ -296,10 +344,10 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	 * Tentatively mark the matview as populated or not (this will roll back
 	 * if we fail later).
 	 */
-	SetMatViewPopulatedState(matviewRel, !skipData);
+	SetMatViewPopulatedState(matviewRel, !skipData, yb_in_place_refresh);
 
 	/* Concurrent refresh builds new data in temp tablespace, and does diff. */
-	if (concurrent)
+	if (concurrent || yb_in_place_refresh)
 	{
 		tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
 		relpersistence = RELPERSISTENCE_TEMP;
@@ -311,34 +359,71 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 	}
 
 	/*
+	 * YB: Required to allow the creation for the temp table since we directly
+	 * call make_new_heap instead of going through DefineRelation.
+	 * For postgres xid cleanup, mark the current transaction as using
+	 * temp tables.
+	 *
+	 * Both concurrent and in-place refresh use temp tables. During a major
+	 * YSQL upgrade, catalog modifications are blocked unless
+	 * force_catalog_modification is enabled. Enable it here so that the temp
+	 * table operations (e.g. CREATE TEMP TABLE, ALTER TABLE) in
+	 * refresh_by_match_merge are allowed during upgrade.
+	 */
+	if (yb_in_place_refresh)
+	{
+		YBCDdlEnableForceCatalogModification();
+		YbSetTxnUsesTempRel();
+	}
+
+	/*
+	 * YB: for CREATE MATERIALIZED VIEW, write the rows into the view directly.
+	 * In YB a relfilenode corresponds to a DocDB table, so a create should
+	 * avoid the make_new_heap and refresh_by_heap_swap paths below that a
+	 * refresh uses.
+	 */
+	yb_fill_matview_directly = (IsYugaByteEnabled() && is_create &&
+								!concurrent && !yb_in_place_refresh);
+
+	/*
 	 * Create the transient table that will receive the regenerated data. Lock
 	 * it against access by any other process until commit (by which time it
 	 * will be gone).
 	 */
-	OIDNewHeap = make_new_heap(matviewOid, tableSpace,
-							   matviewRel->rd_rel->relam,
-							   relpersistence, ExclusiveLock);
-	Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
+	if (!yb_fill_matview_directly)
+	{
+		OIDNewHeap = make_new_heap(matviewOid, tableSpace,
+								   matviewRel->rd_rel->relam,
+								   relpersistence, ExclusiveLock,
+								   false /* yb_copy_split_options */ );
+		Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
+	}
+	else
+		OIDNewHeap = InvalidOid;
 
 	/* Generate the data, if wanted. */
-	if (!skipData)
+	if (!skipData && !yb_xcluster_automatic_mode_target_ddl)
 	{
 		DestReceiver *dest;
 
-		dest = CreateTransientRelDestReceiver(OIDNewHeap);
+		dest = CreateTransientRelDestReceiver(yb_fill_matview_directly ?
+											  matviewOid : OIDNewHeap);
 		processed = refresh_matview_datafill(dest, dataQuery, queryString,
 											 is_create);
 	}
 
 	/* Make the matview match the newly generated data. */
-	if (concurrent)
+	if (concurrent || yb_in_place_refresh)
 	{
 		int			old_depth = matview_maintenance_depth;
 
 		PG_TRY();
 		{
-			refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
-								   save_sec_context);
+			if (!concurrent)
+				yb_refresh_in_place_update(matviewRel, OIDNewHeap);
+			else
+				refresh_by_match_merge(matviewOid, OIDNewHeap, relowner,
+									   save_sec_context);
 		}
 		PG_CATCH();
 		{
@@ -347,6 +432,15 @@ RefreshMatViewByOid(Oid matviewOid, bool is_create, bool skipData,
 		}
 		PG_END_TRY();
 		Assert(matview_maintenance_depth == old_depth);
+	}
+	else if (yb_fill_matview_directly)
+	{
+		/*
+		 * YB: the rows were written into the view, so there is nothing to
+		 * swap.  The stats update is matched from the else branch below.
+		 */
+		if (!skipData)
+			pgstat_count_heap_insert(matviewRel, processed);
 	}
 	else
 	{
@@ -424,8 +518,14 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	/* Check for user-requested abort. */
 	CHECK_FOR_INTERRUPTS();
 
-	/* Plan the query which will generate data for the refresh. */
-	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
+	/*
+	 * Plan the query which will generate data for the refresh.
+	 * YB: parallel query is disabled for DDLs by default.
+	 */
+	plan = pg_plan_query(query, queryString,
+						 (IsYugaByteEnabled() && yb_disable_parallel_query_in_ddl) ?
+						 0 : CURSOR_OPT_PARALLEL_OK,
+						 NULL, NULL);
 
 	/*
 	 * Use a snapshot with an updated command ID to ensure this query sees
@@ -499,6 +599,17 @@ transientrel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 * This may be harmless, but this function hasn't planned for it.
 	 */
 	Assert(RelationGetTargetBlock(transientrel) == InvalidBlockNumber);
+
+	/*
+	 * YB: Create and switch to a temporary memory context that we can reset
+	 * once per row to recover Yugabyte palloc'd memory.
+	 */
+	if (IsYBRelation(transientrel))
+		myState->yb_per_tuple_context = AllocSetContextCreate(CurrentMemoryContext,
+															  "REFRESH MATVIEW (YB)",
+															  ALLOCSET_DEFAULT_SIZES);
+	else
+		myState->yb_per_tuple_context = NULL;
 }
 
 /*
@@ -517,12 +628,25 @@ transientrel_receive(TupleTableSlot *slot, DestReceiver *self)
 	 * cheap either. This also doesn't allow accessing per-AM data (say a
 	 * tuple's xmin), but since we don't do that here...
 	 */
+	if (IsYBRelation(myState->transientrel))
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(myState->yb_per_tuple_context);
 
-	table_tuple_insert(myState->transientrel,
-					   slot,
-					   myState->output_cid,
-					   myState->ti_options,
-					   myState->bistate);
+		YBCExecuteInsert(myState->transientrel,
+						 slot,
+						 ONCONFLICT_NONE);
+
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextReset(myState->yb_per_tuple_context);
+	}
+	else
+	{
+		table_tuple_insert(myState->transientrel,
+						   slot,
+						   myState->output_cid,
+						   myState->ti_options,
+						   myState->bistate);
+	}
 
 	/* We know this is a newly created relation, so there are no indexes */
 
@@ -540,6 +664,12 @@ transientrel_shutdown(DestReceiver *self)
 	FreeBulkInsertState(myState->bistate);
 
 	table_finish_bulk_insert(myState->transientrel, myState->ti_options);
+
+	if (myState->yb_per_tuple_context)
+	{
+		MemoryContextDelete(myState->yb_per_tuple_context);
+		myState->yb_per_tuple_context = NULL;
+	}
 
 	/* close transientrel, but keep lock until commit */
 	table_close(myState->transientrel, NoLock);
@@ -684,9 +814,14 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 	SetUserIdAndSecContext(relowner,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 	resetStringInfo(&querybuf);
-	appendStringInfo(&querybuf,
-					 "CREATE TEMP TABLE %s (tid pg_catalog.tid)",
-					 diffname);
+	if (IsYugaByteEnabled())
+		appendStringInfo(&querybuf,
+						 "CREATE TEMP TABLE %s (mv %s)",
+						 diffname, matviewname);
+	else
+		appendStringInfo(&querybuf,
+						 "CREATE TEMP TABLE %s (tid pg_catalog.tid)",
+						 diffname);
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_UTILITY)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
 	SetUserIdAndSecContext(relowner,
@@ -700,11 +835,18 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 
 	/* Start building the query for populating the diff table. */
 	resetStringInfo(&querybuf);
-	appendStringInfo(&querybuf,
-					 "INSERT INTO %s "
-					 "SELECT mv.ctid AS tid, newdata.*::%s AS newdata "
-					 "FROM %s mv FULL JOIN %s newdata ON (",
-					 diffname, tempname, matviewname, tempname);
+	if (IsYugaByteEnabled())
+		appendStringInfo(&querybuf,
+						 "INSERT INTO %s "
+						 "SELECT mv.*::%s AS mv, newdata.*::%s AS newdata "
+						 "FROM %s mv FULL JOIN %s newdata ON (",
+						 diffname, matviewname, tempname, matviewname, tempname);
+	else
+		appendStringInfo(&querybuf,
+						 "INSERT INTO %s "
+						 "SELECT mv.ctid AS tid, newdata.*::%s AS newdata "
+						 "FROM %s mv FULL JOIN %s newdata ON (",
+						 diffname, tempname, matviewname, tempname);
 
 	/*
 	 * Get the list of index OIDs for the table from the relcache, and look up
@@ -826,10 +968,20 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 				errmsg("could not find suitable unique index on materialized view \"%s\"",
 					   RelationGetRelationName(matviewRel)));
 
-	appendStringInfoString(&querybuf,
-						   " AND newdata.* OPERATOR(pg_catalog.*=) mv.*) "
-						   "WHERE newdata.* IS NULL OR mv.* IS NULL "
-						   "ORDER BY tid");
+	if (IsYugaByteEnabled())
+	{
+		/* Can't use TID in YB mode */
+		appendStringInfoString(&querybuf,
+							   " AND newdata.* OPERATOR(pg_catalog.*=) mv.*) "
+							   "WHERE newdata.* IS NULL OR mv.* IS NULL ");
+	}
+	else
+	{
+		appendStringInfoString(&querybuf,
+							   " AND newdata.* OPERATOR(pg_catalog.*=) mv.*) "
+							   "WHERE newdata.* IS NULL OR mv.* IS NULL "
+							   "ORDER BY tid");
+	}
 
 	/* Populate the temporary "diff" table. */
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
@@ -848,23 +1000,95 @@ refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 
 	OpenMatViewIncrementalMaintenance();
 
+	/*
+	 * In YB mode, we also restrict the data from having rows with all null
+	 * values, because we can't correctly compare fully-null rows to compute
+	 * an accurate diff table.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		resetStringInfo(&querybuf);
+		appendStringInfo(&querybuf, "SELECT newdata, mv FROM %s WHERE ", diffname);
+		TupleDesc	tuple_desc = RelationGetDescr(matviewRel);
+
+		for (int i = 1; i <= tuple_desc->natts; i++)
+		{
+			Form_pg_attribute attribute = TupleDescAttr(tuple_desc, i - 1);
+			const char *attribute_name = quote_identifier(NameStr(attribute->attname));
+
+			appendStringInfo(&querybuf, "(newdata).%s IS NULL AND (mv).%s IS NULL ",
+							 attribute_name, attribute_name);
+			if (i < tuple_desc->natts)
+				appendStringInfo(&querybuf, "AND ");
+
+		}
+
+		if (SPI_execute(querybuf.data, false, 1) != SPI_OK_SELECT)
+			elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+		if (SPI_processed > 0)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_CARDINALITY_VIOLATION),
+					 errmsg("new data for materialized view \"%s\" contains rows with all null values",
+							RelationGetRelationName(matviewRel)),
+					 errdetail("Row: %s",
+							   SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1))));
+		}
+	}
+
 	/* Deletes must come before inserts; do them first. */
 	resetStringInfo(&querybuf);
-	appendStringInfo(&querybuf,
-					 "DELETE FROM %s mv WHERE ctid OPERATOR(pg_catalog.=) ANY "
-					 "(SELECT diff.tid FROM %s diff "
-					 "WHERE diff.tid IS NOT NULL "
-					 "AND diff.newdata IS NULL)",
-					 matviewname, diffname);
+	if (IsYugaByteEnabled())
+	{
+		/* Can't use TID in YB mode */
+		appendStringInfo(&querybuf,
+						 "DELETE FROM %s mv WHERE mv.*::%s OPERATOR(pg_catalog.*=) ANY "
+						 "(SELECT mv FROM %s diff WHERE (",
+						 matviewname, matviewname, diffname);
+		TupleDesc	tuple_desc = RelationGetDescr(matviewRel);
+
+		for (int i = 1; i <= tuple_desc->natts; i++)
+		{
+			Form_pg_attribute attribute = TupleDescAttr(tuple_desc, i - 1);
+			const char *attribute_name = quote_identifier(NameStr(attribute->attname));
+
+			appendStringInfo(&querybuf, "(diff.mv).%s IS NOT NULL ", attribute_name);
+			if (i < tuple_desc->natts)
+				appendStringInfo(&querybuf, "OR ");
+		}
+
+		appendStringInfo(&querybuf, ") AND diff.newdata IS NULL)");
+	}
+	else
+	{
+		appendStringInfo(&querybuf,
+						 "DELETE FROM %s mv WHERE ctid OPERATOR(pg_catalog.=) ANY "
+						 "(SELECT diff.tid FROM %s diff "
+						 "WHERE diff.tid IS NOT NULL "
+						 "AND diff.newdata IS NULL)",
+						 matviewname, diffname);
+	}
+
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_DELETE)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
 
 	/* Inserts go last. */
 	resetStringInfo(&querybuf);
-	appendStringInfo(&querybuf,
-					 "INSERT INTO %s SELECT (diff.newdata).* "
-					 "FROM %s diff WHERE tid IS NULL",
-					 matviewname, diffname);
+	if (IsYugaByteEnabled())
+	{
+		appendStringInfo(&querybuf,
+						 "INSERT INTO %s SELECT (diff.newdata).* "
+						 "FROM %s diff WHERE mv IS NULL",
+						 matviewname, diffname);
+	}
+	else
+	{
+		appendStringInfo(&querybuf,
+						 "INSERT INTO %s SELECT (diff.newdata).* "
+						 "FROM %s diff WHERE tid IS NULL",
+						 matviewname, diffname);
+	}
+
 	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
 		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
 
@@ -894,7 +1118,10 @@ refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence)
 {
 	finish_heap_swap(matviewOid, OIDNewHeap, false, false, true, true,
 					 true,		/* reindex */
-					 RecentXmin, ReadNextMultiXactId(), relpersistence);
+					 RecentXmin, ReadNextMultiXactId(), relpersistence,
+					 false /* yb_copy_split_options */ ,
+					 NIL /* changedIndexNames */ ,
+					 NIL /* changedIndexSplitOpts */ );
 }
 
 /*
@@ -966,4 +1193,55 @@ CloseMatViewIncrementalMaintenance(void)
 {
 	matview_maintenance_depth--;
 	Assert(matview_maintenance_depth >= 0);
+}
+
+/*
+ * yb_refresh_in_place_update
+ * Refresh the matview by using the same heap/DocDB table. Deletes all rows from
+ * the table and inserts the data from the temp table.
+ */
+static void
+yb_refresh_in_place_update(Relation matviewRel, Oid tempOid)
+{
+	Assert(IsYugaByteEnabled());
+
+	StringInfoData querybuf;
+	Relation	tempRel;
+	char	   *matviewname;
+	char	   *tempname;
+
+	initStringInfo(&querybuf);
+	matviewname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
+											 RelationGetRelationName(matviewRel));
+	tempRel = table_open(tempOid, NoLock);
+	tempname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel)),
+										  RelationGetRelationName(tempRel));
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	OpenMatViewIncrementalMaintenance();
+
+	appendStringInfo(&querybuf, "DELETE FROM %s", matviewname);
+
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_DELETE)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+
+	resetStringInfo(&querybuf);
+	appendStringInfo(&querybuf, "INSERT INTO %s SELECT * FROM %s", matviewname,
+					 tempname);
+
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_INSERT)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+
+	CloseMatViewIncrementalMaintenance();
+	table_close(tempRel, NoLock);
+
+	resetStringInfo(&querybuf);
+	appendStringInfo(&querybuf, "DROP TABLE %s", tempname);
+	if (SPI_exec(querybuf.data, 0) != SPI_OK_UTILITY)
+		elog(ERROR, "SPI_exec failed: %s", querybuf.data);
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
 }

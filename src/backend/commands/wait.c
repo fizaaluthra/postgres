@@ -30,6 +30,9 @@
 #include "utils/pg_lsn.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 void
 ExecWaitStmt(ParseState *pstate, WaitStmt *stmt, bool isTopLevel,

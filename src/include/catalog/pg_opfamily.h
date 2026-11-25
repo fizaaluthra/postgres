@@ -64,7 +64,7 @@ MAKE_SYSCACHE(OPFAMILYOID, pg_opfamily_oid_index, 8);
 
 /* This does not account for non-core opfamilies that might accept boolean */
 #define IsBuiltinBooleanOpfamily(opfamily) \
-	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID)
+	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID || (opfamily) == BOOL_LSM_FAM_OID)
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

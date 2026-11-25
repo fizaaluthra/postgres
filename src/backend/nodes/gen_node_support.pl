@@ -138,6 +138,7 @@ my @extra_tags = qw(
   IntList OidList XidList
   AllocSetContext GenerationContext SlabContext BumpContext
   TIDBitmap
+  YbTIDBitmap
   WindowObjectData
 );
 
@@ -765,6 +766,55 @@ _equal${n}(const $n *a, const $n *b)
 			print $cff "\tCOPY_LOCATION_FIELD($f);\n" unless $copy_ignore;
 			print $eff "\tCOMPARE_LOCATION_FIELD($f);\n" unless $equal_ignore;
 		}
+		# YB: value-embedded structs in plan/path nodes
+		elsif ($t eq 'YbPushdownExprs')
+		{
+			print $cff "\tCOPY_NODE_FIELD($f.quals);\n" unless $copy_ignore;
+			print $cff "\tCOPY_NODE_FIELD($f.colrefs);\n" unless $copy_ignore;
+			print $eff "\tCOMPARE_NODE_FIELD($f.quals);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_NODE_FIELD($f.colrefs);\n" unless $equal_ignore;
+		}
+		elsif ($t eq 'YbPlanInfo')
+		{
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_nexts);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_prevs);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_seeks);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_docdb_result_width);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_ybctid_width);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_table_result_pages);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_index_result_pages);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_bmscan_nexts);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_bmscan_prevs);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_bmscan_seeks);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.estimated_num_bmscan_result_pages);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.first_fetch_limit);\n" unless $copy_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_nexts);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_prevs);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_seeks);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_docdb_result_width);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_ybctid_width);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_table_result_pages);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_index_result_pages);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_bmscan_nexts);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_bmscan_prevs);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_bmscan_seeks);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.estimated_num_bmscan_result_pages);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.first_fetch_limit);\n" unless $equal_ignore;
+		}
+		elsif ($t eq 'YbPathInfo')
+		{
+			print $cff "\tCOPY_NODE_FIELD($f.yb_uniqkeys);\n" unless $copy_ignore;
+			print $eff "\tCOMPARE_NODE_FIELD($f.yb_uniqkeys);\n" unless $equal_ignore;
+		}
+		elsif ($t eq 'YbIndexPathInfo')
+		{
+			print $cff "\tCOPY_SCALAR_FIELD($f.yb_distinct_prefixlen);\n" unless $copy_ignore;
+			print $cff "\tCOPY_SCALAR_FIELD($f.yb_lock_mechanism);\n" unless $copy_ignore;
+			print $cff "\tCOPY_NODE_FIELD($f.merge_scan_stream_cols);\n" unless $copy_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.yb_distinct_prefixlen);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_SCALAR_FIELD($f.yb_lock_mechanism);\n" unless $equal_ignore;
+			print $eff "\tCOMPARE_NODE_FIELD($f.merge_scan_stream_cols);\n" unless $equal_ignore;
+		}
 		elsif (elem $t, @scalar_types or elem $t, @enum_types)
 		{
 			print $cff "\tCOPY_SCALAR_FIELD($f);\n" unless $copy_ignore;
@@ -1062,6 +1112,55 @@ _read${n}(void)
 			print $off "\tWRITE_FLOAT_FIELD($f.per_tuple);\n";
 			print $rff "\tREAD_FLOAT_FIELD($f.startup);\n" unless $no_read;
 			print $rff "\tREAD_FLOAT_FIELD($f.per_tuple);\n" unless $no_read;
+		}
+		# YB: value-embedded structs in plan/path nodes (see copy/equal block above).
+		elsif ($t eq 'YbPushdownExprs')
+		{
+			print $off "\tWRITE_NODE_FIELD($f.quals);\n";
+			print $off "\tWRITE_NODE_FIELD($f.colrefs);\n";
+			print $rff "\tREAD_NODE_FIELD($f.quals);\n" unless $no_read;
+			print $rff "\tREAD_NODE_FIELD($f.colrefs);\n" unless $no_read;
+		}
+		elsif ($t eq 'YbPlanInfo')
+		{
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_nexts);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_prevs);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_seeks);\n";
+			print $off "\tWRITE_INT_FIELD($f.estimated_docdb_result_width);\n";
+			print $off "\tWRITE_INT_FIELD($f.estimated_ybctid_width);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_table_result_pages);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_index_result_pages);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_bmscan_nexts);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_bmscan_prevs);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_bmscan_seeks);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.estimated_num_bmscan_result_pages);\n";
+			print $off "\tWRITE_FLOAT_FIELD($f.first_fetch_limit);\n";
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_nexts);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_prevs);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_seeks);\n" unless $no_read;
+			print $rff "\tREAD_INT_FIELD($f.estimated_docdb_result_width);\n" unless $no_read;
+			print $rff "\tREAD_INT_FIELD($f.estimated_ybctid_width);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_table_result_pages);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_index_result_pages);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_bmscan_nexts);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_bmscan_prevs);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_bmscan_seeks);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.estimated_num_bmscan_result_pages);\n" unless $no_read;
+			print $rff "\tREAD_FLOAT_FIELD($f.first_fetch_limit);\n" unless $no_read;
+		}
+		elsif ($t eq 'YbPathInfo')
+		{
+			print $off "\tWRITE_NODE_FIELD($f.yb_uniqkeys);\n";
+			print $rff "\tREAD_NODE_FIELD($f.yb_uniqkeys);\n" unless $no_read;
+		}
+		elsif ($t eq 'YbIndexPathInfo')
+		{
+			print $off "\tWRITE_INT_FIELD($f.yb_distinct_prefixlen);\n";
+			print $off "\tWRITE_ENUM_FIELD($f.yb_lock_mechanism, YbLockMechanism);\n";
+			print $off "\tWRITE_NODE_FIELD($f.merge_scan_stream_cols);\n";
+			print $rff "\tREAD_INT_FIELD($f.yb_distinct_prefixlen);\n" unless $no_read;
+			print $rff "\tREAD_ENUM_FIELD($f.yb_lock_mechanism, YbLockMechanism);\n" unless $no_read;
+			print $rff "\tREAD_NODE_FIELD($f.merge_scan_stream_cols);\n" unless $no_read;
 		}
 		elsif ($t eq 'Selectivity')
 		{

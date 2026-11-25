@@ -575,7 +575,7 @@ RemoveSubscriptionRel(Oid subid, Oid relid)
 							 "DROP SUBSCRIPTION ...")));
 		}
 
-		CatalogTupleDelete(rel, &tup->t_self);
+		CatalogTupleDelete(rel, tup);
 	}
 	table_endscan(scan);
 

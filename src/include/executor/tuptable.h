@@ -19,6 +19,9 @@
 #include "access/tupdesc.h"
 #include "storage/buf.h"
 
+/* YB includes */
+#include "ybctid.h"
+
 /*----------
  * The executor stores tuples in a "tuple table" which is a List of
  * independent TupleTableSlots.
@@ -141,6 +144,13 @@ typedef struct TupleTableSlot
 	MemoryContext tts_mcxt;		/* slot itself is in this context */
 	ItemPointerData tts_tid;	/* stored tuple's tid */
 	Oid			tts_tableOid;	/* table oid of tuple */
+
+	/* YugaByte support */
+	Datum		tts_ybctid;
+
+	/* Fields used by yb_index_check() */
+	Datum		tts_ybidxbasectid;
+	Datum		tts_ybuniqueidxkeysuffix;
 } TupleTableSlot;
 
 /* routines for a TupleTableSlot implementation */
@@ -448,6 +458,24 @@ slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 	{
 		*isnull = false;
 		return PointerGetDatum(&slot->tts_tid);
+	}
+	else if (attnum == YBTupleIdAttributeNumber)
+	{
+		/* heap tuple is not required to obtain the ybctid */
+		*isnull = false;
+		return TABLETUPLE_YBCTID(slot);
+	}
+	else if (attnum == YBIdxBaseTupleIdAttributeNumber)
+	{
+		/* Used for secondary index scan during yb_index_check() */
+		*isnull = false;
+		return slot->tts_ybidxbasectid;
+	}
+	else if (attnum == YBUniqueIdxKeySuffixAttributeNumber)
+	{
+		/* Used for secondary index scan during yb_index_check() */
+		*isnull = DatumGetPointer(slot->tts_ybuniqueidxkeysuffix) == NULL;
+		return slot->tts_ybuniqueidxkeysuffix;
 	}
 
 	/* Fetch the system attribute from the underlying tuple. */

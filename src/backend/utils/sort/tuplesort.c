@@ -111,6 +111,9 @@
 #include "utils/pg_rusage.h"
 #include "utils/tuplesort.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Initial size of memtuples array.  This must be more than
  * ALLOCSET_SEPARATE_THRESHOLD; see comments in grow_memtuples().  Clamp at
@@ -590,6 +593,7 @@ tuplesort_begin_common(int workMem, SortCoordinate coordinate, int sortopt)
 	state->base.sortopt = sortopt;
 	state->base.tuples = true;
 	state->abbrevNext = 10;
+	state->base.yb_sort_type = YB_SORT_UNINITIALIZED;
 
 	/*
 	 * workMem is forced to be at least 64KB, the current minimum valid value
@@ -1352,6 +1356,9 @@ tuplesort_performsort(Tuplesortstate *state)
 			elog(LOG, "performsort of worker %d done: %s",
 				 state->worker, pg_rusage_show(&state->ru_start));
 	}
+
+	if (YBCIsDistTraceActive())
+		YBCDistTraceSetCurrSpanAttrStr("sort.type", yb_sort_type_name(state->base.yb_sort_type));
 
 	MemoryContextSwitchTo(oldcontext);
 }

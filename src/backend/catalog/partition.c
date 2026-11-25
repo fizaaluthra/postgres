@@ -31,6 +31,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 static Oid	get_partition_parent_worker(Relation inhRel, Oid relid,
 										bool *detach_pending);
 static void get_partition_ancestors_worker(Relation inhRel, Oid relid,
@@ -229,7 +232,8 @@ map_partition_varattnos(List *expr, int fromrel_varno,
 
 		part_attmap = build_attrmap_by_name(RelationGetDescr(to_rel),
 											RelationGetDescr(from_rel),
-											false);
+											false,
+											false /* yb_ignore_type_mismatch */ );
 		expr = (List *) map_variable_attnos((Node *) expr,
 											fromrel_varno, 0,
 											part_attmap,
@@ -274,7 +278,7 @@ has_partition_attrs(Relation rel, Bitmapset *attnums, bool *used_in_expr)
 
 		if (partattno != 0)
 		{
-			if (bms_is_member(partattno - FirstLowInvalidHeapAttributeNumber,
+			if (bms_is_member(partattno - YBGetFirstLowInvalidAttributeNumber(rel),
 							  attnums))
 			{
 				if (used_in_expr)
@@ -289,7 +293,13 @@ has_partition_attrs(Relation rel, Bitmapset *attnums, bool *used_in_expr)
 			Bitmapset  *expr_attrs = NULL;
 
 			/* Find all attributes referenced */
-			pull_varattnos(expr, 1, &expr_attrs);
+
+			/*
+			 * pull_varattnos_min_attr offsets attributes by min_attr - 1.
+			 * Therefore pass YBGetFirstLowInvalidAttributeNumber + 1.
+			 */
+			pull_varattnos_min_attr(expr, 1, &expr_attrs,
+									YBGetFirstLowInvalidAttributeNumber(rel) + 1);
 			partexprs_item = lnext(partexprs, partexprs_item);
 
 			if (bms_overlap(attnums, expr_attrs))
@@ -302,6 +312,79 @@ has_partition_attrs(Relation rel, Bitmapset *attnums, bool *used_in_expr)
 	}
 
 	return false;
+}
+
+/*
+ * yb_has_ancestor_partition_attrs
+ *
+ * Returns true if any column in partition_attnums overlaps a partition key
+ * column of ancestor_rel. The columns in a partition may be in a different
+ * order than the ancestor's columns. So, this function builds a name-based
+ * attrmap from ancestor_rel to partition_rel.
+ */
+bool
+yb_has_ancestor_partition_attrs(Relation partition_rel, Relation ancestor_rel,
+								Bitmapset *partition_attnums)
+{
+	/* Both partition and ancestor are guaranteed to have the same offset */
+	AttrNumber	attr_offset = YBGetFirstLowInvalidAttributeNumber(partition_rel);
+	AttrMap    *attrmap = build_attrmap_by_name(RelationGetDescr(partition_rel),
+												RelationGetDescr(ancestor_rel),
+												false /* missing_ok */ ,
+												false /* yb_ignore_type_mismatch */ );
+	PartitionKey key = RelationGetPartitionKey(ancestor_rel);
+	int			partnatts = get_partition_natts(key);
+	List	   *partexprs = get_partition_exprs(key);
+	ListCell   *exprs_item = list_head(partexprs);
+	bool		result = false;
+
+	for (int i = 0; i < partnatts && !result; i++)
+	{
+		AttrNumber	ancestor_attno = get_partition_col_attnum(key, i);
+
+		if (ancestor_attno != 0)
+		{
+			/* Simple key column: remap to partition_rel's space and check. */
+			AttrNumber	partattno = attrmap->attnums[ancestor_attno - 1];
+			Assert(AttributeNumberIsValid(partattno));
+
+			if (bms_is_member(partattno - attr_offset, partition_attnums))
+				result = true;
+		}
+		else
+		{
+			/*
+			 * Expression-based key: extract all column references from the
+			 * expression (in the ancestor's attribute space), map each to
+			 * partition_rel's attribute space, and then check if present in
+			 * partition_attnums.
+			 */
+			Node	   *expr = (Node *) lfirst(exprs_item);
+			Bitmapset  *expr_attrs = NULL;
+			int			bms_idx = -1;
+
+			exprs_item = lnext(partexprs, exprs_item);
+			pull_varattnos_min_attr(expr, 1, &expr_attrs, attr_offset + 1);
+
+			while ((bms_idx = bms_next_member(expr_attrs, bms_idx)) >= 0)
+			{
+				AttrNumber	anc_attno = (AttrNumber) bms_idx + attr_offset;
+				AttrNumber	partattno = attrmap->attnums[anc_attno - 1];
+				Assert(AttributeNumberIsValid(partattno));
+
+				if (bms_is_member(partattno - attr_offset, partition_attnums))
+				{
+					result = true;
+					break;
+				}
+			}
+
+			bms_free(expr_attrs);
+		}
+	}
+
+	free_attrmap(attrmap);
+	return result;
 }
 
 /*
