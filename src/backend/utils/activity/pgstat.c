@@ -196,6 +196,7 @@ static void pgstat_build_snapshot_fixed(PgStat_Kind kind);
 
 static inline bool pgstat_is_kind_valid(PgStat_Kind kind);
 
+uint64_t   *yb_new_conn = NULL;
 
 /* ----------
  * GUC parameters
@@ -218,6 +219,12 @@ PgStat_LocalState pgStatLocal;
  * pgstat_report_stat().
  */
 bool		pgstat_report_fixed = false;
+
+/*
+ * Used in YB to indicate whether the statuses for ongoing concurrent
+ * indexes have been retrieved in this transaction.
+ */
+bool		yb_retrieved_concurrent_index_progress = false;
 
 /* ----------
  * Local data
@@ -957,6 +964,8 @@ pgstat_clear_snapshot(void)
 
 	/* Reset this flag, as it may be possible that a cleanup was forced. */
 	force_stats_snapshot_clear = false;
+
+	yb_retrieved_concurrent_index_progress = false;
 }
 
 void *

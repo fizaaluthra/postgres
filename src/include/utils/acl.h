@@ -168,6 +168,7 @@ typedef struct ArrayType Acl;
 #define ACL_ALL_RIGHTS_PARAMETER_ACL (ACL_SET|ACL_ALTER_SYSTEM)
 #define ACL_ALL_RIGHTS_PROPGRAPH	(ACL_SELECT)
 #define ACL_ALL_RIGHTS_SCHEMA		(ACL_USAGE|ACL_CREATE)
+#define ACL_ALL_RIGHTS_TABLEGROUP	(ACL_CREATE)
 #define ACL_ALL_RIGHTS_TABLESPACE	(ACL_CREATE)
 #define ACL_ALL_RIGHTS_TYPE			(ACL_USAGE)
 
@@ -287,5 +288,11 @@ extern void RemoveRoleFromInitPriv(Oid roleid,
 extern bool object_ownercheck(Oid classid, Oid objectid, Oid roleid);
 extern bool has_createrole_privilege(Oid roleid);
 extern bool has_bypassrls_privilege(Oid roleid);
+
+/* Yugabyte table group feature. */
+extern AclMode pg_tablegroup_aclmask(Oid grp_oid, Oid roleid,
+									 AclMode mask, AclMaskHow how);
+extern AclResult pg_tablegroup_aclcheck(Oid grp_oid, Oid roleid, AclMode mode);
+extern bool pg_tablegroup_ownercheck(Oid grp_oid, Oid roleid);
 
 #endif							/* ACL_H */

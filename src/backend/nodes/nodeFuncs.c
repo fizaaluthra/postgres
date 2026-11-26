@@ -23,6 +23,9 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+
 static bool expression_returns_set_walker(Node *node, void *context);
 static int	leftmostLoc(int loc1, int loc2);
 static bool fix_opfuncids_walker(Node *node, void *context);
@@ -68,6 +71,9 @@ exprType(const Node *expr)
 			break;
 		case T_MergeSupportFunc:
 			type = ((const MergeSupportFunc *) expr)->msftype;
+			break;
+		case T_YbBatchedExpr:
+			type = exprType((Node *) ((const YbBatchedExpr *) expr)->orig_expr);
 			break;
 		case T_SubscriptingRef:
 			type = ((const SubscriptingRef *) expr)->refrestype;
@@ -2139,6 +2145,8 @@ expression_tree_walker_impl(Node *node,
 		case T_MergeSupportFunc:
 			/* primitive node types with no expression subnodes */
 			break;
+		case T_YbBatchedExpr:
+			return walker((Node *) ((YbBatchedExpr *) node)->orig_expr, context);
 		case T_WithCheckOption:
 			return WALK(((WithCheckOption *) node)->qual);
 		case T_Aggref:
@@ -2604,6 +2612,14 @@ expression_tree_walker_impl(Node *node,
 		case T_PartitionPruneStepCombine:
 			/* no expression subnodes */
 			break;
+		case T_YbPartitionPruneStepFuncOp:
+			{
+				YbPartitionPruneStepFuncOp *fstep = (YbPartitionPruneStepFuncOp *) node;
+
+				if (walker((Node *) fstep->exprs, context))
+					return true;
+			}
+			break;
 		case T_JoinExpr:
 			{
 				JoinExpr   *join = (JoinExpr *) node;
@@ -3059,6 +3075,15 @@ expression_tree_mutator_impl(Node *node,
 		case T_CTESearchClause:
 		case T_MergeSupportFunc:
 			return copyObject(node);
+		case T_YbBatchedExpr:
+			{
+				YbBatchedExpr *bexpr = (YbBatchedExpr *) node;
+				YbBatchedExpr *newnode;
+
+				FLATCOPY(newnode, bexpr, YbBatchedExpr);
+				MUTATE(newnode->orig_expr, bexpr->orig_expr, Expr *);
+				return (Node *) newnode;
+			}
 		case T_WithCheckOption:
 			{
 				WithCheckOption *wco = (WithCheckOption *) node;
@@ -3380,7 +3405,7 @@ expression_tree_mutator_impl(Node *node,
 
 				FLATCOPY(newnode, rcexpr, RowCompareExpr);
 				MUTATE(newnode->largs, rcexpr->largs, List *);
-				MUTATE(newnode->rargs, rcexpr->rargs, List *);
+				MUTATE(newnode->rargs, rcexpr->rargs, Node *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3693,6 +3718,16 @@ expression_tree_mutator_impl(Node *node,
 		case T_PartitionPruneStepCombine:
 			/* no expression sub-nodes */
 			return copyObject(node);
+		case T_YbPartitionPruneStepFuncOp:
+			{
+				YbPartitionPruneStepFuncOp *fstep = (YbPartitionPruneStepFuncOp *) node;
+				YbPartitionPruneStepFuncOp *newnode;
+
+				FLATCOPY(newnode, fstep, YbPartitionPruneStepFuncOp);
+				MUTATE(newnode->exprs, fstep->exprs, List *);
+				return (Node *) newnode;
+			}
+			break;
 		case T_JoinExpr:
 			{
 				JoinExpr   *join = (JoinExpr *) node;
@@ -3807,6 +3842,16 @@ expression_tree_mutator_impl(Node *node,
 				MUTATE(newnode->coldefexprs, tf->coldefexprs, List *);
 				MUTATE(newnode->colvalexprs, tf->colvalexprs, List *);
 				MUTATE(newnode->passingvalexprs, tf->passingvalexprs, List *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_RestrictInfo:
+			{
+				RestrictInfo *rinfo = (RestrictInfo *) node;
+				RestrictInfo *newnode;
+
+				FLATCOPY(newnode, rinfo, RestrictInfo);
+				MUTATE(newnode->clause, rinfo->clause, Expr *);
 				return (Node *) newnode;
 			}
 			break;
@@ -4940,4 +4985,28 @@ planstate_walk_members(PlanState **planstates, int nplans,
 	}
 
 	return false;
+}
+
+/*
+ * Given PlanState, return pointer to aggrefs field if it exists, NULL
+ * otherwise.
+ */
+List	  **
+YbPlanStateTryGetAggrefs(PlanState *ps)
+{
+	switch (nodeTag(ps))
+	{
+		case T_IndexOnlyScanState:
+			return &castNode(IndexOnlyScanState, ps)->yb_ioss_aggrefs;
+		case T_IndexScanState:
+			return &castNode(IndexScanState, ps)->yb_iss_aggrefs;
+		case T_YbSeqScanState:
+			return &castNode(YbSeqScanState, ps)->aggrefs;
+		case T_YbBitmapTableScanState:
+			return &castNode(YbBitmapTableScanState, ps)->aggrefs;
+		case T_TidScanState:
+			return &castNode(TidScanState, ps)->yb_tss_aggrefs;
+		default:
+			return NULL;
+	}
 }

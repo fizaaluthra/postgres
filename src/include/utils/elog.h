@@ -18,6 +18,9 @@
 
 #include "lib/stringinfo.h"
 
+/* YB includes */
+#include "yb/yql/pggate/util/ybc_util.h"
+
 /* We cannot include nodes.h yet, so forward-declare struct Node */
 struct Node;
 
@@ -144,10 +147,20 @@ struct Node;
 #define ereport_domain(elevel, domain, ...)	\
 	do { \
 		pg_prevent_errno_in_scope(); \
-		if (pg_integer_constant_p(elevel) && (elevel) >= ERROR ? \
-			errstart_cold(elevel, domain) : \
-			errstart(elevel, domain)) \
-			__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
+		if (IsMultiThreadedMode()) \
+		{ \
+			if (pg_integer_constant_p(elevel) && (elevel) >= ERROR ? \
+				yb_errstart_cold(elevel) : \
+				yb_errstart(elevel)) \
+				__VA_ARGS__, yb_errfinish(__FILE__, __LINE__, __func__); \
+		} \
+		else \
+		{ \
+			if (pg_integer_constant_p(elevel) && (elevel) >= ERROR ? \
+				errstart_cold(elevel, domain) : \
+				errstart(elevel, domain)) \
+				__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
+		} \
 		if (pg_integer_constant_p(elevel) && (elevel) >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
@@ -156,8 +169,16 @@ struct Node;
 	do { \
 		const int elevel_ = (elevel); \
 		pg_prevent_errno_in_scope(); \
-		if (errstart(elevel_, domain)) \
-			__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
+		if (IsMultiThreadedMode()) \
+		{ \
+			if (yb_errstart(elevel_)) \
+				__VA_ARGS__, yb_errfinish(__FILE__, __LINE__, __func__); \
+		} \
+		else \
+		{ \
+			if (errstart(elevel_, domain)) \
+				__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
+		} \
 		if (elevel_ >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
@@ -271,7 +292,12 @@ extern int	getinternalerrposition(void);
 	do { \
 		struct Node *context_ = (context); \
 		pg_prevent_errno_in_scope(); \
-		if (errsave_start(context_, domain)) \
+		if (IsMultiThreadedMode()) \
+		{ \
+			if (yb_errsave_start(context_)) \
+				__VA_ARGS__, yb_errsave_finish(context_, __FILE__, __LINE__, __func__); \
+		} \
+		else if (errsave_start(context_, domain)) \
 			__VA_ARGS__, errsave_finish(context_, __FILE__, __LINE__, __func__); \
 	} while(0)
 
@@ -387,19 +413,19 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
  */
 #define PG_TRY(...)  \
 	do { \
-		sigjmp_buf *_save_exception_stack##__VA_ARGS__ = PG_exception_stack; \
+		sigjmp_buf *_save_exception_stack##__VA_ARGS__ = yb_get_exception_stack(); \
 		ErrorContextCallback *_save_context_stack##__VA_ARGS__ = error_context_stack; \
 		sigjmp_buf _local_sigjmp_buf##__VA_ARGS__; \
 		bool _do_rethrow##__VA_ARGS__ = false; \
 		if (sigsetjmp(_local_sigjmp_buf##__VA_ARGS__, 0) == 0) \
 		{ \
-			PG_exception_stack = &_local_sigjmp_buf##__VA_ARGS__
+			yb_set_exception_stack(&_local_sigjmp_buf##__VA_ARGS__)
 
 #define PG_CATCH(...)	\
 		} \
 		else \
 		{ \
-			PG_exception_stack = _save_exception_stack##__VA_ARGS__; \
+			yb_set_exception_stack(_save_exception_stack##__VA_ARGS__); \
 			error_context_stack = _save_context_stack##__VA_ARGS__
 
 #define PG_FINALLY(...) \
@@ -407,14 +433,15 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
 		else \
 			_do_rethrow##__VA_ARGS__ = true; \
 		{ \
-			PG_exception_stack = _save_exception_stack##__VA_ARGS__; \
+			yb_set_exception_stack(_save_exception_stack##__VA_ARGS__); \
 			error_context_stack = _save_context_stack##__VA_ARGS__
 
 #define PG_END_TRY(...)  \
 		} \
 		if (_do_rethrow##__VA_ARGS__) \
 				PG_RE_THROW(); \
-		PG_exception_stack = _save_exception_stack##__VA_ARGS__; \
+		yb_reset_error_status(); \
+		yb_set_exception_stack(_save_exception_stack##__VA_ARGS__); \
 		error_context_stack = _save_context_stack##__VA_ARGS__; \
 	} while (0)
 
@@ -464,6 +491,8 @@ typedef struct ErrorData
 
 	/* context containing associated non-constant strings */
 	struct MemoryContextData *assoc_context;
+	bool		yb_owns_file_and_func;	/* Whether we own filename/funcname. */
+	int			yb_backtrace_extra_frames_skip;
 } ErrorData;
 
 extern void EmitErrorReport(void);
@@ -531,5 +560,40 @@ extern void write_jsonlog(ErrorData *edata);
  */
 extern void write_stderr(const char *fmt,...) pg_attribute_printf(1, 2);
 extern void vwrite_stderr(const char *fmt, va_list ap) pg_attribute_printf(1, 0);
+
+typedef struct YbStatusErrorDataFormatText {
+	const char *fmt;
+	size_t nargs;
+	const char **args;
+} YbStatusErrorDataFormatText;
+
+typedef struct YbStatusErrorDataErrorLocation {
+	const char *filename;
+	int lineno;
+	const char *funcname;
+} YbStatusErrorDataErrorLocation;
+
+typedef struct YbStatusErrorData {
+	YbStatusErrorDataFormatText msg;
+	YbStatusErrorDataFormatText detail;
+	YbStatusErrorDataFormatText detail_log;
+	YbStatusErrorDataErrorLocation location;
+} YbStatusErrorData;
+
+/* YB */
+/* YB_TODO (amartsinchyk)
+ * These function needs review and modifications to match Pg15.
+ */
+extern bool yb_errstart(int elevel);
+extern pg_attribute_cold bool yb_errstart_cold(int elevel);
+extern bool yb_errsave_start(struct Node *context);
+extern void yb_errsave_finish(struct Node *context, const char *filename,
+							  int lineno, const char *funcname);
+extern void yb_errfinish(const char *filename, int lineno, const char *funcname);
+extern void yb_errapply_yb_status(const YbStatusErrorData *status_data,
+								  int backtrace_extra_frames_skip);
+extern sigjmp_buf *yb_get_exception_stack(void);
+extern void yb_set_exception_stack(sigjmp_buf *new_sigjmp_buf);
+extern void yb_reset_error_status(void);
 
 #endif							/* ELOG_H */

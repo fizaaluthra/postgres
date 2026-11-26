@@ -71,6 +71,11 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "access/htup_details.h"
+#include "commands/sequence.h"
+#include "pg_yb_utils.h"
+
 
 /* Note: these two macros only work on shared buffers, not local ones! */
 #define BufHdrGetBlock(bufHdr)	((Block) (BufferBlocks + ((Size) (bufHdr)->buf_id) * BLCKSZ))
@@ -1364,6 +1369,44 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	return buffer;
 }
 
+/*
+ * YB: Synthesize the single page of a sequence relation from its DocDB-backed
+ * tuple and return a pinned, valid buffer for it.
+ *
+ * Sequence relations have no local storage, so this stands in for the smgr read
+ * on every buffer-read path that reaches the buffer manager (e.g. a heap scan
+ * of "SELECT ... FROM <sequence>"). The page is rebuilt from DocDB on each read
+ * so the value stays current.
+ */
+static Buffer
+YbReadSequenceBuffer(ReadBuffersOperation *operation, BlockNumber blockNum,
+					 IOObject io_object, IOContext io_context)
+{
+	bool		found;
+	Buffer		buf;
+	HeapTuple	seqtuple;
+
+	buf = PinBufferForBlock(operation->rel, operation->smgr,
+							operation->persistence, operation->forknum,
+							blockNum, operation->strategy,
+							io_object, io_context, &found);
+
+	/*
+	 * Read from DocDB before locking the buffer. The content lock holds off
+	 * interrupts and blocks other readers of this sequence, so the RPC must
+	 * not run under it.
+	 */
+	seqtuple = YBReadSequenceTuple(operation->rel);
+
+	/* Zero, exclusively lock and mark the buffer valid, then fill it. */
+	ZeroAndLockBuffer(buf, RBM_ZERO_AND_LOCK, found);
+	YbFillSequencePage(BufferGetPage(buf), seqtuple);
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	heap_freetuple(seqtuple);
+
+	return buf;
+}
+
 static pg_attribute_always_inline bool
 StartReadBuffersImpl(ReadBuffersOperation *operation,
 					 Buffer *buffers,
@@ -1391,6 +1434,32 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 	{
 		io_context = IOContextForStrategy(operation->strategy);
 		io_object = IOOBJECT_RELATION;
+	}
+
+	/*
+	 * YB: sequence relations have no storage; synthesize their single page from
+	 * DocDB rather than reading it through the smgr. All buffer-read paths funnel
+	 * here, so this covers heap scans of "SELECT ... FROM <sequence>".
+	 */
+	if (IsYugaByteEnabled() && operation->rel &&
+		RelationGetForm(operation->rel)->relkind == RELKIND_SEQUENCE)
+	{
+		buffers[0] = YbReadSequenceBuffer(operation, blockNum,
+										  io_object, io_context);
+		*nblocks = 1;
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * Copied from PG's no-IO return path below: initialize enough of
+		 * ReadBuffersOperation to make CheckReadBuffersOperation() work. We
+		 * issue no IO, so outside of assertions this is unnecessary.
+		 */
+		operation->buffers = buffers;
+		operation->blocknum = blockNum;
+		operation->nblocks = 1;
+		operation->nblocks_done = 1;
+		CheckReadBuffersOperation(operation, true);
+#endif
+		return false;
 	}
 
 	for (int i = 0; i < actual_nblocks; ++i)
@@ -4644,6 +4713,11 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 BlockNumber
 RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
 {
+	if (IsYBRelation(relation))
+	{
+		return 0;
+	}
+
 	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
 	{
 		/*

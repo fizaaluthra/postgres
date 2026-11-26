@@ -1141,8 +1141,17 @@ exec_command_d(PsqlScanState scan_state, bool active_branch, const char *cmd)
 				}
 				break;
 			case 'g':
-				/* no longer distinct from \du */
-				success = describeRoles(pattern, show_verbose, show_system);
+				if (strncmp(cmd, "dgrt", 4) == 0)
+					success = listTablegroups(pattern, show_verbose, true);
+				else if (strncmp(cmd, "dgr", 3) == 0)
+				{
+					success = listTablegroups(pattern, show_verbose, false);
+				}
+				else
+				{
+					/* no longer distinct from \du */
+					success = describeRoles(pattern, show_verbose, show_system);
+				}
 				break;
 			case 'l':
 				success = listLargeObjects(show_verbose);
@@ -1944,6 +1953,7 @@ exec_command_getresults(PsqlScanState scan_state, bool active_branch)
 		if (opt != NULL)
 		{
 			num_results = atoi(opt);
+			free(opt);
 			if (num_results < 0)
 			{
 				pg_log_error("\\getresults: invalid number of requested results");
@@ -1999,6 +2009,7 @@ exec_command_gset(PsqlScanState scan_state, bool active_branch)
 		{
 			pg_log_error("\\%s not allowed in pipeline mode", "gset");
 			clean_extended_state();
+			free(prefix);
 			return PSQL_CMD_ERROR;
 		}
 
@@ -2794,10 +2805,12 @@ exec_command_restrict(PsqlScanState scan_state, bool active_branch,
 		if (opt == NULL || opt[0] == '\0')
 		{
 			pg_log_error("\\%s: missing required argument", cmd);
+			free(opt);
 			return PSQL_CMD_ERROR;
 		}
 
 		restrict_key = pstrdup(opt);
+		free(opt);
 		restricted = true;
 	}
 	else
@@ -3202,22 +3215,26 @@ exec_command_unrestrict(PsqlScanState scan_state, bool active_branch,
 		if (opt == NULL || opt[0] == '\0')
 		{
 			pg_log_error("\\%s: missing required argument", cmd);
+			free(opt);
 			return PSQL_CMD_ERROR;
 		}
 
 		if (!restricted)
 		{
 			pg_log_error("\\%s: not currently in restricted mode", cmd);
+			free(opt);
 			return PSQL_CMD_ERROR;
 		}
 		else if (strcmp(opt, restrict_key) == 0)
 		{
 			pfree(restrict_key);
 			restricted = false;
+			free(opt);
 		}
 		else
 		{
 			pg_log_error("\\%s: wrong key", cmd);
+			free(opt);
 			return PSQL_CMD_ERROR;
 		}
 	}

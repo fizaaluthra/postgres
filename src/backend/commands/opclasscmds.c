@@ -48,6 +48,10 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "commands/extension.h"
+#include "pg_yb_utils.h"
+
 static void AlterOpFamilyAdd(AlterOpFamilyStmt *stmt,
 							 Oid amoid, Oid opfamilyoid,
 							 int maxOpNumber, int maxProcNumber,
@@ -378,6 +382,20 @@ DefineOpClass(CreateOpClassStmt *stmt)
 
 	amform = (Form_pg_am) GETSTRUCT(tup);
 	amoid = amform->oid;
+	if (IsYugaByteEnabled() && amoid == LSM_AM_OID)
+	{
+		foreach(l, stmt->items)
+		{
+			CreateOpClassItem *item = lfirst_node(CreateOpClassItem, l);
+
+			if (item->itemtype == OPCLASS_ITEM_STORAGETYPE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("STORAGE clause not supported for CREATE "
+								"OPERATOR CLASS with lsm access method")));
+		}
+	}
+
 	amroutine = GetIndexAmRoutineByAmId(amoid, false);
 	ReleaseSysCache(tup);
 
@@ -410,11 +428,14 @@ DefineOpClass(CreateOpClassStmt *stmt)
 	 * without solving the halting problem :-(
 	 *
 	 * XXX re-enable NOT_USED code sections below if you remove this test.
+	 * In YB mode, we allow users with the yb_extension role who are in the
+	 * midst of creating an extension to create a base type.
 	 */
-	if (!superuser())
+	if (!(IsYbExtensionUser(GetUserId()) && creating_extension) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to create an operator class")));
+				 errmsg("must be superuser or a member of the yb_extension "
+						"role to create an operator class")));
 
 	/* Look up the datatype */
 	typeoid = typenameTypeId(NULL, stmt->datatype);
@@ -875,10 +896,11 @@ AlterOpFamily(AlterOpFamilyStmt *stmt)
 	 *
 	 * XXX re-enable NOT_USED code sections below if you remove this test.
 	 */
-	if (!superuser())
+	if (!superuser() && !(IsYbExtensionUser(GetUserId()) && creating_extension))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to alter an operator family")));
+				 errmsg("must be superuser or a member of the yb_extension "
+						"role to alter an operator family")));
 
 	/*
 	 * ADD and DROP cases need separate code from here on down.
@@ -906,6 +928,11 @@ AlterOpFamilyAdd(AlterOpFamilyStmt *stmt, Oid amoid, Oid opfamilyoid,
 	List	   *operators;		/* OpFamilyMember list for operators */
 	List	   *procedures;		/* OpFamilyMember list for support procs */
 	ListCell   *l;
+
+	if (amoid == LSM_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported lsm index method for ALTER OPERATOR FAMILY")));
 
 	operators = NIL;
 	procedures = NIL;

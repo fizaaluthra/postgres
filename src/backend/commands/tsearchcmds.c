@@ -486,6 +486,32 @@ DefineTSDictionary(List *names, List *parameters)
 	return address;
 }
 
+#ifdef YB_TODO
+/*
+ * Guts of TS dictionary deletion.
+ */
+void
+RemoveTSDictionaryById(Oid dictId)
+{
+	Relation	relation;
+	HeapTuple	tup;
+
+	relation = table_open(TSDictionaryRelationId, RowExclusiveLock);
+
+	tup = SearchSysCache1(TSDICTOID, ObjectIdGetDatum(dictId));
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for text search dictionary %u",
+			 dictId);
+
+	CatalogTupleDelete(relation, tup);
+
+	ReleaseSysCache(tup);
+
+	table_close(relation, RowExclusiveLock);
+}
+#endif
+
 /*
  * ALTER TEXT SEARCH DICTIONARY
  */
@@ -776,6 +802,32 @@ DefineTSTemplate(List *names, List *parameters)
 
 	return address;
 }
+
+#ifdef YB_TODO
+/*
+ * Guts of TS template deletion.
+ */
+void
+RemoveTSTemplateById(Oid tmplId)
+{
+	Relation	relation;
+	HeapTuple	tup;
+
+	relation = table_open(TSTemplateRelationId, RowExclusiveLock);
+
+	tup = SearchSysCache1(TSTEMPLATEOID, ObjectIdGetDatum(tmplId));
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for text search template %u",
+			 tmplId);
+
+	CatalogTupleDelete(relation, tup);
+
+	ReleaseSysCache(tup);
+
+	table_close(relation, RowExclusiveLock);
+}
+#endif
 
 /* ---------------------- TS Configuration commands -----------------------*/
 
@@ -1070,7 +1122,8 @@ DefineTSConfiguration(List *names, List *parameters, ObjectAddress *copied)
 			if (slot_stored_count == max_slots)
 			{
 				CatalogTuplesMultiInsertWithInfo(mapRel, slot, slot_stored_count,
-												 indstate);
+												 indstate,
+												 false /* yb_shared_insert */ );
 				slot_stored_count = 0;
 			}
 		}
@@ -1078,7 +1131,8 @@ DefineTSConfiguration(List *names, List *parameters, ObjectAddress *copied)
 		/* Insert any tuples left in the buffer */
 		if (slot_stored_count > 0)
 			CatalogTuplesMultiInsertWithInfo(mapRel, slot, slot_stored_count,
-											 indstate);
+											 indstate,
+											 false /* yb_shared_insert */ );
 
 		for (int i = 0; i < slot_init_count; i++)
 			ExecDropSingleTupleTableSlot(slot[i]);
@@ -1122,7 +1176,7 @@ RemoveTSConfigurationById(Oid cfgId)
 		elog(ERROR, "cache lookup failed for text search dictionary %u",
 			 cfgId);
 
-	CatalogTupleDelete(relCfg, &tup->t_self);
+	CatalogTupleDelete(relCfg, tup);
 
 	ReleaseSysCache(tup);
 
@@ -1141,7 +1195,7 @@ RemoveTSConfigurationById(Oid cfgId)
 
 	while (HeapTupleIsValid((tup = systable_getnext(scan))))
 	{
-		CatalogTupleDelete(relMap, &tup->t_self);
+		CatalogTupleDelete(relMap, tup);
 	}
 
 	systable_endscan(scan);
@@ -1333,7 +1387,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 
 			while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 			{
-				CatalogTupleDelete(relMap, &maptup->t_self);
+				CatalogTupleDelete(relMap, maptup);
 			}
 
 			systable_endscan(scan);
@@ -1463,7 +1517,8 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 				if (slotCount == nslots)
 				{
 					CatalogTuplesMultiInsertWithInfo(relMap, slot, slotCount,
-													 indstate);
+													 indstate,
+													 false /* yb_shared_insert */ );
 					slotCount = 0;
 				}
 			}
@@ -1472,7 +1527,8 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 		/* Insert any tuples left in the buffer */
 		if (slotCount > 0)
 			CatalogTuplesMultiInsertWithInfo(relMap, slot, slotCount,
-											 indstate);
+											 indstate,
+											 false /* yb_shared_insert */ );
 
 		for (i = 0; i < nslots; i++)
 			ExecDropSingleTupleTableSlot(slot[i]);
@@ -1525,7 +1581,7 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
-			CatalogTupleDelete(relMap, &maptup->t_self);
+			CatalogTupleDelete(relMap, maptup);
 			found = true;
 		}
 

@@ -39,6 +39,9 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* Hook to perform additional EXPLAIN options validation */
 explain_validate_options_hook_type explain_validate_options_hook = NULL;
 
@@ -56,6 +59,9 @@ static int	ExplainExtensionNamesAllocated = 0;
 static ExplainExtensionOption *ExplainExtensionOptionArray = NULL;
 static int	ExplainExtensionOptionsAssigned = 0;
 static int	ExplainExtensionOptionsAllocated = 0;
+
+/* YB */
+static bool YbIsTimingNeeded(ExplainState *es, bool timing_set);
 
 /*
  * Create a new ExplainState struct initialized with default options.
@@ -164,6 +170,27 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
 		}
 		else if (strcmp(opt->defname, "io") == 0)
 			es->io = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "dist") == 0)
+			es->rpc = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "debug") == 0)
+			es->yb_debug = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "commit") == 0)
+			es->yb_commit = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "hints") == 0)
+			es->ybShowHints = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "uids") == 0)
+			es->ybShowUniqueIds = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "planid") == 0)
+			es->ybShowPlanId = defGetBoolean(opt);
+		/* YB */
+		else if (strcmp(opt->defname, "queryid") == 0)
+			es->ybShowQueryId = defGetBoolean(opt);
 		else if (!ApplyExtensionExplainOption(es, opt, pstate))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -178,8 +205,8 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("EXPLAIN option %s requires ANALYZE", "WAL")));
 
-	/* if the timing was not set explicitly, set default value */
-	es->timing = (timing_set) ? es->timing : es->analyze;
+	/* YB: check if timing is required */
+	es->timing = YbIsTimingNeeded(es, timing_set);
 
 	/* if the buffers was not set explicitly, set default value */
 	es->buffers = (buffers_set) ? es->buffers : es->analyze;
@@ -211,6 +238,28 @@ ParseExplainOptionList(ExplainState *es, List *options, ParseState *pstate)
 
 	/* if the summary was not set explicitly, set default value */
 	es->summary = (summary_set) ? es->summary : es->analyze;
+
+	if (es->analyze)
+		yb_run_with_explain_analyze = true;
+
+	/* YB: debug metrics setup */
+	es->yb_debug = YbIsDebugMetricsCollectionNeeded(es->yb_debug, es->rpc);
+
+	if (es->rpc && !es->analyze)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("EXPLAIN option %s requires ANALYZE", "DIST")));
+
+	if (es->yb_commit && !es->analyze)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("EXPLAIN option %s requires ANALYZE", "COMMIT")));
+
+	YbToggleSessionStatsTimer(es->timing);
+	if (es->yb_debug)
+	{
+		YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_ALL);
+	}
 
 	/* plugin specific option validation */
 	if (explain_validate_options_hook)
@@ -495,4 +544,28 @@ GUCCheckBooleanExplainOption(const char *option_name,
 	}
 
 	return true;
+}
+
+static bool
+YbIsTimingNeeded(ExplainState *es, bool timing_set)
+{
+	/* Disable timing if only deterministic fields are requested */
+	if (yb_explain_hide_non_deterministic_fields)
+	{
+		if (timing_set && es->timing)
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("GUC yb_explain_hide_non_deterministic_fields "
+							"disables EXPLAIN option TIMING")));
+		}
+		return false;
+	}
+
+	/* Else if timing option is explicitly set in the query, honor it */
+	if (timing_set)
+		return es->timing;
+
+	/* Else, use timing if the query needs it */
+	return es->analyze;
 }

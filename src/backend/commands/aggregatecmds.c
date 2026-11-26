@@ -34,6 +34,10 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "commands/extension.h"
+#include "pg_yb_utils.h"
+
 
 static char extractModify(DefElem *defel);
 
@@ -339,7 +343,7 @@ DefineAggregate(ParseState *pstate,
 	if (transTypeType == TYPTYPE_PSEUDO &&
 		!IsPolymorphicType(transTypeId))
 	{
-		if (transTypeId == INTERNALOID && superuser())
+		if (transTypeId == INTERNALOID && ((IsYbExtensionUser(GetUserId()) && creating_extension) || superuser()))
 			 /* okay */ ;
 		else
 			ereport(ERROR,

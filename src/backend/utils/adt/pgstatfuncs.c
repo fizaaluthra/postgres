@@ -34,6 +34,19 @@
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "commands/progress.h"
+#include "commands/yb_cmds.h"
+#include "inttypes.h"
+#include "pg_yb_utils.h"
+#include "utils/uuid.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+#include "yb_internal_conn.h"
+
+extern bool yb_retrieved_concurrent_index_progress;
+
+uint64_t   *yb_pg_stat_retrieve_concurrent_index_progress();
+
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
 
 #define HAS_PGSTAT_PERMISSIONS(role)	 (has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS) || has_privs_of_role(GetUserId(), role))
@@ -284,6 +297,9 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 	ProgressCommandType cmdtype;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
+	uint64_t   *index_progress = NULL;
+	uint64_t   *index_progress_iterator = NULL;
+
 	/* Translate command name into command type code. */
 	if (pg_strcasecmp(cmd, "VACUUM") == 0)
 		cmdtype = PROGRESS_COMMAND_VACUUM;
@@ -306,6 +322,27 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 
+	/*
+	 * YB: Fetch stats for in-progress concurrent create indexes that aren't
+	 * captured in the local backend entry from master. We avoid reading these
+	 * stats while constructing the local backend entry in
+	 * pg_read_current_stats() in order to avoid extraneous RPCs to master
+	 * (in case we read from pg_stat_* views within a transaction but don't
+	 * read from pg_stat_progress_create_index). Since these stats are computed
+	 * on the fly and not at the time of pg_read_current_stats(), they may not
+	 * be consistent with other backend stats.
+	 * Also, the fetched values are constant within a transaction - we only
+	 * fetch from master if we haven't already done so within the current
+	 * transaction.
+	 */
+	if (IsYugaByteEnabled() && cmdtype == PROGRESS_COMMAND_CREATE_INDEX &&
+		!yb_retrieved_concurrent_index_progress)
+	{
+		index_progress = yb_pg_stat_retrieve_concurrent_index_progress();
+		index_progress_iterator = index_progress;
+		yb_retrieved_concurrent_index_progress = true;
+	}
+
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
 	{
@@ -321,9 +358,38 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 		/*
 		 * Report values for only those backends which are running the given
 		 * command.
+		 *
+		 * YB: for COPY, report even if the command finished.
 		 */
-		if (beentry->st_progress_command != cmdtype)
+		if (beentry->st_progress_command != cmdtype &&
+			beentry->st_progress_command != PROGRESS_COMMAND_COPY)
 			continue;
+
+		/*
+		 * Fill in tuples_done for concurrent create indexes on YB relations
+		 * that are in the backfilling phase. Note: This block will not be
+		 * executed for indexes on non-YB relations (temporary relations)
+		 * because they are always built non-concurrently.
+		 */
+		if (IsYugaByteEnabled() && cmdtype == PROGRESS_COMMAND_CREATE_INDEX &&
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_COMMAND]
+			 == PROGRESS_CREATEIDX_COMMAND_CREATE_CONCURRENTLY) &&
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_PHASE]
+			 == YB_PROGRESS_CREATEIDX_BACKFILLING) &&
+			index_progress_iterator)
+		{
+			/*
+			 * Note: we expect the ordering of the indexes in index_progress to
+			 * to match the ordering within the backend status array -
+			 * therefore we don't need to loop through index_progress to find
+			 * the relevant entry
+			 */
+			beentry->st_progress_param[PROGRESS_CREATEIDX_TUPLES_DONE]
+				= (*index_progress_iterator > PG_INT64_MAX ?
+				   PG_INT64_MAX :
+				   (int64) *index_progress_iterator);
+			index_progress_iterator++;
+		}
 
 		/* Value available to all callers */
 		values[0] = Int32GetDatum(beentry->st_procpid);
@@ -343,8 +409,42 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 				nulls[i + 3] = true;
 		}
 
+		/*
+		 * YB: Set the columns of pg_stat_progress_create_index that are unused
+		 * in YB to null.
+		 */
+		if (IsYugaByteEnabled() && cmdtype == PROGRESS_COMMAND_CREATE_INDEX)
+		{
+			for (i = 0; i < PGSTAT_NUM_PROGRESS_PARAM; i++)
+			{
+				/*
+				 * In YB, we only use the command, index_relid, phase,
+				 * tuples_total, tuples_done, partitions_total, partitions_done
+				 * columns for YB indexes. For temp indexes, tuples_total and
+				 * tuples_done are never computed (the beentry progress params
+				 * are set to an invalid value (YB_PROGRESS_CREATEIDX_INVALID)
+				 * so we set those to null too.
+				 */
+				if (i == PROGRESS_CREATEIDX_COMMAND ||
+					i == PROGRESS_CREATEIDX_INDEX_OID ||
+					i == PROGRESS_CREATEIDX_PHASE ||
+					i == PROGRESS_CREATEIDX_PARTITIONS_TOTAL ||
+					i == PROGRESS_CREATEIDX_PARTITIONS_DONE ||
+					(beentry->st_progress_param[i] !=
+					 YB_PROGRESS_CREATEIDX_INVALID &&
+					 (i == PROGRESS_CREATEIDX_TUPLES_TOTAL ||
+					  i == PROGRESS_CREATEIDX_TUPLES_DONE)))
+					continue;
+				nulls[i + 3] = true;
+			}
+		}
+
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+
+	/* YB */
+	if (index_progress)
+		pfree(index_progress);
 
 	return (Datum) 0;
 }
@@ -356,19 +456,46 @@ Datum
 pg_stat_get_activity(PG_FUNCTION_ARGS)
 {
 #define PG_STAT_GET_ACTIVITY_COLS	31
+/* YB specific fields in pg_stat_activity */
+#define YB_PG_STAT_GET_ACTIVITY_COLS 1
+#define YB_BACKEND_XID_COL			PG_STAT_GET_ACTIVITY_COLS
 	int			num_backends = pgstat_fetch_stat_numbackends();
 	int			curr_backend;
 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TimestampTz yb_txn_rpc_timestamp;
 
 	InitMaterializedSRF(fcinfo, 0);
+
+	YbcPgSessionTxnInfo *txn_infos = NULL;
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_enable_pg_locks)
+	{
+		txn_infos = (YbcPgSessionTxnInfo *)
+			palloc0(sizeof(YbcPgSessionTxnInfo) * num_backends);
+		/* 1-based index */
+		for (curr_backend = 1; curr_backend <= num_backends; ++curr_backend)
+		{
+			const LocalPgBackendStatus *local_beentry =
+				pgstat_get_local_beentry_by_index(curr_backend);
+
+			if (!local_beentry)
+				break;
+			txn_infos[curr_backend - 1].session_id =
+				local_beentry->backendStatus.yb_session_id;
+		}
+		yb_txn_rpc_timestamp = GetCurrentTimestamp();
+		HandleYBStatus(YBCPgActiveTransactions(txn_infos, num_backends));
+	}
 
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
 	{
 		/* for each row */
-		Datum		values[PG_STAT_GET_ACTIVITY_COLS] = {0};
-		bool		nulls[PG_STAT_GET_ACTIVITY_COLS] = {0};
+		Datum		values[PG_STAT_GET_ACTIVITY_COLS +
+						   YB_PG_STAT_GET_ACTIVITY_COLS] = {0};
+		bool		nulls[PG_STAT_GET_ACTIVITY_COLS +
+						  YB_PG_STAT_GET_ACTIVITY_COLS] = {0};
 		LocalPgBackendStatus *local_beentry;
 		PgBackendStatus *beentry;
 		PGPROC	   *proc;
@@ -453,7 +580,10 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 			proc = BackendPidGetProc(beentry->st_procpid);
 
-			if (proc == NULL && (beentry->st_backendType != B_BACKEND))
+			if (proc == NULL && (beentry->st_backendType != B_BACKEND &&
+								 beentry->st_backendType != YB_YSQL_CONN_MGR &&
+								 beentry->st_backendType != YB_YSQL_CONN_MGR_CTRL &&
+								 !YbIsInternalConnBackendType(beentry->st_backendType)))
 			{
 				/*
 				 * For an auxiliary process, retrieve process info from
@@ -517,7 +647,8 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			 * date.
 			 */
 			if (beentry->st_xact_start_timestamp != 0 &&
-				beentry->st_backendType != B_WAL_SENDER)
+				beentry->st_backendType != B_WAL_SENDER &&
+				beentry->st_backendType != YB_YSQL_CONN_MGR_WAL_SENDER)
 				values[8] = TimestampTzGetDatum(beentry->st_xact_start_timestamp);
 			else
 				nulls[8] = true;
@@ -537,69 +668,93 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			else
 				nulls[11] = true;
 
-			/* A zeroed client addr means we don't know */
-			if (pg_memory_is_all_zeros(&beentry->st_clientaddr,
-									   sizeof(beentry->st_clientaddr)))
+			/*
+			 * YB: For backends served by conn mgr, the physical connection
+			 * is always a Unix socket with conn mgr.
+			 * Show the logical client's address/port/hostname that the
+			 * connection manager forwarded via the yb_conn_mgr_client_*
+			 * GUCs instead.
+			 */
+			if (beentry->yb_st_cm_client_addr[0] != '\0')
 			{
-				nulls[12] = true;
-				nulls[13] = true;
-				nulls[14] = true;
+				values[12] = DirectFunctionCall1(inet_in,
+												 CStringGetDatum(beentry->yb_st_cm_client_addr));
+				if (beentry->yb_st_cm_client_hostname[0] != '\0')
+					values[13] = CStringGetTextDatum(beentry->yb_st_cm_client_hostname);
+				else
+					nulls[13] = true;
+				values[14] = Int32GetDatum(beentry->yb_st_cm_client_port >= 0
+										   ? beentry->yb_st_cm_client_port
+										   : -1);
 			}
 			else
 			{
-				if (beentry->st_clientaddr.addr.ss_family == AF_INET ||
-					beentry->st_clientaddr.addr.ss_family == AF_INET6)
-				{
-					char		remote_host[NI_MAXHOST];
-					char		remote_port[NI_MAXSERV];
-					int			ret;
+				/* YB: non-CM connection: standard upstream client-address reporting */
 
-					remote_host[0] = '\0';
-					remote_port[0] = '\0';
-					ret = pg_getnameinfo_all(&beentry->st_clientaddr.addr,
-											 beentry->st_clientaddr.salen,
-											 remote_host, sizeof(remote_host),
-											 remote_port, sizeof(remote_port),
-											 NI_NUMERICHOST | NI_NUMERICSERV);
-					if (ret == 0)
+				/* A zeroed client addr means we don't know */
+				if (pg_memory_is_all_zeros(&beentry->st_clientaddr,
+										   sizeof(beentry->st_clientaddr)))
+				{
+					nulls[12] = true;
+					nulls[13] = true;
+					nulls[14] = true;
+				}
+				else
+				{
+					if (beentry->st_clientaddr.addr.ss_family == AF_INET ||
+						beentry->st_clientaddr.addr.ss_family == AF_INET6)
 					{
-						clean_ipv6_addr(beentry->st_clientaddr.addr.ss_family, remote_host);
-						values[12] = DirectFunctionCall1(inet_in,
-														 CStringGetDatum(remote_host));
-						if (beentry->st_clienthostname &&
-							beentry->st_clienthostname[0])
-							values[13] = CStringGetTextDatum(beentry->st_clienthostname);
+						char		remote_host[NI_MAXHOST];
+						char		remote_port[NI_MAXSERV];
+						int			ret;
+
+						remote_host[0] = '\0';
+						remote_port[0] = '\0';
+						ret = pg_getnameinfo_all(&beentry->st_clientaddr.addr,
+												 beentry->st_clientaddr.salen,
+												 remote_host, sizeof(remote_host),
+												 remote_port, sizeof(remote_port),
+												 NI_NUMERICHOST | NI_NUMERICSERV);
+						if (ret == 0)
+						{
+							clean_ipv6_addr(beentry->st_clientaddr.addr.ss_family, remote_host);
+							values[12] = DirectFunctionCall1(inet_in,
+															 CStringGetDatum(remote_host));
+							if (beentry->st_clienthostname &&
+								beentry->st_clienthostname[0])
+								values[13] = CStringGetTextDatum(beentry->st_clienthostname);
+							else
+								nulls[13] = true;
+							values[14] = Int32GetDatum(atoi(remote_port));
+						}
 						else
+						{
+							nulls[12] = true;
 							nulls[13] = true;
-						values[14] = Int32GetDatum(atoi(remote_port));
+							nulls[14] = true;
+						}
+					}
+					else if (beentry->st_clientaddr.addr.ss_family == AF_UNIX)
+					{
+						/*
+						 * Unix sockets always reports NULL for host and -1 for
+						 * port, so it's possible to tell the difference to
+						 * connections we have no permissions to view, or with
+						 * errors.
+						 */
+						nulls[12] = true;
+						nulls[13] = true;
+						values[14] = Int32GetDatum(-1);
 					}
 					else
 					{
+						/* Unknown address type, should never happen */
 						nulls[12] = true;
 						nulls[13] = true;
 						nulls[14] = true;
 					}
 				}
-				else if (beentry->st_clientaddr.addr.ss_family == AF_UNIX)
-				{
-					/*
-					 * Unix sockets always reports NULL for host and -1 for
-					 * port, so it's possible to tell the difference to
-					 * connections we have no permissions to view, or with
-					 * errors.
-					 */
-					nulls[12] = true;
-					nulls[13] = true;
-					values[14] = Int32GetDatum(-1);
-				}
-				else
-				{
-					/* Unknown address type, should never happen */
-					nulls[12] = true;
-					nulls[13] = true;
-					nulls[14] = true;
-				}
-			}
+			} /* end yb_st_cm_client_addr check */
 			/* Add backend type */
 			if (beentry->st_backendType == B_BG_WORKER)
 			{
@@ -698,6 +853,28 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			nulls[28] = true;
 			nulls[29] = true;
 			nulls[30] = true;
+		}
+
+		nulls[YB_BACKEND_XID_COL] = true;
+
+		/*
+		 * YB: The activity_start_timestamp is updated at the start of every
+		 * query. When the query start timestamp is later (greater) than the
+		 * timestamp of the RPC above, this indicates that the data in the RPC
+		 * is out-of-date. In such cases, we skip printing the transaction ID.
+		 */
+
+		if (yb_enable_pg_locks && beentry->yb_session_id &&
+			beentry->st_activity_start_timestamp <= yb_txn_rpc_timestamp)
+		{
+			Assert(txn_infos);
+			const YbcPgSessionTxnInfo *info = txn_infos + curr_backend - 1;
+
+			if (info->is_not_null)
+			{
+				values[YB_BACKEND_XID_COL] = UUIDPGetDatum((const pg_uuid_t *) &info->txn_id);
+				nulls[YB_BACKEND_XID_COL] = false;
+			}
 		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
@@ -956,6 +1133,10 @@ pg_stat_get_backend_client_addr(PG_FUNCTION_ARGS)
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
 		PG_RETURN_NULL();
 
+	if (beentry->yb_st_cm_client_addr[0] != '\0')
+		PG_RETURN_DATUM(DirectFunctionCall1(inet_in,
+											CStringGetDatum(beentry->yb_st_cm_client_addr)));
+
 	/* A zeroed client addr means we don't know */
 	if (pg_memory_is_all_zeros(&beentry->st_clientaddr,
 							   sizeof(beentry->st_clientaddr)))
@@ -999,6 +1180,10 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 	else if (!HAS_PGSTAT_PERMISSIONS(beentry->st_userid))
 		PG_RETURN_NULL();
 
+	if (beentry->yb_st_cm_client_addr[0] != '\0')
+		PG_RETURN_INT32(beentry->yb_st_cm_client_port >= 0
+						? beentry->yb_st_cm_client_port : -1);
+
 	/* A zeroed client addr means we don't know */
 	if (pg_memory_is_all_zeros(&beentry->st_clientaddr,
 							   sizeof(beentry->st_clientaddr)))
@@ -1028,6 +1213,77 @@ pg_stat_get_backend_client_port(PG_FUNCTION_ARGS)
 										CStringGetDatum(remote_port)));
 }
 
+Datum
+yb_pg_stat_get_backend_catalog_version(PG_FUNCTION_ARGS)
+{
+	int32		procNumber = PG_GETARG_INT32(0);
+	PgBackendStatus *beentry;
+
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
+		PG_RETURN_NULL();
+
+	if (beentry->yb_st_catalog_version.has_version &&
+		!beentry->yb_st_catalog_version.catalog_pinned_to_historical_read_time)
+		PG_RETURN_DATUM(UInt64GetDatum(beentry->yb_st_catalog_version.version));
+	else
+		PG_RETURN_NULL();
+}
+
+/*
+ * Returns a record of (datid, local_catalog_version) about the backend
+ * with the specified process ID if the backend has both a valid datid
+ * (OidIsValid) and a local_catalog_version (> 0), or one record for each
+ * such valid backend in the system if NULL is specified.
+ */
+Datum
+yb_pg_stat_get_backend_local_catalog_version(PG_FUNCTION_ARGS)
+{
+	int			pid = PG_ARGISNULL(0) ? InvalidPid : PG_GETARG_INT32(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			num_backends = pgstat_fetch_stat_numbackends();
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	/* 1-based index */
+	for (i = 1; i <= num_backends; i++)
+	{
+		PgBackendStatus *beentry;
+		LocalPgBackendStatus *local_beentry = pgstat_get_local_beentry_by_index(i);
+
+		if (!local_beentry)
+			continue;
+
+		beentry = &local_beentry->backendStatus;
+		if (pid != InvalidPid && beentry->st_procpid != pid)
+			continue;
+
+		/*
+		 * ash has version but also has STATE_UNDEFINED, we do not want to
+		 * have a PG background worker to hold off garbage collection of
+		 * tserver invalidation messages.
+		 */
+		if (beentry->st_state == STATE_UNDEFINED)
+			continue;
+
+		/* datid and local_catalog_version are available to all callers */
+		if (beentry->st_databaseid == InvalidOid ||
+			beentry->yb_st_catalog_version.version == 0 ||
+			beentry->yb_st_catalog_version.catalog_pinned_to_historical_read_time)
+			continue;
+
+		/* for each row */
+		Datum		values[2];
+		bool		nulls[2];
+
+		values[0] = ObjectIdGetDatum(beentry->st_databaseid);
+		values[1] = UInt64GetDatum(beentry->yb_st_catalog_version.version);
+		nulls[0] = false;
+		nulls[1] = false;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
 
 Datum
 pg_stat_get_db_numbackends(PG_FUNCTION_ARGS)
@@ -2360,4 +2616,117 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 	PgStat_Kind kind = pgstat_get_kind_from_str(stats_type);
 
 	PG_RETURN_BOOL(pgstat_have_entry(kind, dboid, objid));
+}
+
+/* Returns backend_allocated_mem_bytes from the process's proc number */
+Datum
+yb_pg_stat_get_backend_allocated_mem_bytes(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_memory_tracking)
+		PG_RETURN_NULL();
+
+	int32		procNumber = PG_GETARG_INT32(0);
+	int64		result;
+	PgBackendStatus *beentry;
+
+	if ((beentry = pgstat_get_beentry_by_proc_number(procNumber)) == NULL)
+		PG_RETURN_NULL();
+
+	result = beentry->yb_st_allocated_mem_bytes;
+
+	PG_RETURN_INT64(result);
+}
+
+/* Returns rss_mem_bytes from the process's proc number */
+Datum
+yb_pg_stat_get_backend_rss_mem_bytes(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_memory_tracking)
+		PG_RETURN_NULL();
+
+	int32		procNumber = PG_GETARG_INT32(0);
+	int64		result;
+	LocalPgBackendStatus *local_beentry;
+
+	if ((local_beentry = pgstat_get_local_beentry_by_proc_number(procNumber)) == NULL)
+		PG_RETURN_NULL();
+
+	result = local_beentry->yb_backend_rss_mem_bytes;
+
+	PG_RETURN_INT64(result);
+}
+
+/* Returns pss_mem_bytes from the process's proc number */
+Datum
+yb_pg_stat_get_backend_pss_mem_bytes(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_memory_tracking)
+		PG_RETURN_NULL();
+
+	int32		procNumber = PG_GETARG_INT32(0);
+	int64		result;
+	LocalPgBackendStatus *local_beentry;
+
+	if ((local_beentry = pgstat_get_local_beentry_by_proc_number(procNumber)) == NULL)
+		PG_RETURN_NULL();
+
+	result = local_beentry->yb_backend_pss_mem_bytes;
+
+	PG_RETURN_INT64(result);
+}
+
+/*
+ * In YB, this function is used to retrieve stats for in-progress concurrent
+ * CREATE INDEX from master.
+ */
+uint64_t *
+yb_pg_stat_retrieve_concurrent_index_progress()
+{
+	int			num_backends = pgstat_fetch_stat_numbackends();
+	int			curr_backend;
+	int			num_indexes = 0;
+	Oid			database_oids[num_backends];
+	Oid			index_oids[num_backends];
+	uint64_t   *num_rows_read_from_table = NULL;
+
+	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)
+	{
+		PgBackendStatus *beentry;
+		LocalPgBackendStatus *local_beentry;
+
+		local_beentry = pgstat_get_local_beentry_by_index(curr_backend);
+
+		if (!local_beentry)
+			continue;
+
+		beentry = &local_beentry->backendStatus;
+
+		/*
+		 * Filter out commands besides concurrent create indexes on YB
+		 * relations that are in the backfilling phase.  Note: This block will
+		 * not be executed for indexes on non-YB relations (temporary
+		 * relations) because they are always built non-concurrently.
+		 */
+		if (beentry->st_progress_command != PROGRESS_COMMAND_CREATE_INDEX ||
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_COMMAND]
+			 != PROGRESS_CREATEIDX_COMMAND_CREATE_CONCURRENTLY) ||
+			(beentry->st_progress_param[PROGRESS_CREATEIDX_PHASE]
+			 < YB_PROGRESS_CREATEIDX_BACKFILLING))
+			continue;
+
+		database_oids[num_indexes] = beentry->st_databaseid;
+		index_oids[num_indexes++] =
+			beentry->st_progress_param[PROGRESS_CREATEIDX_INDEX_OID];
+	}
+
+	if (num_indexes > 0)
+	{
+		num_rows_read_from_table = palloc(sizeof(uint64_t) * num_indexes);
+		HandleYBStatus(YBCGetIndexBackfillProgress(index_oids, database_oids,
+												   num_rows_read_from_table,
+												   NULL,
+												   num_indexes));
+	}
+
+	return num_rows_read_from_table;
 }

@@ -2067,6 +2067,20 @@ DecodeTimeOnly(char **field, int *ftype, int nf,
 					char	   *cp;
 					int			value;
 
+					/* YB: Only accept a date under limited circumstances */
+					switch (ptype)
+					{
+						case DTK_JULIAN:
+						case DTK_YEAR:
+						case DTK_MONTH:
+						case DTK_DAY:
+							if (tzp == NULL)
+								return DTERR_BAD_FORMAT;
+							pg_fallthrough;
+						default:
+							break;
+					}
+
 					errno = 0;
 					value = strtoint(field[i], &cp, 10);
 					if (errno == ERANGE)

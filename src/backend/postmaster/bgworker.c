@@ -39,6 +39,11 @@
 #include "utils/timeout.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "commands/async.h"
+#include "yb_ash.h"
+#include "yb_query_diagnostics.h"
+
 /*
  * The postmaster's list of registered background workers, in private memory.
  */
@@ -166,11 +171,52 @@ static const struct
 	{
 		.fn_name = "DataChecksumsWorkerMain",
 		.fn_addr = DataChecksumsWorkerMain
+	},
+	{
+		.fn_name = "YbAshMain",
+		.fn_addr = YbAshMain
+	},
+	{
+		.fn_name = "YbQueryDiagnosticsMain",
+		.fn_addr = YbQueryDiagnosticsMain
+	},
+	{
+		.fn_name = "YbQueryDiagnosticsDatabaseConnectionWorkerMain",
+		.fn_addr = YbQueryDiagnosticsDatabaseConnectionWorkerMain
+	},
+	{
+		.fn_name = "YbNotifsPollerMain",
+		.fn_addr = YbNotifsPollerMain
 	}
+};
+
+/*
+ * YB: A whitelist of InternalBGWorkers that may be registered under YSQL. Any
+ * other worker is refused, so a worker added by an upstream merge stays off
+ * until it is reviewed and listed here. Workers added by extensions are not
+ * affected.
+ */
+static const bgworker_main_type yb_allowed_internal_bgworkers[] = {
+	/* Logical replication workers */
+	ApplyLauncherMain,
+	ApplyWorkerMain,
+	TableSyncWorkerMain,
+
+	/* Parallel query workers */
+	ParallelWorkerMain,
+
+	/* YB-specific workers */
+	YbAshMain,
+	YbQueryDiagnosticsMain,
+	YbQueryDiagnosticsDatabaseConnectionWorkerMain,
+	YbNotifsPollerMain,
 };
 
 /* Private functions. */
 static bgworker_main_type LookupBackgroundWorkerFunction(const char *libraryname, const char *funcname);
+
+/* YB declarations */
+static bool YbIsBackgroundWorkerAllowed(const BackgroundWorker *worker);
 
 
 /*
@@ -763,6 +809,9 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 	MyBgworkerEntry = worker;
 	init_ps_display(worker->bgw_name);
 
+	/* YB: set in the child so the worker never runs with the inherited score */
+	YbSetOomScoreAdjForPid(MyProcPid, worker->bgw_oom_score_adj);
+
 	Assert(GetProcessingMode() == InitProcessing);
 
 	/* Apply PostAuthDelay */
@@ -780,6 +829,8 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 		pqsignal(SIGINT, StatementCancelHandler);
 		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
 		pqsignal(SIGFPE, FloatExceptionHandler);
+		pqsignal(SIGSEGV, YbCriticalSignalHandler);
+		pqsignal(SIGABRT, YbCriticalSignalHandler);
 
 		/* XXX Any other handlers needed here? */
 	}
@@ -846,6 +897,16 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 	 */
 	BaseInit();
 
+	if (YBIsEnabledInPostgresEnvVar())
+	{
+		const char *background_worker_name =
+			worker->bgw_name[0] != '\0' ? worker->bgw_name : "[unknown]";
+
+		YBC_LOG_INFO("Started %s with pid: %d",
+					 background_worker_name,
+					 MyProcPid);
+	}
+
 	/*
 	 * Look up the entry point function, loading its library if necessary.
 	 */
@@ -858,6 +919,8 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 	 * need to wait until the user code does it via
 	 * BackgroundWorkerInitializeConnection().
 	 */
+
+	YbMyProcState->initialization_completed = true;
 
 	/*
 	 * Now invoke the user-defined worker code
@@ -895,6 +958,9 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
 				 init_flags,
 				 NULL);			/* no out_dbname */
 
+	if (yb_enable_ash)
+		YbAshSetMetadataForBgworkers();
+
 	/* it had better not gotten out of "init" mode yet */
 	if (!IsInitProcessingMode())
 		ereport(ERROR,
@@ -906,7 +972,8 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
  * Connect background worker to a database using OIDs.
  */
 void
-BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
+YbBackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags,
+											const YbcPgInitPostgresInfo *yb_init_info)
 {
 	BackgroundWorker *worker = MyBgworkerEntry;
 	uint32		init_flags = 0; /* never honor session_preload_libraries */
@@ -924,16 +991,26 @@ BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("database connection requirement not indicated during registration")));
 
-	InitPostgres(NULL, dboid,	/* database to connect to */
-				 NULL, useroid, /* role to connect as */
-				 init_flags,
-				 NULL);			/* no out_dbname */
+	YbInitPostgres(NULL, dboid,	/* database to connect to */
+				   NULL, useroid, /* role to connect as */
+				   init_flags,
+				   NULL,			/* no out_dbname */
+				   yb_init_info);
+
+	if (yb_enable_ash)
+		YbAshSetMetadataForBgworkers();
 
 	/* it had better not gotten out of "init" mode yet */
 	if (!IsInitProcessingMode())
 		ereport(ERROR,
 				(errmsg("invalid processing mode in background worker")));
 	SetProcessingMode(NormalProcessing);
+}
+
+void
+BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
+{
+	YbBackgroundWorkerInitializeConnectionByOid(dboid, useroid, flags, NULL);
 }
 
 /*
@@ -1002,6 +1079,9 @@ RegisterBackgroundWorker(BackgroundWorker *worker)
 			(errmsg_internal("registering background worker \"%s\"", worker->bgw_name)));
 
 	if (!SanityCheckBackgroundWorker(worker, LOG))
+		return;
+
+	if (!YbIsBackgroundWorkerAllowed(worker))
 		return;
 
 	if (worker->bgw_notify_pid != 0)
@@ -1085,6 +1165,9 @@ RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
 		return false;
 
 	if (!SanityCheckBackgroundWorker(worker, ERROR))
+		return false;
+
+	if (!YbIsBackgroundWorkerAllowed(worker))
 		return false;
 
 	parallel = (worker->bgw_flags & BGWORKER_CLASS_PARALLEL) != 0;
@@ -1462,4 +1545,47 @@ TerminateBackgroundWorkersForDatabase(Oid databaseId)
 	/* Make sure the postmaster notices the change to shared memory. */
 	if (signal_postmaster)
 		SendPostmasterSignal(PMSIGNAL_BACKGROUND_WORKER_CHANGE);
+}
+
+size_t
+YbBackgroundWorkerHandleSize()
+{
+	return sizeof(BackgroundWorkerHandle);
+}
+
+/*
+ * YB: Check if a background worker is allowed.
+ * The worker's name is resolved through InternalBGWorkers rather than
+ * LookupBackgroundWorkerFunction(), which raises an ERROR for an unknown name.
+ */
+static bool
+YbIsBackgroundWorkerAllowed(const BackgroundWorker *worker)
+{
+	bgworker_main_type fn = NULL;
+
+	if (!YBIsEnabledInPostgresEnvVar() ||
+		strcmp(worker->bgw_library_name, "postgres") != 0)
+		return true;
+
+	for (int i = 0; i < lengthof(InternalBGWorkers); i++)
+	{
+		if (strcmp(InternalBGWorkers[i].fn_name,
+				   worker->bgw_function_name) == 0)
+		{
+			fn = InternalBGWorkers[i].fn_addr;
+			break;
+		}
+	}
+
+	for (int i = 0; fn != NULL && i < lengthof(yb_allowed_internal_bgworkers); i++)
+	{
+		if (yb_allowed_internal_bgworkers[i] == fn)
+			return true;
+	}
+
+	ereport(LOG,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("background worker \"%s\" (%s) is not supported in YSQL",
+					worker->bgw_name, worker->bgw_function_name)));
+	return false;
 }

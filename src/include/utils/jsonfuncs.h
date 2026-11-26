@@ -98,4 +98,12 @@ extern Datum json_populate_type(Datum json_val, Oid json_type,
 								bool omit_quotes,
 								Node *escontext);
 
+/* YB: JSON text manipulation functions */
+extern int	json_get_int_value(text *json, char *key);
+extern text *get_json_array_element(text *json, int index);
+extern int	get_json_array_length(text *json);
+extern text *json_get_denormalized_value(text *json, char *key);
+extern text *json_get_value(text *json, char *key);
+extern void validate_json_object_keys(text *json, char **required_keys, int num_required_keys, char **optional_keys, int num_optional_keys);
+
 #endif

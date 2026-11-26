@@ -146,6 +146,8 @@
 #include "utils/snapshot.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
 
 /*
  * Starting a transaction -- which we need to do while exporting a snapshot --
@@ -551,9 +553,11 @@ SnapBuildInitialSnapshot(SnapBuild *builder)
  * For that we need to start a transaction in the current backend as the
  * importing side checks whether the source transaction is still open to make
  * sure the xmin horizon hasn't advanced since then.
+ *
+ * YB Note: yb_read_time is used to build snapshot with associated read time.
  */
-const char *
-SnapBuildExportSnapshot(SnapBuild *builder)
+static const char *
+SnapBuildExportSnapshotImpl(SnapBuild *builder, const uint64_t *yb_read_time)
 {
 	Snapshot	snap;
 	char	   *snapname;
@@ -573,7 +577,21 @@ SnapBuildExportSnapshot(SnapBuild *builder)
 	XactIsoLevel = XACT_REPEATABLE_READ;
 	XactReadOnly = true;
 
-	snap = SnapBuildInitialSnapshot(builder);
+	SnapshotData yb_snap = {};
+
+	/* YB */
+	if (builder)
+	{
+		Assert(!yb_read_time);
+		snap = SnapBuildInitialSnapshot(builder);
+	}
+	else
+	{
+		Assert(yb_read_time);
+		snap = &yb_snap;
+		YbInitSnapshot(snap, YbRegisterSnapshotReadTime(*yb_read_time));
+		snap->yb_is_built_for_export = true;
+	}
 
 	/*
 	 * now that we've built a plain snapshot, make it active and use the
@@ -587,6 +605,18 @@ SnapBuildExportSnapshot(SnapBuild *builder)
 						   snap->xcnt,
 						   snapname, snap->xcnt)));
 	return snapname;
+}
+
+const char *
+SnapBuildExportSnapshot(SnapBuild *builder)
+{
+	return SnapBuildExportSnapshotImpl(builder, NULL /* yb_read_time */ );
+}
+
+const char *
+YbSnapBuildExportSnapshotWithReadTime(uint64_t read_time)
+{
+	return SnapBuildExportSnapshotImpl(NULL /* builder */ , &read_time);
 }
 
 /*

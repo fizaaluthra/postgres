@@ -330,10 +330,11 @@ toast_save_datum(Relation rel, Datum value,
 			if (toastidxs[i]->rd_index->indisready)
 				index_insert(toastidxs[i], t_values, t_isnull,
 							 &(toasttup->t_self),
+							 toasttup->t_ybctid,
 							 toastrel,
 							 toastidxs[i]->rd_index->indisunique ?
 							 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
-							 false, NULL);
+							 false, NULL, false /* yb_shared_insert */ );
 		}
 
 		/*

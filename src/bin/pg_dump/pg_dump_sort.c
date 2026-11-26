@@ -72,6 +72,7 @@ enum dbObjectTypePriorities
 	PRIO_TSCONFIG,
 	PRIO_FDW,
 	PRIO_FOREIGN_SERVER,
+	PRIO_TABLEGROUP,
 	PRIO_TABLE,
 	PRIO_TABLE_ATTACH,
 	PRIO_DUMMY_TYPE,
@@ -152,6 +153,7 @@ static const int dbObjectTypePriority[] =
 	[DO_REL_STATS] = PRIO_STATISTICS_DATA_DATA,
 	[DO_SUBSCRIPTION] = PRIO_SUBSCRIPTION,
 	[DO_SUBSCRIPTION_REL] = PRIO_SUBSCRIPTION_REL,
+	[DO_TABLEGROUP] = PRIO_TABLEGROUP,
 };
 
 StaticAssertDecl(lengthof(dbObjectTypePriority) == NUM_DUMPABLE_OBJECT_TYPES,
@@ -1578,6 +1580,11 @@ describeDumpableObject(DumpableObject *obj, char *buf, int bufsize)
 		case DO_TABLE:
 			snprintf(buf, bufsize,
 					 "TABLE %s  (ID %d OID %u)",
+					 obj->name, obj->dumpId, obj->catId.oid);
+			return;
+		case DO_TABLEGROUP:
+			snprintf(buf, bufsize,
+					 "TABLEGROUP %s  (ID %d OID %u)",
 					 obj->name, obj->dumpId, obj->catId.oid);
 			return;
 		case DO_TABLE_ATTACH:

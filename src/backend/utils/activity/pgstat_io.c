@@ -379,6 +379,25 @@ pgstat_tracks_io_bktype(BackendType bktype)
 		case B_WAL_SUMMARIZER:
 		case B_WAL_WRITER:
 			return true;
+
+		/*
+		 * YB: these are all backend-like processes that run queries or DDL, so
+		 * they do the same IO a regular backend does and are tracked the same
+		 * way. Before excluding a type, also check the conditions listed in
+		 * pgstat_tracks_backend_bktype().
+		 */
+		case YB_YSQL_CONN_MGR:
+		case YB_YSQL_CONN_MGR_WAL_SENDER:
+		case YB_YSQL_CONN_MGR_CTRL:
+		case YB_AUTO_ANALYZE_BACKEND:
+		case YB_INDEX_BACKFILL_DDL:
+		case YB_MATVIEW_REFRESH_DDL:
+		case YB_RELCACHE_INIT_BACKEND:
+		case YB_GLOBAL_VIEW_BACKEND:
+		case YB_XCLUSTER_DDL_QUEUE_BACKEND:
+		case YB_XCLUSTER_SETUP_BACKEND:
+		case YB_OSC_BACKFILL_BACKEND:
+			return true;
 	}
 
 	return false;

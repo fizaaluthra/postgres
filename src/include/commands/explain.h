@@ -17,6 +17,9 @@
 #include "executor/instrument.h"
 #include "parser/parse_node.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 typedef struct ExplainState ExplainState;	/* defined in explain_state.h */
 
 /* Hook for plugins to get control in ExplainOneQuery() */
@@ -81,5 +84,9 @@ extern void ExplainPrintJITSummary(ExplainState *es,
 extern void ExplainQueryText(ExplainState *es, QueryDesc *queryDesc);
 extern void ExplainQueryParameters(ExplainState *es,
 								   ParamListInfo params, int maxlen);
+
+extern void YbExplainCommitStats(DestReceiver *dest);
+
+extern bool YbIsDebugMetricsCollectionNeeded(bool log_debug, bool log_dist);
 
 #endif							/* EXPLAIN_H */

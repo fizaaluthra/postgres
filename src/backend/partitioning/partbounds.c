@@ -41,6 +41,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
+
 /*
  * When qsort'ing partition bounds after reading from the catalog, each bound
  * is represented with one of the following structs.
@@ -3249,6 +3253,13 @@ check_default_partition_contents(Relation parent, Relation default_rel,
 	List	   *all_parts;
 	ListCell   *lc;
 
+	/*
+	 * YB: For an xCluster automatic mode target, the source has already done this
+	 * scan, so we can skip it here.
+	 */
+	if (yb_xcluster_automatic_mode_target_ddl)
+		return;
+
 	new_part_constraints = (new_spec->strategy == PARTITION_STRATEGY_LIST)
 		? get_qual_for_list(parent, new_spec)
 		: get_qual_for_range(parent, new_spec, false);
@@ -5694,7 +5705,9 @@ check_parent_values_in_new_partitions(Relation parent,
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				errmsg("new partitions combined partition bounds do not contain value (%s) but split partition \"%s\" does",
-					   deparse_expression((Node *) notFoundVal, NIL, false, false),
+					   deparse_expression((Node *) notFoundVal, NIL, false, false,
+										  false /* yb_pretty */ ,
+										  false /* yb_maskconstants */ ),
 					   get_rel_name(partOid)),
 				errhint("%s require combined bounds of new partitions must exactly match the bound of the split partition",
 						"ALTER TABLE ... SPLIT PARTITION"));

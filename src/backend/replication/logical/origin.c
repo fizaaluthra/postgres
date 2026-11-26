@@ -105,6 +105,9 @@
 /* GUC variables */
 int			max_active_replication_origins = 10;
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Replay progress of a single remote node.
  */
@@ -202,6 +205,9 @@ static ReplicationState *session_replication_state = NULL;
 
 /* Magic for on disk files. */
 #define REPLICATION_STATE_MAGIC ((uint32) 0x1257DADE)
+
+/* YB declarations */
+static void YbConnMgrLatchIfReplicationOriginExcluded(void);
 
 static void
 replorigin_check_prerequisites(bool check_origins, bool recoveryOK)
@@ -361,7 +367,26 @@ replorigin_create(const char *roname)
 			values[Anum_pg_replication_origin_roname - 1] = roname_d;
 
 			tuple = heap_form_tuple(RelationGetDescr(rel), values, nulls);
+
+			bool yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+			if (IsYugaByteEnabled())
+			{
+				if (yb_use_regular_txn_block)
+					YBAddDdlTxnState(YB_DDL_MODE_SILENT_ALTERING);
+				else
+					YBIncrementDdlNestingLevel(YB_DDL_MODE_SILENT_ALTERING);
+			}
+
 			CatalogTupleInsert(rel, tuple);
+
+			if (IsYugaByteEnabled())
+			{
+				if (yb_use_regular_txn_block)
+					YBMergeDdlTxnState();
+				else
+					YBDecrementDdlNestingLevel();
+			}
+
 			CommandCounterIncrement();
 			break;
 		}
@@ -493,7 +518,25 @@ replorigin_drop_by_name(const char *name, bool missing_ok, bool nowait)
 	/*
 	 * Now, we can delete the catalog entry.
 	 */
-	CatalogTupleDelete(rel, &tuple->t_self);
+	bool yb_use_regular_txn_block = YBIsDdlTransactionBlockEnabled();
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBAddDdlTxnState(YB_DDL_MODE_SILENT_ALTERING);
+		else
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_SILENT_ALTERING);
+	}
+
+	CatalogTupleDelete(rel, tuple);
+
+	if (IsYugaByteEnabled())
+	{
+		if (yb_use_regular_txn_block)
+			YBMergeDdlTxnState();
+		else
+			YBDecrementDdlNestingLevel();
+	}
+
 	ReleaseSysCache(tuple);
 
 	CommandCounterIncrement();
@@ -1334,6 +1377,10 @@ replorigin_session_reset(void)
 void
 replorigin_session_advance(XLogRecPtr remote_commit, XLogRecPtr local_commit)
 {
+	/* Shared origin sessions only tag writes and do not track progress. */
+	if (yb_enable_replication_origin_shared && session_replication_state == NULL)
+		return;
+
 	Assert(session_replication_state != NULL);
 	Assert(session_replication_state->roident != InvalidReplOriginId);
 
@@ -1483,6 +1530,12 @@ pg_replication_origin_session_setup(PG_FUNCTION_ARGS)
 	int			pid;
 
 	replorigin_check_prerequisites(true, false);
+	if (yb_enable_replication_origin_shared &&
+		session_replication_state == NULL &&
+		replorigin_xact_state.origin != InvalidReplOriginId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("replication origin session already setup")));
 
 	name = text_to_cstring((text *) DatumGetPointer(PG_GETARG_DATUM(0)));
 	origin = replorigin_by_name(name, false);
@@ -1490,6 +1543,49 @@ pg_replication_origin_session_setup(PG_FUNCTION_ARGS)
 	replorigin_session_setup(origin, pid);
 
 	replorigin_xact_state.origin = origin;
+
+	YbConnMgrLatchIfReplicationOriginExcluded();
+
+	pfree(name);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Setup a replication origin for this session without acquiring an exclusive
+ * slot. This allows multiple sessions to tag their writes with the same
+ * xrepl_origin_id concurrently. No progress tracking is performed. This is
+ * only suitable for write tagging (e.g., CDC origin filtering).
+ */
+Datum
+yb_replication_origin_session_setup_shared(PG_FUNCTION_ARGS)
+{
+	char	   *name;
+	ReplOriginId origin;
+
+	if (!yb_enable_replication_origin_shared)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("yb_replication_origin_session_setup_shared requires yb_enable_replication_origin_shared to be enabled")));
+
+	replorigin_check_prerequisites(true, false);
+
+	if (session_replication_state != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("cannot use shared replication origin session while an exclusive one is active")));
+
+	if (replorigin_xact_state.origin != InvalidReplOriginId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("replication origin session already setup")));
+
+	name = text_to_cstring((text *) DatumGetPointer(PG_GETARG_DATUM(0)));
+	origin = replorigin_by_name(name, false);
+
+	replorigin_xact_state.origin = origin;
+
+	YbConnMgrLatchIfReplicationOriginExcluded();
 
 	pfree(name);
 
@@ -1507,6 +1603,37 @@ pg_replication_origin_session_reset(PG_FUNCTION_ARGS)
 	replorigin_session_reset();
 
 	replorigin_xact_clear(true);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Reset a shared replication origin previously set with
+ * yb_replication_origin_session_setup_shared(). Simply clears the
+ * session variable without touching shared-memory slots.
+ */
+Datum
+yb_replication_origin_session_reset_shared(PG_FUNCTION_ARGS)
+{
+	if (!yb_enable_replication_origin_shared)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("yb_replication_origin_session_reset_shared requires yb_enable_replication_origin_shared to be enabled")));
+
+	if (session_replication_state != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("cannot reset shared replication origin session while an exclusive one is active"),
+				 errhint("Use pg_replication_origin_session_reset() instead.")));
+
+	if (replorigin_xact_state.origin == InvalidReplOriginId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no replication origin is setup for this session")));
+
+	replorigin_xact_state.origin = InvalidReplOriginId;
+	replorigin_xact_state.origin_lsn = InvalidXLogRecPtr;
+	replorigin_xact_state.origin_timestamp = 0;
 
 	PG_RETURN_VOID();
 }
@@ -1579,7 +1706,6 @@ pg_replication_origin_xact_reset(PG_FUNCTION_ARGS)
 
 	PG_RETURN_VOID();
 }
-
 
 Datum
 pg_replication_origin_advance(PG_FUNCTION_ARGS)
@@ -1710,4 +1836,20 @@ pg_show_replication_origin_status(PG_FUNCTION_ARGS)
 #undef REPLICATION_ORIGIN_PROGRESS_COLS
 
 	return (Datum) 0;
+}
+
+void
+YbAtEOXact_ReplicationOrigin(void)
+{
+	replorigin_xact_state.origin_timestamp = 0;
+}
+
+static void
+YbConnMgrLatchIfReplicationOriginExcluded(void)
+{
+	if (replorigin_xact_state.origin == InvalidReplOriginId)
+		return;
+
+	if (yb_conn_mgr_replication_origin_permanent_sticky)
+		yb_ysql_conn_mgr_sticky_replication_origin = true;
 }

@@ -42,6 +42,10 @@
 #include "utils/sampling.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "file_fdw",
 					.version = PG_VERSION
@@ -260,6 +264,8 @@ file_fdw_validator(PG_FUNCTION_ARGS)
 		if (strcmp(def->defname, "filename") == 0 ||
 			strcmp(def->defname, "program") == 0)
 		{
+			YBCheckServerAccessIsAllowed();
+
 			if (filename)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
@@ -766,7 +772,8 @@ retry:
 	 */
 	ExecClearTuple(slot);
 
-	if (NextCopyFrom(cstate, econtext, slot->tts_values, slot->tts_isnull))
+	if (NextCopyFrom(cstate, econtext, slot->tts_values, slot->tts_isnull,
+					 false /* skip_row */ ))
 	{
 		if (cstate->opts.on_error == COPY_ON_ERROR_IGNORE &&
 			cstate->escontext->error_occurred)
@@ -1246,7 +1253,7 @@ file_acquire_sample_rows(Relation onerel, int elevel,
 		MemoryContextReset(tupcontext);
 		MemoryContextSwitchTo(tupcontext);
 
-		found = NextCopyFrom(cstate, NULL, values, nulls);
+		found = NextCopyFrom(cstate, NULL, values, nulls, false /* skip_row */ );
 
 		MemoryContextSwitchTo(oldcontext);
 

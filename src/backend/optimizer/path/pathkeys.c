@@ -28,6 +28,10 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "optimizer/yb_merge_scan.h"
+
 /* Consider reordering of GROUP BY keys? */
 bool		enable_group_by_reordering = true;
 
@@ -204,14 +208,26 @@ make_pathkey_from_sortinfo(PlannerInfo *root,
 						   bool nulls_first,
 						   Index sortref,
 						   Relids rel,
-						   bool create_it)
+						   bool create_it,
+						   bool yb_is_hash)
 {
 	CompareType cmptype;
 	Oid			equality_op;
 	List	   *opfamilies;
 	EquivalenceClass *eclass;
 
-	cmptype = reverse_sort ? COMPARE_GT : COMPARE_LT;
+	if (yb_is_hash)
+	{
+		/*
+		 * We are picking a hash index. The strategy can only be
+		 * BTEqualStrategyNumber
+		 */
+		cmptype = COMPARE_EQ;
+	}
+	else
+	{
+		cmptype = reverse_sort ? COMPARE_GT : COMPARE_LT;
+	}
 
 	/*
 	 * EquivalenceClasses need to contain opfamily lists based on the family
@@ -284,7 +300,37 @@ make_pathkey_from_sortop(PlannerInfo *root,
 									  nulls_first,
 									  sortref,
 									  NULL,
-									  create_it);
+									  create_it,
+									  false);
+}
+
+/*
+ * yb_make_hash_code_pathkey
+ *	  Create a PathKey matching the index's hash code.
+ *
+ * The hash code is represented as a yb_hash_code() function with the arguments
+ * matching the index's hash key columns. It is always ascending, so we only
+ * need to know if the scan direction is backward to figure out the strategy
+ * and nulls ordering.
+ *
+ * Though the hash code can't be null, the nulls ordering must match the
+ * yb_hash_code() expression in the EC.
+ */
+static PathKey *
+yb_make_hash_code_pathkey(PlannerInfo *root,
+						  IndexOptInfo *index,
+						  bool is_reverse)
+{
+	EquivalenceClass *eclass = yb_get_eclass_for_hash_code(root, index);
+
+	/* Fail if no EC and !create_it */
+	if (!eclass)
+		return NULL;
+
+	int16 strategy = is_reverse ? BTGreaterStrategyNumber : BTLessStrategyNumber;
+	bool nulls_first = is_reverse;
+	return make_canonical_pathkey(root, eclass, INTEGER_BTREE_FAM_OID,
+								  strategy, nulls_first);
 }
 
 
@@ -641,6 +687,12 @@ get_cheapest_path_for_pathkeys(List *paths, List *pathkeys,
 			compare_path_costs(matched_path, path, cost_criterion) <= 0)
 			continue;
 
+		/* YB */
+		if (matched_path != NULL && yb_prefer_bnl &&
+			YB_PATH_NEEDS_BATCHED_RELS(matched_path)
+			&& !YB_PATH_NEEDS_BATCHED_RELS(path))
+			continue;
+
 		if (pathkeys_contained_in(pathkeys, path->pathkeys) &&
 			bms_is_subset(PATH_REQ_OUTER(path), required_outer))
 			matched_path = path;
@@ -735,18 +787,63 @@ get_cheapest_parallel_safe_total_inner(List *paths)
  * that test is just based on the existence of an EquivalenceClass and not
  * on position in pathkey lists, so it's not complete.  Caller should call
  * truncate_useless_pathkeys() to possibly remove more pathkeys.
+ *
+ * YB: 'yb_distinct_nkeys' is an in-out param.
+ * For distinct index scans, we require the set of PathKey's that correspond
+ * to the distinct index prefix. This is necessary for de-duplicating some
+ * edge cases in range partioned columns, see #18101 for more information.
+ * Hence, the function takes the distinct prefix length as input in
+ * 'yb_distinct_nkeys'. -1 if the index is hash-partitioned.
+ * The function returns the set of pathkeys corresponding to the prefix
+ * back again in 'yb_distinct_nkeys'. Since this set is a prefix, we need only
+ * return the prefix length of returned pathkeys in 'yb_distinct_nkeys'.
+ * This field is eventually used in generating a UniquePath node.
+ * Returns -1 in 'yb_distinct_nkeys' if the pathkeys cannot span the prefix.
+ * Returns 0 in 'yb_distinct_nkeys' when the prefix is empty.
+ *
+ * YB: 'yb_merge_scan_stream_cols' is an out-param.  List of
+ * YbMergeScanStreamColInfo.  If NULL is passed, disallow merge scan.
+ * Otherwise, an empty list should be passed.
  */
 List *
 build_index_pathkeys(PlannerInfo *root,
 					 IndexOptInfo *index,
-					 ScanDirection scandir)
+					 ScanDirection scandir,
+					 int *yb_distinct_nkeys,
+					 List **yb_merge_scan_stream_cols)
 {
 	List	   *retval = NIL;
 	ListCell   *lc;
 	int			i;
+	int			yb_distinct_prefixlen;
+	int			yb_merge_scan_cardinality = 1;
+	PathKey	   *yb_pathkey = NULL;
 
 	if (index->sortopfamily == NULL)
 		return NIL;				/* non-orderable index */
+
+	/*
+	 * YB: Compute the set of pathkeys corresponding to the distinct index scan
+	 * prefix. 0 when the prefix is empty.
+	 */
+	yb_distinct_prefixlen = *yb_distinct_nkeys;
+	*yb_distinct_nkeys = yb_distinct_prefixlen == 0 ? 0 : -1;
+
+	Assert(!yb_merge_scan_stream_cols || *yb_merge_scan_stream_cols == NIL);
+
+	/*
+	 * YB: If the index is hash, check if we have a matching yb_hash_code()
+	 * expression in the ORDER BY or WHERE clause. The hash index is ordered
+	 * by the hash code first, and not suitable for ordering unless the hash
+	 * code is the desired order, or redundant.
+	 */
+	if (index->nhashcolumns > 0)
+	{
+		bool is_reverse = ScanDirectionIsBackward(scandir);
+		yb_pathkey = yb_make_hash_code_pathkey(root, index, is_reverse);
+		if (yb_pathkey && !pathkey_is_redundant(yb_pathkey, retval))
+			retval = lappend(retval, yb_pathkey);
+	}
 
 	i = 0;
 	foreach(lc, index->indextlist)
@@ -756,6 +853,13 @@ build_index_pathkeys(PlannerInfo *root,
 		bool		reverse_sort;
 		bool		nulls_first;
 		PathKey    *cpathkey;
+
+		/*
+		 * If the hash code is useful to support the order, treat the hash
+		 * columns as regular key columns. Sort order of the hash columns is
+		 * valid if the hash code is participating.
+		 */
+		bool		yb_is_hash_column = !yb_pathkey && i < index->nhashcolumns;
 
 		/*
 		 * INCLUDE columns are stored in index unordered, so they don't
@@ -790,9 +894,27 @@ build_index_pathkeys(PlannerInfo *root,
 											  nulls_first,
 											  0,
 											  index->rel->relids,
-											  false);
+											  false,
+											  yb_is_hash_column);
 
-		if (cpathkey)
+		/*
+		 * YB: Index keys part of scalar array operations may be eligible for
+		 * merge scan, in which case we can continue to examine lower-order
+		 * index columns.  Disqualify from consideration if the index key is
+		 * part of a redundant EC or a pure sort EC (i.e. a sort EC that is not
+		 * equivalent to another column).
+		 */
+		if (!(cpathkey && (EC_MUST_BE_REDUNDANT(cpathkey->pk_eclass) ||
+						   cpathkey->pk_eclass->ec_sortref != 0)) &&
+			yb_indexcol_can_merge_scan(root, index, indexkey, i,
+									   &yb_merge_scan_cardinality,
+									   yb_merge_scan_stream_cols))
+		{
+			/* Do nothing */
+		}
+		/* YB: For hash columns, sort pathkeys are invalid. */
+		else if (cpathkey && !(yb_is_hash_column &&
+							   cpathkey->pk_eclass->ec_sortref != 0))
 		{
 			/*
 			 * We found the sort key in an EquivalenceClass, so it's relevant
@@ -814,12 +936,25 @@ build_index_pathkeys(PlannerInfo *root,
 			 * keys won't be useful either.
 			 */
 			if (!indexcol_is_bool_constant_for_query(root, index, i))
+			{
+				/*
+				 * YB: A hash index is only good for ordering if all the hash
+				 * columns are participating. Current column is a hash, and not
+				 * participating, hence discard all the accumulated pathkeys
+				 * and exit.
+				 */
+				if (yb_is_hash_column)
+					return NIL;
+
 				break;
+			} /* YB: silence up the linter */
 		}
 
 		i++;
+		/* YB: For later use in creating a UniquePath node. */
+		if (i == yb_distinct_prefixlen)
+			*yb_distinct_nkeys = list_length(retval);
 	}
-
 	return retval;
 }
 
@@ -949,6 +1084,7 @@ build_partition_pathkeys(PlannerInfo *root, RelOptInfo *partrel,
 											  ScanDirectionIsBackward(scandir),
 											  0,
 											  partrel->relids,
+											  false,
 											  false);
 
 
@@ -1024,7 +1160,8 @@ build_expression_pathkey(PlannerInfo *root,
 										  (cmptype == COMPARE_GT),
 										  0,
 										  rel,
-										  create_it);
+										  create_it,
+										  false);
 
 	if (cpathkey)
 		pathkeys = list_make1(cpathkey);
@@ -1314,7 +1451,7 @@ build_join_pathkeys(PlannerInfo *root,
 	 * contain pathkeys that were useful for forming this joinrel but are
 	 * uninteresting to higher levels.
 	 */
-	return truncate_useless_pathkeys(root, joinrel, outer_pathkeys);
+	return truncate_useless_pathkeys(root, joinrel, outer_pathkeys, 0);
 }
 
 /****************************************************************************
@@ -2195,11 +2332,29 @@ count_common_leading_pathkeys_unordered(List *keys1, List *keys2)
  *		Shorten the given PathKey List to just the useful PathKeys.  If all
  *		PathKeys are useful, return the input List, otherwise return a new
  *		List containing only the useful PathKeys.
+ *
+ * YB: Do NOT truncate pathkeys useful for distinct index scan because
+ * UniquePath nodes require these pathkeys. 'yb_distinct_nkeys' restricts
+ * this.
+ *
+ * YB: Normally, distinct pathkeys are retained in pathkeys_useful_for_ordering
+ * by retaining all query pathkeys (contains both sortkeys and distinct keys).
+ * However, the pathkeys_contained_in function used for determing usefulness
+ * is insufficient for Distinct Index Scans.
+ *
+ * Example: say, r1 is sorted ASC, r2 is sorted DESC in the index.
+ * Then, the query SELECT DISTINCT r1, r2
+ * should be able to generate a distinct index scan for the query since
+ * the precise ordering of keys r1, r2 within the index is immaterial for
+ * the DISTINCT operation. Such queries are unfortunately disallowed by
+ * the pathkeys_contained_in function. This behavior is fixed by
+ * 'yb_distinct_nkeys'.
  */
 List *
 truncate_useless_pathkeys(PlannerInfo *root,
 						  RelOptInfo *rel,
-						  List *pathkeys)
+						  List *pathkeys,
+						  int yb_distinct_nkeys)
 {
 	int			nuseful;
 	int			nuseful2;
@@ -2262,6 +2417,11 @@ truncate_useless_pathkeys(PlannerInfo *root,
 	nuseful2 = pathkeys_useful_for_merging(root, rel, pathkeys);
 	nuseful = Max(nuseful, nuseful2);
 
+	Assert(yb_distinct_nkeys <= list_length(pathkeys));
+	/* YB: Use yb_distinct_nkeys and not yb_distinct_prefixlen. */
+	if (yb_distinct_nkeys > nuseful)
+		nuseful = yb_distinct_nkeys;
+
 	/*
 	 * Note: not safe to modify input list destructively, but we can avoid
 	 * copying the list if we're not actually going to change it
@@ -2296,4 +2456,83 @@ has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel)
 		return true;			/* the upper planner might need them */
 
 	return false;				/* definitely useless */
+}
+
+/*
+ * YB: yb_get_ecs_for_query_uniqkeys
+ *
+ * Returns the EquivalenceClasses for the DISTINCT keys in the query.
+ */
+List *
+yb_get_ecs_for_query_uniqkeys(PlannerInfo *root)
+{
+	ListCell   *lc;
+	List	   *ecs = NIL;
+
+	foreach(lc, root->parse->distinctClause)
+	{
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(lc);
+		Expr	   *sortkey;
+		PathKey    *pathkey;
+
+		sortkey = (Expr *) get_sortgroupclause_expr(sortcl,
+													root->processed_tlist);
+		Assert(OidIsValid(sortcl->sortop));
+		pathkey = make_pathkey_from_sortop(root,
+										   sortkey,
+										   sortcl->sortop,
+										   sortcl->reverse_sort,
+										   sortcl->nulls_first,
+										   sortcl->tleSortGroupRef,
+										   false);
+
+		ecs = lappend(ecs, pathkey->pk_eclass);
+	}
+
+	return ecs;
+}
+
+/*
+ * Convert a subquery's uniqkeys into the terms of the outer query.
+ */
+List *
+yb_convert_subquery_uniqkeys(RelOptInfo *rel, List *subquery_uniqkeys,
+							 List *subquery_tlist)
+{
+	List	   *retval = NIL;
+	ListCell   *i;
+
+	foreach(i, subquery_uniqkeys)
+	{
+		Expr	   *uniqkey = (Expr *) lfirst(i);
+		Var		   *outer_var = NULL;
+		ListCell   *j;
+
+		foreach(j, subquery_tlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(j);
+			Expr	   *tle_expr;
+
+			tle_expr = canonicalize_ec_expression(tle->expr,
+												  exprType((Node *) uniqkey),
+												  exprCollation((Node *) uniqkey));
+			if (!equal(tle_expr, uniqkey))
+				continue;
+
+			outer_var = find_var_for_subquery_tle(rel, tle);
+			if (outer_var)
+				break;
+		}
+
+		/*
+		 * DISTINCT on {a, b} does not imply DISTINCT on {a}.  Therefore,
+		 * if one uniqkey cannot be translated, the whole set must be dropped.
+		 */
+		if (!outer_var)
+			return NIL;
+
+		retval = lappend(retval, outer_var);
+	}
+
+	return retval;
 }

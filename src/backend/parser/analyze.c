@@ -61,6 +61,12 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/xact.h"
+#include "catalog/catalog.h"
+#include "commands/dbcommands.h"
+#include "pg_yb_utils.h"
+
 
 /* Passthrough data for transformPLAssignStmtTarget */
 typedef struct SelectStmtPassthrough
@@ -143,6 +149,13 @@ parse_analyze_fixedparams(RawStmt *parseTree, const char *sourceText,
 
 	query = transformTopLevelStmt(pstate, parseTree);
 
+	if (pstate->p_target_relation &&
+		pstate->p_target_relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP
+		&& IsYugaByteEnabled())
+	{
+		YbSetTxnUsesTempRel();
+	}
+
 	if (IsQueryIdEnabled())
 		jstate = JumbleQuery(query);
 
@@ -181,6 +194,13 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 	pstate->p_queryEnv = queryEnv;
 
 	query = transformTopLevelStmt(pstate, parseTree);
+
+	if (pstate->p_target_relation &&
+		pstate->p_target_relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP
+		&& IsYugaByteEnabled())
+	{
+		YbSetTxnUsesTempRel();
+	}
 
 	/* make sure all is well with parameter types */
 	check_variable_parameters(pstate, query);
@@ -221,6 +241,13 @@ parse_analyze_withcb(RawStmt *parseTree, const char *sourceText,
 	(*parserSetup) (pstate, parserSetupArg);
 
 	query = transformTopLevelStmt(pstate, parseTree);
+
+	if (pstate->p_target_relation &&
+		pstate->p_target_relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP
+		&& IsYugaByteEnabled())
+	{
+		YbSetTxnUsesTempRel();
+	}
 
 	if (IsQueryIdEnabled())
 		jstate = JumbleQuery(query);
@@ -417,6 +444,19 @@ transformStmt(ParseState *pstate, Node *parseTree)
 			break;
 
 		case T_ExplainStmt:
+
+			/*
+			 * YB: Preemptively enable timing of storage-layer RPC requests in
+			 * case of Explain stmts. Enabling the timer here allows us to
+			 * capture system catalog requests that happen between the parse
+			 * phase and initialization of Explain context. If we discover in
+			 * the Explain context that the query has the timing option turned
+			 * off, this preemption reprsents a small but constant overhead of
+			 * invoking gettimeofday() twice per system catalog request in the
+			 * pg_analyze (and rewrite) phase.
+			 */
+			YbToggleSessionStatsTimer(true);
+
 			result = transformExplainStmt(pstate,
 										  (ExplainStmt *) parseTree);
 			break;
@@ -493,6 +533,10 @@ stmt_requires_parse_analysis(RawStmt *parseTree)
 		case T_CreateTableAsStmt:
 		case T_CallStmt:
 			result = true;
+			break;
+
+		case T_YbBackfillIndexStmt:
+			result = false;
 			break;
 
 		default:
@@ -1033,7 +1077,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		qry->targetList = lappend(qry->targetList, tle);
 
 		perminfo->insertedCols = bms_add_member(perminfo->insertedCols,
-												attr_num - FirstLowInvalidHeapAttributeNumber);
+												attr_num - YBGetFirstLowInvalidAttributeNumber(pstate->p_target_relation));
 	}
 
 	/*
@@ -2994,7 +3038,7 @@ transformUpdateTargetList(ParseState *pstate, List *origTlist, ForPortionOfExpr 
 
 		/* Mark the target column as requiring update permissions */
 		target_perminfo->updatedCols = bms_add_member(target_perminfo->updatedCols,
-													  attrno - FirstLowInvalidHeapAttributeNumber);
+													  attrno - YBGetFirstLowInvalidAttributeNumber(pstate->p_target_relation));
 
 		orig_tl = lnext(origTlist, orig_tl);
 	}

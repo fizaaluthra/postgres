@@ -49,6 +49,9 @@
 #include "utils/elog.h"
 #include "utils/palloc.h"
 
+/* YB includes */
+#include "tcop/cmdtag.h"
+
 /* IWYU pragma: end_exports */
 
 /* ----------------------------------------------------------------
@@ -510,6 +513,15 @@ Float8GetDatum(float8 X)
 	myunion.value = X;
 	return Int64GetDatum(myunion.retval);
 }
+
+/*
+ * YB: Redact the password if it appears in the query.
+ * If the query is a CREATE USER / CREATE ROLE / ALTER USER / ALTER ROLE, and
+ * the keyword "PASSWORD" exists in the text, redact the portion following it.
+ * The logic is refactored from the LOGSTMT_DDL statement case of pgaudit extension.
+ */
+extern const char *YbRedactPasswordIfExists(const char *queryStr, CommandTag commandTag);
+extern CommandTag YbParseCommandTag(const char *query_string);
 
 /*
  * Int64GetDatumFast

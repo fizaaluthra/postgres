@@ -55,8 +55,65 @@ typedef struct MemoryContextCallback
  * CurrentMemoryContext is the default allocation context for palloc().
  * Avoid accessing it directly!  Instead, use MemoryContextSwitchTo()
  * to change the setting.
+ *
+ * YB: rename upstream PG's CurrentMemoryContext to YbCurrentMemoryContext and
+ * make CurrentMemoryContext a macro that calls YbGetCurrentMemoryContext.
+ * This lets us leave reads of CurrentMemoryContext untouched so that future
+ * upstream PG merges become easier.
  */
-extern PGDLLIMPORT MemoryContext CurrentMemoryContext;
+extern PGDLLIMPORT MemoryContext YbCurrentMemoryContext;
+
+/*
+ * YB: This enables running query-layer code in a multi-threaded constext by
+ * using thread-local variables instead of globals. Currently only used for
+ * expression evaluation in DocDB (i.e. for pushdown).
+ */
+static inline bool
+IsMultiThreadedMode()
+{
+	/*
+	 * Just checking if the memory infrastructure is initialized.
+	 * TODO Consider using a specific global variable or compiler flag
+	 * for this.
+	 */
+	return YbCurrentMemoryContext == NULL;
+}
+
+extern MemoryContext GetThreadLocalCurrentMemoryContext();
+extern MemoryContext SetThreadLocalCurrentMemoryContext(MemoryContext memctx);
+
+static inline MemoryContext
+YbGetCurrentMemoryContext()
+{
+	if (IsMultiThreadedMode())
+	{
+		return (MemoryContext) GetThreadLocalCurrentMemoryContext();
+	}
+	else
+	{
+		return YbCurrentMemoryContext;
+	}
+}
+
+/* YB: see above comment on YbCurrentMemoryContext. */
+#define CurrentMemoryContext (YbGetCurrentMemoryContext())
+
+extern MemoryContext CreateThreadLocalCurrentMemoryContext(MemoryContext parent,
+														   const char *name);
+
+extern void PrepareThreadLocalCurrentMemoryContext();
+
+extern void ResetThreadLocalCurrentMemoryContext();
+
+extern void DeleteThreadLocalCurrentMemoryContext();
+
+extern void *YbSwitchPgGateMemoryContext(void *context);
+
+extern void *YbCreatePgGateMemoryContext(void *parent, const char *name);
+
+extern void YbDeletePgGateMemoryContext(void *context);
+
+struct PgMemctx *GetCurrentYbMemctx();
 
 /*
  * Flags for MemoryContextAllocExtended.
@@ -123,10 +180,17 @@ pg_nodiscard extern void *repalloc_huge(void *pointer, Size size);
 static inline MemoryContext
 MemoryContextSwitchTo(MemoryContext context)
 {
-	MemoryContext old = CurrentMemoryContext;
+	if (IsMultiThreadedMode())
+	{
+		return SetThreadLocalCurrentMemoryContext(context);
+	}
+	else
+	{
+		MemoryContext old = CurrentMemoryContext;
 
-	CurrentMemoryContext = context;
-	return old;
+		YbCurrentMemoryContext = context;
+		return old;
+	}
 }
 #endif							/* FRONTEND */
 

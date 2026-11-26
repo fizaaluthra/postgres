@@ -66,6 +66,10 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "commands/yb_tablegroup.h"
+#include "pg_yb_utils.h"
+
 static Oid	AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid);
 
 /*
@@ -366,6 +370,10 @@ AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
 ObjectAddress
 ExecRenameStmt(RenameStmt *stmt)
 {
+	if (IsYugaByteEnabled() && stmt->relation &&
+		YbIsRangeVarTempRelation(stmt->relation))
+		YBCRecordTempRelationDDL();
+
 	switch (stmt->renameType)
 	{
 		case OBJECT_TABCONSTRAINT:
@@ -381,6 +389,9 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_SCHEMA:
 			return RenameSchema(stmt->subname, stmt->newname);
 
+		case OBJECT_YBTABLEGROUP:
+			return RenameTablegroup(stmt->subname, stmt->newname);
+
 		case OBJECT_TABLESPACE:
 			return RenameTableSpace(stmt->subname, stmt->newname);
 
@@ -391,7 +402,7 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_INDEX:
 		case OBJECT_FOREIGN_TABLE:
 		case OBJECT_PROPGRAPH:
-			return RenameRelation(stmt);
+			return RenameRelation(stmt, false /* yb_is_internal_clone_rename */ );
 
 		case OBJECT_COLUMN:
 		case OBJECT_ATTRIBUTE:
@@ -411,13 +422,15 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_TYPE:
 			return RenameType(stmt);
 
+		case OBJECT_FUNCTION:
+			return RenameFunction(stmt, stmt->newname);
+
 		case OBJECT_AGGREGATE:
 		case OBJECT_COLLATION:
 		case OBJECT_CONVERSION:
 		case OBJECT_EVENT_TRIGGER:
 		case OBJECT_FDW:
 		case OBJECT_FOREIGN_SERVER:
-		case OBJECT_FUNCTION:
 		case OBJECT_OPCLASS:
 		case OBJECT_OPFAMILY:
 		case OBJECT_LANGUAGE:
@@ -867,11 +880,17 @@ ExecAlterOwnerStmt(AlterOwnerStmt *stmt)
 			return AlterSubscriptionOwner(strVal(stmt->object),
 										  newowner);
 
+		case OBJECT_YBTABLEGROUP:
+			return AlterTablegroupOwner(strVal(stmt->object),
+										newowner);
+
+		case OBJECT_FUNCTION:
+			return AlterFunctionOwner(stmt, newowner);
+
 			/* Generic cases */
 		case OBJECT_AGGREGATE:
 		case OBJECT_COLLATION:
 		case OBJECT_CONVERSION:
-		case OBJECT_FUNCTION:
 		case OBJECT_LANGUAGE:
 		case OBJECT_LARGEOBJECT:
 		case OBJECT_OPERATOR:

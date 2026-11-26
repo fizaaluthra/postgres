@@ -21,7 +21,11 @@
 #include "utils/pg_locale.h"
 #include "utils/pg_locale_c.h"
 
-static pg_locale_t pg_regex_locale;
+/* YB includes */
+#include "pg_yb_utils.h"
+
+static YB_THREAD_LOCAL pg_locale_t pg_regex_locale;
+
 
 
 /*
@@ -212,7 +216,7 @@ typedef struct pg_ctype_cache
 	struct pg_ctype_cache *next;	/* chain link */
 } pg_ctype_cache;
 
-static pg_ctype_cache *pg_ctype_cache_list = NULL;
+static YB_THREAD_LOCAL pg_ctype_cache *pg_ctype_cache_list = NULL;
 
 /*
  * Add a chr or range to pcc->cv; return false if run out of memory

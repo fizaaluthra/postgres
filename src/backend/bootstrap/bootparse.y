@@ -34,6 +34,13 @@
 
 #include "bootparse.h"
 
+/* YB includes */
+#include "bootstrap/yb_bootstrap.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
+#include "executor/ybModifyTable.h"
+#include "pg_yb_utils.h"
+
 
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
@@ -87,6 +94,7 @@ static int num_columns_read = 0;
 {
 	List		*list;
 	IndexElem	*ielem;
+	IndexStmt	*istmt;  /* Used for YugaByte index/pkey clauses */
 	char		*str;
 	const char	*kw;
 	int			ival;
@@ -95,6 +103,7 @@ static int num_columns_read = 0;
 
 %type <list>  boot_index_params
 %type <ielem> boot_index_param
+%type <istmt> Boot_YBIndex
 %type <str>   boot_ident
 %type <ival>  optbootstrap optsharedrelation boot_column_nullness
 %type <oidval> oidspec optrowtypeoid
@@ -108,6 +117,7 @@ static int num_columns_read = 0;
 %token <kw> XDECLARE INDEX ON USING XBUILD INDICES UNIQUE XTOAST
 %token <kw> OBJ_ID XBOOTSTRAP XSHARED_RELATION XROWTYPE_OID
 %token <kw> XFORCE XNOT XNULL
+%token <kw> PRIMARY YBCHECKINITDBDONE YBDECLARE
 
 %start TopLevel
 
@@ -130,8 +140,10 @@ Boot_Query :
 		| Boot_InsertStmt
 		| Boot_DeclareIndexStmt
 		| Boot_DeclareUniqueIndexStmt
+		| Boot_DeclarePrimaryIndexStmt
 		| Boot_DeclareToastStmt
 		| Boot_BuildIndsStmt
+    | Boot_CheckInitDbDone
 		;
 
 Boot_OpenStmt:
@@ -153,6 +165,40 @@ Boot_CloseStmt:
 					do_end();
 				}
 		;
+Boot_YBIndex:
+          /* EMPTY */ { $$ = NULL; }
+          | YBDECLARE PRIMARY INDEX boot_ident oidspec ON boot_ident USING boot_ident
+            LPAREN boot_index_params RPAREN
+				{
+					IndexStmt *stmt = makeNode(IndexStmt);
+
+					do_start();
+
+					stmt->idxname = $4;
+					stmt->relation = makeRangeVar(NULL, $7, -1);
+					stmt->accessMethod = $9;
+					stmt->tableSpace = NULL;
+					stmt->indexParams = $11;
+					stmt->options = NIL;
+					stmt->whereClause = NULL;
+					stmt->excludeOpNames = NIL;
+					stmt->idxcomment = NULL;
+					stmt->indexOid = $5;
+					stmt->oldNumber = InvalidRelFileNumber;
+					stmt->unique = true;
+					stmt->primary = true;
+					stmt->isconstraint = false;
+					stmt->deferrable = false;
+					stmt->initdeferred = false;
+					stmt->transformed = false;
+					stmt->concurrent = false;
+					stmt->if_not_exists = false;
+
+					do_end();
+
+					$$ = stmt;
+				}
+		;
 
 Boot_CreateStmt:
 		  XCREATE boot_ident oidspec optbootstrap optsharedrelation optrowtypeoid LPAREN
@@ -169,7 +215,7 @@ Boot_CreateStmt:
 				{
 					do_end();
 				}
-		  RPAREN
+		  RPAREN Boot_YBIndex
 				{
 					TupleDesc	tupdesc;
 					bool		shared_relation;
@@ -206,6 +252,7 @@ Boot_CreateStmt:
 						boot_reldesc = heap_create($2,
 												   PG_CATALOG_NAMESPACE,
 												   shared_relation ? GLOBALTABLESPACE_OID : 0,
+												   InvalidOid, /* reltablegroup */
 												   $3,
 												   InvalidOid,
 												   HEAP_TABLE_AM_OID,
@@ -227,6 +274,7 @@ Boot_CreateStmt:
 						id = heap_create_with_catalog($2,
 													  PG_CATALOG_NAMESPACE,
 													  shared_relation ? GLOBALTABLESPACE_OID : 0,
+													  InvalidOid, /* reltablegroup */
 													  $3,
 													  $6,
 													  InvalidOid,
@@ -244,9 +292,16 @@ Boot_CreateStmt:
 													  true,
 													  false,
 													  InvalidOid,
-													  NULL);
+													  NULL,
+													  false);
 						elog(DEBUG4, "relation created with OID %u", id);
 					}
+
+					if (IsYugaByteEnabled())
+					{
+						YBCCreateSysCatalogTable($2, $3, tupdesc, shared_relation, $12);
+					}
+
 					do_end();
 				}
 		;
@@ -378,6 +433,54 @@ Boot_DeclareUniqueIndexStmt:
 				}
 		;
 
+Boot_DeclarePrimaryIndexStmt:
+		  XDECLARE PRIMARY INDEX boot_ident oidspec ON boot_ident USING boot_ident LPAREN boot_index_params RPAREN
+				{
+					IndexStmt *stmt = makeNode(IndexStmt);
+					Oid		relationId;
+
+					do_start();
+
+					stmt->idxname = $4;
+					stmt->relation = makeRangeVar(NULL, $7, -1);
+					stmt->accessMethod = $9;
+					stmt->tableSpace = NULL;
+					stmt->indexParams = $11;
+					stmt->options = NIL;
+					stmt->whereClause = NULL;
+					stmt->excludeOpNames = NIL;
+					stmt->idxcomment = NULL;
+					stmt->indexOid = InvalidOid;
+					stmt->oldNumber = InvalidRelFileNumber;
+					stmt->unique = true;
+					stmt->primary = true;
+					stmt->isconstraint = false;
+					stmt->deferrable = false;
+					stmt->initdeferred = false;
+					stmt->transformed = false;
+					stmt->concurrent = false;
+					stmt->if_not_exists = false;
+
+					/* locks and races need not concern us in bootstrap mode */
+					relationId = RangeVarGetRelid(stmt->relation, NoLock,
+												  false);
+
+					DefineIndex(NULL,
+								relationId,
+								stmt,
+								$5,
+								InvalidOid,
+								InvalidOid,
+								-1,
+								false,
+								false,
+								false,
+								true, /* skip_build */
+								false);
+					do_end();
+				}
+		;
+
 Boot_DeclareToastStmt:
 		  XDECLARE XTOAST oidspec oidspec ON boot_ident
 				{
@@ -474,6 +577,18 @@ boot_column_val:
 			{ InsertOneNull(num_columns_read++); }
 		;
 
+Boot_CheckInitDbDone:
+      YBCHECKINITDBDONE
+      {
+				/*
+				 * In the normal case, don't run initdb twice. During a ysql major version upgrade,
+				 * initdb is already done for the prior version, but we need to run it for the new
+				 * version.
+				 */
+				if (!YBIsMajorUpgradeInitDb() && YBIsInitDbAlreadyDone())
+					exit(YB_INITDB_ALREADY_DONE_EXIT_CODE);
+			}
+
 boot_ident:
 		  ID			{ $$ = $1; }
 		| OPEN			{ $$ = pstrdup($1); }
@@ -481,6 +596,7 @@ boot_ident:
 		| XCREATE		{ $$ = pstrdup($1); }
 		| INSERT_TUPLE	{ $$ = pstrdup($1); }
 		| XDECLARE		{ $$ = pstrdup($1); }
+		| YBDECLARE		{ $$ = pstrdup($1); }
 		| INDEX			{ $$ = pstrdup($1); }
 		| ON			{ $$ = pstrdup($1); }
 		| USING			{ $$ = pstrdup($1); }
@@ -495,5 +611,6 @@ boot_ident:
 		| XFORCE		{ $$ = pstrdup($1); }
 		| XNOT			{ $$ = pstrdup($1); }
 		| XNULL			{ $$ = pstrdup($1); }
+		| YBCHECKINITDBDONE { $$ = pstrdup($1); }
 		;
 %%

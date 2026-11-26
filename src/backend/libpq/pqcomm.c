@@ -82,6 +82,13 @@
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "access/xact.h"
+#include "common/pg_yb_common.h"
+#include "libpq/yb_pqcomm_extensions.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb_ysql_conn_mgr_helper.h"
+
 /*
  * Cope with the various platform-specific ways to spell TCP keepalive socket
  * options.  This doesn't cover Windows, which as usual does its own thing.
@@ -115,15 +122,22 @@ static List *sock_paths = NIL;
  *
  * The receive buffer is fixed size. Send buffer is usually 8k, but can be
  * enlarged by pq_putmessage_noblock() if the message doesn't fit otherwise.
+ *
+ * YB: Send buffer is controlled by ysql_output_buffer_size pggate gflag.
  */
 
-#define PQ_SEND_BUFFER_SIZE 8192
 #define PQ_RECV_BUFFER_SIZE 8192
 
 static char *PqSendBuffer;
 static int	PqSendBufferSize;	/* Size send buffer */
 static size_t PqSendPointer;	/* Next index to store a byte in PqSendBuffer */
 static size_t PqSendStart;		/* Next index to send a byte in PqSendBuffer */
+static size_t PqSendYbSavedBufPos;	/* Value of PqSendPointer to restore
+									 * during statement restart */
+static bool PqSendYbNonRestartableData; /* Indicates whether data sent to user
+										 * should be treated as preventing
+										 * transparent restarts. This should
+										 * be false e.g. for BEGIN statement. */
 
 static char PqRecvBuffer[PQ_RECV_BUFFER_SIZE];
 static int	PqRecvPointer;		/* Next index to read a byte from PqRecvBuffer */
@@ -223,6 +237,8 @@ pq_init(ClientSocket *client_sock)
 
 #ifdef WIN32
 
+#define PQ_SEND_BUFFER_SIZE 8192
+
 		/*
 		 * This is a Win32 socket optimization.  The OS send buffer should be
 		 * large enough to send the whole Postgres send buffer in one go, or
@@ -277,9 +293,11 @@ pq_init(ClientSocket *client_sock)
 	}
 
 	/* initialize state variables */
-	PqSendBufferSize = PQ_SEND_BUFFER_SIZE;
+	PqSendBufferSize = YBGetYsqlOutputBufferSize();
 	PqSendBuffer = MemoryContextAlloc(TopMemoryContext, PqSendBufferSize);
 	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
+	PqSendYbSavedBufPos = 0;
+	PqSendYbNonRestartableData = true;
 	PqCommBusy = false;
 	PqCommReadingMsg = false;
 
@@ -391,6 +409,35 @@ socket_close(int code, Datum arg)
 		 */
 		MyProcPort->sock = PGINVALID_SOCKET;
 	}
+}
+
+
+
+/*
+ * yb_pqcomm_extensions.h
+ */
+
+/*
+ * Save current output buffer position, allowing for rollback if needed.
+ *
+ * sending_non_restartable_data controls whether internal_flush should mark data as sent.
+ * Disabling this is used specifically for BEGIN statement to not prevent transaction restart.
+ */
+void
+YBSaveOutputBufferPosition(bool sending_non_restartable_data)
+{
+	PqSendYbSavedBufPos = PqSendPointer;
+	PqSendYbNonRestartableData = sending_non_restartable_data;
+}
+
+/*
+ * Rollback output buffer to a previously saved position, discarding everything added after it.
+ * Should ONLY be called after YBSaveOutputBufferPosition.
+ */
+void
+YBRestoreOutputBufferPosition(void)
+{
+	PqSendPointer = PqSendYbSavedBufPos;
 }
 
 
@@ -979,17 +1026,29 @@ pq_getbyte(void)
  *	 Same as pq_getbyte() except we don't advance the pointer.
  * --------------------------------
  */
-int
-pq_peekbyte(void)
+static int
+pq_peekbyte_impl(void)
 {
-	Assert(PqCommReadingMsg);
-
 	while (PqRecvPointer >= PqRecvLength)
 	{
 		if (pq_recvbuf())		/* If nothing in buffer, then recv some */
 			return EOF;			/* Failed to recv data */
 	}
 	return (unsigned char) PqRecvBuffer[PqRecvPointer];
+}
+
+int
+pq_peekbyte(void)
+{
+	Assert(PqCommReadingMsg);
+
+	return pq_peekbyte_impl();
+}
+
+int
+yb_pq_peekbyte_no_msg_reading_status_check(void)
+{
+	return pq_peekbyte_impl();
 }
 
 /* --------------------------------
@@ -1225,6 +1284,11 @@ pq_getmessage(StringInfo s, int maxlen)
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("invalid message length")));
+
+		/* YB: Conn Mgr sent the whole message; skip it to stay in sync */
+		if (len >= 4 && YbIsAuthPassthroughInProgress(MyProcPort) &&
+			pq_discardbytes(len - 4) != EOF)
+			PqCommReadingMsg = false;
 		return EOF;
 	}
 
@@ -1362,6 +1426,11 @@ internal_flush(void)
 static pg_noinline int
 internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 {
+	if (PqSendYbNonRestartableData)
+	{
+		YBMarkDataSent();
+	}
+
 	static int	last_reported_send_errno = 0;
 
 	const char *bufptr = buf + *start;
@@ -1371,7 +1440,11 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 	{
 		int			r;
 
-		r = secure_write(MyProcPort, bufptr, bufend - bufptr);
+		/* YB: For compatibility reasons, cap at ysql_output_flush_size. */
+		int			yb_send_len = Min(bufend - bufptr,
+									  *YBCGetGFlags()->ysql_output_flush_size);
+
+		r = secure_write(MyProcPort, bufptr, yb_send_len);
 
 		if (r <= 0)
 		{
@@ -1412,6 +1485,7 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 			 * the connection.
 			 */
 			*start = *end = 0;
+			PqSendYbSavedBufPos = 0;
 			ClientConnectionLost = 1;
 			InterruptPending = 1;
 			return EOF;
@@ -1423,6 +1497,7 @@ internal_flush_buffer(const char *buf, size_t *start, size_t *end)
 	}
 
 	*start = *end = 0;
+	PqSendYbSavedBufPos = 0;
 	return 0;
 }
 

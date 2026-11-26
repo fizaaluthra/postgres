@@ -18,6 +18,10 @@
 #include "parser/parse_node.h"
 #include "port/pg_bitutils.h"
 
+/* YB includes */
+#include "executor/instrument.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 typedef enum ExplainSerializeOption
 {
 	EXPLAIN_SERIALIZE_NONE,
@@ -41,6 +45,18 @@ typedef struct ExplainWorkersState
 	int		   *worker_state_save;	/* per-worker grouping state save areas */
 	StringInfo	prev_str;		/* saved output buffer while redirecting */
 } ExplainWorkersState;
+
+typedef struct YbExplainExecStats
+{
+	YbPgRpcStats read;
+	YbPgRpcStats catalog_read;
+	YbPgRpcStats flush;
+	double		write_count;
+	double		catalog_write_count;
+
+	YbcPgExecStorageMetrics *read_metrics;
+	YbcPgExecStorageMetrics *write_metrics;
+} YbExplainExecStats;
 
 typedef struct ExplainState
 {
@@ -76,6 +92,18 @@ typedef struct ExplainState
 	/* extensions */
 	void	  **extension_state;
 	int			extension_state_allocated;
+
+	/* YB */
+	bool		rpc;			/* print RPC stats */
+	YbExplainExecStats yb_stats;	/* hold YB-specific exec stats */
+	bool		yb_debug;		/* print debug information */
+	bool		ybMaskConstants;	/* mask constants in Explain text? */
+	bool		yb_commit;		/* print commit stats (when available) */
+	bool		ybShowHints;	/* generate and display hints that will
+								 * produce the same plan as one Explained */
+	bool		ybShowUniqueIds;	/* show unique Path/Plan ids */
+	bool		ybShowPlanId;	/* display plan id */
+	bool		ybShowQueryId;	/* display query id */
 } ExplainState;
 
 typedef void (*ExplainOptionHandler) (ExplainState *, DefElem *, ParseState *);

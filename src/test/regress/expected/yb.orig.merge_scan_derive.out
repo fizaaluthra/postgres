@@ -1,0 +1,1777 @@
+--
+-- Test YB's automatic insertion of scalar-array-op conditions for merge scan.
+--
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set filename :abs_srcdir '/yb_commands/merge_scan_setup.sql'
+\i :filename
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set filename :abs_srcdir '/yb_commands/parameterized_query.sql'
+\i :filename
+\set _echo_parameterized_query :ECHO
+\set ECHO none
+\set explain 'EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF)'
+\set off '/*+Set(yb_max_merge_scan_streams 0)*/'
+\set on '/*+Set(yb_max_merge_scan_streams 64)*/'
+\set P1 ':explain'
+\set P2
+\set Q1 ':off'
+\set Q2 ':on'
+-- Small response pages make the execution metrics of the plan variants
+-- distinct without growing the tables: at the default page size their rows
+-- come back in one read request either way.
+SET yb_fetch_row_limit = 16;
+\set off '/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/'
+\set on '/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/'
+SET yb_enable_derived_saops = true;
+--
+-- Derive from generated column
+--
+-- No order
+-- Merge scan should not be used.
+\set query ':explain :Q SELECT * FROM bkt_tbl;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   Storage Table Read Requests: 107
+   Storage Table Read Ops: 321
+   Storage Table Rows Scanned: 5048
+(5 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl;
+(output identical to previous)
+-- No limit
+\set query ':explain :Q SELECT * FROM bkt_tbl ORDER BY r1, r2, r3;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r1, r2, r3;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Sort (actual rows=5048.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+   Sort Method: quicksort
+   ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Storage Table Read Requests: 107
+         Storage Table Read Ops: 321
+         Storage Table Rows Scanned: 5048
+(9 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r1, r2, r3;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=5048.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+   Merge Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+   Merge Stream Key: bkt_tbl.bkt
+   Merge Streams: 3
+   Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+   Storage Table Read Requests: 107
+   Storage Table Read Ops: 320
+   Storage Table Rows Scanned: 5048
+(10 rows)
+
+-- Forward scan
+\set query ':P :Q SELECT * FROM bkt_tbl ORDER BY r1, r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r1, r2, r3, n LIMIT 5;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3, bkt_tbl.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Storage Table Read Requests: 107
+               Storage Table Read Ops: 321
+               Storage Table Rows Scanned: 5048
+(11 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r1, r2, r3, n LIMIT 5;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3, bkt_tbl.n
+         Presorted Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=9.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 3
+               Storage Table Rows Scanned: 15
+(17 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r1, r2, r3, n LIMIT 5;
+   n   | r5 | r3 | r1 | r2 | r4 | bkt 
+-------+----+----+----+----+----+-----
+ 86000 |  8 |  0 |  0 |  0 |  6 |   2
+ 96000 |  9 |  0 |  0 |  0 |  6 |   0
+ 98000 |  9 |  0 |  0 |  0 |  8 |   2
+  9100 |  0 |  1 |  0 |  0 |  9 |   0
+ 27100 |  2 |  1 |  0 |  0 |  7 |   0
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r1, r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Backward scan
+\set query ':P :Q SELECT * FROM bkt_tbl ORDER BY r1 DESC, r2 DESC, r3 DESC, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r1 DESC, r2 DESC, r3 DESC, n LIMIT 5;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r1 DESC, bkt_tbl.r2 DESC, bkt_tbl.r3 DESC, bkt_tbl.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Storage Table Read Requests: 107
+               Storage Table Read Ops: 321
+               Storage Table Rows Scanned: 5048
+(11 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r1 DESC, r2 DESC, r3 DESC, n LIMIT 5;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r1 DESC, bkt_tbl.r2 DESC, bkt_tbl.r3 DESC, bkt_tbl.n
+         Presorted Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan Backward using bkt_tbl_pkey on public.bkt_tbl (actual rows=7.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r1 DESC, bkt_tbl.r2 DESC, bkt_tbl.r3 DESC
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 3
+               Storage Table Rows Scanned: 15
+(17 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r1 DESC, r2 DESC, r3 DESC, n LIMIT 5;
+   n   | r5 | r3 | r1 | r2 | r4 | bkt 
+-------+----+----+----+----+----+-----
+ 81999 |  8 |  9 |  9 |  9 |  1 |   0
+ 38899 |  3 |  8 |  9 |  9 |  8 |   0
+ 55899 |  5 |  8 |  9 |  9 |  5 |   2
+ 88899 |  8 |  8 |  9 |  9 |  8 |   1
+ 92899 |  9 |  8 |  9 |  9 |  2 |   1
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r1 DESC, r2 DESC, r3 DESC, n LIMIT 5;
+(output identical to previous)
+-- DISTINCT
+\set query ':P :Q SELECT DISTINCT r1, r2, r3 FROM bkt_tbl ORDER BY r1, r2, r3 LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT DISTINCT r1, r2, r3 FROM bkt_tbl ORDER BY r1, r2, r3 LIMIT 5;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r2, r3
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r1, r2, r3
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         Sort Method: top-N heapsort
+         ->  HashAggregate (actual rows=997.00 loops=1)
+               Output: r1, r2, r3
+               Group Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               ->  Distinct Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=2476.00 loops=1)
+                     Output: r1, r2, r3
+                     Distinct Keys: bkt_tbl.bkt, bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+                     Storage Table Read Requests: 52
+                     Storage Table Read Ops: 160
+                     Storage Table Rows Scanned: 2476
+(15 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT DISTINCT r1, r2, r3 FROM bkt_tbl ORDER BY r1, r2, r3 LIMIT 5;
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r2, r3
+   ->  Unique (actual rows=5.00 loops=1)
+         Output: r1, r2, r3
+         ->  Distinct Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=12.00 loops=1)
+               Output: r1, r2, r3
+               Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Distinct Keys: bkt_tbl.bkt, bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 3
+               Storage Table Rows Scanned: 15
+(15 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT DISTINCT r1, r2, r3 FROM bkt_tbl ORDER BY r1, r2, r3 LIMIT 5;
+ r1 | r2 | r3 
+----+----+----
+  0 |  0 |  0
+  0 |  0 |  1
+  0 |  0 |  2
+  0 |  0 |  3
+  0 |  0 |  4
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT DISTINCT r1, r2, r3 FROM bkt_tbl ORDER BY r1, r2, r3 LIMIT 5;
+(output identical to previous)
+-- GROUP BY
+\set query ':P :Q SELECT COUNT(*), r1, r2, r3 FROM bkt_tbl GROUP BY r1, r2, r3 ORDER BY r1, r2, r3 LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT COUNT(*), r1, r2, r3 FROM bkt_tbl GROUP BY r1, r2, r3 ORDER BY r1, r2, r3 LIMIT 5;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: (count(*)), r1, r2, r3
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: (count(*)), r1, r2, r3
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         Sort Method: top-N heapsort
+         ->  HashAggregate (actual rows=997.00 loops=1)
+               Output: count(*), r1, r2, r3
+               Group Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+                     Output: r1, r2, r3
+                     Storage Table Read Requests: 107
+                     Storage Table Read Ops: 321
+                     Storage Table Rows Scanned: 5048
+(14 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT COUNT(*), r1, r2, r3 FROM bkt_tbl GROUP BY r1, r2, r3 ORDER BY r1, r2, r3 LIMIT 5;
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: (count(*)), r1, r2, r3
+   ->  GroupAggregate (actual rows=5.00 loops=1)
+         Output: count(*), r1, r2, r3
+         Group Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         ->  Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=24.00 loops=1)
+               Output: r1, r2, r3
+               Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 6
+               Storage Table Rows Scanned: 48
+(15 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT COUNT(*), r1, r2, r3 FROM bkt_tbl GROUP BY r1, r2, r3 ORDER BY r1, r2, r3 LIMIT 5;
+ count | r1 | r2 | r3 
+-------+----+----+----
+     3 |  0 |  0 |  0
+     5 |  0 |  0 |  1
+     4 |  0 |  0 |  2
+     5 |  0 |  0 |  3
+     6 |  0 |  0 |  4
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT COUNT(*), r1, r2, r3 FROM bkt_tbl GROUP BY r1, r2, r3 ORDER BY r1, r2, r3 LIMIT 5;
+(output identical to previous)
+-- Explicit SAOP smaller than derived SAOP
+\set query ':P :Q SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2) ORDER BY r1, r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2) ORDER BY r1, r2, r3, n LIMIT 5;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r2, r3, n, bkt
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r1, r2, r3, n, bkt
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3, bkt_tbl.n
+         Sort Method: top-N heapsort
+         ->  Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=3367.00 loops=1)
+               Output: r1, r2, r3, n, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{1,2}'::integer[]))
+               Storage Table Read Requests: 107
+               Storage Table Read Ops: 214
+               Storage Table Rows Scanned: 3367
+(12 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2) ORDER BY r1, r2, r3, n LIMIT 5;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r2, r3, n, bkt
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r1, r2, r3, n, bkt
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3, bkt_tbl.n
+         Presorted Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=6.00 loops=1)
+               Output: r1, r2, r3, n, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 2
+               Merge Cond: (bkt_tbl.bkt = ANY ('{1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 2
+               Storage Table Rows Scanned: 10
+(17 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2) ORDER BY r1, r2, r3, n LIMIT 5;
+ r1 | r2 | r3 |   n   | bkt 
+----+----+----+-------+-----
+  0 |  0 |  0 | 86000 |   2
+  0 |  0 |  0 | 98000 |   2
+  0 |  0 |  1 | 31100 |   1
+  0 |  0 |  1 | 43100 |   1
+  0 |  0 |  1 | 99100 |   2
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2) ORDER BY r1, r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Explicit SAOP larger than derived SAOP
+\set query ':P :Q SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2, 3, 4) ORDER BY r1, r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2, 3, 4) ORDER BY r1, r2, r3, n LIMIT 5;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r2, r3, n, bkt
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r1, r2, r3, n, bkt
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3, bkt_tbl.n
+         Sort Method: top-N heapsort
+         ->  Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=3367.00 loops=1)
+               Output: r1, r2, r3, n, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{1,2,3,4}'::integer[]))
+               Storage Table Read Requests: 107
+               Storage Table Read Ops: 215
+               Storage Table Rows Scanned: 3367
+(12 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2, 3, 4) ORDER BY r1, r2, r3, n LIMIT 5;
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r2, r3, n, bkt
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r1, r2, r3, n, bkt
+         Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3, bkt_tbl.n
+         Presorted Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan using bkt_tbl_pkey on public.bkt_tbl (actual rows=6.00 loops=1)
+               Output: r1, r2, r3, n, bkt
+               Index Cond: ((bkt_tbl.bkt = ANY ('{1,2,3,4}'::integer[])) AND (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[])))
+               Merge Sort Key: bkt_tbl.r1, bkt_tbl.r2, bkt_tbl.r3
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 2
+               Storage Table Rows Scanned: 10
+(17 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2, 3, 4) ORDER BY r1, r2, r3, n LIMIT 5;
+ r1 | r2 | r3 |   n   | bkt 
+----+----+----+-------+-----
+  0 |  0 |  0 | 86000 |   2
+  0 |  0 |  0 | 98000 |   2
+  0 |  0 |  1 | 31100 |   1
+  0 |  0 |  1 | 43100 |   1
+  0 |  0 |  1 | 99100 |   2
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r2, r3, n, bkt FROM bkt_tbl WHERE bkt IN (1, 2, 3, 4) ORDER BY r1, r2, r3, n LIMIT 5;
+(output identical to previous)
+CREATE INDEX NONCONCURRENTLY ON bkt_tbl (bkt ASC, r3, r2, r1)
+SPLIT AT VALUES (
+    (1),
+    (2),
+    (2, 2),
+    (2, 2, 2),
+    (2, 2, 2, 2),
+    (3));
+-- No limit
+-- TODO(#29078): this likely should use merge scan.
+\set query ':explain :Q SELECT * FROM bkt_tbl ORDER BY r3, r2, r1;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r3, r2, r1;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Sort (actual rows=5048.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   Sort Key: bkt_tbl.r3, bkt_tbl.r2, bkt_tbl.r1
+   Sort Method: quicksort
+   ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Storage Table Read Requests: 107
+         Storage Table Read Ops: 321
+         Storage Table Rows Scanned: 5048
+(9 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r3, r2, r1;
+(output identical to previous)
+-- Forward scan
+\set query ':P :Q SELECT * FROM bkt_tbl ORDER BY r3, r2, r1, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r3, r2, r1, n LIMIT 5;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r3, bkt_tbl.r2, bkt_tbl.r1, bkt_tbl.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Storage Table Read Requests: 107
+               Storage Table Read Ops: 321
+               Storage Table Rows Scanned: 5048
+(11 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r3, r2, r1, n LIMIT 5;
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r3, bkt_tbl.r2, bkt_tbl.r1, bkt_tbl.n
+         Presorted Key: bkt_tbl.r3, bkt_tbl.r2, bkt_tbl.r1
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan using bkt_tbl_bkt_r3_r2_r1_idx on public.bkt_tbl (actual rows=9.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r3, bkt_tbl.r2, bkt_tbl.r1
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 4
+               Storage Table Rows Scanned: 11
+               Storage Index Read Requests: 1
+               Storage Index Read Ops: 3
+               Storage Index Rows Scanned: 15
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r3, r2, r1, n LIMIT 5;
+   n   | r5 | r3 | r1 | r2 | r4 | bkt 
+-------+----+----+----+----+----+-----
+ 86000 |  8 |  0 |  0 |  0 |  6 |   2
+ 96000 |  9 |  0 |  0 |  0 |  6 |   0
+ 98000 |  9 |  0 |  0 |  0 |  8 |   2
+ 52001 |  5 |  0 |  1 |  0 |  2 |   0
+ 62001 |  6 |  0 |  1 |  0 |  2 |   2
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r3, r2, r1, n LIMIT 5;
+(output identical to previous)
+-- Backward scan
+\set query ':P :Q SELECT * FROM bkt_tbl ORDER BY r3 DESC, r2 DESC, r1 DESC, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r3 DESC, r2 DESC, r1 DESC, n LIMIT 5;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r3 DESC, bkt_tbl.r2 DESC, bkt_tbl.r1 DESC, bkt_tbl.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.bkt_tbl (actual rows=5048.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Storage Table Read Requests: 107
+               Storage Table Read Ops: 321
+               Storage Table Rows Scanned: 5048
+(11 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r3 DESC, r2 DESC, r1 DESC, n LIMIT 5;
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4, bkt
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4, bkt
+         Sort Key: bkt_tbl.r3 DESC, bkt_tbl.r2 DESC, bkt_tbl.r1 DESC, bkt_tbl.n
+         Presorted Key: bkt_tbl.r3, bkt_tbl.r2, bkt_tbl.r1
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan Backward using bkt_tbl_bkt_r3_r2_r1_idx on public.bkt_tbl (actual rows=8.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4, bkt
+               Index Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: bkt_tbl.r3 DESC, bkt_tbl.r2 DESC, bkt_tbl.r1 DESC
+               Merge Stream Key: bkt_tbl.bkt
+               Merge Streams: 3
+               Merge Cond: (bkt_tbl.bkt = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 6
+               Storage Table Rows Scanned: 45
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 9
+               Storage Index Rows Scanned: 63
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM bkt_tbl ORDER BY r3 DESC, r2 DESC, r1 DESC, n LIMIT 5;
+   n   | r5 | r3 | r1 | r2 | r4 | bkt 
+-------+----+----+----+----+----+-----
+ 81999 |  8 |  9 |  9 |  9 |  1 |   0
+ 26998 |  2 |  9 |  8 |  9 |  6 |   0
+ 30998 |  3 |  9 |  8 |  9 |  0 |   0
+ 97998 |  9 |  9 |  8 |  9 |  7 |   0
+  8997 |  0 |  9 |  7 |  9 |  8 |   0
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM bkt_tbl ORDER BY r3 DESC, r2 DESC, r1 DESC, n LIMIT 5;
+(output identical to previous)
+--
+-- Derive from secondary index expression, expression being a prefix
+--
+CREATE INDEX NONCONCURRENTLY ON r5n ((yb_hash_code(r2, r3, r4) % 3) ASC, r2, r3, r4)
+SPLIT AT VALUES (
+    (1),
+    (2),
+    (2, 2),
+    (2, 2, 2),
+    (2, 2, 2, 2),
+    (3));
+ANALYZE r5n;
+-- No limit
+-- TODO(#29078): this likely should use merge scan.
+\set query ':explain :Q SELECT * FROM r5n ORDER BY r2, r3;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM r5n ORDER BY r2, r3;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Sort (actual rows=5048.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4
+   Sort Key: r5n.r2, r5n.r3
+   Sort Method: quicksort
+   ->  Seq Scan on public.r5n (actual rows=5048.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4
+         Storage Table Read Requests: 224
+         Storage Table Read Ops: 320
+         Storage Table Rows Scanned: 5048
+(9 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM r5n ORDER BY r2, r3;
+(output identical to previous)
+-- Forward scan
+\set query ':P :Q SELECT * FROM r5n ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM r5n ORDER BY r2, r3, n LIMIT 5;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.r5n (actual rows=5048.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4
+               Storage Table Read Requests: 224
+               Storage Table Read Ops: 320
+               Storage Table Rows Scanned: 5048
+(11 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM r5n ORDER BY r2, r3, n LIMIT 5;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Presorted Key: r5n.r2, r5n.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=46.00 loops=1)
+               Output: n, r5, r3, r1, r2, r4
+               Index Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: r5n.r2, r5n.r3
+               Merge Stream Key: (yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3)
+               Merge Streams: 3
+               Merge Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 8
+               Storage Table Rows Scanned: 54
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 9
+               Storage Index Rows Scanned: 63
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM r5n ORDER BY r2, r3, n LIMIT 5;
+   n   | r5 | r3 | r1 | r2 | r4 
+-------+----+----+----+----+----
+     6 |  0 |  0 |  6 |  0 |  0
+     8 |  0 |  0 |  8 |  0 |  0
+  7006 |  0 |  0 |  6 |  0 |  7
+ 12007 |  1 |  0 |  7 |  0 |  2
+ 14003 |  1 |  0 |  3 |  0 |  4
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM r5n ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Explicit SAOP smaller than derived SAOP
+\set query ':P :Q SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2) ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2) ORDER BY r2, r3, n LIMIT 5;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.r5n (actual rows=3311.00 loops=1)
+               Output: r2, r3, n, (yb_hash_code(r2, r3, r4) % 3)
+               Filter: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,2}'::integer[]))
+               Rows Removed by Filter: 1737
+               Storage Table Read Requests: 224
+               Storage Table Read Ops: 320
+               Storage Table Rows Scanned: 5048
+(13 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2) ORDER BY r2, r3, n LIMIT 5;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Presorted Key: r5n.r2, r5n.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=30.00 loops=1)
+               Output: r2, r3, n, (yb_hash_code(r2, r3, r4) % 3)
+               Index Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,2}'::integer[]))
+               Merge Sort Key: r5n.r2, r5n.r3
+               Merge Stream Key: (yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3)
+               Merge Streams: 2
+               Merge Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,2}'::integer[]))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 7
+               Storage Table Rows Scanned: 35
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 6
+               Storage Index Rows Scanned: 42
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2) ORDER BY r2, r3, n LIMIT 5;
+ r2 | r3 |   n   | ?column? 
+----+----+-------+----------
+  0 |  0 |     6 |        2
+  0 |  0 |     8 |        2
+  0 |  0 | 15009 |        2
+  0 |  0 | 20009 |        2
+  0 |  0 | 25003 |        2
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2) ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Explicit SAOP larger than derived SAOP
+\set query ':P :Q SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2, 4, 8) ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2, 4, 8) ORDER BY r2, r3, n LIMIT 5;
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.r5n (actual rows=3311.00 loops=1)
+               Output: r2, r3, n, (yb_hash_code(r2, r3, r4) % 3)
+               Filter: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,2,4,8}'::integer[]))
+               Rows Removed by Filter: 1737
+               Storage Table Read Requests: 224
+               Storage Table Read Ops: 320
+               Storage Table Rows Scanned: 5048
+(13 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2, 4, 8) ORDER BY r2, r3, n LIMIT 5;
+                                                                                      QUERY PLAN                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r2, r3, n, ((yb_hash_code(r2, r3, r4) % 3))
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Presorted Key: r5n.r2, r5n.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=30.00 loops=1)
+               Output: r2, r3, n, (yb_hash_code(r2, r3, r4) % 3)
+               Index Cond: (((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,2,4,8}'::integer[])) AND ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[])))
+               Merge Sort Key: r5n.r2, r5n.r3
+               Merge Stream Key: (yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3)
+               Merge Streams: 3
+               Merge Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 7
+               Storage Table Rows Scanned: 35
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 6
+               Storage Index Rows Scanned: 42
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2, 4, 8) ORDER BY r2, r3, n LIMIT 5;
+ r2 | r3 |   n   | ?column? 
+----+----+-------+----------
+  0 |  0 |     6 |        2
+  0 |  0 |     8 |        2
+  0 |  0 | 15009 |        2
+  0 |  0 | 20009 |        2
+  0 |  0 | 25003 |        2
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n, yb_hash_code(r2, r3, r4) % 3 FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 in (0, 2, 4, 8) ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Expression bound to constant
+-- Merge scan should not be used.
+\set query ':explain :Q SELECT yb_hash_code(r2, r3, r4) % 3, r2, r3, n FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 = 1 ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT yb_hash_code(r2, r3, r4) % 3, r2, r3, n FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 = 1 ORDER BY r2, r3, n LIMIT 5;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: ((yb_hash_code(r2, r3, r4) % 3)), r2, r3, n
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: ((yb_hash_code(r2, r3, r4) % 3)), r2, r3, n
+         Sort Key: r5n.r2, r5n.r3, r5n.n
+         Presorted Key: r5n.r2, r5n.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=17.00 loops=1)
+               Output: (yb_hash_code(r2, r3, r4) % 3), r2, r3, n
+               Index Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = 1)
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 5
+               Storage Table Rows Scanned: 21
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 3
+               Storage Index Rows Scanned: 21
+(16 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT yb_hash_code(r2, r3, r4) % 3, r2, r3, n FROM r5n WHERE yb_hash_code(r2, r3, r4) % 3 = 1 ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Range filter; no ORDER BY
+-- Merge scan should not be used.
+\set query ':explain :Q SELECT * FROM r5n WHERE r2 > 1 LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT * FROM r5n WHERE r2 > 1 LIMIT 5;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: n, r5, r3, r1, r2, r4
+   ->  Index Scan using r5n_pkey on public.r5n (actual rows=5.00 loops=1)
+         Output: n, r5, r3, r1, r2, r4
+         Index Cond: (r5n.r2 > 1)
+         Storage Table Read Requests: 1
+         Storage Table Read Ops: 6
+         Storage Table Rows Scanned: 16
+(8 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT * FROM r5n WHERE r2 > 1 LIMIT 5;
+(output identical to previous)
+-- (Drop this index)
+DROP INDEX r5n_expr_r2_r3_r4_idx;
+--
+-- Derive from secondary index expression, expression not being a prefix
+--
+CREATE INDEX NONCONCURRENTLY r5n_r1_expr_r3_r4_idx ON r5n (r1 ASC, (yb_hash_code(r1, r3, r4) % 5) ASC, r3, r4)
+SPLIT AT VALUES (
+    (1),
+    (2),
+    (2, 2),
+    (2, 2, 2),
+    (2, 2, 2, 2),
+    (3));
+ANALYZE r5n;
+-- Expression in sort, so not derived
+-- Merge scan should not be used.
+\set query ':explain :Q SELECT r1, yb_hash_code(r1, r3, r4) % 5, r3, n FROM r5n WHERE r1 = 1 ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, yb_hash_code(r1, r3, r4) % 5, r3, n FROM r5n WHERE r1 = 1 ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, ((yb_hash_code(r1, r3, r4) % 5)), r3, n
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r1, ((yb_hash_code(r1, r3, r4) % 5)), r3, n
+         Sort Key: ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)), r5n.r3, r5n.n
+         Presorted Key: ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)), r5n.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_r1_expr_r3_r4_idx on public.r5n (actual rows=19.00 loops=1)
+               Output: r1, (yb_hash_code(r1, r3, r4) % 5), r3, n
+               Index Cond: (r5n.r1 = 1)
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 2
+               Storage Table Rows Scanned: 21
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 3
+               Storage Index Rows Scanned: 21
+(16 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, yb_hash_code(r1, r3, r4) % 5, r3, n FROM r5n WHERE r1 = 1 ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;
+(output identical to previous)
+-- Expression in sort, so not derived (v2)
+\set query ':P :Q SELECT yb_hash_code(r1, r3, r4) % 5, r3, n, r1 FROM r5n WHERE r1 in (0, 1, 2) ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT yb_hash_code(r1, r3, r4) % 5, r3, n, r1 FROM r5n WHERE r1 in (0, 1, 2) ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: ((yb_hash_code(r1, r3, r4) % 5)), r3, n, r1
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: ((yb_hash_code(r1, r3, r4) % 5)), r3, n, r1
+         Sort Key: ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)), r5n.r3, r5n.n
+         Sort Method: top-N heapsort
+         ->  Index Scan using r5n_pkey on public.r5n (actual rows=1489.00 loops=1)
+               Output: (yb_hash_code(r1, r3, r4) % 5), r3, n, r1
+               Index Cond: (r5n.r1 = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 31
+               Storage Table Read Ops: 97
+               Storage Table Rows Scanned: 1489
+(12 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT yb_hash_code(r1, r3, r4) % 5, r3, n, r1 FROM r5n WHERE r1 in (0, 1, 2) ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: ((yb_hash_code(r1, r3, r4) % 5)), r3, n, r1
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: ((yb_hash_code(r1, r3, r4) % 5)), r3, n, r1
+         Sort Key: ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)), r5n.r3, r5n.n
+         Presorted Key: ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)), r5n.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_r1_expr_r3_r4_idx on public.r5n (actual rows=37.00 loops=1)
+               Output: (yb_hash_code(r1, r3, r4) % 5), r3, n, r1
+               Index Cond: (r5n.r1 = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: (yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5), r5n.r3
+               Merge Stream Key: r5n.r1
+               Merge Streams: 3
+               Merge Cond: (r5n.r1 = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 9
+               Storage Table Rows Scanned: 45
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 9
+               Storage Index Rows Scanned: 63
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT yb_hash_code(r1, r3, r4) % 5, r3, n, r1 FROM r5n WHERE r1 in (0, 1, 2) ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;
+ ?column? | r3 |   n   | r1 
+----------+----+-------+----
+        0 |  0 |  3030 |  0
+        0 |  0 |  4082 |  2
+        0 |  0 |  8061 |  1
+        0 |  0 | 12091 |  1
+        0 |  0 | 16071 |  1
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT yb_hash_code(r1, r3, r4) % 5, r3, n, r1 FROM r5n WHERE r1 in (0, 1, 2) ORDER BY yb_hash_code(r1, r3, r4) % 5, r3, n LIMIT 5;
+(output identical to previous)
+-- Derived
+-- Third hint is to use the expression index.
+\set query ':P :Q SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;'
+\set Q3 '/*+IndexScan(r5n r5n_r1_expr_r3_r4_idx) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r3, r4, n
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r1, r3, r4, n
+         Sort Key: r5n.r3, r5n.r4, r5n.n
+         Sort Method: top-N heapsort
+         ->  Index Scan using r5n_pkey on public.r5n (actual rows=492.00 loops=1)
+               Output: r1, r3, r4, n
+               Index Cond: (r5n.r1 = 1)
+               Storage Table Read Requests: 31
+               Storage Table Read Ops: 31
+               Storage Table Rows Scanned: 492
+(12 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r1, r3, r4, n
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r1, r3, r4, n
+         Sort Key: r5n.r3, r5n.r4, r5n.n
+         Presorted Key: r5n.r3, r5n.r4
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan using r5n_r1_expr_r3_r4_idx on public.r5n (actual rows=10.00 loops=1)
+               Output: r1, r3, r4, n
+               Index Cond: ((r5n.r1 = 1) AND ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5) = ANY ('{0,1,2,3,4}'::integer[])))
+               Merge Sort Key: r5n.r3, r5n.r4
+               Merge Stream Key: r5n.r1, (yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)
+               Merge Streams: 5
+               Merge Cond: ((r5n.r1 = 1) AND ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5) = ANY ('{0,1,2,3,4}'::integer[])))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 2
+               Storage Table Rows Scanned: 42
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 15
+               Storage Index Rows Scanned: 105
+(20 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+IndexScan(r5n r5n_r1_expr_r3_r4_idx) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;
+(output identical to previous)
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;
+ r1 | r3 | r4 |   n   
+----+----+----+-------
+  1 |  0 |  0 | 10081
+  1 |  0 |  0 | 40021
+  1 |  0 |  0 | 50081
+  1 |  0 |  0 | 60041
+  1 |  0 |  0 | 60051
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;
+(output identical to previous)
+/*+IndexScan(r5n r5n_r1_expr_r3_r4_idx) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r1, r3, r4, n FROM r5n WHERE r1 = 1 ORDER BY r3, r4, n LIMIT 5;
+(output identical to previous)
+\unset Q3
+-- Following queries send various numbers of requests/scan various number of
+-- rows due to non-deterministic order of equal rows in merge sort.  Hide their
+-- DIST.
+\set explain 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF)'
+-- Derived with multiple stream keys
+\set query ':P :Q SELECT r3, r4, n, r1 FROM r5n WHERE r1 IN (0, 1, 2) ORDER BY r3, r4, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r3, r4, n, r1 FROM r5n WHERE r1 IN (0, 1, 2) ORDER BY r3, r4, n LIMIT 5;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r3, r4, n, r1
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r3, r4, n, r1
+         Sort Key: r5n.r3, r5n.r4, r5n.n
+         Sort Method: top-N heapsort
+         ->  Index Scan using r5n_pkey on public.r5n (actual rows=1489.00 loops=1)
+               Output: r3, r4, n, r1
+               Index Cond: (r5n.r1 = ANY ('{0,1,2}'::integer[]))
+(9 rows)
+
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r3, r4, n, r1 FROM r5n WHERE r1 IN (0, 1, 2) ORDER BY r3, r4, n LIMIT 5;
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r3, r4, n, r1
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r3, r4, n, r1
+         Sort Key: r5n.r3, r5n.r4, r5n.n
+         Presorted Key: r5n.r3, r5n.r4
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Index Scan using r5n_r1_expr_r3_r4_idx on public.r5n (actual rows=26.00 loops=1)
+               Output: r3, r4, n, r1
+               Index Cond: ((r5n.r1 = ANY ('{0,1,2}'::integer[])) AND ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5) = ANY ('{0,1,2,3,4}'::integer[])))
+               Merge Sort Key: r5n.r3, r5n.r4
+               Merge Stream Key: r5n.r1, (yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5)
+               Merge Streams: 15
+               Merge Cond: ((r5n.r1 = ANY ('{0,1,2}'::integer[])) AND ((yb_hash_code(r5n.r1, r5n.r3, r5n.r4) % 5) = ANY ('{0,1,2,3,4}'::integer[])))
+(14 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r3, r4, n, r1 FROM r5n WHERE r1 IN (0, 1, 2) ORDER BY r3, r4, n LIMIT 5;
+ r3 | r4 |   n   | r1 
+----+----+-------+----
+  0 |  0 |    60 |  0
+  0 |  0 | 10072 |  2
+  0 |  0 | 10081 |  1
+  0 |  0 | 10090 |  0
+  0 |  0 | 20080 |  0
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r3, r4, n, r1 FROM r5n WHERE r1 IN (0, 1, 2) ORDER BY r3, r4, n LIMIT 5;
+(output identical to previous)
+-- (Reset the explain change)
+\set explain 'EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF)'
+-- (Drop this index)
+DROP INDEX r5n_r1_expr_r3_r4_idx;
+--
+-- Derive from partitioned secondary index expression
+--
+CREATE INDEX NONCONCURRENTLY ON parent ((yb_hash_code(r2, r3) % 3) ASC, r2, r3)
+SPLIT AT VALUES (
+    (1),
+    (2),
+    (2, 2),
+    (2, 2, 2),
+    (3));
+ANALYZE parent;
+-- Parent
+\set query ':P :Q SELECT r2, r3, n FROM parent ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n FROM parent ORDER BY r2, r3, n LIMIT 5;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent.r2, parent.r3, parent.n
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: parent.r2, parent.r3, parent.n
+         Sort Key: parent.r2, parent.r3, parent.n
+         Sort Method: top-N heapsort
+         ->  Append (actual rows=5048.00 loops=1)
+               ->  Seq Scan on public.child1a parent_2 (actual rows=1117.00 loops=1)
+                     Output: parent_2.r2, parent_2.r3, parent_2.n
+                     Storage Table Read Requests: 70
+                     Storage Table Read Ops: 70
+                     Storage Table Rows Scanned: 1117
+               ->  Seq Scan on public.child1b parent_3 (actual rows=714.00 loops=1)
+                     Output: parent_3.r2, parent_3.r3, parent_3.n
+                     Storage Table Read Requests: 45
+                     Storage Table Read Ops: 45
+                     Storage Table Rows Scanned: 714
+               ->  Seq Scan on public.child2 parent_4 (actual rows=1918.00 loops=1)
+                     Output: parent_4.r2, parent_4.r3, parent_4.n
+                     Storage Table Read Requests: 120
+                     Storage Table Read Ops: 120
+                     Storage Table Rows Scanned: 1918
+               ->  Seq Scan on public.child3 parent_5 (actual rows=1299.00 loops=1)
+                     Output: parent_5.r2, parent_5.r3, parent_5.n
+                     Storage Table Read Requests: 82
+                     Storage Table Read Ops: 82
+                     Storage Table Rows Scanned: 1299
+(27 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n FROM parent ORDER BY r2, r3, n LIMIT 5;
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent.r2, parent.r3, parent.n
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: parent.r2, parent.r3, parent.n
+         Sort Key: parent.r2, parent.r3, parent.n
+         Presorted Key: parent.r2, parent.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Merge Append (actual rows=46.00 loops=1)
+               Sort Key: parent.r2, parent.r3
+               ->  Index Scan using child1a_expr_r2_r3_idx on public.child1a parent_2 (actual rows=9.00 loops=1)
+                     Output: parent_2.r2, parent_2.r3, parent_2.n
+                     Index Cond: ((yb_hash_code(parent_2.r2, parent_2.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_2.r2, parent_2.r3
+                     Merge Stream Key: (yb_hash_code(parent_2.r2, parent_2.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_2.r2, parent_2.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 2
+                     Storage Table Rows Scanned: 21
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 9
+                     Storage Index Rows Scanned: 63
+               ->  Index Scan using child1b_expr_r2_r3_idx on public.child1b parent_3 (actual rows=6.00 loops=1)
+                     Output: parent_3.r2, parent_3.r3, parent_3.n
+                     Index Cond: ((yb_hash_code(parent_3.r2, parent_3.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_3.r2, parent_3.r3
+                     Merge Stream Key: (yb_hash_code(parent_3.r2, parent_3.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_3.r2, parent_3.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 2
+                     Storage Table Rows Scanned: 21
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 9
+                     Storage Index Rows Scanned: 63
+               ->  Index Scan using child2_expr_r2_r3_idx on public.child2 parent_4 (actual rows=22.00 loops=1)
+                     Output: parent_4.r2, parent_4.r3, parent_4.n
+                     Index Cond: ((yb_hash_code(parent_4.r2, parent_4.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_4.r2, parent_4.r3
+                     Merge Stream Key: (yb_hash_code(parent_4.r2, parent_4.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_4.r2, parent_4.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 3
+                     Storage Table Read Ops: 3
+                     Storage Table Rows Scanned: 37
+                     Storage Index Read Requests: 3
+                     Storage Index Read Ops: 12
+                     Storage Index Rows Scanned: 111
+               ->  Index Scan using child3_expr_r2_r3_idx on public.child3 parent_5 (actual rows=12.00 loops=1)
+                     Output: parent_5.r2, parent_5.r3, parent_5.n
+                     Index Cond: ((yb_hash_code(parent_5.r2, parent_5.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_5.r2, parent_5.r3
+                     Merge Stream Key: (yb_hash_code(parent_5.r2, parent_5.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_5.r2, parent_5.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 2
+                     Storage Table Rows Scanned: 21
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 9
+                     Storage Index Rows Scanned: 63
+(61 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n FROM parent ORDER BY r2, r3, n LIMIT 5;
+ r2 | r3 |   n   
+----+----+-------
+  0 |  0 |     6
+  0 |  0 |     8
+  0 |  0 |  7006
+  0 |  0 | 12007
+  0 |  0 | 14003
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n FROM parent ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Child
+\set query ':P :Q SELECT r2, r3, n FROM child1 ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n FROM child1 ORDER BY r2, r3, n LIMIT 5;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: child1.r2, child1.r3, child1.n
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: child1.r2, child1.r3, child1.n
+         Sort Key: child1.r2, child1.r3, child1.n
+         Sort Method: top-N heapsort
+         ->  Append (actual rows=1831.00 loops=1)
+               ->  Seq Scan on public.child1a child1_1 (actual rows=1117.00 loops=1)
+                     Output: child1_1.r2, child1_1.r3, child1_1.n
+                     Storage Table Read Requests: 70
+                     Storage Table Read Ops: 70
+                     Storage Table Rows Scanned: 1117
+               ->  Seq Scan on public.child1b child1_2 (actual rows=714.00 loops=1)
+                     Output: child1_2.r2, child1_2.r3, child1_2.n
+                     Storage Table Read Requests: 45
+                     Storage Table Read Ops: 45
+                     Storage Table Rows Scanned: 714
+(17 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n FROM child1 ORDER BY r2, r3, n LIMIT 5;
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: child1.r2, child1.r3, child1.n
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: child1.r2, child1.r3, child1.n
+         Sort Key: child1.r2, child1.r3, child1.n
+         Presorted Key: child1.r2, child1.r3
+         Full-sort Groups: 1  Sort Method: top-N heapsort
+         ->  Merge Append (actual rows=14.00 loops=1)
+               Sort Key: child1.r2, child1.r3
+               ->  Index Scan using child1a_expr_r2_r3_idx on public.child1a child1_1 (actual rows=9.00 loops=1)
+                     Output: child1_1.r2, child1_1.r3, child1_1.n
+                     Index Cond: ((yb_hash_code(child1_1.r2, child1_1.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: child1_1.r2, child1_1.r3
+                     Merge Stream Key: (yb_hash_code(child1_1.r2, child1_1.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(child1_1.r2, child1_1.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 2
+                     Storage Table Rows Scanned: 21
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 9
+                     Storage Index Rows Scanned: 63
+               ->  Index Scan using child1b_expr_r2_r3_idx on public.child1b child1_2 (actual rows=6.00 loops=1)
+                     Output: child1_2.r2, child1_2.r3, child1_2.n
+                     Index Cond: ((yb_hash_code(child1_2.r2, child1_2.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: child1_2.r2, child1_2.r3
+                     Merge Stream Key: (yb_hash_code(child1_2.r2, child1_2.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(child1_2.r2, child1_2.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 2
+                     Storage Table Rows Scanned: 21
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 9
+                     Storage Index Rows Scanned: 63
+(35 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n FROM child1 ORDER BY r2, r3, n LIMIT 5;
+ r2 | r3 |   n   
+----+----+-------
+  0 |  0 |     6
+  0 |  0 |     8
+  0 |  0 | 12007
+  0 |  0 | 20009
+  0 |  0 | 30002
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n FROM child1 ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- Grandchild
+\set query ':P :Q SELECT r2, r3, n FROM child1b ORDER BY r2, r3, n LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n FROM child1b ORDER BY r2, r3, n LIMIT 5;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r2, r3, n
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r2, r3, n
+         Sort Key: child1b.r2, child1b.r3, child1b.n
+         Sort Method: top-N heapsort
+         ->  Seq Scan on public.child1b (actual rows=714.00 loops=1)
+               Output: r2, r3, n
+               Storage Table Read Requests: 45
+               Storage Table Read Ops: 45
+               Storage Table Rows Scanned: 714
+(11 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n FROM child1b ORDER BY r2, r3, n LIMIT 5;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r2, r3, n
+   ->  Incremental Sort (actual rows=5.00 loops=1)
+         Output: r2, r3, n
+         Sort Key: child1b.r2, child1b.r3, child1b.n
+         Presorted Key: child1b.r2, child1b.r3
+         Full-sort Groups: 1  Sort Method: quicksort
+         ->  Index Scan using child1b_expr_r2_r3_idx on public.child1b (actual rows=6.00 loops=1)
+               Output: r2, r3, n
+               Index Cond: ((yb_hash_code(child1b.r2, child1b.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: child1b.r2, child1b.r3
+               Merge Stream Key: (yb_hash_code(child1b.r2, child1b.r3) % 3)
+               Merge Streams: 3
+               Merge Cond: ((yb_hash_code(child1b.r2, child1b.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 2
+               Storage Table Read Ops: 2
+               Storage Table Rows Scanned: 21
+               Storage Index Read Requests: 2
+               Storage Index Read Ops: 9
+               Storage Index Rows Scanned: 63
+(20 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r2, r3, n FROM child1b ORDER BY r2, r3, n LIMIT 5;
+ r2 | r3 |   n   
+----+----+-------
+  0 |  0 | 52001
+  0 |  0 | 61007
+  0 |  0 | 62001
+  0 |  0 | 81005
+  0 |  0 | 91007
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r2, r3, n FROM child1b ORDER BY r2, r3, n LIMIT 5;
+(output identical to previous)
+-- (Drop this index)
+DROP INDEX parent_expr_r2_r3_idx;
+--
+-- Joins
+--
+CREATE INDEX NONCONCURRENTLY ON r5n ((yb_hash_code(r2, r3, r4) % 3) ASC, r2, r3, r4)
+SPLIT AT VALUES (
+    (1),
+    (2),
+    (2, 2),
+    (2, 2, 2),
+    (2, 2, 2, 2),
+    (3));
+ANALYZE r5n;
+CREATE INDEX NONCONCURRENTLY ON parent ((yb_hash_code(r2, r3) % 3) ASC, r2, r3)
+SPLIT AT VALUES (
+    (1),
+    (2),
+    (2, 2),
+    (2, 2, 2),
+    (3));
+ANALYZE parent;
+-- Derive from r5n
+\set query ':P :Q SELECT r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY r5n.r2 LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY r5n.r2 LIMIT 5;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n
+         Sort Key: r5n.r2
+         Sort Method: top-N heapsort
+         ->  Hash Join (actual rows=2549846.00 loops=1)
+               Output: r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n
+               Hash Cond: (parent.r3 = r5n.r3)
+               ->  Append (actual rows=5048.00 loops=1)
+                     ->  Seq Scan on public.child1a parent_2 (actual rows=1117.00 loops=1)
+                           Output: parent_2.r3, parent_2.n
+                           Storage Table Read Requests: 70
+                           Storage Table Read Ops: 70
+                           Storage Table Rows Scanned: 1117
+                     ->  Seq Scan on public.child1b parent_3 (actual rows=714.00 loops=1)
+                           Output: parent_3.r3, parent_3.n
+                           Storage Table Read Requests: 45
+                           Storage Table Read Ops: 45
+                           Storage Table Rows Scanned: 714
+                     ->  Seq Scan on public.child2 parent_4 (actual rows=1918.00 loops=1)
+                           Output: parent_4.r3, parent_4.n
+                           Storage Table Read Requests: 120
+                           Storage Table Read Ops: 120
+                           Storage Table Rows Scanned: 1918
+                     ->  Seq Scan on public.child3 parent_5 (actual rows=1299.00 loops=1)
+                           Output: parent_5.r3, parent_5.n
+                           Storage Table Read Requests: 82
+                           Storage Table Read Ops: 82
+                           Storage Table Rows Scanned: 1299
+               ->  Hash (actual rows=5048.00 loops=1)
+                     Output: r5n.r2, r5n.r3, r5n.n
+                     Buckets: 8192 (originally 8192)  Original Batches: 1
+                     ->  Seq Scan on public.r5n (actual rows=5048.00 loops=1)
+                           Output: r5n.r2, r5n.r3, r5n.n
+                           Storage Table Read Requests: 224
+                           Storage Table Read Ops: 320
+                           Storage Table Rows Scanned: 5048
+(38 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY r5n.r2 LIMIT 5;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n
+   ->  Nested Loop (actual rows=5.00 loops=1)
+         Output: r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n
+         Join Filter: (r5n.r3 = parent.r3)
+         Rows Removed by Join Filter: 37
+         ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=1.00 loops=1)
+               Output: r5n.r2, r5n.r3, r5n.n
+               Index Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[]))
+               Merge Sort Key: r5n.r2
+               Merge Stream Key: (yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3)
+               Merge Streams: 3
+               Merge Cond: ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[]))
+               Storage Table Read Requests: 1
+               Storage Table Read Ops: 4
+               Storage Table Rows Scanned: 13
+               Storage Index Read Requests: 1
+               Storage Index Read Ops: 3
+               Storage Index Rows Scanned: 15
+         ->  Materialize (actual rows=42.00 loops=1)
+               Output: parent.r3, parent.n
+               ->  Append (actual rows=42.00 loops=1)
+                     ->  Seq Scan on public.child1a parent_2 (actual rows=42.00 loops=1)
+                           Output: parent_2.r3, parent_2.n
+                           Storage Table Read Requests: 4
+                           Storage Table Read Ops: 5
+                           Storage Table Rows Scanned: 53
+                     ->  Seq Scan on public.child1b parent_3 (never executed)
+                           Output: parent_3.r3, parent_3.n
+                     ->  Seq Scan on public.child2 parent_4 (never executed)
+                           Output: parent_4.r3, parent_4.n
+                     ->  Seq Scan on public.child3 parent_5 (never executed)
+                           Output: parent_5.r3, parent_5.n
+(33 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY r5n.r2 LIMIT 5;
+ r2 | r3 | r3 |   n   |   n   
+----+----+----+-------+-------
+  0 |  1 |  1 | 12109 | 31100
+  0 |  1 |  1 | 27108 | 31100
+  0 |  1 |  1 | 42109 | 31100
+  0 |  1 |  1 |  4109 | 31100
+  0 |  1 |  1 | 35108 | 31100
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY r5n.r2 LIMIT 5;
+ r2 | r3 | r3 |   n   |   n   
+----+----+----+-------+-------
+  0 |  0 |  0 | 31004 | 51010
+  0 |  0 |  0 | 31004 | 33020
+  0 |  0 |  0 | 31004 | 40030
+  0 |  0 |  0 | 31004 | 31030
+  0 |  0 |  0 | 31004 |  3030
+(5 rows)
+
+-- Derive from parent
+\set query ':P :Q SELECT parent.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY parent.r2 LIMIT 5;'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT parent.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY parent.r2 LIMIT 5;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent.r2, r5n.r3, parent.r3, r5n.n, parent.n
+   ->  Sort (actual rows=5.00 loops=1)
+         Output: parent.r2, r5n.r3, parent.r3, r5n.n, parent.n
+         Sort Key: parent.r2
+         Sort Method: top-N heapsort
+         ->  Hash Join (actual rows=2549846.00 loops=1)
+               Output: parent.r2, r5n.r3, parent.r3, r5n.n, parent.n
+               Hash Cond: (parent.r3 = r5n.r3)
+               ->  Append (actual rows=5048.00 loops=1)
+                     ->  Seq Scan on public.child1a parent_2 (actual rows=1117.00 loops=1)
+                           Output: parent_2.r2, parent_2.r3, parent_2.n
+                           Storage Table Read Requests: 70
+                           Storage Table Read Ops: 70
+                           Storage Table Rows Scanned: 1117
+                     ->  Seq Scan on public.child1b parent_3 (actual rows=714.00 loops=1)
+                           Output: parent_3.r2, parent_3.r3, parent_3.n
+                           Storage Table Read Requests: 45
+                           Storage Table Read Ops: 45
+                           Storage Table Rows Scanned: 714
+                     ->  Seq Scan on public.child2 parent_4 (actual rows=1918.00 loops=1)
+                           Output: parent_4.r2, parent_4.r3, parent_4.n
+                           Storage Table Read Requests: 120
+                           Storage Table Read Ops: 120
+                           Storage Table Rows Scanned: 1918
+                     ->  Seq Scan on public.child3 parent_5 (actual rows=1299.00 loops=1)
+                           Output: parent_5.r2, parent_5.r3, parent_5.n
+                           Storage Table Read Requests: 82
+                           Storage Table Read Ops: 82
+                           Storage Table Rows Scanned: 1299
+               ->  Hash (actual rows=5048.00 loops=1)
+                     Output: r5n.r3, r5n.n
+                     Buckets: 8192 (originally 8192)  Original Batches: 1
+                     ->  Seq Scan on public.r5n (actual rows=5048.00 loops=1)
+                           Output: r5n.r3, r5n.n
+                           Storage Table Read Requests: 224
+                           Storage Table Read Ops: 320
+                           Storage Table Rows Scanned: 5048
+(38 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT parent.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY parent.r2 LIMIT 5;
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent.r2, r5n.r3, parent.r3, r5n.n, parent.n
+   ->  Nested Loop (actual rows=5.00 loops=1)
+         Output: parent.r2, r5n.r3, parent.r3, r5n.n, parent.n
+         ->  Merge Append (actual rows=1.00 loops=1)
+               Sort Key: parent.r2
+               ->  Index Scan using child1a_expr_r2_r3_idx on public.child1a parent_2 (actual rows=1.00 loops=1)
+                     Output: parent_2.r2, parent_2.r3, parent_2.n
+                     Index Cond: ((yb_hash_code(parent_2.r2, parent_2.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_2.r2
+                     Merge Stream Key: (yb_hash_code(parent_2.r2, parent_2.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_2.r2, parent_2.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 1
+                     Storage Table Read Ops: 1
+                     Storage Table Rows Scanned: 13
+                     Storage Index Read Requests: 1
+                     Storage Index Read Ops: 3
+                     Storage Index Rows Scanned: 15
+               ->  Index Scan using child1b_expr_r2_r3_idx on public.child1b parent_3 (actual rows=1.00 loops=1)
+                     Output: parent_3.r2, parent_3.r3, parent_3.n
+                     Index Cond: ((yb_hash_code(parent_3.r2, parent_3.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_3.r2
+                     Merge Stream Key: (yb_hash_code(parent_3.r2, parent_3.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_3.r2, parent_3.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 1
+                     Storage Table Read Ops: 1
+                     Storage Table Rows Scanned: 13
+                     Storage Index Read Requests: 1
+                     Storage Index Read Ops: 3
+                     Storage Index Rows Scanned: 15
+               ->  Index Scan using child2_expr_r2_r3_idx on public.child2 parent_4 (actual rows=1.00 loops=1)
+                     Output: parent_4.r2, parent_4.r3, parent_4.n
+                     Index Cond: ((yb_hash_code(parent_4.r2, parent_4.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_4.r2
+                     Merge Stream Key: (yb_hash_code(parent_4.r2, parent_4.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_4.r2, parent_4.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 1
+                     Storage Table Read Ops: 1
+                     Storage Table Rows Scanned: 13
+                     Storage Index Read Requests: 1
+                     Storage Index Read Ops: 3
+                     Storage Index Rows Scanned: 15
+               ->  Index Scan using child3_expr_r2_r3_idx on public.child3 parent_5 (actual rows=1.00 loops=1)
+                     Output: parent_5.r2, parent_5.r3, parent_5.n
+                     Index Cond: ((yb_hash_code(parent_5.r2, parent_5.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Merge Sort Key: parent_5.r2
+                     Merge Stream Key: (yb_hash_code(parent_5.r2, parent_5.r3) % 3)
+                     Merge Streams: 3
+                     Merge Cond: ((yb_hash_code(parent_5.r2, parent_5.r3) % 3) = ANY ('{0,1,2}'::integer[]))
+                     Storage Table Read Requests: 1
+                     Storage Table Read Ops: 1
+                     Storage Table Rows Scanned: 13
+                     Storage Index Read Requests: 1
+                     Storage Index Read Ops: 3
+                     Storage Index Rows Scanned: 15
+         ->  Memoize (actual rows=5.00 loops=1)
+               Output: r5n.r3, r5n.n
+               Cache Key: parent.r3
+               Cache Mode: logical
+               ->  Index Scan using r5n_pkey on public.r5n (actual rows=5.00 loops=1)
+                     Output: r5n.r3, r5n.n
+                     Index Cond: (r5n.r3 = parent.r3)
+                     Storage Table Read Requests: 1
+                     Storage Table Read Ops: 6
+                     Storage Table Rows Scanned: 15
+(68 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT parent.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY parent.r2 LIMIT 5;
+ r2 | r3 | r3 |   n   |   n   
+----+----+----+-------+-------
+  0 |  1 |  1 | 83199 | 31100
+  0 |  1 |  1 | 82199 | 31100
+  0 |  1 |  1 | 12199 | 31100
+  0 |  1 |  1 | 70199 | 31100
+  0 |  1 |  1 | 86199 | 31100
+(5 rows)
+
+/*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT parent.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM parent JOIN r5n ON r5n.r3 = parent.r3 ORDER BY parent.r2 LIMIT 5;
+ r2 | r3 | r3 |   n   |   n   
+----+----+----+-------+-------
+  0 |  4 |  4 | 30400 | 30400
+  0 |  4 |  4 | 21400 | 30400
+  0 |  4 |  4 | 64400 | 30400
+  0 |  4 |  4 | 45400 | 30400
+  0 |  4 |  4 | 55400 | 30400
+(5 rows)
+
+-- 2-hop =-const equivalence
+-- Third hint is to show that when a JOIN doesn't care about the ordering of
+-- the index scan, Merge scan is not used.
+-- Fourth hint is to show merge scan in a merge join.
+-- Fifth hint is to show merge scan in the inner side of a merge join.
+-- TODO(#29030): fifth hint should use merge scan.
+\set query ':explain :Q SELECT DISTINCT ON (r5n.r3, r5n.r4) parent.p1, r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM r5n JOIN parent ON r5n.r3 = parent.r3 WHERE parent.p1 = 9 AND r5n.r2 IN (3, 4, 5) LIMIT 5;'
+\set Q3 '/*+Leading((parent r5n)) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/'
+\set Q4 '/*+MergeJoin(parent r5n) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/'
+\set Q5 '/*+MergeJoin(parent r5n) Leading((parent r5n)) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/'
+\i :run_query
+\set _echo_run_query :ECHO
+\set ECHO none
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 0)*/ SELECT DISTINCT ON (r5n.r3, r5n.r4) parent.p1, r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM r5n JOIN parent ON r5n.r3 = parent.r3 WHERE parent.p1 = 9 AND r5n.r2 IN (3, 4, 5) LIMIT 5;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+   ->  Unique (actual rows=5.00 loops=1)
+         Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+         ->  Incremental Sort (actual rows=2547.00 loops=1)
+               Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+               Sort Key: r5n.r3, r5n.r4
+               Presorted Key: r5n.r3
+               Full-sort Groups: 1  Sort Method: quicksort
+               Pre-sorted Groups: 1  Sort Method: quicksort
+               ->  Merge Join (actual rows=6157.00 loops=1)
+                     Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+                     Merge Cond: (parent_1.r3 = r5n.r3)
+                     ->  Sort (actual rows=39.00 loops=1)
+                           Output: parent_1.p1, parent_1.r3, parent_1.n
+                           Sort Key: parent_1.r3
+                           Sort Method: quicksort
+                           ->  Seq Scan on public.child3 parent_1 (actual rows=489.00 loops=1)
+                                 Output: parent_1.p1, parent_1.r3, parent_1.n
+                                 Storage Filter: (parent_1.p1 = 9)
+                                 Storage Table Read Requests: 31
+                                 Storage Table Read Ops: 31
+                                 Storage Table Rows Scanned: 1299
+                     ->  Sort (actual rows=6157.00 loops=1)
+                           Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                           Sort Key: r5n.r3
+                           Sort Method: quicksort
+                           ->  Index Scan using r5n_pkey on public.r5n (actual rows=1512.00 loops=1)
+                                 Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                                 Index Cond: (r5n.r2 = ANY ('{3,4,5}'::bigint[]))
+                                 Storage Table Read Requests: 68
+                                 Storage Table Read Ops: 100
+                                 Storage Table Rows Scanned: 1512
+(33 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT DISTINCT ON (r5n.r3, r5n.r4) parent.p1, r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM r5n JOIN parent ON r5n.r3 = parent.r3 WHERE parent.p1 = 9 AND r5n.r2 IN (3, 4, 5) LIMIT 5;
+                                                                      QUERY PLAN                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+   ->  Unique (actual rows=5.00 loops=1)
+         Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+         ->  Nested Loop (actual rows=2547.00 loops=1)
+               Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+               ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=68.00 loops=1)
+                     Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                     Index Cond: ((r5n.r2 = ANY ('{3,4,5}'::bigint[])) AND ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[])))
+                     Merge Sort Key: r5n.r3, r5n.r4
+                     Merge Stream Key: (yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3), r5n.r2
+                     Merge Streams: 9
+                     Merge Cond: (((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[])) AND (r5n.r2 = ANY ('{3,4,5}'::bigint[])))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 8
+                     Storage Table Rows Scanned: 73
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 27
+                     Storage Index Rows Scanned: 189
+               ->  Memoize (actual rows=37.46 loops=68)
+                     Output: parent_1.p1, parent_1.r3, parent_1.n
+                     Cache Key: r5n.r3
+                     Cache Mode: logical
+                     ->  Index Scan using child3_pkey on public.child3 parent_1 (actual rows=38.00 loops=1)
+                           Output: parent_1.p1, parent_1.r3, parent_1.n
+                           Index Cond: ((parent_1.r3 = r5n.r3) AND (parent_1.p1 = 9))
+                           Storage Table Read Requests: 4
+                           Storage Table Read Ops: 4
+                           Storage Table Rows Scanned: 38
+(29 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+Leading((parent r5n)) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT DISTINCT ON (r5n.r3, r5n.r4) parent.p1, r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM r5n JOIN parent ON r5n.r3 = parent.r3 WHERE parent.p1 = 9 AND r5n.r2 IN (3, 4, 5) LIMIT 5;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+   ->  Unique (actual rows=5.00 loops=1)
+         Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+         ->  Incremental Sort (actual rows=2547.00 loops=1)
+               Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+               Sort Key: r5n.r3, r5n.r4
+               Presorted Key: r5n.r3
+               Full-sort Groups: 1  Sort Method: quicksort
+               Pre-sorted Groups: 1  Sort Method: quicksort
+               ->  Merge Join (actual rows=6157.00 loops=1)
+                     Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+                     Merge Cond: (parent_1.r3 = r5n.r3)
+                     ->  Sort (actual rows=39.00 loops=1)
+                           Output: parent_1.p1, parent_1.r3, parent_1.n
+                           Sort Key: parent_1.r3
+                           Sort Method: quicksort
+                           ->  Seq Scan on public.child3 parent_1 (actual rows=489.00 loops=1)
+                                 Output: parent_1.p1, parent_1.r3, parent_1.n
+                                 Storage Filter: (parent_1.p1 = 9)
+                                 Storage Table Read Requests: 31
+                                 Storage Table Read Ops: 31
+                                 Storage Table Rows Scanned: 1299
+                     ->  Sort (actual rows=6157.00 loops=1)
+                           Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                           Sort Key: r5n.r3
+                           Sort Method: quicksort
+                           ->  Index Scan using r5n_pkey on public.r5n (actual rows=1512.00 loops=1)
+                                 Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                                 Index Cond: (r5n.r2 = ANY ('{3,4,5}'::bigint[]))
+                                 Storage Table Read Requests: 68
+                                 Storage Table Read Ops: 100
+                                 Storage Table Rows Scanned: 1512
+(33 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+MergeJoin(parent r5n) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT DISTINCT ON (r5n.r3, r5n.r4) parent.p1, r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM r5n JOIN parent ON r5n.r3 = parent.r3 WHERE parent.p1 = 9 AND r5n.r2 IN (3, 4, 5) LIMIT 5;
+                                                                      QUERY PLAN                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+   ->  Unique (actual rows=5.00 loops=1)
+         Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+         ->  Merge Join (actual rows=2547.00 loops=1)
+               Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+               Merge Cond: (r5n.r3 = parent_1.r3)
+               ->  Index Scan using r5n_expr_r2_r3_r4_idx on public.r5n (actual rows=68.00 loops=1)
+                     Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                     Index Cond: ((r5n.r2 = ANY ('{3,4,5}'::bigint[])) AND ((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[])))
+                     Merge Sort Key: r5n.r3, r5n.r4
+                     Merge Stream Key: (yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3), r5n.r2
+                     Merge Streams: 9
+                     Merge Cond: (((yb_hash_code(r5n.r2, r5n.r3, r5n.r4) % 3) = ANY ('{0,1,2}'::integer[])) AND (r5n.r2 = ANY ('{3,4,5}'::bigint[])))
+                     Storage Table Read Requests: 2
+                     Storage Table Read Ops: 8
+                     Storage Table Rows Scanned: 73
+                     Storage Index Read Requests: 2
+                     Storage Index Read Ops: 27
+                     Storage Index Rows Scanned: 189
+               ->  Sort (actual rows=2547.00 loops=1)
+                     Output: parent_1.p1, parent_1.r3, parent_1.n
+                     Sort Key: parent_1.r3
+                     Sort Method: quicksort
+                     ->  Seq Scan on public.child3 parent_1 (actual rows=489.00 loops=1)
+                           Output: parent_1.p1, parent_1.r3, parent_1.n
+                           Storage Filter: (parent_1.p1 = 9)
+                           Storage Table Read Requests: 31
+                           Storage Table Read Ops: 31
+                           Storage Table Rows Scanned: 1299
+(30 rows)
+
+EXPLAIN (ANALYZE, DIST, VERBOSE, COSTS OFF, SUMMARY OFF, TIMING OFF, BUFFERS OFF) /*+MergeJoin(parent r5n) Leading((parent r5n)) Set(enable_parallel_append off) Set(yb_max_merge_scan_streams 64)*/ SELECT DISTINCT ON (r5n.r3, r5n.r4) parent.p1, r5n.r2, r5n.r3, parent.r3, r5n.n, parent.n FROM r5n JOIN parent ON r5n.r3 = parent.r3 WHERE parent.p1 = 9 AND r5n.r2 IN (3, 4, 5) LIMIT 5;
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Limit (actual rows=5.00 loops=1)
+   Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+   ->  Unique (actual rows=5.00 loops=1)
+         Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+         ->  Incremental Sort (actual rows=2547.00 loops=1)
+               Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+               Sort Key: r5n.r3, r5n.r4
+               Presorted Key: r5n.r3
+               Full-sort Groups: 1  Sort Method: quicksort
+               Pre-sorted Groups: 1  Sort Method: quicksort
+               ->  Merge Join (actual rows=6157.00 loops=1)
+                     Output: parent_1.p1, r5n.r2, r5n.r3, parent_1.r3, r5n.n, parent_1.n, r5n.r4
+                     Merge Cond: (parent_1.r3 = r5n.r3)
+                     ->  Sort (actual rows=39.00 loops=1)
+                           Output: parent_1.p1, parent_1.r3, parent_1.n
+                           Sort Key: parent_1.r3
+                           Sort Method: quicksort
+                           ->  Seq Scan on public.child3 parent_1 (actual rows=489.00 loops=1)
+                                 Output: parent_1.p1, parent_1.r3, parent_1.n
+                                 Storage Filter: (parent_1.p1 = 9)
+                                 Storage Table Read Requests: 31
+                                 Storage Table Read Ops: 31
+                                 Storage Table Rows Scanned: 1299
+                     ->  Sort (actual rows=6157.00 loops=1)
+                           Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                           Sort Key: r5n.r3
+                           Sort Method: quicksort
+                           ->  Index Scan using r5n_pkey on public.r5n (actual rows=1512.00 loops=1)
+                                 Output: r5n.r2, r5n.r3, r5n.n, r5n.r4
+                                 Index Cond: (r5n.r2 = ANY ('{3,4,5}'::bigint[]))
+                                 Storage Table Read Requests: 68
+                                 Storage Table Read Ops: 100
+                                 Storage Table Rows Scanned: 1512
+(33 rows)
+

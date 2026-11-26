@@ -110,6 +110,15 @@ StaticAssertDecl(ALLOC_CHUNK_LIMIT == ALLOCSET_SEPARATE_THRESHOLD,
 #define FIRST_BLOCKHDRSZ	(MAXALIGN(sizeof(AllocSetContext)) + \
 							 ALLOC_BLOCKHDRSZ)
 
+/* YB: Calculate the total allocated size for a block */
+#define ASET_BLOCK_TOTAL_SIZE(BLK) (BLK->endptr - ((char *)BLK))
+/*
+ * YB: Calculate the total initial allocated size for a set. Note that the
+ * keeper block is always allocated along with the set header at the same time.
+ * It is never removed from the header or replaced.
+ */
+#define ASET_INITIAL_TOTAL_SIZE(SET) (KeeperBlock((AllocSetContext *) SET)->endptr - ((char *) SET))
+
 typedef struct AllocBlockData *AllocBlock;	/* forward reference */
 
 /*
@@ -388,9 +397,13 @@ AllocSetContextCreateInternal(MemoryContext parent,
 	/*
 	 * Check whether the parameters match either available freelist.  We do
 	 * not need to demand a match of maxBlockSize.
+	 * YB: Access to the freelist is not thread safe, so avoid it in
+	 * multi-thread mode.
 	 */
-	if (minContextSize == ALLOCSET_DEFAULT_MINSIZE &&
-		initBlockSize == ALLOCSET_DEFAULT_INITSIZE)
+	if (IsMultiThreadedMode())
+		freeListIndex = -1;
+	else if (minContextSize == ALLOCSET_DEFAULT_MINSIZE &&
+			 initBlockSize == ALLOCSET_DEFAULT_INITSIZE)
 		freeListIndex = 0;
 	else if (minContextSize == ALLOCSET_SMALL_MINSIZE &&
 			 initBlockSize == ALLOCSET_SMALL_INITSIZE)
@@ -452,6 +465,8 @@ AllocSetContextCreateInternal(MemoryContext parent,
 				 errdetail("Failed while creating memory context \"%s\".",
 						   name)));
 	}
+
+	YbPgMemAddConsumption(firstBlockSize);
 
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
@@ -589,6 +604,8 @@ AllocSetReset(MemoryContext context)
 		else
 		{
 			/* Normal case, release the block */
+			size_t		freed_sz = ASET_BLOCK_TOTAL_SIZE(block);
+
 			context->mem_allocated -= block->endptr - ((char *) block);
 
 #ifdef CLOBBER_FREED_MEMORY
@@ -603,6 +620,7 @@ AllocSetReset(MemoryContext context)
 			VALGRIND_MEMPOOL_FREE(set, block);
 
 			free(block);
+			YbPgMemSubConsumption(freed_sz);
 		}
 		block = next;
 	}
@@ -676,8 +694,11 @@ AllocSetDelete(MemoryContext context)
 				/* Destroy the context's vpool --- see notes below */
 				VALGRIND_DESTROY_MEMPOOL(oldset);
 
+				size_t		freed_sz = ASET_INITIAL_TOTAL_SIZE(oldset);
+
 				/* All that remains is to free the header/initial block */
 				free(oldset);
+				YbPgMemSubConsumption(freed_sz);
 			}
 			Assert(freelist->num_free == 0);
 		}
@@ -706,11 +727,17 @@ AllocSetDelete(MemoryContext context)
 		{
 			/* As in AllocSetReset, free block-header vchunks explicitly */
 			VALGRIND_MEMPOOL_FREE(set, block);
+
+			size_t		freed_sz = ASET_BLOCK_TOTAL_SIZE(block);
+
 			free(block);
+			YbPgMemSubConsumption(freed_sz);
 		}
 
 		block = next;
 	}
+
+	size_t		freed_sz = ASET_INITIAL_TOTAL_SIZE(set);
 
 	Assert(context->mem_allocated == keepersize);
 
@@ -723,6 +750,7 @@ AllocSetDelete(MemoryContext context)
 
 	/* Finally, free the context header, including the keeper block */
 	free(set);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -757,6 +785,8 @@ AllocSetAllocLarge(MemoryContext context, Size size, int flags)
 
 	/* Make a vchunk covering the new block's header */
 	VALGRIND_MEMPOOL_ALLOC(set, block, ALLOC_BLOCKHDRSZ);
+
+	YbPgMemAddConsumption(blksize);
 
 	context->mem_allocated += blksize;
 
@@ -967,6 +997,8 @@ AllocSetAllocFromNewBlock(MemoryContext context, Size size, int flags,
 	/* Make a vchunk covering the new block's header */
 	VALGRIND_MEMPOOL_ALLOC(set, block, ALLOC_BLOCKHDRSZ);
 
+	YbPgMemAddConsumption(blksize);
+
 	context->mem_allocated += blksize;
 
 	block->aset = set;
@@ -1144,6 +1176,9 @@ AllocSetFree(void *pointer)
 		if (block->next)
 			block->next->prev = block->prev;
 
+		/* Must be placed before the wipe_mem wipes the content */
+		size_t		freed_sz = ASET_BLOCK_TOTAL_SIZE(block);
+
 		set->header.mem_allocated -= block->endptr - ((char *) block);
 
 #ifdef CLOBBER_FREED_MEMORY
@@ -1154,6 +1189,7 @@ AllocSetFree(void *pointer)
 		VALGRIND_MEMPOOL_FREE(set, block);
 
 		free(block);
+		YbPgMemSubConsumption(freed_sz);
 	}
 	else
 	{
@@ -1312,6 +1348,8 @@ AllocSetRealloc(void *pointer, Size size, int flags)
 		set->header.mem_allocated += blksize;
 
 		block->freeptr = block->endptr = ((char *) block) + blksize;
+		YbPgMemSubConsumption(oldblksize);
+		YbPgMemAddConsumption(blksize);
 
 		/* Update pointers since block has likely been moved */
 		chunk = (MemoryChunk *) (((char *) block) + ALLOC_BLOCKHDRSZ);

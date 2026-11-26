@@ -18,6 +18,9 @@
 #include "common/relpath.h"
 #include "nodes/bitmapset.h"
 
+/* YB includes */
+#include "nodes/parsenodes.h"
+
 
 /*
  * Name of relcache init file(s), used to speed up backend startup
@@ -125,7 +128,9 @@ extern Relation RelationBuildLocalRelation(const char *relname,
 /*
  * Routines to manage assignment of new relfilenumber to a relation
  */
-extern void RelationSetNewRelfilenumber(Relation relation, char persistence);
+extern void RelationSetNewRelfilenumber(Relation relation, char persistence,
+										bool yb_copy_split_options,
+										YbOptSplit *preserved_index_split_options);
 extern void RelationAssumeNewRelfilelocator(Relation relation);
 
 /*
@@ -159,5 +164,40 @@ extern PGDLLIMPORT bool criticalRelcachesBuilt;
 
 /* should be used only by relcache.c and postinit.c */
 extern PGDLLIMPORT bool criticalSharedRelcachesBuilt;
+
+/* YB */
+extern List *YbRelationGetFKeyReferencedByList(Relation relation);
+extern List *YbRelationGetUnConstifiedIndexExpressions(Relation relation);
+extern Node *YbRelationGetUnConstifiedIndexPredicate(Relation relation);
+extern void YbComputeIndexExprOrPredicateAttrs(Bitmapset **indexattrs,
+											   Relation indexDesc,
+											   const int Anum_pg_index,
+											   AttrNumber attr_offset);
+extern bool CheckIndexForUpdate(Oid indexoid,
+								const Bitmapset *updated_attrs, AttrNumber attr_offset);
+extern bool CheckUpdateExprOrPred(const Bitmapset *updated_attrs,
+								  Relation indexDesc,
+								  const int Anum_pg_index,
+								  AttrNumber attr_offset);
+extern void YBPreloadRelCache();
+extern void YbRelationCacheInvalidate(void);
+extern bool YbRelationIdIsInInitFileAndNotCached(Oid relationId);
+extern bool YbSharedRelationIdNeedsGlobalImpact(Oid relationId);
+extern Relation YbRelationIdCacheLookup(Oid relid);
+
+extern long YbGetRelCachePreloads(void);
+extern long YbGetRelCacheInitFileRevalidated(void);
+extern long YbGetRelCacheInitFileRevalidationFailed(void);
+
+extern void YbPrefetchRequiredData(bool preload_rel_cache);
+
+/*
+ * Carry a connection that read the catalog at a version this node already had cached up to the
+ * version it would otherwise have read at, by applying the invalidation messages
+ * YbTryPrepareStaleCatalogPrefetch collected. Called once startup is past the point where
+ * removing a relcache entry is unsafe, and before anything reads the catalog for a decision
+ * that is never revisited.
+ */
+extern void YbFinishStaleCatalogPrefetch(void);
 
 #endif							/* RELCACHE_H */

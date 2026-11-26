@@ -292,6 +292,9 @@ typedef enum ExprEvalOp
 	EEOP_AGG_ORDERED_TRANS_DATUM,
 	EEOP_AGG_ORDERED_TRANS_TUPLE,
 
+	/* bytecodes added by YB */
+	EEOP_ROWARRAY_COMPARE,
+
 	/* non-existent operation, used e.g. to check array lengths */
 	EEOP_LAST
 } ExprEvalOp;
@@ -769,6 +772,13 @@ typedef struct ExprEvalStep
 			void	   *json_coercion_cache;
 			ErrorSaveContext *escontext;
 		}			jsonexpr_coercion;
+
+		struct
+		{
+			FunctionCallInfo *fcinfos;
+			PGFunction *fn_addrs;
+			int			ncols;
+		}			row_array_compare;
 	}			d;
 } ExprEvalStep;
 
@@ -916,5 +926,8 @@ extern void ExecEvalAggOrderedTransDatum(ExprState *state, ExprEvalStep *op,
 										 ExprContext *econtext);
 extern void ExecEvalAggOrderedTransTuple(ExprState *state, ExprEvalStep *op,
 										 ExprContext *econtext);
+
+/* YB */
+extern void YBExecEvalRowArrayComparison(ExprState *state, ExprEvalStep *op);
 
 #endif							/* EXEC_EXPR_H */
