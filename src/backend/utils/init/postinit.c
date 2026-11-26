@@ -10,7 +10,22 @@
  * IDENTIFICATION
  *	  src/backend/utils/init/postinit.c
  *
+ * The following only applies to changes made to this file as part of
+ * YugabyteDB development.
  *
+ * Portions Copyright (c) YugabyteDB, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you
+ * may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied.  See the License for the specific language governing
+ * permissions and limitations under the License.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -71,6 +86,22 @@
 #include "utils/syscache.h"
 #include "utils/timeout.h"
 
+/* YB includes */
+#include "catalog/pg_auth_members.h"
+#include "catalog/pg_yb_catalog_version.h"
+#include "catalog/pg_yb_logical_client_version.h"
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "catalog/yb_catalog_version.h"
+#include "catalog/yb_logical_client_version.h"
+#include "commands/dbcommands.h"
+#include "utils/catcache.h"
+#include "utils/yb_inheritscache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb_ash.h"
+#include <poll.h>
+
 /* has this backend called EmitConnectionWarnings()? */
 static bool ConnectionWarningsEmitted;
 
@@ -101,6 +132,20 @@ static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
 static void EmitConnectionWarnings(void);
 
+/* YB functions */
+static void YbEmitAuthPassthroughConnectionWarnings(void);
+static void YbPresetDatabaseCollation(HeapTuple tuple);
+static void YbEnableStartupClientConnectionCheck(void);
+static void YbDisableStartupClientConnectionCheck(void);
+static void YbCheckClientConnectionFromSignalHandler(void);
+
+static long YbNumAuthorizedConnections = 0L;
+
+/*
+ * Set while InitPostgres runs with the client connection check armed; see
+ * YbEnableStartupClientConnectionCheck.
+ */
+static volatile sig_atomic_t yb_startup_client_connection_check = false;
 
 /*** InitPostgres support ***/
 
@@ -229,7 +274,7 @@ PerformAuthentication(Port *port)
 												  "Postmaster",
 												  ALLOCSET_DEFAULT_SIZES);
 
-	if (!load_hba())
+	if (!load_hba(NULL /* yb_validate_conf_file */ ))
 	{
 		/*
 		 * It makes no sense to continue if we fail to load the HBA file,
@@ -240,7 +285,7 @@ PerformAuthentication(Port *port)
 				(errmsg("could not load %s", HbaFileName)));
 	}
 
-	if (!load_ident())
+	if (!load_ident(NULL, NULL /* yb_validate_conf_file */ ))
 	{
 		/*
 		 * It is ok to continue if we fail to load the IDENT file, although it
@@ -325,11 +370,297 @@ PerformAuthentication(Port *port)
 		pfree(logmsg.data);
 	}
 
+	if (IsYugaByteEnabled())
+		YbNumAuthorizedConnections++;
+
 	set_ps_display("startup");
 
 	ClientAuthInProgress = false;	/* client_min_messages is active now */
 }
 
+void
+YbLogAuthPassthroughConnReceived(struct Port *port)
+{
+	/*
+	 * YB: Now we issue the Log_connections message, if wanted.
+	 * Conn Mgr does not provide the port number, so we only log the host.
+	 */
+
+	if (log_connections)
+		ereport(LOG,
+				(errmsg("connection received (Auth Passthrough): host=%s",
+						port->remote_host)));
+}
+
+/*
+ * YbLogAuthPassthroughConnAuthenticated -- post-authentication bookkeeping
+ * for connections authenticated via the auth passthrough path.
+ *
+ * Mirrors the logging and counter updates done in PerformAuthentication(),
+ * adapted for logical connections through the connection manager.
+ */
+void
+YbLogAuthPassthroughConnAuthenticated(Port *port)
+{
+	Assert(YbIsAuthPassthroughInProgress(port));
+	/*
+	 * YB: SSL details are not available for logical connections, so we only
+	 * log that SSL is enabled on the CM-client side. Similarly, GSS is not
+	 * supported with Connection Manager, so we don't log that either.
+	 */
+	if (log_connections)
+	{
+		StringInfoData logmsg;
+
+		initStringInfo(&logmsg);
+		if (am_walsender)
+			appendStringInfo(&logmsg,
+							 _("replication connection authorized: user=%s"),
+							 port->user_name);
+		else
+			appendStringInfo(&logmsg, _("connection authorized: user=%s"),
+							 port->user_name);
+		if (!am_walsender)
+			appendStringInfo(&logmsg, _(" database=%s"),
+							 port->database_name);
+
+		if (port->application_name != NULL)
+			appendStringInfo(&logmsg, _(" application_name=%s"),
+							 port->application_name);
+
+		if (port->yb_is_ssl_enabled_in_logical_conn)
+			appendStringInfo(&logmsg, _(" SSL enabled"));
+
+		appendStringInfo(&logmsg, _(" (via Auth Passthrough)"));
+
+		ereport(LOG, errmsg_internal("%s", logmsg.data));
+		pfree(logmsg.data);
+	}
+
+	YbNumAuthorizedConnections++;
+}
+
+static int
+YbHandleAuthPassthroughFailureAndGetElevel()
+{
+	Assert(YbIsAuthPassthroughInProgress(MyProcPort));
+
+	MyProcPort->yb_has_auth_passthrough_finished = true;
+	YbSendFatalForLogicalConnectionPacket();
+
+	return YbAuthFailedErrorLevel(true /* auth_passthrough */ );
+}
+
+/*
+ * YB: This function is essentially a copy of the first half of CheckMyDatabase.
+ * This is used in the Auth Passthrough mode of Connection Manager to performs
+ * checks on db CONNECT privileges during authentication, while avoiding
+ * changing other state on the control backend.
+ * This functions checks:
+ *   1) Whether the supplied dbname matches the dboid
+ *   2) Whether the database is accepting connections
+ *   3) Whether the user has login privileges for this db
+ *   4) Whether there is any collation version mismatch for the target db.
+ *
+ * Finally, we do update the client and server encoding GUCs but skip modifying
+ * the lc_collate and lc_ctype GUCs (these will be set on the txn backend) to
+ * avoid unnecessary state changes on the control backend as these will be done
+ * on the appropriate transactional backend when the client fires a query.
+ */
+void
+YbCheckMyDatabase(const char *name, bool am_superuser,
+				  bool override_allow_connections, Oid db_oid)
+{
+	Assert(YbIsAuthPassthroughInProgress(MyProcPort));
+
+	HeapTuple	tup;
+	Form_pg_database dbform;
+	Datum		datum;
+	bool		isnull;
+	char	   *collate;
+	char	   *iculocale;
+
+	/*
+	 * YB: Connection Manager Authentication Passthrough mode specific:
+	 * Flush cached pg_database entries.  The control backend tracks its own
+	 * database's catalog version, so it never sees invalidations triggered by
+	 * DDL in other databases (e.g. ALTER DATABASE ... REFRESH COLLATION
+	 * VERSION).  Since we may be looking up any database here, a stale entry
+	 * would silently return outdated attribute values.
+	 */
+	CatalogCacheFlushCatalog(DatabaseRelationId);
+
+	/* Fetch our pg_database row normally, via syscache */
+	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(db_oid));
+	if (!HeapTupleIsValid(tup))
+	{
+		elog(YbHandleAuthPassthroughFailureAndGetElevel(),
+			 "cache lookup failed for database %u or "
+			 "database \"%s\" does not exist", db_oid, name);
+		return;
+	}
+	dbform = (Form_pg_database) GETSTRUCT(tup);
+
+	/* This recheck is strictly paranoia */
+	if (strcmp(name, NameStr(dbform->datname)) != 0)
+	{
+		ereport(YbHandleAuthPassthroughFailureAndGetElevel(),
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("database \"%s\" has disappeared from pg_database", name),
+				 errdetail("Database OID %u now seems to belong to \"%s\".", db_oid,
+						   NameStr(dbform->datname))));
+
+		ReleaseSysCache(tup);
+		return;
+	}
+
+	/*
+	 * Check permissions to connect to the database.
+	 *
+	 * These checks are not enforced when in standalone mode, so that there is
+	 * a way to recover from disabling all access to all databases, for
+	 * example "UPDATE pg_database SET datallowconn = false;".
+	 */
+	if (IsUnderPostmaster)
+	{
+		/*
+		 * Check that the database is currently allowing connections.
+		 * (Background processes can override this test and the next one by
+		 * setting override_allow_connections.)
+		 */
+		if (!dbform->datallowconn && !override_allow_connections)
+		{
+			ereport(YbHandleAuthPassthroughFailureAndGetElevel(),
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("database \"%s\" is not currently accepting "
+							"connections",
+							name)));
+
+			ReleaseSysCache(tup);
+			return;
+		}
+
+		/*
+		 * Check privilege to connect to the database.  (The am_superuser test
+		 * is redundant, but since we have the flag, might as well check it
+		 * and save a few cycles.)
+		 */
+		if (!am_superuser && !override_allow_connections &&
+			object_aclcheck(DatabaseRelationId, db_oid, GetUserId(), ACL_CONNECT) !=
+			ACLCHECK_OK)
+		{
+			ereport(YbHandleAuthPassthroughFailureAndGetElevel(),
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied for database \"%s\"", name),
+					 errdetail("User does not have CONNECT privilege.")));
+
+			ReleaseSysCache(tup);
+			return;
+		}
+
+		/*
+		 * Check connection limit for this database.  We enforce the limit
+		 * only for regular backends, since other process types have their own
+		 * PGPROC pools.
+		 *
+		 * There is a race condition here --- we create our PGPROC before
+		 * checking for other PGPROCs.  If two backends did this at about the
+		 * same time, they might both think they were over the limit, while
+		 * ideally one should succeed and one fail.  Getting that to work
+		 * exactly seems more trouble than it is worth, however; instead we
+		 * just document that the connection limit is approximate.
+		 */
+		if (dbform->datconnlimit >= 0 && AmRegularBackendProcess() &&
+			!am_superuser && CountDBConnections(db_oid) > dbform->datconnlimit)
+		{
+			ereport(YbHandleAuthPassthroughFailureAndGetElevel(),
+					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+					 errmsg("too many connections for database \"%s\"", name)));
+
+			ReleaseSysCache(tup);
+			return;
+		}
+	}
+
+	/*
+	 * OK, we're golden.  Next to-do item is to save the encoding info out of
+	 * the pg_database tuple.
+	 *
+	 * YB: Ideally, during an Auth Passthrough authentication, GUC modifications
+	 * need to:
+	 *   - Set the current value of the GUC (change visible on calling SHOW)
+	 *   - Be reported to the client *only if* they were
+	 *       - set by the client (startup packet); or
+	 *       - marked to be reported by default (GUC_REPORT).
+	 *   - Not set the GUC default (GUC sources >= PGC_S_INTERACTIVE)
+	 *
+	 * However, here we make an exception to the last rule as this setting is
+	 * done for every authentication before any text encoding conversion is
+	 * done. Conversely, these encoding set calls need to be here because both
+	 * these vars are GUC_REPORT, and will always be reported back to the
+	 * client.
+	 *
+	 * Thus, every incoming client sees the encoding set for their supplied db
+	 * only (or encoding set via startup packet, if suppliec).
+	 */
+	SetDatabaseEncoding(dbform->encoding);
+	/* Record it as a GUC internal option, too */
+	SetConfigOption("server_encoding", GetDatabaseEncodingName(), PGC_INTERNAL,
+					PGC_S_DYNAMIC_DEFAULT);
+	/* If we have no other source of client_encoding, use server encoding */
+	SetConfigOption("client_encoding", GetDatabaseEncodingName(), PGC_BACKEND,
+					PGC_S_DYNAMIC_DEFAULT);
+
+	/*
+	 * Check collation version.  See similar code in CheckMyDatabase() and
+	 * pg_newlocale_from_collation().  Note that here we warn instead of error
+	 * in any case, so that we don't prevent connecting.
+	 */
+	datum = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_datcollate,
+							&isnull);
+	Assert(!isnull);
+	collate = TextDatumGetCString(datum);
+
+	if (dbform->datlocprovider == COLLPROVIDER_LIBC)
+		iculocale = NULL;
+	else
+	{
+		datum = SysCacheGetAttrNotNull(DATABASEOID, tup,
+									   Anum_pg_database_datlocale);
+		iculocale = TextDatumGetCString(datum);
+	}
+
+	datum = SysCacheGetAttr(DATABASEOID, tup, Anum_pg_database_datcollversion,
+							&isnull);
+	if (!isnull)
+	{
+		char	   *actual_versionstr;
+		char	   *collversionstr;
+
+		collversionstr = TextDatumGetCString(datum);
+
+		actual_versionstr = get_collation_actual_version(dbform->datlocprovider,
+														  dbform->datlocprovider == COLLPROVIDER_LIBC ? collate : iculocale);
+		if (!actual_versionstr)
+			/* should not happen */
+			elog(WARNING,
+				 "database \"%s\" has no actual collation version, but a version was recorded",
+				 name);
+		else if (strcmp(actual_versionstr, collversionstr) != 0)
+			ereport(WARNING,
+					(errmsg("database \"%s\" has a collation version mismatch",
+							name),
+					 errdetail("The database was created using collation version %s, "
+							   "but the operating system provides version %s.",
+							   collversionstr, actual_versionstr),
+					 errhint("Rebuild all objects in this database that use the default collation and run "
+							 "ALTER DATABASE %s REFRESH COLLATION VERSION, "
+							 "or build PostgreSQL with the right library version.",
+							 quote_identifier(name))));
+	}
+
+	ReleaseSysCache(tup);
+}
 
 /*
  * CheckMyDatabase -- fetch information from the pg_database entry for our DB
@@ -715,6 +1046,10 @@ BaseInit(void)
  * We expect that InitProcess() was already called, so we already have a
  * PGPROC struct ... but it's not completely filled in yet.
  *
+ * YB extension: yb_session_id. If greater than zero, connect local YbSession
+ * to existing YBClientSession instance in TServer, rather than requesting new.
+ * Helpful to initialize background worker backends that need to share state.
+ *
  * Note:
  *		Be very careful with the order of calls in the InitPostgres function.
  * --------------------------------
@@ -724,6 +1059,18 @@ InitPostgres(const char *in_dbname, Oid dboid,
 			 const char *username, Oid useroid,
 			 uint32 flags,
 			 char *out_dbname)
+{
+	YbInitPostgres(in_dbname, dboid, username, useroid,
+				   flags, out_dbname, NULL);
+}
+
+static void
+InitPostgresImpl(const char *in_dbname, Oid dboid,
+				 const char *username, Oid useroid,
+				 uint32 flags,
+				 char *out_dbname,
+				 const YbcPgInitPostgresInfo *yb_init_info,
+				 bool *yb_sys_table_prefetching_started)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
@@ -780,6 +1127,8 @@ InitPostgres(const char *in_dbname, Oid dboid,
 						IdleStatsUpdateTimeoutHandler);
 	}
 
+	YbMyProcState->initialization_completed = true;
+
 	/*
 	 * If this is either a bootstrap process or a standalone backend, start up
 	 * the XLOG machinery, and register to have it closed down at exit. In
@@ -829,9 +1178,117 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	InitCatalogCache();
 	InitPlanCache();
 
+	if (YBIsEnabledInPostgresEnvVar())
+		YbInitPgInheritsCache();
+
 	/* Initialize portal manager */
 	EnablePortalManager();
 
+	/*
+	 * YB: Set client_addr and client_host in ASH metadata which will remain
+	 * constant throughout the session. We don't want to do this during
+	 * bootstrap because it won't have client address anyway.
+	 */
+	if (YbAshIsClientAddrSet())
+		YbAshSetOneTimeMetadata();
+
+	/* Connect to YugaByte cluster. */
+	YBInitPostgresBackend("postgres", yb_init_info);
+
+	/* YB: Disabled by YbInitPostgres. */
+	if (IsUnderPostmaster)
+		YbEnableStartupClientConnectionCheck();
+
+	if (!bootstrap && MyProcPort != NULL &&
+		MyProcPort->yb_dist_traceparent != NULL &&
+		MyProcPort->yb_dist_traceparent[0] != '\0')
+	{
+		char		tracecontext[YB_TRACEPARENT_KEY_PREFIX_LEN +
+								 2 * YB_TRACEPARENT_QUOTE_LEN +
+								 YB_TRACEPARENT_VALUE_LEN + 1];
+
+		snprintf(tracecontext, sizeof(tracecontext),
+				 YB_TRACEPARENT_KEY_PREFIX "'%s'",
+				 MyProcPort->yb_dist_traceparent);
+
+		/* Warn instead of failing the connection when the value is rejected. */
+		(void) set_config_option_ext("yb_dist_tracecontext", tracecontext,
+									 PGC_BACKEND, PGC_S_SESSION,
+									 BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET,
+									 true /* changeVal */ , WARNING,
+									 false /* is_reload */ );
+	}
+
+	if (IsYugaByteEnabled() && !bootstrap)
+	{
+		HandleYBStatus(YBCPgTableExists(Template1DbOid,
+										YbRoleProfileRelationId,
+										&YbLoginProfileCatalogsExist));
+
+		/*
+		 * TODO (dmitry): Next call of the YBIsDBCatalogVersionMode function
+		 * is kind of a hack and must be removed. This function is called
+		 * before starting prefetching because for now switching into DB
+		 * catalog version mode is impossible in case prefething is started.
+		 */
+		YBIsDBCatalogVersionMode();
+		uint64_t	shared_catalog_version;
+
+		HandleYBStatus(YBCGetSharedCatalogVersion(&shared_catalog_version));
+		if (YbUseTserverResponseCacheForAuth(shared_catalog_version))
+		{
+			/*
+			 * Serve the connection-auth prefetch from the tserver response
+			 * cache. For scalability we key the cache on the shared memory
+			 * catalog version (an approximation of the latest master catalog
+			 * version) instead of calling YbGetMasterCatalogVersion(), avoiding
+			 * one master RPC per connection. Treats connection manager auth
+			 * backends and regular backends uniformly when
+			 * ysql_enable_read_request_cache_for_connection_auth is set.
+			 */
+			YbcPgLastKnownCatalogVersionInfo catalog_version =
+				(YbcPgLastKnownCatalogVersionInfo)
+			{
+				.version = shared_catalog_version,
+				.version_read_time = {},
+				.is_db_catalog_version_mode = YBIsDBCatalogVersionMode(),
+			};
+
+			YBCStartSysTablePrefetching(Template1DbOid,
+										catalog_version,
+										YB_YQL_PREFETCHER_TRUST_CACHE_AUTH,
+										YbAuthPrefetchKind(), false, false);
+		}
+		else
+			YBCStartSysTablePrefetchingNoCache(YbAuthPrefetchKind());
+		YbRegisterSysTableForPrefetching(AuthIdRelationId); /* pg_authid */
+		YbRegisterSysTableForPrefetching(DatabaseRelationId);	/* pg_database */
+
+		if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+		{
+			YbRegisterSysTableForPrefetching(YbProfileRelationId);	/* pg_yb_profile */
+			YbRegisterSysTableForPrefetching(YbRoleProfileRelationId);	/* pg_yb_role_profile */
+		}
+		YbTryRegisterCatalogVersionTableForPrefetching();
+
+		/*
+		 * YB: We prefetch the Logical Client Version table for all backends
+		 * as the LCV will be queried during backend startup.
+		 */
+		YbTryRegisterLogicalClientVersionTableForPrefetching();
+
+		/* Not a connection start's large set, so this records no catalog version. */
+		HandleYBStatus(YBCPrefetchRegisteredSysTables(false /* completes_connection_prefetch */ ));
+		/*
+		 * If per database catalog version mode is enabled, this will load the
+		 * catalog version of template1. It is fine because at this time we
+		 * only read shared relations and therefore can use any database OID.
+		 * We will update yb_catalog_cache_version to match MyDatabaseId once
+		 * the latter is resolved so we will never use the catalog version of
+		 * template1 to query relations that are private to MyDatabaseId.
+		 */
+		YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
+	}
 	/*
 	 * Load relcache entries for the shared system catalogs.  This must create
 	 * at least entries for pg_database and catalogs used for authentication.
@@ -874,6 +1331,22 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		 * Fortunately, "read committed" is plenty good enough.
 		 */
 		XactIsoLevel = XACT_READ_COMMITTED;
+
+		/*
+		 * YB: Preload the pg_authid catalog caches (by-name AUTHNAME and by-OID
+		 * AUTHOID) before client authentication.  Authentication reads pg_authid
+		 * by role name to fetch the stored password, and backend startup then
+		 * reads it again by role OID for session-user setup and the superuser
+		 * check.  Both happen before the regular catalog cache preload, so
+		 * without this they incur a catalog cache miss on every new connection.
+		 * pg_authid is a shared catalog that is already prefetched at backend
+		 * startup (see YbRegisterSysTableForPrefetching above), so a single scan
+		 * populates both caches from already-fetched data and adds no master
+		 * read.
+		 */
+		if (IsYugaByteEnabled() &&
+			*YBCGetGFlags()->ysql_preload_pg_authid_for_auth)
+			YbPreloadCatalogCache(AUTHOID, AUTHNAME);
 	}
 
 	/*
@@ -925,6 +1398,13 @@ InitPostgres(const char *in_dbname, Oid dboid,
 			InitializeSystemUser(MyClientConnectionInfo.authn_id,
 								 hba_authname(MyClientConnectionInfo.auth_method));
 		am_superuser = superuser();
+
+		/*
+		 * In YSQL upgrade mode (uses tserver auth method), we allow connecting to
+		 * databases with disabled connections (normally it's just template0).
+		 */
+		if (IsYugaByteEnabled() && MyProcPort->yb_is_tserver_auth_method)
+			flags |= INIT_PG_OVERRIDE_ALLOW_CONNS;
 	}
 
 	/* Report any SSL/GSS details for the session. */
@@ -1139,6 +1619,12 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	MyDatabaseId = dboid;
 
+	if (IsYugaByteEnabled())
+	{
+		YBCSetupPgBackendCgroup(MyDatabaseId);
+		YBCPgSetConnectedDatabaseOid(MyDatabaseId);
+	}
+
 	/*
 	 * Now we can mark our PGPROC entry with the database ID.
 	 *
@@ -1153,6 +1639,50 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	MyProc->databaseId = MyDatabaseId;
 
+	if (MyDatabaseId != Template1DbOid && YBIsDBCatalogVersionMode())
+	{
+		/*
+		 * Here we assume that the entire table pg_yb_catalog_version is
+		 * prefetched. Note that in this case YbGetMasterCatalogVersion()
+		 * returns the prefetched catalog version of MyDatabaseId which is
+		 * consistent with all the other tables that are prefetched.
+		 */
+		uint64_t	master_catalog_version = YbGetMasterCatalogVersion();
+
+		Assert(master_catalog_version > YB_CATCACHE_VERSION_UNINITIALIZED);
+		YbUpdateCatalogCacheVersion(master_catalog_version);
+	}
+
+	if (IsYugaByteEnabled() && !bootstrap)
+	{
+		HeapTuple	tuple;
+		Form_pg_database datform;
+
+		tuple = GetDatabaseTupleByOid(dboid);
+		Assert(HeapTupleIsValid(tuple));
+		datform = (Form_pg_database) GETSTRUCT(tuple);
+
+		SetDatabaseEncoding(datform->encoding);
+		YbPresetDatabaseCollation(tuple);
+		if (yb_enable_ash)
+			YbAshSetDatabaseId(MyDatabaseId);
+	}
+
+	/* YB: Set LCV cache version as sum of global and local LCV */
+	if (YBIsDBLogicalClientVersionMode())
+	{
+		uint64_t	global_logical_client_version =
+			YbGetMasterLogicalClientVersion();
+
+		elog(DEBUG1,
+			 "global_logical_client_version = %" PRIu64
+			 ", sighup_logical_client_version = %" PRIu64,
+			 global_logical_client_version,
+			 yb_conn_mgr_sighup_logical_client_version);
+		YbSetLogicalClientCacheVersion(global_logical_client_version
+									   + yb_conn_mgr_sighup_logical_client_version);
+	}
+
 	/*
 	 * We established a catalog snapshot while reading pg_authid and/or
 	 * pg_database; but until we have set up MyDatabaseId, we won't react to
@@ -1160,36 +1690,42 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * if the snapshot has been invalidated.  Assume it's no good anymore.
 	 */
 	InvalidateCatalogSnapshot();
+	if (IsYugaByteEnabled() && YBCIsSysTablePrefetchingStarted())
+		YBCStopSysTablePrefetching();
 
-	/*
-	 * Now we should be able to access the database directory safely. Verify
-	 * it's there and looks reasonable.
-	 */
-	fullpath = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
-
-	if (!bootstrap)
+	/* No local physical path for the database in YugaByte mode */
+	if (!IsYugaByteEnabled())
 	{
-		if (access(fullpath, F_OK) == -1)
+		/*
+		 * Now we should be able to access the database directory safely. Verify
+		 * it's there and looks reasonable.
+		 */
+		fullpath = GetDatabasePath(MyDatabaseId, MyDatabaseTableSpace);
+
+		if (!bootstrap)
 		{
-			if (errno == ENOENT)
-				ereport(FATAL,
-						(errcode(ERRCODE_UNDEFINED_DATABASE),
-						 errmsg("database \"%s\" does not exist",
-								dbname),
-						 errdetail("The database subdirectory \"%s\" is missing.",
-								   fullpath)));
-			else
-				ereport(FATAL,
-						(errcode_for_file_access(),
-						 errmsg("could not access directory \"%s\": %m",
-								fullpath)));
+			if (access(fullpath, F_OK) == -1)
+			{
+				if (errno == ENOENT)
+					ereport(FATAL,
+							(errcode(ERRCODE_UNDEFINED_DATABASE),
+							 errmsg("database \"%s\" does not exist",
+									dbname),
+							 errdetail("The database subdirectory \"%s\" is missing.",
+									   fullpath)));
+				else
+					ereport(FATAL,
+							(errcode_for_file_access(),
+							 errmsg("could not access directory \"%s\": %m",
+									fullpath)));
+			}
+
+			ValidatePgVersion(fullpath);
 		}
 
-		ValidatePgVersion(fullpath);
+		SetDatabasePath(fullpath);
+		pfree(fullpath);
 	}
-
-	SetDatabasePath(fullpath);
-	pfree(fullpath);
 
 	/*
 	 * It's now possible to do real access to the system catalogs.
@@ -1197,7 +1733,28 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * Load relcache entries for the system catalogs.  This must create at
 	 * least the minimum set of "nailed-in" cache entries.
 	 */
+
+	/*
+	 * YB: See if tablegroup catalog exists - needs to happen before cache
+	 * fully initialized.
+	 */
+	if (IsYugaByteEnabled() && !bootstrap)
+		HandleYBStatus(YBCPgTableExists(MyDatabaseId, YbTablegroupRelationId,
+										&YbTablegroupCatalogExists));
+
 	RelationCacheInitializePhase3();
+
+	/* Before anything below reads the catalog for a decision that lasts the session. */
+	YbFinishStaleCatalogPrefetch();
+
+	/*
+	 * YB: Also cache whether the database is colocated for optimization
+	 * purposes.
+	 */
+	if (IsYugaByteEnabled() && !IsBootstrapProcessingMode())
+	{
+		MyDatabaseColocated = YbIsDatabaseColocated(MyDatabaseId, &MyColocatedDatabaseLegacy);
+	}
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();
@@ -1211,6 +1768,44 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	if (!bootstrap)
 		CheckMyDatabase(dbname, am_superuser,
 						(flags & INIT_PG_OVERRIDE_ALLOW_CONNS) != 0);
+
+	/*
+	 * YB: We are done with the authentication. Now we can send the db oid to
+	 * the connection, process the startup options and return.
+	 *
+	 * This block of code must be after the values of global variables such as
+	 * MyDatabaseId are set, since YbCreateClientIdWithDatabaseOid relies on it.
+	 */
+	if (yb_is_auth_backend)
+	{
+		/*
+		 * Initialize the client id and also send the db oid back to the
+		 * connection manager.
+		 */
+		YbCreateClientIdWithDatabaseOid(MyDatabaseId);
+
+		/*
+		 * Process any options passed in the startup packet. This is important
+		 * to do here since this is what sets the GUC values sent to the client.
+		 */
+		if (MyProcPort != NULL)
+			process_startup_options(MyProcPort, am_superuser);
+
+		if (YBIsDBLogicalClientVersionMode())
+			YbSendLogicalClientCacheVersionToFrontend();
+
+		/* Process pg_db_role_setting options */
+		process_settings(MyDatabaseId, GetSessionUserId());
+
+		/* close the transaction we started above */
+		CommitTransactionCommand();
+
+		/*
+		 * The auth-backend is only responsible for authentication, so we skip
+		 * the remaining steps below.
+		 */
+		return;
+	}
 
 	/*
 	 * Now process any command-line switches and any additional GUC variable
@@ -1261,6 +1856,223 @@ InitPostgres(const char *in_dbname, Oid dboid,
 
 	/* send any WARNINGs we've accumulated during initialization */
 	EmitConnectionWarnings();
+}
+
+static void
+YbEnsureSysTablePrefetchingStopped()
+{
+	if (IsYugaByteEnabled() && YBCIsSysTablePrefetchingStarted())
+		YBCStopSysTablePrefetching();
+}
+
+void
+YbInitPostgres(const char *in_dbname, Oid dboid,
+			   const char *username, Oid useroid,
+			   uint32 flags,
+			   char *out_dbname, const YbcPgInitPostgresInfo *yb_init_info)
+{
+	bool		sys_table_prefetching_started = false;
+
+	PG_TRY();
+	{
+		InitPostgresImpl(in_dbname, dboid, username, useroid,
+						 flags, out_dbname, yb_init_info, &sys_table_prefetching_started);
+	}
+	PG_CATCH();
+	{
+		YbDisableStartupClientConnectionCheck();
+		YbEnsureSysTablePrefetchingStopped();
+		YBCUpdateInitPostgresMetrics();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	YbDisableStartupClientConnectionCheck();
+	YbEnsureSysTablePrefetchingStopped();
+	YBCUpdateInitPostgresMetrics();
+}
+
+/*
+ * PG's client_connection_check_interval normally applies only after the
+ * backend has initialized.  In YB, initialization RPCs such as the catalog
+ * preload can take a while, so this check honors the GUC during those RPCs
+ * too.  They run before the per-database and per-role values of
+ * client_connection_check_interval are loaded, so only the server-wide
+ * setting (ysql_pg_conf_csv) is respected here.
+ */
+static void
+YbEnableStartupClientConnectionCheck(void)
+{
+	/*
+	 * MyProcPort is not set for other types of workers, which don't process
+	 * queries.
+	 */
+	if (!*YBCGetGFlags()->ysql_enable_startup_client_connection_check ||
+		client_connection_check_interval <= 0 || MyProcPort == NULL)
+		return;
+
+	yb_startup_client_connection_check = true;
+	/* Set up a signal handler to fire periodically (SIGALRM). */
+	enable_timeout_every(CLIENT_CONNECTION_CHECK_TIMEOUT,
+						 TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+													 client_connection_check_interval),
+						 client_connection_check_interval);
+}
+
+static void
+YbDisableStartupClientConnectionCheck(void)
+{
+	if (!yb_startup_client_connection_check)
+		return;
+
+	disable_timeout(CLIENT_CONNECTION_CHECK_TIMEOUT, false);
+	yb_startup_client_connection_check = false;
+}
+
+/*
+ * The goal is to do the same work as pq_check_connection, but in signal
+ * context.  pq_check_connection is not safe to run inside a signal handler.
+ *
+ * On a lost client this does what die() does, but sets ClientConnectionLost
+ * instead of ProcDiePending, so that ProcessInterrupts reports the lost
+ * client.  Interrupting pggate fails the pending request, and the error path
+ * runs CHECK_FOR_INTERRUPTS, which exits with FATAL.  The timer is still armed
+ * when InitPostgres exits with FATAL; after proc_exit destroys pggate,
+ * IsYugaByteEnabled() returns false.
+ */
+static void
+YbCheckClientConnectionFromSignalHandler(void)
+{
+	struct pollfd pfd;
+	short		hangup_events = POLLHUP | POLLERR;
+
+	if (ClientConnectionLost || proc_exit_inprogress)
+		return;
+
+	/*
+	 * MyProcPort is non-NULL only in backends started for a client
+	 * connection: regular backends and walsenders.  Background workers,
+	 * parallel workers and autovacuum have none, so the check is never armed
+	 * for them.
+	 */
+	pfd.fd = MyProcPort->sock;
+	/*
+	 * POLLRDHUP is a Linux-only flag that captures graceful close of conn. The
+	 * other poll flags capture errors on the socket. This means that the
+	 * client connection check cannot detect graceful client close on MacOS.
+	 */
+#ifdef POLLRDHUP
+	hangup_events |= POLLRDHUP;
+#endif
+	pfd.events = hangup_events;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, 0) > 0 && (pfd.revents & hangup_events) != 0)
+	{
+		ClientConnectionLost = true;
+		InterruptPending = true;
+
+
+		if (IsYugaByteEnabled())
+			YBCInterruptPgGate(); /* abort pending RPCs, if any */
+
+		SetLatch(MyLatch); /* wake up PG waits, if any */
+	}
+}
+
+/*
+ * Check and set database collation once MyDatabaseId is resolved. In YB we
+ * need to do this earlier because of prefetching where we may need to
+ * compare text values with DEFAULT_COLLATION_OID. For example,
+ * CREATE TABLE t1 (a INT, region VARCHAR, c INT, PRIMARY KEY(a, region))
+ * PARTITION BY LIST (region), the column region has default collation,
+ * which is the collation of the database of t1. During prefetching
+ * partition_bounds_create is invoked on t1 to build a list of sorted
+ * regions which does text comparisons.
+ * This function is adapted from CheckMyDatabase and should be kept in sync.
+ */
+static void
+YbPresetDatabaseCollation(HeapTuple tuple)
+{
+	Datum		datum;
+	bool		isnull;
+	char	   *collate;
+
+	/* There is no dbform->datcollate, must get it from tuple */
+	datum = SysCacheGetAttr(DATABASEOID, tuple, Anum_pg_database_datcollate, &isnull);
+	Assert(!isnull);
+	collate = TextDatumGetCString(datum);
+	if (pg_perm_setlocale(LC_COLLATE, collate) == NULL)
+		ereport(FATAL,
+				(errmsg("database locale is incompatible with operating system"),
+				 errdetail("The database was initialized with LC_COLLATE \"%s\", "
+						   " which is not recognized by setlocale().", collate),
+				 errhint("Recreate the database with another locale or install the missing locale.")));
+	elog(DEBUG1, "LC_COLLATE of %u is set to %s", MyDatabaseId, collate);
+	/*
+	 * Do not call init_database_collation here: its syscache lookup would
+	 * happen before the relcache is initialized and before the latest catalog
+	 * version is resolved. pg_newlocale_from_collation sets up default_locale
+	 * on first use instead.
+	 */
+	yb_default_collation_resolved = true;
+}
+
+long
+YbGetAuthorizedConnections()
+{
+	return YbNumAuthorizedConnections;
+}
+
+/*
+ * YB: Used in Connection Manager with Auth Passthrough mode.
+ * Initialise GUC state on the control backend and report GUC vars back to
+ * connection manager.
+ */
+void
+YbAuthPassthroughSetupGUCAndReport(Oid dboid)
+{
+	/* This function is only for auth passthrough via Connection Manager */
+	Assert(YbIsAuthPassthroughInProgress(MyProcPort));
+
+	Assert(OidIsValid(dboid));
+
+	/*
+	 * Process any options passed in the startup packet. This is important
+	 * to do here since this is what sets the GUC values sent to the client.
+	 */
+	if (MyProcPort != NULL)
+	{
+		process_startup_options(MyProcPort, superuser_arg(GetSessionUserId()));
+
+		/*
+		 * A reserved name in "options" has failed this logical connection,
+		 * see process_postgres_switches().
+		 */
+		if (MyProcPort->yb_has_auth_passthrough_finished)
+			return;
+	}
+
+	if (YBIsDBLogicalClientVersionMode())
+	{
+		uint64_t	global_logical_client_version =
+			YbGetMasterLogicalClientVersion();
+
+		elog(DEBUG1,
+			"global_logical_client_version = %" PRIu64
+			", sighup_logical_client_version = %" PRIu64,
+			global_logical_client_version,
+			yb_conn_mgr_sighup_logical_client_version);
+		YbResetLogicalClientCacheVersion();
+		YbSetLogicalClientCacheVersion(global_logical_client_version
+									   + yb_conn_mgr_sighup_logical_client_version);
+		YbSendLogicalClientCacheVersionToFrontend();
+	}
+
+	/* Process pg_db_role_setting options */
+	process_settings(dboid, GetSessionUserId());
+
+	YbEmitAuthPassthroughConnectionWarnings();
+
+	BeginReportingGUCOptions();
 }
 
 /*
@@ -1380,6 +2192,29 @@ ShutdownPostgres(int code, Datum arg)
 }
 
 
+#if defined(ADDRESS_SANITIZER)
+static volatile int yb_skip_lsan_check = 0;
+
+int
+__lsan_is_turned_off(void)
+{
+	return yb_skip_lsan_check;
+}
+#endif
+
+static void
+YbKillMe(int sig)
+{
+#if defined(ADDRESS_SANITIZER)
+	yb_skip_lsan_check = 1;
+#endif
+#ifdef HAVE_SETSID
+	/* try to signal whole process group */
+	kill(-MyProcPid, sig);
+#endif
+	kill(MyProcPid, sig);
+}
+
 /*
  * STATEMENT_TIMEOUT handler: trigger a query-cancel interrupt.
  */
@@ -1395,11 +2230,7 @@ StatementTimeoutHandler(void)
 	if (ClientAuthInProgress)
 		sig = SIGTERM;
 
-#ifdef HAVE_SETSID
-	/* try to signal whole process group */
-	kill(-MyProcPid, sig);
-#endif
-	kill(MyProcPid, sig);
+	YbKillMe(sig);
 }
 
 /*
@@ -1408,11 +2239,7 @@ StatementTimeoutHandler(void)
 static void
 LockTimeoutHandler(void)
 {
-#ifdef HAVE_SETSID
-	/* try to signal whole process group */
-	kill(-MyProcPid, SIGINT);
-#endif
-	kill(MyProcPid, SIGINT);
+	YbKillMe(SIGINT);
 }
 
 static void
@@ -1450,6 +2277,12 @@ IdleStatsUpdateTimeoutHandler(void)
 static void
 ClientCheckTimeoutHandler(void)
 {
+	if (yb_startup_client_connection_check)
+	{
+		YbCheckClientConnectionFromSignalHandler();
+		return;
+	}
+
 	CheckClientConnectionPending = true;
 	InterruptPending = true;
 	SetLatch(MyLatch);
@@ -1495,7 +2328,12 @@ StoreConnectionWarning(char *msg, char *detail, ConnectionWarningFilter filter)
 	Assert(msg);
 	Assert(detail);
 
-	if (ConnectionWarningsEmitted)
+	/*
+	 * YB: a Connection Manager control backend authenticates a new client
+	 * after its own startup emitted its warnings.
+	 * YbEmitAuthPassthroughConnectionWarnings() sends those.
+	 */
+	if (ConnectionWarningsEmitted && !YbIsAuthPassthroughInProgress(MyProcPort))
 		elog(ERROR, "StoreConnectionWarning() called after EmitConnectionWarnings()");
 
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
@@ -1537,4 +2375,41 @@ EmitConnectionWarnings(void)
 
 	list_free(ConnectionWarnings);
 	ConnectionWarnings = NIL;
+}
+
+/*
+ * YB: drop warnings queued by an earlier auth passthrough request on this
+ * control backend, e.g. one whose authentication failed.
+ */
+void
+YbResetAuthPassthroughConnectionWarnings(void)
+{
+	foreach_ptr(ConnectionWarning, warning, ConnectionWarnings)
+	{
+		pfree(warning->message);
+		pfree(warning->detail);
+		pfree(warning);
+	}
+
+	list_free(ConnectionWarnings);
+	ConnectionWarnings = NIL;
+}
+
+/*
+ * YB: the auth passthrough counterpart of EmitConnectionWarnings(), sent to
+ * the client that was just authenticated. Unlike EmitConnectionWarnings(),
+ * this runs once per authenticated client.
+ */
+static void
+YbEmitAuthPassthroughConnectionWarnings(void)
+{
+	foreach_ptr(ConnectionWarning, warning, ConnectionWarnings)
+	{
+		if (warning->filter == NULL || warning->filter())
+			ereport(WARNING,
+					(errmsg("%s", warning->message),
+					 errdetail("%s", warning->detail)));
+	}
+
+	YbResetAuthPassthroughConnectionWarnings();
 }

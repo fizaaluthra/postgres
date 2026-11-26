@@ -44,6 +44,9 @@
 #include "utils/pg_lsn.h"
 #include "utils/sortsupport.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* ----------
  * Uncomment the following to enable compilation of dump_numeric()
  * and dump_var() and to get a dump of any result produced by make_result().
@@ -527,6 +530,10 @@ static bool numericvar_to_int64(const NumericVar *var, int64 *result);
 static void int64_to_numericvar(int64 val, NumericVar *var);
 static bool numericvar_to_uint64(const NumericVar *var, uint64 *result);
 static void int128_to_numericvar(INT128 val, NumericVar *var);
+#ifdef YB_TODO
+/*  No longer in postgres new code. */
+double		numeric_to_double_no_overflow(Numeric num);
+#endif
 static double numericvar_to_double_no_overflow(const NumericVar *var);
 
 static Datum numeric_abbrev_convert(Datum original_datum, SortSupport ssup);
@@ -6445,11 +6452,8 @@ int8_sum(PG_FUNCTION_ARGS)
  * we need to count the inputs.
  */
 
-typedef struct Int8TransTypeData
-{
-	int64		count;
-	int64		sum;
-} Int8TransTypeData;
+/* YB: defined in numeric.h as YbInt8TransTypeData for use by nodeAgg.c. */
+typedef YbInt8TransTypeData Int8TransTypeData;
 
 Datum
 int2_avg_accum(PG_FUNCTION_ARGS)
@@ -8031,6 +8035,38 @@ int128_to_numericvar(INT128 val, NumericVar *var)
 	var->ndigits = ndigits;
 	var->weight = ndigits - 1;
 }
+
+#ifdef YB_TODO
+/*  No longer in Postgres code. */
+/*
+ * Convert numeric to float8; if out of range, return +/- HUGE_VAL
+ */
+double
+numeric_to_double_no_overflow(Numeric num)
+{
+	char	   *tmp;
+	double		val;
+	char	   *endptr;
+
+	tmp = DatumGetCString(DirectFunctionCall1(numeric_out,
+											  NumericGetDatum(num)));
+
+	/* unlike float8in, we ignore ERANGE from strtod */
+	val = strtod(tmp, &endptr);
+	if (*endptr != '\0')
+	{
+		/* shouldn't happen ... */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s: \"%s\"",
+						"double precision", tmp)));
+	}
+
+	pfree(tmp);
+
+	return val;
+}
+#endif
 
 /*
  * Convert a NumericVar to float8; if out of range, return +/- HUGE_VAL

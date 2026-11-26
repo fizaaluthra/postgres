@@ -81,6 +81,12 @@
 %token K_USE_SNAPSHOT
 %token K_UPLOAD_MANIFEST
 
+/* YB tokens */
+%token K_YB_HYBRID_TIME
+%token K_YB_ROW
+%token K_YB_SEQUENCE
+%token K_YB_TRANSACTION
+
 %type <node>	command
 %type <node>	base_backup start_replication start_logical_replication
 				create_replication_slot drop_replication_slot
@@ -243,6 +249,27 @@ create_slot_legacy_opt:
 				{
 				  $$ = makeDefElem("two_phase",
 								   (Node *) makeBoolean(true), -1);
+				}
+
+			| K_YB_SEQUENCE
+				{
+				  $$ = makeDefElem("lsn_type",
+								   (Node *) makeString("SEQUENCE"), -1);
+				}
+			| K_YB_HYBRID_TIME
+				{
+				  $$ = makeDefElem("lsn_type",
+								   (Node *) makeString("HYBRID_TIME"), -1);
+				}
+			| K_YB_ROW
+				{
+				  $$ = makeDefElem("ordering_mode",
+								   (Node *) makeString("ROW"), -1);
+				}
+			| K_YB_TRANSACTION
+				{
+				  $$ = makeDefElem("ordering_mode",
+								   (Node *) makeString("TRANSACTION"), -1);
 				}
 			;
 
@@ -443,6 +470,10 @@ ident_or_keyword:
 			| K_NOEXPORT_SNAPSHOT			{ $$ = "noexport_snapshot"; }
 			| K_USE_SNAPSHOT				{ $$ = "use_snapshot"; }
 			| K_UPLOAD_MANIFEST				{ $$ = "upload_manifest"; }
+			| K_YB_SEQUENCE					{ $$ = "sequence"; }
+			| K_YB_HYBRID_TIME				{ $$ = "hybrid_time"; }
+			| K_YB_ROW						{ $$ = "row"; }
+			| K_YB_TRANSACTION				{ $$ = "transaction"; }
 		;
 
 %%

@@ -15,6 +15,9 @@
 
 #include "portability/instr_time.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 /*
  * BufferUsage and WalUsage counters keep being incremented infinitely,
@@ -69,6 +72,37 @@ typedef enum InstrumentOption
 } InstrumentOption;
 
 /*
+ * YugabyteDB RPC statistics
+ */
+typedef struct YbPgRpcStats
+{
+	double		count;			/* # of RPCs */
+	double		ops_count;		/* # of operations */
+	double		rows_scanned;	/* # of rows scanned by RPCs */
+	double		rows_received;	/* # of rows received from RPCs */
+	double		wait_time;		/* RPC wait time (ns) */
+} YbPgRpcStats;
+
+typedef struct YbInstrumentation
+{
+	YbPgRpcStats tbl_reads;
+	YbPgRpcStats index_reads;
+	YbPgRpcStats catalog_reads;
+	YbPgRpcStats write_flushes;
+	double		tbl_writes;
+	double		index_writes;
+	double		catalog_writes;
+
+	YbcPgExecStorageMetrics read_metrics;
+	YbcPgExecStorageMetrics write_metrics;
+
+	uint64_t	rows_removed_by_recheck;
+	uint64_t	commit_wait;
+
+	uint32_t max_read_ahead;
+} YbInstrumentation;
+
+/*
  * General purpose instrumentation that can capture time and WAL/buffer usage
  *
  * Initialized through InstrAlloc, followed by one or more calls to a pair of
@@ -110,6 +144,7 @@ typedef struct NodeInstrumentation
 	double		nloops;			/* # of run cycles for this node */
 	double		nfiltered1;		/* # of tuples removed by scanqual or joinqual */
 	double		nfiltered2;		/* # of tuples removed by "other" quals */
+	YbInstrumentation yb_instr; /* YB specific instrumentation stats */
 } NodeInstrumentation;
 
 typedef struct WorkerNodeInstrumentation

@@ -33,6 +33,9 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "catalog/pg_opfamily.h"
+
 
 static EquivalenceMember *make_eq_member(EquivalenceClass *ec,
 										 Expr *expr, Relids relids,
@@ -899,6 +902,45 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 	MemoryContextSwitchTo(oldcontext);
 
 	return newec;
+}
+
+/*
+ * yb_get_eclass_for_hash_code
+ *		Find an EquivalenceClass with the expressionthat matches the hash code.
+ *		Returns NULL if no match.
+ *
+ * The expression matching the hash code is the yb_hash_code() function with
+ * the arguments matching the index's hash key columns.
+ */
+EquivalenceClass *
+yb_get_eclass_for_hash_code(PlannerInfo *root, IndexOptInfo *index)
+{
+	/* yb_hash_code's opfamily membership is known, no need to lookup. */
+	List	   *opfamilies = list_make2_oid(INTEGER_BTREE_FAM_OID,
+											INTEGER_LSM_FAM_OID);
+	ListCell   *lc1;
+	foreach(lc1, root->eq_classes)
+	{
+		EquivalenceClass *cur_ec = (EquivalenceClass *) lfirst(lc1);
+		ListCell   *lc2;
+
+		if (cur_ec->ec_has_volatile ||
+			!equal(opfamilies, cur_ec->ec_opfamilies))
+			continue;
+
+		foreach(lc2, cur_ec->ec_members)
+		{
+			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc2);
+
+			if (cur_em->em_is_child || cur_em->em_is_const ||
+				cur_em->em_datatype != INT4OID)
+				continue;
+
+			if (yb_hash_code_match_index((Node *) cur_em->em_expr, index))
+				return cur_ec;	/* Match! */
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -4012,6 +4054,71 @@ ec_search_derived_clause_for_ems(PlannerInfo *root, EquivalenceClass *ec,
 				rinfo->right_em == leftem &&
 				rinfo->parent_ec == parent_ec)
 				return rinfo;
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * yb_find_ec_member_for_var
+ *   Find an EC member that can substitute for the given Var.
+ *   When target_rti == 0: looks for a constant in the same EC as var
+ *   When target_rti != 0: looks for a var from target_rti in the same EC as var
+ *   Returns NULL if no suitable substitution is found.
+ */
+EquivalenceMember *
+yb_find_ec_member_for_var(PlannerInfo *root, Var *var, Index rti, Index target_rti)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->eq_classes)
+	{
+		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc);
+		EquivalenceMember *var_member = NULL;
+		EquivalenceMember *other_member = NULL;
+		ListCell   *mem_lc;
+
+		/* skip volatile ECs - we can't use them for substitution */
+		if (ec->ec_has_volatile)
+			continue;
+
+		foreach(mem_lc, ec->ec_members)
+		{
+			EquivalenceMember *em = (EquivalenceMember *) lfirst(mem_lc);
+
+			/* skip child members */
+			if (em->em_is_child)
+				continue;
+
+			if (IsA(em->em_expr, Var) &&
+				((Var *) em->em_expr)->varno == rti &&
+				((Var *) em->em_expr)->varattno == var->varattno)
+			{
+				if (other_member)
+					return other_member;
+				var_member = em;
+			}
+
+			if (target_rti != 0)
+			{
+				if (IsA(em->em_expr, Var) &&
+					((Var *) em->em_expr)->varno == target_rti)
+				{
+					if (var_member)
+						return em;
+					other_member = em;
+				}
+			}
+			else
+			{
+				if (em->em_is_const)
+				{
+					if (var_member)
+						return em;
+					other_member = em;
+				}
+			}
 		}
 	}
 

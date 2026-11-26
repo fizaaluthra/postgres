@@ -17,7 +17,12 @@
 #ifndef MEMUTILS_H
 #define MEMUTILS_H
 
+#include "c.h"					/* YB include */
+
 #include "nodes/memnodes.h"
+
+/* YB includes */
+#include "yb/yql/pggate/util/ybc_util.h"
 
 
 /*
@@ -92,6 +97,7 @@ extern void MemoryContextStatsDetail(MemoryContext context,
 									 bool print_to_stderr);
 extern void MemoryContextAllowInCriticalSection(MemoryContext context,
 												bool allow);
+extern int64 MemoryContextStatsUsage(MemoryContext context, int max_children);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 extern void MemoryContextCheck(MemoryContext context);
@@ -318,5 +324,70 @@ pg_memory_is_all_zeros(const void *ptr, size_t len)
 
 	return true;
 }
+
+/*
+ * YB: Tracking memory consumption for both PG backend and pggate tcmalloc
+ * actual heap consumption.
+ * Global accessible in one PG backend process.
+ */
+typedef struct YbPgMemTracker
+{
+	/*
+	 * Current, at time of cutting Snapshot(), memory in bytes allocated by PG
+	 * (pggate is not included in this field)
+	 */
+	Size		pg_cur_mem_bytes;
+	/*
+	 * The current allocated memory including PG, pggate and cached memory.
+	 */
+	int64_t		backend_cur_allocated_mem_bytes;
+	/*
+	 * The maximum memory ever allocated by current statement including PG and
+	 * pggate
+	 */
+	Size		stmt_max_mem_bytes;
+	/*
+	 * The initial base memory already allocated by PG and paggate at the
+	 * beginning of current statement.
+	 * NOTE: Only set if yb_run_with_explain_analyze is true.
+	 */
+	Size		stmt_max_mem_base_bytes;
+
+	/*
+	 * A flag to tell if pggate is inititated. This is used to track the memory
+	 * used by PG before pggate is started.
+	 * Note: the design here is that this flag is a "link" to MemTracker in the
+	 * pggate. It pushes down fundamental memory work to it, while this layer
+	 * stays as light as possible in PG.
+	 */
+	bool		pggate_alive;
+} YbPgMemTracker;
+
+extern YbPgMemTracker PgMemTracker;
+
+/*
+ * Add memory consumption to PgMemTracker in bytes.
+ * sz can be negative. In this case, the max values are not
+ * updated.
+ */
+extern void YbPgMemAddConsumption(const Size sz);
+
+/*
+ * Substract the sz bytes from PgMemTracker. It doesn't update the maximum
+ * values for the backend and stmt.
+ */
+extern void YbPgMemSubConsumption(const Size sz);
+
+/*
+ * Reset the PgMemTracker's stmt fields and make it ready to
+ * track peak memory usage for a new statement.
+ */
+extern void YbPgMemResetStmtConsumption();
+
+/*
+ * Returns the resident set size (physical memory use) of a process
+ * measured in bytes, or -1 if the value cannot be determined on this OS.
+ */
+extern void YbPgGetCurRssPssMemUsage(int pid, int64_t *rss, int64_t *pss);
 
 #endif							/* MEMUTILS_H */

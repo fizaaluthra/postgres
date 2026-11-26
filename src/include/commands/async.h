@@ -15,6 +15,9 @@
 
 #include <signal.h>
 
+/* YB includes */
+#include "storage/proc.h"
+
 extern PGDLLIMPORT bool Trace_notify;
 extern PGDLLIMPORT int max_notify_queue_pages;
 extern PGDLLIMPORT volatile sig_atomic_t notifyInterruptPending;
@@ -45,5 +48,17 @@ extern void ProcessNotifyInterrupt(bool flush);
 
 /* freeze old transaction IDs in notify queue (called by VACUUM) */
 extern void AsyncNotifyFreezeXids(TransactionId newFrozenXid);
+
+/* entry point for notifications poller background process */
+extern void YbNotifsPollerMain(Datum main_arg);
+
+/* cleans up state when a listening backend crashes, called by postmaster.  */
+extern void YbCleanupListenStateForProc(PGPROC *proc);
+
+/* True if this session is listening or has a pending LISTEN in the xact. */
+extern bool YbHasActiveOrPendingListen(void);
+
+extern int	YbPendingNotifiesMark(void);
+extern void YbRollbackPendingNotifiesTo(int mark);
 
 #endif							/* ASYNC_H */

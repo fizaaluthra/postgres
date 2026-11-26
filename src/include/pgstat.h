@@ -70,6 +70,10 @@ typedef enum SessionEndType
  */
 typedef int64 PgStat_Counter;
 
+/* YB_TODO(neil)
+ * - "typedef enum StatMsgType" or MTYPE is obsolete.
+ * - Replace PGSTAT_MTYPE_ANALYZE must be reimplemented.
+ */
 
 /* ------------------------------------------------------------
  * Structures kept in backend local memory while accumulating counts
@@ -655,6 +659,7 @@ extern void pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount);
 extern void pgstat_report_connect(Oid dboid);
 extern void pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 												 PgStat_Counter workers_launched);
+extern void yb_pgstat_clear_entry_pid(int pid);
 
 #define pgstat_count_buffer_read_time(n)							\
 	(pgStatBlockReadTime += (n))
@@ -675,7 +680,13 @@ extern PgStat_StatDBEntry *pgstat_fetch_stat_dbentry(Oid dboid);
 extern void pgstat_create_function(Oid proid);
 extern void pgstat_drop_function(Oid proid);
 
+/* YB_TODO(ted@yugabyte) Need to look at all related code every time we merge. */
 struct FunctionCallInfoBaseData;
+
+extern void pgstat_init_function_usage_org(struct FunctionCallInfoBaseData *fcinfo,
+										   PgStat_FunctionCallUsage *fcu);
+
+/* YB_TODO(neil) Need to remove Ted's call structure */
 extern void pgstat_init_function_usage(struct FunctionCallInfoBaseData *fcinfo,
 									   PgStat_FunctionCallUsage *fcu);
 extern void pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu,
@@ -840,7 +851,14 @@ extern PgStat_WalStats *pgstat_fetch_stat_wal(void);
 extern PGDLLIMPORT bool pgstat_track_counts;
 extern PGDLLIMPORT int pgstat_track_functions;
 extern PGDLLIMPORT int pgstat_fetch_consistency;
+extern char *pgstat_ybstat_filename;
+extern char *pgstat_ybstat_tmpname;
 
+/*
+ * YB: Metric to track number of sql connections established since
+ * postmaster started.
+ */
+extern uint64_t *yb_new_conn;
 
 /*
  * Variables in pgstat_bgwriter.c
@@ -878,5 +896,13 @@ extern PGDLLIMPORT PgStat_Counter pgStatTransactionIdleTime;
 
 /* updated by the traffic cop and in errfinish() */
 extern PGDLLIMPORT SessionEndType pgStatSessionEndCause;
+
+/* ----------
+ * YB functions called from backends
+ * ----------
+ */
+extern void yb_pgstat_report_allocated_mem_bytes(void);
+extern void yb_pgstat_set_catalog_version(uint64_t catalog_version);
+extern void yb_pgstat_set_has_catalog_version(bool has_catalog_version);
 
 #endif							/* PGSTAT_H */

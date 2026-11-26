@@ -244,13 +244,11 @@ addLSNWaiter(XLogRecPtr lsn, WaitLSNType lsnType)
 	INJECTION_POINT("wait-for-lsn-after-register", NULL);
 }
 
-/*
- * Remove current process from appropriate waiters heap based on LSN type
- */
+/* YB: Parameterized by procno so the postmaster can clean up after a killed process. */
 static void
-deleteLSNWaiter(WaitLSNType lsnType)
+YbDeleteLSNWaiterForProc(ProcNumber procno, WaitLSNType lsnType)
 {
-	WaitLSNProcInfo *procInfo = &waitLSNState->procInfos[MyProcNumber];
+	WaitLSNProcInfo *procInfo = &waitLSNState->procInfos[procno]; /* YB */
 	int			i = (int) lsnType;
 
 	Assert(i >= 0 && i < WAIT_LSN_TYPE_COUNT);
@@ -276,6 +274,15 @@ deleteLSNWaiter(WaitLSNType lsnType)
 	}
 
 	LWLockRelease(WaitLSNLock);
+}
+
+/*
+ * Remove current process from appropriate waiters heap based on LSN type
+ */
+static void
+deleteLSNWaiter(WaitLSNType lsnType)
+{
+	YbDeleteLSNWaiterForProc(MyProcNumber, lsnType);
 }
 
 /*
@@ -377,20 +384,31 @@ WaitLSNWakeup(WaitLSNType lsnType, XLogRecPtr currentLSN)
 }
 
 /*
- * Clean up any LSN wait state for the current process.
+ * YB: Clean up any LSN wait state for a given procno.
+ * Parameterized by procno so the postmaster can clean up after a killed process.
  */
 void
-WaitLSNCleanup(void)
+YbWaitLSNCleanupForProc(ProcNumber procno)
 {
 	/*
-	 * deleteLSNWaiter() starts with the same lockless inHeap check, so
-	 * calling it unconditionally costs nothing when this process isn't
+	 * YbDeleteLSNWaiterForProc() starts with the same lockless inHeap check,
+	 * so calling it unconditionally costs nothing when this process isn't
 	 * waiting.  Its lsnType is then unused, and reading it is harmless in any
 	 * case: an entry that was never used is zeroed, which is a valid
 	 * WaitLSNType.
 	 */
 	if (waitLSNState)
-		deleteLSNWaiter(waitLSNState->procInfos[MyProcNumber].lsnType);
+		YbDeleteLSNWaiterForProc(procno,
+								 waitLSNState->procInfos[procno].lsnType);
+}
+
+/*
+ * Clean up any LSN wait state for the current process.
+ */
+void
+WaitLSNCleanup(void)
+{
+	YbWaitLSNCleanupForProc(MyProcNumber);
 }
 
 /*

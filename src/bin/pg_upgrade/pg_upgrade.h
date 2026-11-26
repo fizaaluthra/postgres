@@ -30,6 +30,13 @@
 #define GLOBALS_DUMP_FILE	"pg_upgrade_dump_globals.sql"
 #define DB_DUMP_FILE_MASK	"pg_upgrade_dump_%u.custom"
 
+/* YB: files written by --yb-collect-schema-dump, named to match the support runbook */
+#define YB_SCHEMA_DUMP_OUTPUTDIR		"schema_dump"
+#define YB_SCHEMA_DUMP_STAGING_SUFFIX	".tmp"
+#define YB_SCHEMA_DUMP_GLOBALS_FILE		"globals_dump.sql"
+#define YB_SCHEMA_DUMP_DATABASES_FILE	"all_databases_dump.sql"
+#define YB_SCHEMA_DUMP_VERSION_FILE		"version.txt"
+
 /*
  * Base directories that include all the files generated internally, from the
  * root path of the new cluster.  The paths are dynamically built as of
@@ -313,6 +320,9 @@ typedef struct
 	int			nsubs;			/* number of subscriptions */
 	bool		sub_retain_dead_tuples; /* whether a subscription enables
 										 * retain_dead_tuples. */
+
+	char	   *yb_hostaddr;	/* host address for Yugabyte node */
+	char	   *yb_user;		/* username for the cluster */
 } ClusterInfo;
 
 
@@ -349,6 +359,8 @@ typedef struct
 	int			char_signedness;	/* default char signedness: -1 for initial
 									 * value, 1 for "signed" and 0 for
 									 * "unsigned" */
+	char	   *yb_working_dir;	/* YB: working directory for pg_upgrade */
+	bool		yb_collect_schema_dump; /* YB: collect a schema dump of the old cluster */
 } UserOpts;
 
 typedef struct
@@ -383,6 +395,7 @@ extern ClusterInfo old_cluster,
 			new_cluster;
 extern OSInfo os_info;
 
+extern bool yb_has_check_fatal;
 
 /* check.c */
 
@@ -396,6 +409,7 @@ void		check_cluster_versions(void);
 void		check_cluster_compatibility(void);
 void		create_script_for_old_cluster_deletion(char **deletion_script_file_name);
 
+void		yb_check_cluster_versions(void);
 
 /* controldata.c */
 
@@ -407,6 +421,9 @@ void		disable_old_cluster(transferMode transfer_mode);
 /* dump.c */
 
 void		generate_old_dump(void);
+
+/* YB declarations */
+extern void yb_generate_schema_dump(void);
 
 
 /* exec.c */
@@ -481,6 +498,7 @@ char	   *cluster_conn_opts(ClusterInfo *cluster);
 bool		start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error);
 void		stop_postmaster(bool in_atexit);
 void		check_pghost_envvar(void);
+void		yb_get_old_cluster_version(void);
 
 
 /* util.c */
@@ -498,6 +516,9 @@ void		prep_status_progress(const char *fmt, ...) pg_attribute_printf(1, 2);
 unsigned int str2uint(const char *str);
 uint64		str2uint64(const char *str);
 
+extern bool is_yugabyte_enabled();
+extern int	yb_fprintf_and_log(FILE *stream, const char *fmt,...);
+extern void yb_fatal(const char *fmt,...);
 
 /* version.c */
 

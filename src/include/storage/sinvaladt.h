@@ -24,6 +24,9 @@
 
 #include "storage/sinval.h"
 
+/* YB */
+typedef struct PGPROC PGPROC;
+
 /*
  * prototypes for functions in sinvaladt.c
  */
@@ -34,5 +37,9 @@ extern int	SIGetDataEntries(SharedInvalidationMessage *data, int datasize);
 extern void SICleanupQueue(bool callerHasWriteLock, int minFree);
 
 extern LocalTransactionId GetNextLocalTransactionId(void);
+
+/* YB */
+extern void CleanupInvalidationState(int status, Datum arg);
+extern void YbCleanupInvalidationStateForProc(PGPROC *proc);
 
 #endif							/* SINVALADT_H */

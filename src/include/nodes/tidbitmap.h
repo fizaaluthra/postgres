@@ -25,6 +25,9 @@
 #include "storage/itemptr.h"
 #include "utils/dsa.h"
 
+/* YB includes */
+#include "nodes/ybtidbitmap.h"
+
 /*
  * The maximum number of tuples per page is not large (typically 256 with
  * 8K pages, or 1024 with 32K pages).  So there's not much point in making
@@ -38,6 +41,12 @@
  * do IsA(x, TIDBitmap) on it, but nothing else.
  */
 typedef struct TIDBitmap TIDBitmap;
+
+typedef union
+{
+	TIDBitmap  *tbm;
+	YbTIDBitmap *ybtbm;
+} YbTupleBitmap;
 
 /* Likewise, TBMPrivateIterator is private */
 typedef struct TBMPrivateIterator TBMPrivateIterator;

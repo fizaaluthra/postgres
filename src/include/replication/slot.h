@@ -17,6 +17,10 @@
 #include "storage/spin.h"
 #include "replication/walreceiver.h"
 
+/* YB includes */
+#include "replication/walsender.h"
+#include "utils/uuid.h"
+
 /* directory to store replication slot data in */
 #define PG_REPLSLOT_DIR     "pg_replslot"
 
@@ -159,6 +163,45 @@ typedef struct ReplicationSlotPersistentData
 	 * for logical slots on the primary server.
 	 */
 	bool		failover;
+
+	/* YB: The CDC stream_id (32 bytes + 1 for null terminator) */
+	char		yb_stream_id[33];
+
+	/*
+	 * YB: Stores the replica identity value of the tables as they existed
+	 * during the creation of the replication slot.
+	 */
+	HTAB	   *yb_replica_identities;
+
+	/*
+	 * YB: The record_commit_time of the replication slot as received at the
+	 * time this information was fetched from the CDC state table. This
+	 * information is not kept up to date, it should only be used at the start
+	 * of streaming right after fetching the replication slot information.
+	 */
+	uint64_t	yb_initial_record_commit_time_ht;
+
+	/* YB: The last time at which a publication's table list was refreshed */
+	uint64_t	yb_last_pub_refresh_time;
+
+	/*
+	 * YB: Whether tables without primary key are allowed to be polled by
+	 * replication slot.
+	 */
+	bool		yb_allow_tables_without_primary_key;
+
+	/*
+	 * YB: Whether the slot will use pub refresh mechanism or mechanism to poll sys
+	 * catalog tablet for detecting changes to publications.
+	 */
+	bool		yb_detect_publication_changes_implicitly;
+
+	/*
+	 * YB: The publication this slot is statically bound to (publication-scoped
+	 * replication slots, created with the yb_publication option). Empty string
+	 * for regular slots.
+	 */
+	NameData	yb_bound_publication_name;
 } ReplicationSlotPersistentData;
 
 /*
@@ -282,6 +325,9 @@ typedef struct ReplicationSlot
 	 * slotsync_skip_reason provides no practical benefit.
 	 */
 	SlotSyncSkipReason slotsync_skip_reason;
+
+	/* YB fields */
+	YbCRSLsnType yb_lsn_type;
 } ReplicationSlot;
 
 #define SlotIsPhysical(slot) ((slot)->data.database == InvalidOid)
@@ -328,13 +374,29 @@ extern PGDLLIMPORT int max_repack_replication_slots;
 extern PGDLLIMPORT char *synchronized_standby_slots;
 extern PGDLLIMPORT int idle_replication_slot_timeout_secs;
 
+/* YB */
+extern PGDLLIMPORT const char *YB_OUTPUT_PLUGIN;
+extern PGDLLIMPORT const char *PG_OUTPUT_PLUGIN;
+extern PGDLLIMPORT const char *YB_GRPC_STREAM_INDICATOR;
+extern PGDLLIMPORT const char *LSN_TYPE_SEQUENCE;
+extern PGDLLIMPORT const char *LSN_TYPE_HYBRID_TIME;
+extern PGDLLIMPORT const char *ORDERING_MODE_ROW;
+extern PGDLLIMPORT const char *ORDERING_MODE_TRANSACTION;
+
 /* management of individual slots */
 extern void ReplicationSlotCreate(const char *name, bool db_specific,
 								  ReplicationSlotPersistency persistency,
 								  bool two_phase, bool repack, bool failover,
-								  bool synced);
+								  bool synced,
+								  char *yb_plugin_name,
+								  CRSSnapshotAction yb_snapshot_action,
+								  uint64_t *yb_consistent_snapshot_time,
+								  YbCRSLsnType lsn_type,
+								  YbCRSOrderingMode yb_ordering_mode,
+								  const char *yb_publication_name);
 extern void ReplicationSlotPersist(void);
-extern void ReplicationSlotDrop(const char *name, bool nowait);
+extern void ReplicationSlotDrop(const char *name, bool nowait,
+								bool yb_force, bool yb_if_exists);
 extern void ReplicationSlotDropAcquired(bool try_disable);
 extern void ReplicationSlotAlter(const char *name, const bool *failover,
 								 const bool *two_phase);
@@ -383,5 +445,17 @@ extern const char *GetSlotInvalidationCauseName(ReplicationSlotInvalidationCause
 extern bool SlotExistsInSyncStandbySlots(const char *slot_name);
 extern bool StandbySlotsHaveCaughtup(XLogRecPtr wait_for_lsn, int elevel);
 extern void WaitForStandbyConfirmation(XLogRecPtr wait_for_lsn);
+
+/* YB */
+extern void ReplicationSlotCleanupForProc(PGPROC *proc, bool synced_only);
+extern char YBCGetReplicaIdentityForRelation(Oid relid);
+extern void YbReplicationSlotCreateForDB(const char *name, bool two_phase,
+										 const char *yb_plugin_name,
+										 CRSSnapshotAction yb_snapshot_action,
+										 uint64_t *yb_consistent_snapshot_time,
+										 YbCRSLsnType lsn_type,
+										 YbCRSOrderingMode yb_ordering_mode,
+										 Oid database_oid,
+										 const char *yb_publication_name);
 
 #endif							/* SLOT_H */

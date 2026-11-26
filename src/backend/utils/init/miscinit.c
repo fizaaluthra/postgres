@@ -57,6 +57,10 @@
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "yb_ysql_conn_mgr_helper.h"
+#include <pg_yb_utils.h>
+
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
 
@@ -352,7 +356,7 @@ checkDataDir(void)
 	 */
 #if !defined(WIN32) && !defined(__CYGWIN__)
 	if (stat_buf.st_mode & PG_MODE_MASK_GROUP)
-		ereport(FATAL,
+		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("data directory \"%s\" has invalid permissions",
 						DataDir),
@@ -994,6 +998,13 @@ GetUserNameFromId(Oid roleid, bool noerr)
 	tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
 	if (!HeapTupleIsValid(tuple))
 	{
+		/*
+		 * YB: Send YbObjectDropped to ConnMgr. We match against AuthenticatedUserId
+		 * to only detect when the initial login role is deleted
+		 */
+		if (YbIsClientYsqlConnMgr() && !noerr && roleid == AuthenticatedUserId)
+			YbSendConnMgrObjectDropped('u', roleid);
+
 		if (!noerr)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -1898,4 +1909,18 @@ pg_bindtextdomain(const char *domain)
 		pg_bind_textdomain_codeset(domain);
 	}
 #endif
+}
+
+void
+YbSetUserContext(const Oid roleid, const bool is_superuser, const char *rname)
+{
+	AuthenticatedUserId = roleid;
+
+	SetSessionUserId(roleid, is_superuser);
+
+	SetConfigOption("session_authorization", rname,
+					PGC_INTERNAL, PGC_S_OVERRIDE);
+	SetConfigOption("is_superuser",
+					is_superuser ? "on" : "off",
+					PGC_INTERNAL, PGC_S_OVERRIDE);
 }

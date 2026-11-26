@@ -41,6 +41,9 @@
 #ifndef BGWORKER_H
 #define BGWORKER_H
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 /*---------------------------------------------------------------------
  * External module API.
  *---------------------------------------------------------------------
@@ -105,6 +108,9 @@ typedef struct BackgroundWorker
 	Datum		bgw_main_arg;
 	char		bgw_extra[BGW_EXTRALEN];
 	pid_t		bgw_notify_pid; /* SIGUSR1 this backend on start/stop */
+
+	/* YB */
+	char		bgw_oom_score_adj[BGW_MAXLEN];	/* ignored if empty */
 } BackgroundWorker;
 
 typedef enum BgwHandleStatus
@@ -157,6 +163,12 @@ extern void BackgroundWorkerInitializeConnection(const char *dbname, const char 
 extern void BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags);
 
 /*
+ * YB: Just like the above, but specifying session to share with main backend.
+ */
+extern void YbBackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags,
+														const YbcPgInitPostgresInfo *yb_init_info);
+
+/*
  * Flags to BackgroundWorkerInitializeConnection et al
  *
  *
@@ -170,5 +182,7 @@ extern void BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, ui
 /* Block/unblock signals in a background worker process */
 extern void BackgroundWorkerBlockSignals(void);
 extern void BackgroundWorkerUnblockSignals(void);
+
+extern size_t YbBackgroundWorkerHandleSize();
 
 #endif							/* BGWORKER_H */

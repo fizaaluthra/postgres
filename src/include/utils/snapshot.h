@@ -15,6 +15,9 @@
 
 #include "lib/pairingheap.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 /*
  * The different snapshot types.  We use SnapshotData structures to represent
@@ -118,6 +121,12 @@ typedef struct SnapshotData *Snapshot;
 
 #define InvalidSnapshot		((Snapshot) NULL)
 
+typedef struct YbOptionalReadPointHandle
+{
+	bool		has_value;
+	YbcReadPointHandle value;
+} YbOptionalReadPointHandle;
+
 /*
  * Struct representing all kind of possible snapshots.
  *
@@ -207,6 +216,9 @@ typedef struct SnapshotData
 	 * transactions completed since the last GetSnapshotData().
 	 */
 	uint64		snapXactCompletionCount;
+	YbOptionalReadPointHandle yb_read_point_handle;
+	bool		yb_is_built_for_export;
+	bool		yb_is_catalog_snapshot;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

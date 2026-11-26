@@ -21,6 +21,9 @@
 
 #include "common/int.h"
 
+/* YB includes */
+#include "yb/util/debug/leak_annotations.h"
+
 pg_noreturn static pg_noinline void add_size_error(Size s1, Size s2);
 pg_noreturn static pg_noinline void mul_size_error(Size s1, Size s2);
 
@@ -46,6 +49,8 @@ pg_malloc_internal(size_t size, int flags)
 
 	if ((flags & MCXT_ALLOC_ZERO) != 0)
 		MemSet(tmp, 0, size);
+
+	__lsan_ignore_object(tmp);
 	return tmp;
 }
 
@@ -104,6 +109,7 @@ pg_strdup(const char *in)
 		fprintf(stderr, _("out of memory\n"));
 		exit(EXIT_FAILURE);
 	}
+	__lsan_ignore_object(tmp);
 	return tmp;
 }
 

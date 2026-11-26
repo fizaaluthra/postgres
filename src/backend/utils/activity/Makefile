@@ -16,6 +16,8 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
+	yb_terminated_queries.o \
+	\
 	backend_progress.o \
 	backend_status.o \
 	pgstat.o \

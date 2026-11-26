@@ -27,6 +27,9 @@
 #include "utils/timestamp.h"
 #include "utils/uuid.h"
 
+/* YB includes */
+#include "utils/builtins.h"
+
 /* helper macros */
 #define NS_PER_S	INT64CONST(1000000000)
 #define NS_PER_MS	INT64CONST(1000000)

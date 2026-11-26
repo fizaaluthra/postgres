@@ -57,9 +57,9 @@ usage(unsigned short int pager)
 	 */
 	initPQExpBuffer(&buf);
 
-	HELP0("psql is the PostgreSQL interactive terminal.\n\n");
+	HELP0("ysqlsh is the PostgreSQL interactive terminal.\n\n");
 	HELP0("Usage:\n");
-	HELP0("  psql [OPTION]... [DBNAME [USERNAME]]\n\n");
+	HELP0("  ysqlsh [OPTION]... [DBNAME [USERNAME]]\n\n");
 
 	HELP0("General options:\n");
 	HELP0("  -c, --command=COMMAND    run only single command (SQL or internal) and exit\n");
@@ -67,7 +67,7 @@ usage(unsigned short int pager)
 	HELP0("  -f, --file=FILENAME      execute commands from file, then exit\n");
 	HELP0("  -l, --list               list available databases, then exit\n");
 	HELP0("  -v, --set=, --variable=NAME=VALUE\n"
-		  "                           set psql variable NAME to VALUE\n"
+		  "                           set ysqlsh variable NAME to VALUE\n"
 		  "                           (e.g., -v ON_ERROR_STOP=1)\n");
 	HELP0("  -V, --version            output version information, then exit\n");
 	HELP0("  -X, --no-psqlrc          do not read startup file (~/.psqlrc)\n");
@@ -115,9 +115,9 @@ usage(unsigned short int pager)
 	HELP0("  -W, --password           force password prompt (should happen automatically)\n");
 
 	HELP0("\nFor more information, type \"\\?\" (for internal commands) or \"\\help\" (for SQL\n"
-		  "commands) from within psql, or consult the psql section in the PostgreSQL\n"
+		  "commands) from within ysqlsh, or consult the ysqlsh section in YugabyteDB\n"
 		  "documentation.\n\n");
-	HELPN("Report bugs to <%s>.\n", PACKAGE_BUGREPORT);
+	HELPN("Report bugs to <%s>.\n", "https://github.com/YugaByte/yugabyte-db/issues");
 	HELPN("%s home page: <%s>\n", PACKAGE_NAME, PACKAGE_URL);
 
 	/* Now we can count the lines. */
@@ -719,12 +719,20 @@ helpSQL(const char *topic, unsigned short int pager)
 					/* # of newlines in format must match constant above! */
 					fprintf(output, _("Command:     %s\n"
 									  "Description: %s\n"
+#ifdef YB_DISABLED				/* Exclude links to postgres documentation */
 									  "Syntax:\n%s\n\n"
 									  "URL: %s\n\n"),
+#else
+									  "Syntax:\n%s\n\n"),
+#endif
 							QL_HELP[i].cmd,
 							_(QL_HELP[i].help),
+#ifdef YB_DISABLED
 							buffer.data,
 							url);
+#else
+							buffer.data);
+#endif
 					free(url);
 					termPQExpBuffer(&buffer);
 

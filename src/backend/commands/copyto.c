@@ -624,7 +624,11 @@ CopySendEndOfRow(CopyToState cstate)
 	switch (cstate->copy_dest)
 	{
 		case COPY_FILE:
-			pgstat_report_wait_start(WAIT_EVENT_COPY_TO_WRITE);
+			/* YB: report YB's COPY wait event instead, as documented for ASH */
+			if (IsYugaByteEnabled())
+				pgstat_report_wait_start(WAIT_EVENT_YB_COPY_COMMAND_STREAM_WRITE);
+			else
+				pgstat_report_wait_start(WAIT_EVENT_COPY_TO_WRITE);
 			if (fwrite(fe_msgbuf->data, fe_msgbuf->len, 1,
 					   cstate->copy_file) != 1 ||
 				ferror(cstate->copy_file))
@@ -777,6 +781,9 @@ EndCopy(CopyToState cstate)
 	}
 
 	pgstat_progress_end_command();
+
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_SUCCESS);
 
 	MemoryContextDelete(cstate->copycontext);
 
@@ -1020,9 +1027,10 @@ BeginCopyTo(ParseState *pstate,
 					 errmsg("COPY query must have a RETURNING clause")));
 		}
 
-		/* plan the query */
+		/* plan the query. YB: parallel query is disabled for DDLs by default. */
 		plan = pg_plan_query(query, pstate->p_sourcetext,
-							 CURSOR_OPT_PARALLEL_OK, NULL, NULL);
+							 (IsYugaByteEnabled() && yb_disable_parallel_query_in_ddl) ?
+							 0 : CURSOR_OPT_PARALLEL_OK, NULL, NULL);
 
 		/*
 		 * With row-level security and a user using "COPY relation TO", we
@@ -1175,6 +1183,9 @@ BeginCopyTo(ParseState *pstate,
 	cstate->encoding_embeds_ascii = PG_ENCODING_IS_CLIENT_ONLY(cstate->file_encoding);
 
 	cstate->copy_dest = COPY_FILE;	/* default */
+
+	/* YB */
+	pgstat_progress_update_param(PROGRESS_COPY_STATUS, CP_IN_PROG);
 
 	if (data_dest_cb)
 	{
@@ -1392,10 +1403,14 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 	TableScanDesc scandesc;
 	AttrMap    *map = NULL;
 	TupleTableSlot *root_slot = NULL;
+	bool		is_yb_relation;
+	MemoryContext oldcontext = NULL;
+	MemoryContext yb_context = NULL;
 
 	scandesc = table_beginscan(rel, GetActiveSnapshot(), 0, NULL,
 							   SO_NONE);
 	slot = table_slot_create(rel, NULL);
+	is_yb_relation = IsYBRelation(rel);
 
 	/*
 	 * If we are exporting partition data here, we check if converting tuples
@@ -1408,6 +1423,18 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 		map = build_attrmap_by_name_if_req(RelationGetDescr(rel),
 										   RelationGetDescr(root_rel),
 										   false);
+	}
+
+	/*
+	 * Create and switch to a temporary memory context that we can reset
+	 * once per row to recover Yugabyte palloc'd memory.
+	 */
+	if (is_yb_relation)
+	{
+		yb_context = AllocSetContextCreate(CurrentMemoryContext,
+										   "COPY TO (YB)",
+										   ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(yb_context);
 	}
 
 	while (table_scan_getnextslot(scandesc, ForwardScanDirection, slot))
@@ -1433,6 +1460,20 @@ CopyRelationTo(CopyToState cstate, Relation rel, Relation root_rel, uint64 *proc
 		 */
 		pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
 									 ++(*processed));
+
+		/* Free Yugabyte memory for this row */
+		if (is_yb_relation)
+			MemoryContextReset(yb_context);
+	}
+
+	/*
+	 * Switch out of and delete the temporary memory context for Yugabyte
+	 * palloc'd memory.
+	 */
+	if (is_yb_relation)
+	{
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(yb_context);
 	}
 
 	ExecDropSingleTupleTableSlot(slot);

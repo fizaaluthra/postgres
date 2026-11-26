@@ -37,6 +37,10 @@
 #include "utils/memutils.h"
 #include "utils/varlena.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
 #define PG_GETARG_TEXT_PP_IF_EXISTS(_n) \
 	(PG_NARGS() > (_n) ? PG_GETARG_TEXT_PP(_n) : NULL)
 
@@ -96,7 +100,14 @@ typedef struct regexp_matches_ctx
 #endif
 
 /* A parent memory context for regular expressions. */
-static MemoryContext RegexpCacheMemoryContext;
+/*
+ * YB: per-thread. Concurrent RE_compile_and_cache calls on a tserver update
+ * the parent's child list in MemoryContextSetParent, so this context cannot
+ * be shared and, on a tserver, is not a child of TopMemoryContext. __thread
+ * has no destructor; YbFreeRegexpCache runs from a pggate thread-local when
+ * the thread exits.
+ */
+static YB_THREAD_LOCAL MemoryContext RegexpCacheMemoryContext = NULL;
 
 /* this structure describes one cached regular expression */
 typedef struct cached_re_str
@@ -109,9 +120,26 @@ typedef struct cached_re_str
 	regex_t		cre_re;			/* the compiled regular expression */
 } cached_re_str;
 
-static int	num_res = 0;		/* # of cached re's */
-static cached_re_str re_array[MAX_CACHED_RES];	/* cached re's */
+/* YB: per-thread. One thread in a backend, one copy per tserver thread. */
+static YB_THREAD_LOCAL int	num_res = 0;		/* # of cached re's */
+/* YB: one copy per thread, same as num_res. */
+static YB_THREAD_LOCAL cached_re_str re_array[MAX_CACHED_RES];	/* cached re's */
 
+/*
+ * YB: on a tserver RegexpCacheMemoryContext has no parent, so thread exit is
+ * what frees it. Cached regex contexts are its children and go with it.
+ */
+static void
+YbFreeRegexpCache(void)
+{
+	if (RegexpCacheMemoryContext != NULL)
+	{
+		/* YB: child contexts of the re_array entries are deleted with it. */
+		MemoryContextDelete(RegexpCacheMemoryContext);
+		RegexpCacheMemoryContext = NULL;
+	}
+	num_res = 0;
+}
 
 /* Local functions */
 static regexp_matches_ctx *setup_regexp_matches(text *orig_str, text *pattern,
@@ -178,10 +206,23 @@ RE_compile_and_cache(text *text_re, int cflags, Oid collation)
 
 	/* Set up the cache memory on first go through. */
 	if (unlikely(RegexpCacheMemoryContext == NULL))
-		RegexpCacheMemoryContext =
-			AllocSetContextCreate(TopMemoryContext,
-								  "RegexpCacheMemoryContext",
-								  ALLOCSET_SMALL_SIZES);
+	{
+		if (IsMultiThreadedMode())
+		{
+			/* YB: __thread has no destructor; call cleanup before the context exists. */
+			YBCPgRegisterThreadLocalRegexpCacheCleanup(YbFreeRegexpCache);
+			/* YB: NULL parent. TopMemoryContext's child list is shared. */
+			RegexpCacheMemoryContext =
+				AllocSetContextCreate(NULL,
+									  "RegexpCacheMemoryContext",
+									  ALLOCSET_SMALL_SIZES);
+		}
+		else
+			RegexpCacheMemoryContext =
+				AllocSetContextCreate(TopMemoryContext,
+									  "RegexpCacheMemoryContext",
+									  ALLOCSET_SMALL_SIZES);
+	}
 
 	/*
 	 * Couldn't find it, so try to compile the new RE.  To avoid leaking

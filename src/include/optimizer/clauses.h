@@ -70,4 +70,7 @@ extern bool expression_has_grouping_conflict(Node *expr,
 											 grouping_eqop_callback get_eqop,
 											 void *context);
 
+/* YB */
+extern Node *yb_get_saop_left_op(const Expr *clause);
+
 #endif							/* CLAUSES_H */

@@ -25,6 +25,9 @@
 #include "storage/proclist_types.h"
 #include "storage/spin.h"
 
+/* YB includes */
+#include "storage/proc.h"
+
 typedef struct
 {
 	slock_t		mutex;			/* spinlock protecting the wakeup list */
@@ -69,5 +72,15 @@ extern void ConditionVariablePrepareToSleep(ConditionVariable *cv);
 /* Wake up a single waiter (via signal) or all waiters (via broadcast). */
 extern void ConditionVariableSignal(ConditionVariable *cv);
 extern void ConditionVariableBroadcast(ConditionVariable *cv);
+
+/*
+ * In YB, the Postmaster cleans up on behalf of abruptly terminated
+ * backends. In these cases, the CV functions cannot just use the `MyProc`
+ * variable, because that refers to the postmaster's PGPROC instead of the
+ * backend's PGPROC.
+ */
+extern void YbConditionVariableCancelSleepForProc(volatile PGPROC *proc);
+extern void YbConditionVariableBroadcastForProc(ConditionVariable *cv,
+												volatile PGPROC *proc);
 
 #endif							/* CONDITION_VARIABLE_H */

@@ -44,8 +44,14 @@ extern PGDLLIMPORT RelFileNumber binary_upgrade_next_toast_pg_class_relfilenumbe
 extern PGDLLIMPORT BinaryUpgradeAttributeVersions *binary_upgrade_next_attribute_versions;
 
 extern PGDLLIMPORT Oid binary_upgrade_next_pg_enum_oid;
+extern PGDLLIMPORT float4 yb_binary_upgrade_next_pg_enum_sortorder;
 extern PGDLLIMPORT Oid binary_upgrade_next_pg_authid_oid;
+extern PGDLLIMPORT Oid yb_binary_upgrade_next_colocation_id;
 
 extern PGDLLIMPORT bool binary_upgrade_record_init_privs;
+
+/* YB */
+extern PGDLLIMPORT Oid binary_upgrade_next_tablegroup_oid;
+extern PGDLLIMPORT bool binary_upgrade_next_tablegroup_default;
 
 #endif							/* BINARY_UPGRADE_H */

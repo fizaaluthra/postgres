@@ -61,6 +61,9 @@ typedef enum ReorderBufferChangeType
 	REORDER_BUFFER_CHANGE_INTERNAL_SPEC_CONFIRM,
 	REORDER_BUFFER_CHANGE_INTERNAL_SPEC_ABORT,
 	REORDER_BUFFER_CHANGE_TRUNCATE,
+
+	YB_REORDER_BUFFER_CHANGE_DDL,
+	YB_REORDER_BUFFER_CHANGE_PUBLICATION_INVALIDATION,
 } ReorderBufferChangeType;
 
 /* forward declaration */
@@ -104,6 +107,24 @@ typedef struct ReorderBufferChange
 			HeapTuple	oldtuple;
 			/* valid for INSERT || UPDATE */
 			HeapTuple	newtuple;
+
+			/* YB */
+			Oid			yb_table_oid;
+			uint64		yb_read_time;
+			uint64		yb_in_txn_limit;
+			char		yb_txn_id[37];	/* UUID string (36) + NUL */
+
+			/*
+			 * Columns of newtuple omitted under REPLICA IDENTITY CHANGE,
+			 * indexed by attno - 1 of the decode-time tupdesc. NULL otherwise.
+			 * Allocated in rb->tup_context and owned by the change. There is
+			 * no old-tuple counterpart: an old tuple is formed only under
+			 * REPLICA IDENTITY FULL, which never omits columns.
+			 * yb_new_is_omitted_natts is its length; it fits in the padding
+			 * after yb_txn_id.
+			 */
+			int16		yb_new_is_omitted_natts;
+			bool	   *yb_new_is_omitted;
 		}			tp;
 
 		/*
@@ -159,6 +180,12 @@ typedef struct ReorderBufferChange
 			uint32		ninvalidations; /* Number of messages */
 			SharedInvalidationMessage *invalidations;	/* invalidation message */
 		}			inval;
+
+		/* YB DDL marker. */
+		struct
+		{
+			Oid			table_oid;
+		}			yb_ddl;
 	}			data;
 
 	/*
@@ -576,6 +603,10 @@ typedef void (*ReorderBufferUpdateProgressTxnCB) (ReorderBuffer *rb,
 												  ReorderBufferTXN *txn,
 												  XLogRecPtr lsn);
 
+typedef void (*YBReorderBufferSchemaChangeCB) (
+											   ReorderBuffer *rb,
+											   Oid relid);
+
 struct ReorderBuffer
 {
 	/*
@@ -618,6 +649,8 @@ struct ReorderBuffer
 	ReorderBufferApplyTruncateCB apply_truncate;
 	ReorderBufferCommitCB commit;
 	ReorderBufferMessageCB message;
+
+	YBReorderBufferSchemaChangeCB yb_schema_change;
 
 	/*
 	 * Callbacks to be called when streaming a transaction at prepare time.
@@ -792,5 +825,13 @@ extern uint32 ReorderBufferGetInvalidations(ReorderBuffer *rb,
 											SharedInvalidationMessage **msgs);
 
 extern void StartupReorderBuffer(void);
+
+/*
+ * YB: Return a palloc'd array of bool allocated in the reorderbuffer's memory
+ * context to be used for storing yb_is_omitted values for each attribute.
+ */
+bool	   *YBAllocateIsOmittedArray(ReorderBuffer *rb, int nattrs);
+
+void		YBReorderBufferSchemaChange(ReorderBuffer *, Oid relid);
 
 #endif

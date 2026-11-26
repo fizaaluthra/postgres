@@ -39,6 +39,12 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
+/* YB includes */
+#include "libpq/pqformat.h"
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_dist_trace.h"
+#include "yb_ysql_conn_mgr_helper.h"
+
 
 /*
  * The hash table in which prepared queries are stored. This is
@@ -53,6 +59,9 @@ static ParamListInfo EvaluateParams(ParseState *pstate,
 									PreparedStatement *pstmt, List *params,
 									EState *estate);
 static Datum build_regtype_array(Oid *param_types, int num_params);
+static inline bool
+			YbConnMgrShouldRetainCachedQuery(PreparedStatement *prep_stmt);
+static void YbConnMgrSendCloseComplete(PreparedStatement *entry);
 
 /*
  * Implements the 'PREPARE' utility statement.
@@ -138,6 +147,19 @@ PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	StorePreparedStatement(stmt->name,
 						   plansource,
 						   true);
+
+	if (YbIsClientYsqlConnMgr())
+	{
+		/*
+		 * PREPARE statements (do not consider protocol-level prepared statements)
+		 * are not tracked by ysql connection manager.
+		 * EXECUTE statement should be forwarded on the same connection on
+		 * which PREPARE statement is executed, therefore the connection should be
+		 * made sticky.
+		 */
+		yb_ysql_conn_mgr_sticky_nontxn_object = true;
+		elog(LOG, "Making connection sticky for prepared statement %s", stmt->name);
+	}
 }
 
 /*
@@ -255,9 +277,11 @@ ExecuteQuery(ParseState *pstate,
 	/*
 	 * Run the portal as appropriate.
 	 */
+	YB_DIST_TRACE_START_SPAN("execute");
 	PortalStart(portal, paramLI, eflags, GetActiveSnapshot());
 
 	(void) PortalRun(portal, count, false, dest, dest, qc);
+	YB_DIST_TRACE_END_SPAN();
 
 	PortalDrop(portal, false);
 
@@ -522,16 +546,31 @@ DropPreparedStatement(const char *stmt_name, bool showError)
 {
 	PreparedStatement *entry;
 
-	/* Find the query's hash table entry; raise error if wanted */
-	entry = FetchPreparedStatement(stmt_name, showError);
+	/*
+	 * Find the query's hash table entry; raise error if wanted
+	 *
+	 * YB: For connection manager clients we never raise the error. A SQL
+	 * DEALLOCATE naming a protocol-level prepared statement cannot find it
+	 * here (the backend only knows such statements by their conn mgr given
+	 * hash name), and PG cannot distinguish that case from a genuinely
+	 * nonexistent statement, so we treat not-found as a no-op.
+	 */
+	entry = FetchPreparedStatement(stmt_name,
+								   showError && !YbIsClientYsqlConnMgr());
 
 	if (entry)
 	{
-		/* Release the plancache entry */
-		DropCachedPlan(entry->plansource);
+		if (!YbConnMgrShouldRetainCachedQuery(entry))
+		{
+			/* Release the plancache entry */
+			DropCachedPlan(entry->plansource);
 
-		/* Now we can remove the hash table entry */
-		hash_search(prepared_queries, entry->stmt_name, HASH_REMOVE, NULL);
+			/* YB: Send close complete packet if connection manager is used */
+			YbConnMgrSendCloseComplete(entry);
+
+			/* Now we can remove the hash table entry */
+			hash_search(prepared_queries, entry->stmt_name, HASH_REMOVE, NULL);
+		}
 	}
 }
 
@@ -552,8 +591,14 @@ DropAllPreparedStatements(void)
 	hash_seq_init(&seq, prepared_queries);
 	while ((entry = hash_seq_search(&seq)) != NULL)
 	{
+		if (YbConnMgrShouldRetainCachedQuery(entry))
+			continue;
+
 		/* Release the plancache entry */
 		DropCachedPlan(entry->plansource);
+
+		/* YB: Send close complete packet if connection manager is used */
+		YbConnMgrSendCloseComplete(entry);
 
 		/* Now we can remove the hash table entry */
 		hash_search(prepared_queries, entry->stmt_name, HASH_REMOVE, NULL);
@@ -759,4 +804,56 @@ build_regtype_array(Oid *param_types, int num_params)
 
 	result = construct_array_builtin(tmp_ary, num_params, REGTYPEOID);
 	return PointerGetDatum(result);
+}
+
+void
+YbForceDropPreparedStatement(PreparedStatement *entry)
+{
+	if (!entry)
+		return;
+
+	/* Release the plancache entry */
+	DropCachedPlan(entry->plansource);
+
+	/* YB: Send close complete packet if connection manager is used */
+	YbConnMgrSendCloseComplete(entry);
+
+	/* Now we can remove the hash table entry */
+	hash_search(prepared_queries, entry->stmt_name, HASH_REMOVE, NULL);
+}
+
+void
+YbDropProtoPrepStmtIfInvalid(PreparedStatement *entry)
+{
+	if (!entry || entry->from_sql || YbIsCachedQueryValid(entry->plansource))
+		return;
+
+	YbForceDropPreparedStatement(entry);
+}
+
+/*
+ * YB: Determine whether a prepared statement should be retained (not dropped)
+ * during DEALLOCATE when the connection manager is active.
+ *
+ * For connection manager clients, DEALLOCATE of protocol-level prepared
+ * statements is a no-op (they are shared across logical connections and are
+ * reclaimed only by conn mgr's LRU eviction at detach), whereas SQL-level
+ * (PREPARE) statements are dropped normally. Non-conn-mgr clients keep
+ * vanilla PostgreSQL semantics.
+ */
+static inline bool
+YbConnMgrShouldRetainCachedQuery(PreparedStatement *prep_stmt)
+{
+	return YbIsClientYsqlConnMgr() && !prep_stmt->from_sql;
+}
+
+/* Send close complete packet if connection manager is used. */
+static void
+YbConnMgrSendCloseComplete(PreparedStatement *entry)
+{
+	if (!YbIsClientYsqlConnMgr())
+		return;
+
+	if (!entry->from_sql && whereToSendOutput == DestRemote)
+		pq_puttextmessage('5', entry->stmt_name);
 }

@@ -70,6 +70,9 @@
 #include "utils/resowner.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 /*----------
  * Shared memory area for communication between checkpointer and backends
@@ -1042,7 +1045,8 @@ ExecCheckpoint(ParseState *pstate, CheckPointStmt *stmt)
 				 errdetail("Only roles with privileges of the \"%s\" role may execute this command.",
 						   "pg_checkpoint")));
 
-	RequestCheckpoint(CHECKPOINT_WAIT |
+	RequestCheckpoint(CHECKPOINT_CAUSE_CLIENT |
+					  CHECKPOINT_WAIT |
 					  (fast ? CHECKPOINT_FAST : 0) |
 					  (unlogged ? CHECKPOINT_FLUSH_UNLOGGED : 0) |
 					  (RecoveryInProgress() ? 0 : CHECKPOINT_FORCE));
@@ -1064,10 +1068,22 @@ ExecCheckpoint(ParseState *pstate, CheckPointStmt *stmt)
  *		just signal checkpointer to do it, and return).
  *	CHECKPOINT_CAUSE_XLOG: checkpoint is requested due to xlog filling.
  *		(This affects logging, and in particular enables CheckPointWarning.)
+ *	CHECKPOINT_CAUSE_CLIENT: (YB) Client explicitly requested checkpoint
  */
 void
 RequestCheckpoint(int flags)
 {
+	/*
+	 * YB: ignoring user requested checkpoints for now
+	 */
+	if (flags & CHECKPOINT_CAUSE_CLIENT)
+	{
+		ereport(WARNING,
+				(errmsg("CHECKPOINT will be ignored")));
+		return;
+	}
+
+
 	int			ntries;
 	int			old_failed,
 				old_started;

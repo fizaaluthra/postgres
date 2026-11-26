@@ -20,4 +20,7 @@ extern LockRowsState *ExecInitLockRows(LockRows *node, EState *estate, int eflag
 extern void ExecEndLockRows(LockRowsState *node);
 extern void ExecReScanLockRows(LockRowsState *node);
 
+/* YB */
+extern void ExecShutdownLockRows(LockRowsState *node);
+
 #endif							/* NODELOCKROWS_H */

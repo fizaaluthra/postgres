@@ -1,0 +1,1394 @@
+-- Regression tests for UPDATE/DELETE single row operations.
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set filename :abs_srcdir '/yb_commands/parameterized_query.sql'
+\i :filename
+\set P1 ':explain'
+\set P2
+\set explain 'EXPLAIN (COSTS OFF)'
+-- Expression pushdown is disabled.
+SET yb_enable_expression_pushdown to off;
+
+CREATE OR REPLACE PROCEDURE check_fast_path_txn(query TEXT, expected BOOL) LANGUAGE PLPGSQL AS
+$$
+DECLARE
+	output JSON;
+	txn_type TEXT;
+BEGIN
+	-- Note that buffered writes may not be flushed at the the statement boundary for
+	-- statements in stored procedures/functions, and are instead done so before the start of other
+	-- statements in the procedure or at the end of the procedure.
+	EXECUTE 'EXPLAIN (ANALYZE, DIST, COSTS OFF, FORMAT JSON)' || query INTO output;
+	SELECT json_extract_path(output->0, 'Transaction')::TEXT INTO txn_type;
+	ASSERT (CASE WHEN txn_type = '"Fast Path"' THEN TRUE ELSE FALSE END) = expected;
+END;
+$$;
+
+--
+-- Test that single-row UPDATE/DELETEs bypass scan.
+--
+CREATE TABLE single_row (k int primary key, v1 int, v2 int);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k = 1 RETURNING k;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k = 1 RETURNING v1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k IN (1);
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k = 1 and v1 = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE v1 = 1 and v2 = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k > 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k != 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k IN (1, 2);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k = 1 RETURNING k, v1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1, v2 = 1 + 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1, v2 = 2 WHERE k = 1 RETURNING k, v1, v2;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1, v2 = 2 WHERE k = 1 RETURNING *;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k IN (1);
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 3 + 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = power(2, 3 - 1) WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k = 1 RETURNING v2;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k = 1 RETURNING *;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = CASE WHEN random() < 0.1 THEN 0 ELSE 1 END WHERE k = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v1 + 3 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v1 * 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v1 + 1 WHERE k = 1 RETURNING v1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v1 + v2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v2 + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1, v2 = v1 + v2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v2 + 1, v2 = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v1 + 1, v2 = 2 WHERE k = 1 RETURNING v2;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k = 1 and v2 = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k > 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k != 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k IN (1, 2);
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = power(2, 3 - k) WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 1 WHERE k % 2 = 0;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v2 = CASE WHEN v1 % 2 = 0 THEN v2 * 3 ELSE v2 *2 END WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v2 = CASE v1 WHEN 1 THEN v2 * 2 ELSE v2 END WHERE k = 1;
+-- Nullable identity SET must not corrupt the identity column (GH-33845).
+-- With pushdown disabled, the identity target falls back to the non-single-row path.
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 2, v2 = v2 WHERE k = 1;
+-- With pushdown enabled, the identity target is evaluated by DocDB on the fast path.
+SET yb_enable_expression_pushdown TO on;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 2, v2 = v2 WHERE k = 1;
+SET yb_enable_expression_pushdown TO off;
+
+--
+-- Test single-row UPDATE/DELETE execution.
+--
+INSERT INTO single_row VALUES (1, 1, 1);
+
+UPDATE single_row SET v1 = 2 WHERE k = 1;
+SELECT * FROM single_row;
+
+UPDATE single_row SET v1 = v1 * 2 WHERE k = 1;
+SELECT * FROM single_row;
+
+UPDATE single_row SET v2 = CASE WHEN v1 % 2 = 0 THEN v2 * 3 ELSE v2 *2 END WHERE k = 1;
+SELECT * FROM single_row;
+
+DELETE FROM single_row WHERE k = 1;
+SELECT * FROM single_row;
+
+-- Nullable identity SET must preserve the column value (GH-33845).
+INSERT INTO single_row VALUES (1, 1, 1);
+UPDATE single_row SET v1 = 42, v2 = v2 WHERE k = 1;
+SELECT * FROM single_row;
+DELETE FROM single_row WHERE k = 1;
+
+-- Same validation under pushdown enabled exercises the fast-path fix (GH-33845).
+SET yb_enable_expression_pushdown TO on;
+INSERT INTO single_row VALUES (1, 1, 1);
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 42, v2 = v2 WHERE k = 1;
+UPDATE single_row SET v1 = 42, v2 = v2 WHERE k = 1;
+SELECT * FROM single_row;
+DELETE FROM single_row WHERE k = 1;
+SET yb_enable_expression_pushdown TO off;
+
+--
+-- Test UPDATE/DELETEs of non-existent data return no rows.
+--
+UPDATE single_row SET v1 = 1 WHERE k = 100 RETURNING k;
+DELETE FROM single_row WHERE k = 100 RETURNING k;
+SELECT * FROM single_row;
+
+--
+-- Test prepared statements.
+--
+INSERT INTO single_row VALUES (1, 1, 1);
+
+PREPARE single_row_update (int, int, int) AS
+  UPDATE single_row SET v1 = $2, v2 = $3 WHERE k = $1;
+
+PREPARE single_row_delete (int) AS
+  DELETE FROM single_row WHERE k = $1;
+
+EXPLAIN (COSTS FALSE) EXECUTE single_row_update (1, 2, 2);
+EXECUTE single_row_update (1, 2, 2);
+SELECT * FROM single_row;
+
+EXPLAIN (COSTS FALSE) EXECUTE single_row_delete (1);
+EXECUTE single_row_delete (1);
+SELECT * FROM single_row;
+
+--
+-- Test returning clauses.
+--
+INSERT INTO single_row VALUES (1, 1, 1);
+
+UPDATE single_row SET v1 = 2, v2 = 2 WHERE k = 1 RETURNING v1, v2, k;
+SELECT * FROM single_row;
+
+UPDATE single_row SET v1 = 3, v2 = 3 WHERE k = 1 RETURNING *;
+SELECT * FROM single_row;
+
+UPDATE single_row SET v1 = v1 + 1 WHERE k = 1 RETURNING v1;
+SELECT * FROM single_row;
+
+UPDATE single_row SET v1 = v1 + 1, v2 = 4 WHERE k = 1 RETURNING v2;
+SELECT * FROM single_row;
+
+DELETE FROM single_row WHERE k = 1 RETURNING k;
+SELECT * FROM single_row;
+
+---
+--- Test in transaction block.
+---
+INSERT INTO single_row VALUES (1, 1, 1);
+
+BEGIN;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row WHERE k = 1;
+DELETE FROM single_row WHERE k = 1;
+END;
+
+SELECT * FROM single_row;
+
+-- Test UPDATE/DELETE of non-existing rows.
+BEGIN;
+DELETE FROM single_row WHERE k = 1;
+UPDATE single_row SET v1 = 2 WHERE k = 1;
+END;
+
+SELECT * FROM single_row;
+
+---
+--- Test WITH clause.
+---
+INSERT INTO single_row VALUES (1, 1, 1);
+
+EXPLAIN (COSTS FALSE) WITH temp AS (UPDATE single_row SET v1 = 2 WHERE k = 1)
+  UPDATE single_row SET v1 = 2 WHERE k = 1;
+
+WITH temp AS (UPDATE single_row SET v1 = 2 WHERE k = 1)
+  UPDATE single_row SET v1 = 2 WHERE k = 1;
+
+SELECT * FROM single_row;
+
+-- Update row that doesn't exist.
+WITH temp AS (UPDATE single_row SET v1 = 2 WHERE k = 2)
+  UPDATE single_row SET v1 = 2 WHERE k = 2;
+
+SELECT * FROM single_row;
+
+-- Test for case when leftop is non-Var (GH#26536)
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE single_row SET v1 = 1 WHERE yb_hash_code(k) = yb_hash_code(1); -- not single row path
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE single_row SET v1 = 1 WHERE k = 1 AND yb_hash_code(k) = yb_hash_code(1); -- not single row path
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE single_row SET v1 = 1 WHERE 1 = k; -- single row path
+
+-- Adding secondary index should force re-planning, which would
+-- then not choose single-row plan due to the secondary index.
+EXPLAIN (COSTS FALSE) EXECUTE single_row_delete (1);
+CREATE INDEX single_row_index ON single_row (v1);
+EXPLAIN (COSTS FALSE) EXECUTE single_row_delete (1);
+DROP INDEX single_row_index;
+
+-- Same as above but for UPDATE.
+EXPLAIN (COSTS FALSE) EXECUTE single_row_update (1, 1, 1);
+CREATE INDEX single_row_index ON single_row (v1);
+EXPLAIN (COSTS FALSE) EXECUTE single_row_update (1, 1, 1);
+DROP INDEX single_row_index;
+
+-- Adding BEFORE DELETE row triggers should do the same as secondary index.
+EXPLAIN (COSTS FALSE) EXECUTE single_row_delete (1);
+CREATE TRIGGER single_row_delete_trigger BEFORE DELETE ON single_row
+  FOR EACH ROW EXECUTE PROCEDURE suppress_redundant_updates_trigger();
+EXPLAIN (COSTS FALSE) EXECUTE single_row_delete (1);
+-- UPDATE should still use single-row since trigger does not apply to it.
+EXPLAIN (COSTS FALSE) EXECUTE single_row_update (1, 1, 1);
+DROP TRIGGER single_row_delete_trigger ON single_row;
+
+-- Adding BEFORE UPDATE row triggers should do the same as secondary index.
+EXPLAIN (COSTS FALSE) EXECUTE single_row_update (1, 1, 1);
+CREATE TRIGGER single_row_update_trigger BEFORE UPDATE ON single_row
+  FOR EACH ROW EXECUTE PROCEDURE suppress_redundant_updates_trigger();
+EXPLAIN (COSTS FALSE) EXECUTE single_row_update (1, 1, 1);
+-- DELETE should still use single-row since trigger does not apply to it.
+EXPLAIN (COSTS FALSE) EXECUTE single_row_delete (1);
+DROP TRIGGER single_row_update_trigger ON single_row;
+
+--
+-- Test table with composite primary key.
+--
+CREATE TABLE single_row_comp_key (v int, k1 int, k2 int, PRIMARY KEY (k1 HASH, k2 ASC));
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1 RETURNING k1, k2;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k1 = 1 and k2 = 1 RETURNING v;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k1 = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k2 = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE v = 1 and k1 = 1 and k2 = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k1 = 1 AND k2 < 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_comp_key WHERE k1 = 1 AND k2 != 1;
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1 RETURNING k1, k2, v;
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = 1 + 2 WHERE k1 = 1 and k2 = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 3 - 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = ceil(3 - 2.5) WHERE k = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = v + 1 WHERE k1 = 1 and k2 = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = k1 + 1 WHERE k1 = 1 and k2 = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_comp_key SET v = 1 WHERE k1 = 1 and k2 = 1 and v = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 3 - v1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = 3 - k WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row SET v1 = v1 - k WHERE k = 1;
+
+-- Test the impact of functions on single row optimization.
+CREATE TABLE single_row_function_test (k INTEGER NOT NULL, date_pk TIMESTAMPTZ, random_field INTEGER, v varchar, created_at TIMESTAMP, PRIMARY KEY(k, date_pk));
+
+-- Verify that using unsupported non-immutable functions in the WHERE clause disables the use of fast path.
+EXPLAIN (COSTS OFF) UPDATE single_row_function_test SET random_field = 2 WHERE k = 1 AND date_pk = timeofday()::TIMESTAMP;
+
+-- Verify that using unsupported non-immutable functions to assign values does not disable the use of fast path.
+EXPLAIN (COSTS OFF) UPDATE single_row_function_test SET v=getpgusername() WHERE k = 1 AND date_pk = NOW();
+
+-- Verify that using supported non-immutable functions (like random(), NOW(), timestamp, timestampz etc) which do not perform reads or writes to the database
+-- to assign values/WHERE clause does not prevent the use of fast-path.
+EXPLAIN (COSTS OFF) UPDATE single_row_function_test SET created_at = '2022-01-01 00:00:00'::TIMESTAMP WITH TIME ZONE, random_field = ceil(random())::int  WHERE date_pk = NOW() AND k = 1;
+
+-- Verify that even if the function used in the WHERE clause is a supported but volatile function, the fast path is still disabled.
+EXPLAIN (COSTS OFF) UPDATE single_row_function_test SET created_at = '2022-01-01 00:00:00'::TIMESTAMP WITH TIME ZONE, random_field = ceil(random())::int  WHERE date_pk = NOW() AND k = random()::int;
+DROP TABLE single_row_function_test;
+
+-- Test execution.
+INSERT INTO single_row_comp_key VALUES (1, 2, 3);
+
+UPDATE single_row_comp_key SET v = 2 WHERE k1 = 2 and k2 = 3;
+SELECT * FROM single_row_comp_key;
+
+-- try switching around the order, reversing value/key
+DELETE FROM single_row_comp_key WHERE 2 = k2 and 3 = k1;
+SELECT * FROM single_row_comp_key;
+DELETE FROM single_row_comp_key WHERE 3 = k2 and 2 = k1;
+SELECT * FROM single_row_comp_key;
+
+--
+-- Test table with non-standard const type.
+--
+CREATE TABLE single_row_complex (k bigint PRIMARY KEY, v float);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_complex WHERE k = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_complex WHERE k = 1 RETURNING k;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_complex WHERE k = 1 RETURNING v;
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_complex;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_complex WHERE k = 1 and v = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_complex WHERE v = 1;
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = 1 WHERE k = 1 RETURNING k, v;
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = 1 + 2 WHERE k = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = k + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = 1 WHERE k = 1 and v = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = v + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex SET v = 3 * (v + 3 - 2) WHERE k = 1;
+
+-- Test execution.
+INSERT INTO single_row_complex VALUES (1, 1);
+
+UPDATE single_row_complex SET v = 2 WHERE k = 1;
+SELECT * FROM single_row_complex;
+
+UPDATE single_row_complex SET v = 3 * (v + 3 - 2) WHERE k = 1;
+SELECT * FROM single_row_complex;
+
+DELETE FROM single_row_complex WHERE k = 1;
+SELECT * FROM single_row_complex;
+
+--
+-- Test table with non-const type.
+--
+CREATE TABLE single_row_array (k int primary key, arr int []);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_array WHERE k = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_array WHERE k = 1 RETURNING k;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_array WHERE k = 1 RETURNING arr;
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_array;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_array WHERE k = 1 and arr[1] = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_array WHERE arr[1] = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_array SET arr[1] = 1 WHERE k = 1;
+
+-- Test execution.
+INSERT INTO single_row_array VALUES (1, ARRAY [1, 2, 3]);
+
+DELETE FROM single_row_array WHERE k = 1;
+SELECT * FROM single_row_array;
+
+--
+-- Test update with complex returning clause expressions
+--
+CREATE TYPE two_int AS (first integer, second integer);
+CREATE TYPE two_text AS (first_text text, second_text text);
+CREATE TABLE single_row_complex_returning (k int primary key, v1 int, v2 text, v3 two_text, array_int int[], v5 int);
+CREATE FUNCTION assign_one_plus_param_to_v1(integer) RETURNS integer
+   AS 'UPDATE single_row_complex_returning SET v1 = $1 + 1 WHERE k = 1 RETURNING $1 * 2;'
+   LANGUAGE SQL;
+CREATE FUNCTION assign_one_plus_param_to_v1_hard(integer) RETURNS two_int
+   AS 'UPDATE single_row_complex_returning SET v1 = $1 + 1 WHERE k = 1 RETURNING $1 * 2, v5 + 1;'
+   LANGUAGE SQL;
+
+-- Below statements should all USE single-row.
+-- (1) Constant
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 1 WHERE k = 1 RETURNING 1;
+-- (2) Column reference
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 2 WHERE k = 1 RETURNING v2, v3, array_int;
+-- (3) Subscript
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 3 WHERE k = 1 RETURNING array_int[1];
+-- (4) Field selection
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 4 WHERE k = 1 RETURNING (v3).first_text;
+-- (5) Immutable Operator Invocation
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 5 WHERE k = 1 RETURNING v2||'abc';
+-- (6) Immutable Function Call
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 6 WHERE k = 1 RETURNING power(v5, 2);
+-- (7) Type Cast
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 7 WHERE k = 1 RETURNING v5::text;
+-- (8) Collation Expression
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 8 WHERE k = 1 RETURNING v2 COLLATE "C";
+-- (9) Array Constructor
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 9 WHERE k = 1 RETURNING ARRAY[[v1,2,v5], [2,3,v5+1]];
+-- (10) Row Constructor
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 10 WHERE k = 1 RETURNING ROW(1,v2,v3,v5);
+-- (11) Scalar Subquery
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 11 WHERE k = 1 RETURNING (SELECT MAX(v5)+1 from single_row_complex_returning);
+-- (12) Mutable function
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 12 WHERE k = 1 RETURNING assign_one_plus_param_to_v1(1);
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 12 WHERE k = 1 RETURNING assign_one_plus_param_to_v1(v1);
+EXPLAIN (COSTS FALSE) UPDATE single_row_complex_returning SET v1 = 12 WHERE k = 1 RETURNING assign_one_plus_param_to_v1_hard(v1);
+
+-- Test execution
+INSERT INTO single_row_complex_returning VALUES (1, 1, 'xyz', ('a','b'), '{11, 11, 11}', 1);
+
+UPDATE single_row_complex_returning SET v1 = 1 WHERE k = 1 RETURNING 1, v2, array_int[1], (v3).first_text;
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 2 WHERE k = 1 RETURNING v2||'abc', power(v5, 2), v5::text, v2 COLLATE "C";
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 3 WHERE k = 1 RETURNING ARRAY[[v1,2,v5], [2,3,v5+1]];
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 4 WHERE k = 1 RETURNING ROW(1,v2,v3,v5);
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 5 WHERE k = 1 RETURNING (SELECT MAX(v5)+1 from single_row_complex_returning);
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 6 WHERE k = 1 RETURNING assign_one_plus_param_to_v1(1);
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 7 WHERE k = 1 RETURNING assign_one_plus_param_to_v1(v1);
+SELECT * FROM single_row_complex_returning;
+
+UPDATE single_row_complex_returning SET v1 = 8 WHERE k = 1 RETURNING assign_one_plus_param_to_v1_hard(v1);
+SELECT * FROM single_row_complex_returning;
+
+--
+-- Test table without a primary key.
+--
+CREATE TABLE single_row_no_primary_key (a int, b int);
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_no_primary_key;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_no_primary_key WHERE a = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_no_primary_key WHERE a = 1 and b = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_no_primary_key SET a = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_no_primary_key SET b = 1 WHERE a = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_no_primary_key SET b = 1 WHERE b = 1;
+
+--
+-- Test table with range primary key (ASC).
+--
+CREATE TABLE single_row_range_asc_primary_key (k int, v int, primary key (k ASC));
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_range_asc_primary_key WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = 1 + 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k > 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = 1 WHERE k != 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = v + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = v + k WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_asc_primary_key SET v = abs(5 - k) WHERE k = 1;
+
+-- Test execution
+INSERT INTO single_row_range_asc_primary_key(k,v) values (1,1), (2,2), (3,3), (4,4);
+
+UPDATE single_row_range_asc_primary_key SET v = 10 WHERE k = 1;
+SELECT * FROM single_row_range_asc_primary_key;
+UPDATE single_row_range_asc_primary_key SET v = v + 1 WHERE k = 2;
+SELECT * FROM single_row_range_asc_primary_key;
+UPDATE single_row_range_asc_primary_key SET v = -3 WHERE k < 4 AND k >= 3;
+SELECT * FROM single_row_range_asc_primary_key;
+UPDATE single_row_range_asc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
+SELECT * FROM single_row_range_asc_primary_key;
+DELETE FROM single_row_range_asc_primary_key WHERE k < 3;
+SELECT * FROM single_row_range_asc_primary_key;
+DELETE FROM single_row_range_asc_primary_key WHERE k = 4;
+SELECT * FROM single_row_range_asc_primary_key;
+
+--
+-- Test table with range primary key (DESC).
+--
+CREATE TABLE single_row_range_desc_primary_key (k int, v int, primary key (k DESC));
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_range_desc_primary_key WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = 1 + 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k > 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = 1 WHERE k != 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = v + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = k + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_range_desc_primary_key SET v = abs(5 - k) WHERE k = 1;
+
+-- Test execution
+INSERT INTO single_row_range_desc_primary_key(k,v) values (1,1), (2,2), (3,3), (4,4);
+
+UPDATE single_row_range_desc_primary_key SET v = 10 WHERE k = 1;
+SELECT * FROM single_row_range_desc_primary_key;
+UPDATE single_row_range_desc_primary_key SET v = v + 1 WHERE k = 2;
+SELECT * FROM single_row_range_desc_primary_key;
+UPDATE single_row_range_desc_primary_key SET v = -3 WHERE k < 4 AND k >= 3;
+SELECT * FROM single_row_range_desc_primary_key;
+UPDATE single_row_range_desc_primary_key SET v = ceil(2.5 + power(2,2)) WHERE k = 4;
+SELECT * FROM single_row_range_desc_primary_key;
+DELETE FROM single_row_range_desc_primary_key WHERE k < 3;
+SELECT * FROM single_row_range_desc_primary_key;
+DELETE FROM single_row_range_desc_primary_key WHERE k = 4;
+SELECT * FROM single_row_range_desc_primary_key;
+
+--
+-- Test tables with constraints.
+--
+CREATE TABLE single_row_not_null_constraints (k int PRIMARY KEY, v1 int NOT NULL, v2 int NOT NULL);
+CREATE TABLE single_row_check_constraints (k int PRIMARY KEY, v1 int NOT NULL, v2 int CHECK (v2 >= 0));
+CREATE TABLE single_row_check_constraints2 (k int PRIMARY KEY, v1 int NOT NULL, v2 int CHECK (v1 >= v2));
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_not_null_constraints WHERE k = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_check_constraints WHERE k = 1;
+EXPLAIN (COSTS FALSE) DELETE FROM single_row_check_constraints2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v1 = 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v2 = 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v2 = v2 + null WHERE k = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v2 = v2 + 3 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v1 = abs(v1), v2 = power(v2,2) WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v1 = 2, v2 = v2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints SET v2 = NULL WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_check_constraints SET v1 = 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_check_constraints SET v2 = 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_check_constraints2 SET v1 = 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_check_constraints2 SET v2 = 2 WHERE k = 1;
+
+-- Test execution.
+INSERT INTO single_row_not_null_constraints(k,v1, v2) values (1,1,1), (2,2,2), (3,3,3);
+UPDATE single_row_not_null_constraints SET v1 = 2 WHERE k = 1;
+UPDATE single_row_not_null_constraints SET v2 = v2 + 3 WHERE k = 1;
+DELETE FROM single_row_not_null_constraints where k = 3;
+SELECT * FROM single_row_not_null_constraints ORDER BY k;
+UPDATE single_row_not_null_constraints SET v1 = abs(v1), v2 = power(v2,2) WHERE k = 1;
+SELECT * FROM single_row_not_null_constraints ORDER BY k;
+-- Identity SET on NOT NULL must succeed via non-single-row path (GH-32716).
+UPDATE single_row_not_null_constraints SET v1 = 3, v2 = v2 WHERE k = 1;
+-- Should fail constraint check.
+UPDATE single_row_not_null_constraints SET v2 = NULL WHERE k = 1;
+SELECT * FROM single_row_not_null_constraints ORDER BY k;
+-- Should fail constraint check.
+UPDATE single_row_not_null_constraints SET v2 = v2 + null WHERE k = 1;
+-- Should update 0 rows (non-existent key).
+UPDATE single_row_not_null_constraints SET v2 = v2 + 2 WHERE k = 4;
+SELECT * FROM single_row_not_null_constraints ORDER BY k;
+
+INSERT INTO single_row_check_constraints(k,v1, v2) values (1,1,1), (2,2,2), (3,3,3);
+UPDATE single_row_check_constraints SET v1 = 2 WHERE k = 1;
+UPDATE single_row_check_constraints SET v2 = 3 WHERE k = 1;
+UPDATE single_row_check_constraints SET v2 = -3 WHERE k = 1;
+DELETE FROM single_row_check_constraints where k = 3;
+SELECT * FROM single_row_check_constraints ORDER BY k;
+
+INSERT INTO single_row_check_constraints2(k,v1, v2) values (1,1,1), (2,2,2), (3,3,3);
+UPDATE single_row_check_constraints2 SET v1 = 2 WHERE k = 1;
+UPDATE single_row_check_constraints2 SET v2 = 3 WHERE k = 1;
+UPDATE single_row_check_constraints2 SET v2 = 1 WHERE k = 1;
+DELETE FROM single_row_check_constraints2 where k = 3;
+SELECT * FROM single_row_check_constraints2 ORDER BY k;
+
+--
+-- Test table with decimal.
+--
+CREATE TABLE single_row_decimal (k int PRIMARY KEY, v1 decimal, v2 decimal(10,2), v3 int);
+CREATE FUNCTION next_v3(int) returns int language sql as $$
+  SELECT v3 + 1 FROM single_row_decimal WHERE k = $1;
+$$;
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = 1.555 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = 1.555 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v1 + null WHERE k = 2;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = null + v2 WHERE k = 2;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = v3 + 4 * (null - 5) WHERE k = 2;
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v1 + 1.555 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = v2 + 1.555 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = v3 + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v1 + 1.555, v2 = v2 + 1.555, v3 = 3 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v1 + 1.555, v2 = v2 + 1.555, v3 = next_v3(1) WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v1 + 1.555, v2 = v2 + 1.555, v3 = v3 + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v2 + 1.555 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = k + 1.555 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = k - v3 WHERE k = 1;
+
+-- Test execution.
+INSERT INTO single_row_decimal(k, v1, v2, v3) values (1,1.5,1.5,1), (2,2.5,2.5,2), (3,null, null,null);
+SELECT * FROM single_row_decimal ORDER BY k;
+UPDATE single_row_decimal SET v1 = v1 + 1.555, v2 = v2 + 1.555, v3 = v3 + 1 WHERE k = 1;
+-- v2 should be rounded to 2 decimals.
+SELECT * FROM single_row_decimal ORDER BY k;
+
+UPDATE single_row_decimal SET v1 = v1 + 1.555, v2 = v2 + 1.555, v3 = 3 WHERE k = 1;
+SELECT * FROM single_row_decimal ORDER BY k;
+UPDATE single_row_decimal SET v1 = v1 + 1.555, v2 = v2 + 1.555, v3 = next_v3(1) WHERE k = 1;
+SELECT * FROM single_row_decimal ORDER BY k;
+
+-- Test null arguments, all expressions should evaluate to null.
+UPDATE single_row_decimal SET v1 = v1 + null WHERE k = 2;
+UPDATE single_row_decimal SET v2 = null + v2 WHERE k = 2;
+UPDATE single_row_decimal SET v3 = v3 + 4 * (null - 5) WHERE k = 2;
+SELECT * FROM single_row_decimal ORDER BY k;
+
+-- Test null values, all expressions should evaluate to null.
+UPDATE single_row_decimal SET v1 = v1 + 1.555 WHERE k = 3;
+UPDATE single_row_decimal SET v2 = v2 + 1.555 WHERE k = 3;
+UPDATE single_row_decimal SET v3 = v3 + 1 WHERE k = 3;
+SELECT * FROM single_row_decimal ORDER BY k;
+
+--
+-- Test table with foreign key constraint.
+-- Should still try single-row if (and only if) the FK column is not updated.
+--
+CREATE TABLE single_row_decimal_fk(k int PRIMARY KEY);
+INSERT INTO single_row_decimal_fk(k) VALUES (1), (2), (3), (4);
+ALTER TABLE single_row_decimal ADD FOREIGN KEY (v3) REFERENCES single_row_decimal_fk(k);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = 1.555 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = 1.555 WHERE k = 4;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v1 + 1.555 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = v2 + 1.555 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = 1 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = v3 + 1 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v1 = v2 + 1.555 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v2 = k + 1.555 WHERE k = 4;
+EXPLAIN (COSTS FALSE) UPDATE single_row_decimal SET v3 = k - v3 WHERE k = 4;
+
+-- Test execution.
+INSERT INTO single_row_decimal(k, v1, v2, v3) values (4,4.5,4.5,4);
+
+SELECT * FROM single_row_decimal ORDER BY k;
+UPDATE single_row_decimal SET v1 = v1 + 4.555 WHERE k = 4;
+UPDATE single_row_decimal SET v2 = v2 + 4.555 WHERE k = 4;
+UPDATE single_row_decimal SET v3 = v3 + 4 WHERE k = 4;
+-- v2 should be rounded to 2 decimals.
+SELECT * FROM single_row_decimal ORDER BY k;
+
+--
+-- Test table with indexes.
+-- Should use single-row for expressions if (and only if) the indexed columns are not updated.
+--
+CREATE TABLE single_row_index(k int PRIMARY KEY, v1 smallint, v2 smallint, v3 smallint);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v1 = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v2 = 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v3 = 3 WHERE k = 1;
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v1 = v1 + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v2 = v2 + 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v3 = v3 + 3 WHERE k = 1;
+
+CREATE INDEX single_row_index_idx on single_row_index(v1) include (v3);
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v2 = 2 WHERE k = 1;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v2 = v2 + 2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v1 = 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v1 = v1 + 1 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v3 = 3 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v3 = v3 + 3 WHERE k = 1;
+
+-- Test execution.
+INSERT INTO single_row_index(k, v1, v2, v3) VALUES (1,0,0,0), (2,2,32000,2);
+
+SELECT * FROM single_row_index ORDER BY k;
+UPDATE single_row_index SET v1 = 1 WHERE k = 1;
+UPDATE single_row_index SET v2 = 2 WHERE k = 1;
+UPDATE single_row_index SET v3 = 3 WHERE k = 1;
+SELECT * FROM single_row_index ORDER BY k;
+UPDATE single_row_index SET v1 = v1 + 1 WHERE k = 1;
+UPDATE single_row_index SET v2 = v2 + 2 WHERE k = 1;
+UPDATE single_row_index SET v3 = v3 + 3 WHERE k = 1;
+SELECT * FROM single_row_index ORDER BY k;
+
+-- Test error reporting (overflow).
+EXPLAIN (COSTS FALSE) UPDATE single_row_index SET v2 = v2 + 1000 WHERE k = 2;
+UPDATE single_row_index SET v2 = v2 + 1000 WHERE k = 2;
+
+-- Test column ordering.
+CREATE TABLE single_row_col_order(a int, b int, c int, d int, e int, primary key(d, b));
+
+-- Below statements should all USE single-row.
+EXPLAIN (COSTS OFF) UPDATE single_row_col_order SET c = 6, a = 2, e = 10 WHERE b = 2 and d = 4;
+EXPLAIN (COSTS OFF) UPDATE single_row_col_order SET c = c * c, a = a * 2, e = power(e, 2) WHERE b = 2 and d = 4;
+EXPLAIN (COSTS OFF) DELETE FROM single_row_col_order WHERE b = 2 and d = 4;
+
+-- Below statements should all NOT USE single-row.
+EXPLAIN (COSTS OFF) UPDATE single_row_col_order SET c = 6, a = c + 2, e = 10 WHERE b = 2 and d = 4;
+EXPLAIN (COSTS OFF) UPDATE single_row_col_order SET c = c * b, a = a * 2, e = power(e, 2) WHERE b = 2 and d = 4;
+
+-- Test execution.
+INSERT INTO single_row_col_order(a,b,c,d,e) VALUES (1,2,3,4,5), (2,3,4,5,6);
+
+UPDATE single_row_col_order SET c = 6, a = 2, e = 10 WHERE b = 2 and d = 4;
+SELECT * FROM single_row_col_order ORDER BY d, b;
+
+UPDATE single_row_col_order SET c = c * c, a = a * 2, e = power(e, 2) WHERE d = 4 and b = 2;
+SELECT * FROM single_row_col_order ORDER BY d, b;
+
+DELETE FROM single_row_col_order WHERE b = 2 and d = 4;
+SELECT * FROM single_row_col_order ORDER BY d, b;
+
+--
+-- Test single-row with default values
+--
+
+CREATE TABLE single_row_default_col(k int PRIMARY KEY, a int default 10, b int default 20 not null, c int);
+
+------------------
+-- Test Planning
+
+EXPLAIN (COSTS FALSE) UPDATE single_row_default_col SET a = 3 WHERE k = 2;
+EXPLAIN (COSTS FALSE) UPDATE single_row_default_col SET b = 3 WHERE k = 2;
+EXPLAIN (COSTS FALSE) UPDATE single_row_default_col SET a = 3, c = 4 WHERE k = 2;
+EXPLAIN (COSTS FALSE) UPDATE single_row_default_col SET b = NULL, c = 5 WHERE k = 3;
+EXPLAIN (COSTS FALSE) UPDATE single_row_default_col SET a = 3, b = 3, c = 3 WHERE k = 2;
+
+------------------
+-- Test Execution
+
+-- Insert should use defaults for missing columns.
+INSERT INTO single_row_default_col(k, a, b, c) VALUES (1, 1, 1, 1);
+INSERT INTO single_row_default_col(k, c) VALUES (2, 2);
+INSERT INTO single_row_default_col(k, a, c) VALUES (3, NULL, 3);
+INSERT INTO single_row_default_col(k, a, c) VALUES (4, NULL, 4);
+
+-- Setting b to null should not be allowed.
+INSERT INTO single_row_default_col(k, a, b, c) VALUES (5, 5, NULL, 5);
+
+SELECT * FROM single_row_default_col ORDER BY k;
+
+-- Updates should not modify the existing (non-updated) values.
+UPDATE single_row_default_col SET b = 3 WHERE k = 2;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+UPDATE single_row_default_col SET a = 3, c = 4 WHERE k = 2;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+-- a should stay null (because it was explicitly set).
+UPDATE single_row_default_col SET b = 4, c = 5 WHERE k = 3;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+UPDATE single_row_default_col SET a = 4 WHERE k = 3;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+-- Setting b to null should not be allowed.
+UPDATE single_row_default_col SET b = NULL, c = 5 WHERE k = 3;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+ALTER TABLE single_row_default_col ALTER COLUMN a SET DEFAULT 30;
+
+-- Insert should use the new default.
+INSERT INTO single_row_default_col(k, c) VALUES (5, 5);
+SELECT * FROM single_row_default_col ORDER BY k;
+
+-- Updates should not modify the existing (non-updated) values.
+UPDATE single_row_default_col SET a = 4 WHERE k = 4;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+UPDATE single_row_default_col SET c = 6, b = 5 WHERE k = 5;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+UPDATE single_row_default_col SET c = 7, b = 7, a = 7 WHERE k = 5;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+-- Setting b to null should not be allowed.
+UPDATE single_row_default_col SET b = NULL, c = 5 WHERE k = 3;
+SELECT * FROM single_row_default_col ORDER BY k;
+
+--
+-- Test single-row with partial index
+--
+
+CREATE TABLE single_row_partial_index(k SERIAL PRIMARY KEY, value INT NOT NULL, status INT NOT NULL);
+CREATE UNIQUE INDEX ON single_row_partial_index(value ASC) WHERE status = 10;
+INSERT INTO single_row_partial_index(value, status) VALUES(1, 10), (2, 20), (3, 10), (4, 30);
+EXPLAIN (COSTS OFF) SELECT * FROM single_row_partial_index WHERE status = 10;
+SELECT * FROM single_row_partial_index WHERE status = 10;
+EXPLAIN (COSTS OFF) UPDATE single_row_partial_index SET status = 10 WHERE k = 2;
+UPDATE single_row_partial_index SET status = 10 WHERE k = 2;
+SELECT * FROM single_row_partial_index WHERE status = 10;
+EXPLAIN (COSTS OFF) UPDATE single_row_partial_index SET status = 9 WHERE k = 1;
+UPDATE single_row_partial_index SET status = 9 WHERE k = 1;
+SELECT * FROM single_row_partial_index WHERE status = 10;
+
+--
+-- Test single-row with index expression
+--
+
+CREATE TABLE single_row_expression_index(k SERIAL PRIMARY KEY, value text NOT NULL);
+CREATE UNIQUE INDEX ON single_row_expression_index(lower(value) ASC);
+INSERT INTO single_row_expression_index(value) VALUES('aBc'), ('deF'), ('HIJ');
+EXPLAIN (COSTS OFF) SELECT * FROM single_row_expression_index WHERE lower(value)='def';
+SELECT * FROM single_row_expression_index WHERE lower(value)='def';
+EXPLAIN (COSTS OFF) UPDATE single_row_expression_index SET value = 'kLm' WHERE k = 2;
+UPDATE single_row_expression_index SET value = 'kLm' WHERE k = 2;
+SELECT * FROM single_row_expression_index WHERE lower(value)='def';
+SELECT * FROM single_row_expression_index WHERE lower(value)='klm';
+
+--
+-- Test array types.
+--
+
+-----------------------------------
+-- int[] arrays.
+
+CREATE TABLE array_t1(k int PRIMARY KEY, arr int[]);
+INSERT INTO array_t1(k, arr) VALUES (1, '{1, 2, 3, 4}'::int[]);
+SELECT * FROM array_t1 ORDER BY k;
+
+-- the || operator.
+UPDATE array_t1 SET arr = arr||'{5, 6}'::int[] WHERE k = 1;
+SELECT * FROM array_t1 ORDER BY k;
+
+-- array_cat().
+UPDATE array_t1 SET arr = array_cat(arr, '{7, 8}'::int[]) WHERE k = 1;
+SELECT * FROM array_t1 ORDER BY k;
+
+-- array_append().
+UPDATE array_t1 SET arr = array_append(arr, 9::int) WHERE k = 1;
+SELECT * FROM array_t1 ORDER BY k;
+
+-- array_prepend().
+UPDATE array_t1 SET arr = array_prepend(0::int, arr) WHERE k = 1;
+SELECT * FROM array_t1 ORDER BY k;
+
+-- array_remove().
+UPDATE array_t1 SET arr = array_remove(arr, 4) WHERE k = 1;
+SELECT * FROM array_t1 ORDER BY k;
+
+-- array_replace().
+UPDATE array_t1 SET arr = array_replace(arr, 7, 77) WHERE k = 1;
+SELECT * FROM array_t1 ORDER BY k;
+
+-----------------------------------
+-- text[] arrays.
+
+CREATE TABLE array_t2(k int PRIMARY KEY, arr text[]);
+INSERT INTO array_t2(k, arr) VALUES (1, '{a, b}'::text[]);
+SELECT * FROM array_t2 ORDER BY k;
+
+UPDATE array_t2 SET arr = array_replace(arr, 'b', 'p') WHERE k = 1;
+SELECT * FROM array_t2 ORDER BY k;
+
+UPDATE array_t2 SET arr = '{x, y, z}'::text[] WHERE k = 1;
+SELECT * FROM array_t2 ORDER BY k;
+
+UPDATE array_t2 SET arr[2] = 'q' where k = 1;
+SELECT * FROM array_t2 ORDER BY k;
+
+-----------------------------------
+-- Arrays of composite types.
+
+CREATE TYPE rt as (f1 int, f2 text);
+CREATE TABLE array_t3(k int PRIMARY KEY, arr rt[] NOT NULL);
+INSERT INTO array_t3(k, arr) VALUES (1, '{"(1,a)", "(2,b)"}'::rt[]);
+SELECT * FROM array_t3 ORDER BY k;
+
+UPDATE array_t3 SET arr = '{"(1,c)", "(2,d)"}'::rt[] WHERE k = 1;
+SELECT * FROM array_t3 ORDER BY k;
+
+UPDATE array_t3 SET arr[2] = '(2,e)'::rt WHERE k = 1;
+SELECT * FROM array_t3 ORDER BY k;
+
+UPDATE array_t3 SET arr = array_replace(arr, '(1,c)', '(1,p)') WHERE k = 1;
+SELECT * FROM array_t3 ORDER BY k;
+
+-----------------------------------
+-- Test more builtin array types.
+-- INT2ARRAYOID, FLOAT8ARRAYOID, CHARARRAYOID.
+
+CREATE TABLE array_t4(k int PRIMARY KEY, arr1 int2[], arr2 double precision[], arr3 char[]);
+INSERT INTO array_t4(k, arr1, arr2, arr3) VALUES (1, '{1, 2, 3}'::int2[], '{1.5, 2.25, 3.25}'::float[], '{a, b, c}'::char[]);
+SELECT * FROM array_t4 ORDER BY k;
+
+-- array_replace().
+UPDATE array_t4 SET arr1 = array_replace(arr1, 2::int2, 22::int2) WHERE k = 1;
+UPDATE array_t4 SET arr2 = array_replace(arr2, 2.25::double precision, 22.25::double precision) WHERE k = 1;
+UPDATE array_t4 SET arr3 = array_replace(arr3, 'b'::char, 'x'::char) WHERE k = 1;
+SELECT * FROM array_t4 ORDER BY k;
+
+-- array_cat().
+UPDATE array_t4 SET arr1 = array_cat(arr1, '{4, 5}'::int2[]) WHERE k = 1;
+UPDATE array_t4 SET arr2 = array_cat(arr2, '{4.5, 5.25}'::double precision[][]) WHERE k = 1;
+UPDATE array_t4 SET arr3 = array_cat(arr3, '{d, e, f}'::char[]) WHERE k = 1;
+SELECT * FROM array_t4 ORDER BY k;
+
+-- array_prepend().
+UPDATE array_t4 SET arr1 = array_prepend(0::int2, arr1),
+                    arr2 = array_prepend(0.5::double precision, arr2),
+                    arr3 = array_prepend('z'::char, arr3) WHERE k = 1;
+SELECT * FROM array_t4 ORDER BY k;
+
+-- array_remove().
+UPDATE array_t4 SET arr1 = array_remove(arr1, 3::int2),
+                    arr2 = array_remove(arr2, 3.25::double precision),
+                    arr3 = array_remove(arr3, 'c'::char) WHERE k = 1;
+SELECT * FROM array_t4 ORDER BY k;
+
+-----------------------------------
+-- Test json types.
+
+CREATE TABLE json_t1(k int PRIMARY KEY, json1 json, json2 jsonb);
+
+INSERT INTO json_t1 (k, json1, json2) VALUES (1, '["a", 1]'::json, '["b", 2]'::jsonb);
+SELECT * FROM json_t1;
+
+UPDATE json_t1 SET json1 = json1 -> 0, json2 = json2||'["c", 3]'::jsonb WHERE k = 1;
+SELECT * FROM json_t1;
+
+-----------------------------------
+-- Test for https://github.com/yugabyte/yugabyte-db/issues/11346.
+-- Original test case.
+CREATE TABLE t0(c0 money, PRIMARY KEY(c0));
+INSERT INTO t0(c0) VALUES(CAST(1.38073114E9 AS MONEY));
+DELETE FROM t0 WHERE (((0.14198202)::MONEY)>=((0.14222479)::MONEY));
+-- Confirm that multi-row delete isn't done incorrectly as single row delete.
+CREATE TABLE multi_row (k int primary key, v1 int, v2 int);
+INSERT INTO multi_row VALUES (1, 1, 1);
+INSERT INTO multi_row VALUES (2, 2, 2);
+INSERT INTO multi_row VALUES (3, 3, 3);
+SELECT * FROM multi_row;
+-- Test if delete on top of YBSeqScan works properly (GHI #14103)
+EXPLAIN (COSTS FALSE) /*+ SeqScan(multi_row) */ DELETE FROM multi_row WHERE k < 2;
+/*+ SeqScan(multi_row) */ DELETE FROM multi_row WHERE k < 2;
+SELECT * FROM multi_row;
+
+EXPLAIN (COSTS FALSE) DELETE FROM multi_row WHERE 2::MONEY <= 2::MONEY;
+DELETE FROM multi_row WHERE 2::MONEY <= 2::MONEY;
+SELECT * FROM multi_row;
+
+-- Test for case when parent and child column nos don't match.
+-- GH issue: https://github.com/yugabyte/yugabyte-db/issues/23857.
+CREATE TABLE pk (a int PRIMARY KEY) PARTITION BY RANGE (a);
+CREATE TABLE pk2 (b int, a int NOT NULL);
+ALTER TABLE pk2 DROP COLUMN b;
+ALTER TABLE pk ATTACH PARTITION pk2 FOR VALUES FROM (1000) TO (2000);
+INSERT into pk VALUES (1000);
+EXPLAIN(costs off) UPDATE pk SET a = 1002 WHERE a = 1000;
+UPDATE pk SET a = 1002 WHERE a = 1000;
+
+-- Test NOT NULL constraint enforcement in single-row UPDATE when parent and
+-- child column orders don't match.
+-- GH issue: https://github.com/yugabyte/yugabyte-db/issues/32472.
+CREATE TABLE pk_nn (k int, a int, b int NOT NULL, PRIMARY KEY (k))
+    PARTITION BY RANGE (k);
+CREATE TABLE pk_nn1 (b int NOT NULL, a int, k int NOT NULL, PRIMARY KEY (k));
+ALTER TABLE pk_nn ATTACH PARTITION pk_nn1 FOR VALUES FROM (1) TO (100);
+CREATE TABLE pk_nn2 (a int, b int NOT NULL, k int NOT NULL, PRIMARY KEY (k));
+ALTER TABLE pk_nn ATTACH PARTITION pk_nn2 FOR VALUES FROM (100) TO (200);
+INSERT INTO pk_nn VALUES (5, 10, 20), (105, 110, 120);
+-- All plans should USE single-row.  Setting NOT NULL column b to NULL should
+-- fail on either partition; updating only 'a' should succeed without checking
+-- the unmodified column b.
+\set Q1 'b = NULL'
+\set Q2 'a = 11'
+\set R1 '5'
+\set R2 '105'
+\set query ':P UPDATE pk_nn SET :Q WHERE k = :R;'
+\i :run_query
+SELECT * FROM pk_nn ORDER BY k;
+-- Same misfire via dropped columns: CREATE TABLE ... PARTITION OF does not
+-- materialize the parent's dropped columns, so the leaf's attribute numbers
+-- differ from the root's even though the column order matches.
+CREATE TABLE pk_nn_drop (k int, dropme int, a int, b int NOT NULL,
+    PRIMARY KEY (k)) PARTITION BY RANGE (k);
+ALTER TABLE pk_nn_drop DROP COLUMN dropme;
+CREATE TABLE pk_nn_drop1 PARTITION OF pk_nn_drop FOR VALUES FROM (1) TO (100);
+INSERT INTO pk_nn_drop VALUES (5, 10, 20);
+\set query ':P UPDATE pk_nn_drop SET :Q WHERE k = 5;'
+\i :run_query
+SELECT * FROM pk_nn_drop ORDER BY k;
+
+-- Test NOT NULL constraint enforcement on a stored generated column in
+-- single-row UPDATE: the column is not in the SET list, but it is recomputed
+-- from columns that are, so it must still be checked.
+CREATE TABLE gen_nn (k int PRIMARY KEY, a int, b int,
+    g int GENERATED ALWAYS AS (a + b) STORED NOT NULL);
+-- The dropped column makes the leaf's attribute numbers differ from the root's.
+CREATE TABLE gen_nn_part (k int, dropme int, a int, b int,
+    g int GENERATED ALWAYS AS (a + b) STORED NOT NULL, PRIMARY KEY (k))
+    PARTITION BY RANGE (k);
+ALTER TABLE gen_nn_part DROP COLUMN dropme;
+CREATE TABLE gen_nn_part1 PARTITION OF gen_nn_part FOR VALUES FROM (1) TO (100);
+INSERT INTO gen_nn VALUES (5, 1, 2);
+INSERT INTO gen_nn_part VALUES (5, 1, 2);
+-- All plans should USE single-row.  The first two updates should fail because
+-- g becomes NULL; the third should succeed.
+\set Q1 'a = NULL, b = 5'
+\set Q2 'a = 1, b = NULL'
+\set Q3 'a = 3, b = 4'
+\set R1 'gen_nn'
+\set R2 'gen_nn_part'
+\set query ':P UPDATE :R SET :Q WHERE k = 5;'
+\i :run_query
+\unset Q3
+SELECT * FROM gen_nn ORDER BY k;
+SELECT * FROM gen_nn_part ORDER BY k;
+
+-- Test single-shard transactions in a partition table.
+-- The absence of flushes and storage scans in the EXPLAIN plan indicate the use
+-- of single-shard transactions.
+CREATE TABLE p_test (k INT, v INT, PRIMARY KEY (k)) PARTITION BY RANGE (k);
+CREATE TABLE p_test_1 PARTITION OF p_test FOR VALUES FROM (0) TO (10);
+CREATE TABLE p_test_2 PARTITION OF p_test FOR VALUES FROM (10) TO (20);
+CREATE TABLE p_test_3 PARTITION OF p_test FOR VALUES FROM (20) TO (30);
+
+-- Create an index on one of the partitions to ensure that it is not applicable
+-- for single-shard transactions.
+CREATE INDEX NONCONCURRENTLY ON p_test_3 (v);
+
+-- Inserting a single row into a single partition (without indexes) should be
+-- eligible for single-shard.
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (1, 1);
+-- Inserting multiple rows should not be eligible for single-shard, even if all
+-- inserts may end up in the same partition.
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (11, 11), (12, 12);
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test_1 VALUES (2, 2), (3, 3);
+-- Inserts spanning multiple partitions should be ineligible for single-shard.
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (4, 4), (13, 13);
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (14, 14), (5, 5);
+-- Inserts involving p_test_3 should be ineligible for single-shard.
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (21, 21);
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (15, 15), (22, 22);
+EXPLAIN (ANALYZE, DIST, COSTS OFF) INSERT INTO p_test VALUES (23, 23), (16, 16);
+-- Plans having multiple modify-table operations should be ineligible for single-shard.
+EXPLAIN (ANALYZE, DIST, COSTS OFF)
+WITH cte AS (INSERT INTO p_test VALUES (6, 6) RETURNING k)
+INSERT INTO p_test (SELECT cte.k + 1, cte.k + 1 FROM cte);
+EXPLAIN (ANALYZE, DIST, COSTS OFF)
+WITH cte AS (INSERT INTO p_test_2 VALUES (17, 17) RETURNING k)
+INSERT INTO p_test (SELECT cte.k + 1, cte.k + 1 FROM cte);
+EXPLAIN (ANALYZE, DIST, COSTS OFF)
+WITH cte AS (INSERT INTO p_test VALUES (9, 9) RETURNING k)
+INSERT INTO p_test (SELECT cte.k + 10, cte.k + 10 FROM cte);
+EXPLAIN (ANALYZE, DIST, COSTS OFF)
+WITH cte AS (INSERT INTO p_test VALUES (8, 8) RETURNING k)
+INSERT INTO p_test (SELECT cte.k + 20, cte.k + 20 FROM cte);
+
+SELECT * FROM p_test ORDER BY k;
+DELETE FROM p_test WHERE k % 10 >= 5;
+
+-- Cross partition updates should never be eligible for single-shard.
+-- Row movement between partitions that have no indexes or triggers.
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE p_test SET k = k + 15 WHERE k = 1;
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE p_test SET k = k + 15 WHERE k IN (2, 3);
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE p_test SET k = (k + 15) % 20 WHERE k IN (4, 14);
+-- Row movement between partitions, one of which has indexes or triggers.
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE p_test SET k = (k + 11) % 30 WHERE k IN (13, 23);
+INSERT INTO p_test VALUES (1, 1);
+DELETE FROM p_test WHERE k % 10 = 2;
+EXPLAIN (ANALYZE, DIST, COSTS OFF) UPDATE p_test SET k = (k + 11) % 30 WHERE k IN (21, 1, 11);
+
+SELECT * FROM p_test ORDER BY k;
+
+--
+-- Test to validate the transaction type in EXPLAIN.
+--
+CREATE TABLE t_simple(k INT PRIMARY KEY, v INT);
+CREATE TEMP TABLE t_temp(k INT PRIMARY KEY, v INT);
+
+-- Writing multiple rows should make a transaction ineligible for single-shard.
+CALL check_fast_path_txn('INSERT INTO t_simple (SELECT i, i FROM generate_series(1, 10) AS i)', false);
+-- Writing a single row should make a transaction eligible for single-shard.
+CALL check_fast_path_txn('INSERT INTO t_simple VALUES (11, 11)', true);
+CALL check_fast_path_txn('UPDATE t_simple SET v = 12 WHERE k = 11', true);
+CALL check_fast_path_txn('DELETE FROM t_simple WHERE k = 11', true);
+-- Reads are not single-shard transactions.
+CALL check_fast_path_txn('SELECT * FROM t_simple', false);
+-- Combinations of reads and writes should not be single-shard either.
+CALL check_fast_path_txn('DELETE FROM t_simple WHERE k < 2', false);
+-- Operations involving only temporary tables do not use DocDB transactions and
+-- so should not be eligible to be classified as single-shard transactions.
+CALL check_fast_path_txn('INSERT INTO t_temp (SELECT i, i FROM generate_series(1, 10) AS i)', false);
+CALL check_fast_path_txn('INSERT INTO t_temp VALUES (11, 11)', false);
+CALL check_fast_path_txn('UPDATE t_temp SET v = 12 WHERE k = 11', false);
+CALL check_fast_path_txn('DELETE FROM t_temp WHERE k = 11', false);
+CALL check_fast_path_txn('SELECT * FROM t_temp', false);
+CALL check_fast_path_txn('DELETE FROM t_temp WHERE k < 2', false);
+-- Operations involving both temporary and non-temporary tables should also
+-- not be eligible for single-shard transactions as this optimization is
+-- currently not supported when multiple tables are involved.
+CALL check_fast_path_txn('INSERT INTO t_simple (SELECT k + 10, v + 10 FROM t_temp WHERE k = 1)', false);
+CALL check_fast_path_txn('INSERT INTO t_temp (SELECT k, v FROM t_simple WHERE k = 11)', false);
+-- TODO(kramanathan): The following query currently crashes. Uncomment when fixed.
+-- WITH cte AS (INSERT INTO t_temp VALUES (13, 13) RETURNING *) INSERT INTO t_simple (SELECT * FROM cte);
+-- Queries in an explicit transaction block should not be labeled as single-shard transactions.
+BEGIN;
+CALL check_fast_path_txn('INSERT INTO t_simple VALUES (15, 15)', false);
+CALL check_fast_path_txn('UPDATE t_simple SET v = 16 WHERE k = 15', false);
+CALL check_fast_path_txn('DELETE FROM t_simple WHERE k = 15', false);
+COMMIT;
+
+SELECT * FROM t_simple ORDER BY k;
+SELECT * FROM t_temp ORDER BY k;
+
+-- Test to validate that NOT NULL constraints are enforced for partitioned tables.
+CREATE TABLE single_row_not_null_constraints_partitioned (k int PRIMARY KEY, v1 int NOT NULL, v2 int NOT NULL) PARTITION BY RANGE (k);
+CREATE TABLE not_null_constraints_partitioned_1 PARTITION OF single_row_not_null_constraints_partitioned FOR VALUES FROM (1) TO (10);
+CREATE TABLE not_null_constraints_partitioned_default PARTITION OF single_row_not_null_constraints_partitioned DEFAULT;
+INSERT INTO not_null_constraints_partitioned_1 VALUES (1, 1, 1);
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints_partitioned SET v1 = v1 + 1, v2 = v2 WHERE k = 1;
+EXPLAIN (COSTS FALSE) UPDATE single_row_not_null_constraints_partitioned SET v2 = NULL WHERE k = 1;
+UPDATE single_row_not_null_constraints_partitioned SET v1 = v1 + 1, v2 = v2 WHERE k = 1;
+-- Should fail constraint check.
+UPDATE single_row_not_null_constraints_partitioned SET v2 = NULL WHERE k = 1;
+SELECT * FROM single_row_not_null_constraints_partitioned ORDER BY k;
+
+-- Nullable identity SET on partitioned table must preserve value (GH-33845).
+CREATE TABLE single_row_nullable_partitioned (k int PRIMARY KEY, v1 int, v2 int) PARTITION BY RANGE (k);
+CREATE TABLE nullable_partitioned_1 PARTITION OF single_row_nullable_partitioned FOR VALUES FROM (1) TO (10);
+INSERT INTO nullable_partitioned_1 VALUES (1, 1, 1);
+EXPLAIN (COSTS FALSE) UPDATE single_row_nullable_partitioned SET v1 = 2, v2 = v2 WHERE k = 1;
+UPDATE single_row_nullable_partitioned SET v1 = 2, v2 = v2 WHERE k = 1;
+SELECT * FROM single_row_nullable_partitioned ORDER BY k;
+DELETE FROM single_row_nullable_partitioned WHERE k = 1;
+
+-- Same validation under pushdown enabled exercises the fast-path fix on
+-- partitioned tables (GH-33845).
+SET yb_enable_expression_pushdown TO on;
+INSERT INTO nullable_partitioned_1 VALUES (1, 1, 1);
+EXPLAIN (COSTS FALSE) UPDATE single_row_nullable_partitioned SET v1 = 42, v2 = v2 WHERE k = 1;
+UPDATE single_row_nullable_partitioned SET v1 = 42, v2 = v2 WHERE k = 1;
+SELECT * FROM single_row_nullable_partitioned ORDER BY k;
+DELETE FROM single_row_nullable_partitioned WHERE k = 1;
+SET yb_enable_expression_pushdown TO off;
+
+-- Cleanup.
+DROP FUNCTION next_v3;
+DROP FUNCTION assign_one_plus_param_to_v1;
+DROP FUNCTION assign_one_plus_param_to_v1_hard;
+DROP TABLE single_row;
+DROP TABLE single_row_comp_key;
+DROP TABLE single_row_complex;
+DROP TABLE single_row_array;
+DROP TABLE single_row_complex_returning;
+DROP TABLE single_row_no_primary_key;
+DROP TABLE single_row_range_asc_primary_key;
+DROP TABLE single_row_range_desc_primary_key;
+DROP TABLE single_row_not_null_constraints;
+DROP TABLE single_row_not_null_constraints_partitioned;
+DROP TABLE single_row_nullable_partitioned;
+DROP TABLE single_row_check_constraints;
+DROP TABLE single_row_check_constraints2;
+DROP TABLE single_row_decimal;
+DROP TABLE single_row_decimal_fk;
+DROP TABLE single_row_index;
+DROP TABLE single_row_col_order;
+DROP TABLE single_row_default_col;
+DROP TABLE single_row_partial_index;
+DROP TABLE single_row_expression_index;
+DROP TABLE array_t1;
+DROP TABLE array_t2;
+DROP TABLE array_t3;
+DROP TABLE array_t4;
+DROP TABLE json_t1;
+DROP TABLE p_test;
+DROP TABLE pk;
+DROP TABLE pk_nn;
+DROP TABLE pk_nn_drop;
+DROP TABLE gen_nn;
+DROP TABLE gen_nn_part;
+DROP TABLE t_simple;
+DROP TABLE t_temp;
+DROP TYPE rt;
+DROP TYPE two_int;
+DROP TYPE two_text;
+
+--
+-- Test single-row UPDATE/DELETE where the WHERE value has another type than the
+-- primary key column (GH#35476).  A value must not be reinterpreted as the
+-- column type: statements must update the same rows as they do in PostgreSQL.
+--
+CREATE TABLE sr_cross_int4 (k int PRIMARY KEY, v int);
+INSERT INTO sr_cross_int4 VALUES (-2147483648, 0), (1, 0), (2, 0), (3, 0), (2147483647, 0);
+CREATE TABLE sr_cross_int2 (k smallint PRIMARY KEY, v int);
+INSERT INTO sr_cross_int2 VALUES (-32768, 0), (1, 0), (2, 0), (32767, 0);
+CREATE TABLE sr_cross_int8 (k bigint PRIMARY KEY, v int);
+INSERT INTO sr_cross_int8 VALUES (-1, 0), (2, 0), (4294967295, 0);
+
+-- bigint values that do not fit an int4 column match no row.  Their low 32 bits
+-- are the keys 1 and 2.
+UPDATE sr_cross_int4 SET v = 1 WHERE k = 4294967297;
+DELETE FROM sr_cross_int4 WHERE k = 4294967298;
+-- One past either end of the int4 range.
+UPDATE sr_cross_int4 SET v = 1 WHERE k = 2147483648;
+UPDATE sr_cross_int4 SET v = 1 WHERE k = -2147483649;
+SELECT * FROM sr_cross_int4 ORDER BY k;
+-- bigint values that fit still use single-row.
+EXPLAIN (COSTS OFF) UPDATE sr_cross_int4 SET v = 5 WHERE k = 2::bigint;
+UPDATE sr_cross_int4 SET v = 5 WHERE k = 2::bigint;
+UPDATE sr_cross_int4 SET v = 5 WHERE k = 2147483647::bigint;
+UPDATE sr_cross_int4 SET v = 5 WHERE k = -2147483648::bigint;
+SELECT * FROM sr_cross_int4 ORDER BY k;
+
+-- Same for smallint with int4 and bigint values.
+UPDATE sr_cross_int2 SET v = 1 WHERE k = 65537;
+DELETE FROM sr_cross_int2 WHERE k = 4294967298;
+UPDATE sr_cross_int2 SET v = 1 WHERE k = 32768;
+UPDATE sr_cross_int2 SET v = 1 WHERE k = -32769;
+SELECT * FROM sr_cross_int2 ORDER BY k;
+
+-- A wider column holds every narrower value: single-row.
+EXPLAIN (COSTS OFF) UPDATE sr_cross_int8 SET v = 1 WHERE k = -1;
+UPDATE sr_cross_int8 SET v = 1 WHERE k = -1;
+SELECT * FROM sr_cross_int8 ORDER BY k;
+
+-- The same with an int parameter in a generic plan (GH#36130).
+SET plan_cache_mode = force_generic_plan;
+PREPARE sr_cross_pw(int) AS UPDATE sr_cross_int8 SET v = 2 WHERE k = $1;
+EXPLAIN (COSTS OFF) EXECUTE sr_cross_pw(-1);
+EXECUTE sr_cross_pw(-1);
+SELECT * FROM sr_cross_int8 ORDER BY k;
+DEALLOCATE sr_cross_pw;
+RESET plan_cache_mode;
+
+-- A bind parameter in a generic plan, which is still single-row, gives the same
+-- result.
+SET plan_cache_mode = force_generic_plan;
+PREPARE sr_cross_p(bigint) AS UPDATE sr_cross_int4 SET v = 9 WHERE k = $1;
+EXPLAIN (COSTS OFF) EXECUTE sr_cross_p(3);
+EXECUTE sr_cross_p(4294967297);
+EXECUTE sr_cross_p(2147483648);
+EXECUTE sr_cross_p(NULL);
+EXECUTE sr_cross_p(3);
+SELECT * FROM sr_cross_int4 ORDER BY k;
+DEALLOCATE sr_cross_p;
+RESET plan_cache_mode;
+
+-- Partitioned table: 4294967446 is 2^32 + 150, its low 32 bits are the key 150.
+CREATE TABLE sr_cross_part (k int PRIMARY KEY, v int) PARTITION BY RANGE (k);
+CREATE TABLE sr_cross_part_lo PARTITION OF sr_cross_part FOR VALUES FROM (MINVALUE) TO (100);
+CREATE TABLE sr_cross_part_hi PARTITION OF sr_cross_part FOR VALUES FROM (100) TO (MAXVALUE);
+INSERT INTO sr_cross_part VALUES (1, 0), (150, 0);
+UPDATE sr_cross_part SET v = 1 WHERE k = 4294967446;
+SELECT * FROM sr_cross_part ORDER BY k;
+UPDATE sr_cross_part SET v = 2 WHERE k = 150::bigint;
+SELECT * FROM sr_cross_part ORDER BY k;
+
+-- A two-column key: 4294967297 and 4294967298 are 2^32 + 1 and 2^32 + 2, their
+-- low 32 bits are the keys 1 and 2.  A generic plan checks the values of both
+-- columns at execution.
+CREATE TABLE sr_cross_two (a int, b int, v int, PRIMARY KEY (a, b));
+INSERT INTO sr_cross_two VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0);
+UPDATE sr_cross_two SET v = 1 WHERE a = 4294967297 AND b = 1;
+EXPLAIN (COSTS OFF) UPDATE sr_cross_two SET v = 2 WHERE a = 1::bigint AND b = 2::bigint;
+UPDATE sr_cross_two SET v = 2 WHERE a = 1::bigint AND b = 2::bigint;
+SET plan_cache_mode = force_generic_plan;
+PREPARE sr_cross_p2(bigint, bigint) AS UPDATE sr_cross_two SET v = 3 WHERE a = $1 AND b = $2;
+EXPLAIN (COSTS OFF) EXECUTE sr_cross_p2(2, 1);
+EXECUTE sr_cross_p2(2, 4294967297);
+EXECUTE sr_cross_p2(4294967298, 1);
+EXECUTE sr_cross_p2(2, 1);
+SELECT * FROM sr_cross_two ORDER BY a, b;
+DEALLOCATE sr_cross_p2;
+RESET plan_cache_mode;
+
+-- A key of columns of different types, each with values of another type.
+-- 65537 and 65538 are 2^16 + 1 and 2^16 + 2, their low 16 bits are the keys 1
+-- and 2.
+CREATE TABLE sr_cross_mixed (a smallint, b bigint, c varchar, v int,
+	PRIMARY KEY (a, b, c));
+INSERT INTO sr_cross_mixed VALUES (1, 1, 'x', 0), (1, 2, 'x', 0), (2, 1, 'x', 0);
+UPDATE sr_cross_mixed SET v = 1 WHERE a = 65537 AND b = 1 AND c = 'x';
+EXPLAIN (COSTS OFF) UPDATE sr_cross_mixed SET v = 2
+	WHERE a = 1::bigint AND b = 2::int AND c = 'x'::text;
+UPDATE sr_cross_mixed SET v = 2 WHERE a = 1::bigint AND b = 2::int AND c = 'x'::text;
+SET plan_cache_mode = force_generic_plan;
+PREPARE sr_cross_pm(int, smallint, text) AS
+	UPDATE sr_cross_mixed SET v = 3 WHERE a = $1 AND b = $2 AND c = $3;
+EXPLAIN (COSTS OFF) EXECUTE sr_cross_pm(2, 1, 'x');
+EXECUTE sr_cross_pm(65538, 1, 'x');
+EXECUTE sr_cross_pm(2, 1, 'x');
+PREPARE sr_cross_dm(bigint, int, text) AS
+	DELETE FROM sr_cross_mixed WHERE a = $1 AND b = $2 AND c = $3 RETURNING *;
+EXECUTE sr_cross_dm(65537, 2, 'x');
+EXECUTE sr_cross_dm(1, 2, 'x');
+SELECT * FROM sr_cross_mixed ORDER BY a, b, c;
+DEALLOCATE sr_cross_pm;
+DEALLOCATE sr_cross_dm;
+RESET plan_cache_mode;
+
+-- An ascending (range) key.
+CREATE TABLE sr_cross_asc (k int, v int, PRIMARY KEY (k ASC));
+INSERT INTO sr_cross_asc VALUES (1, 0), (2, 0);
+UPDATE sr_cross_asc SET v = 1 WHERE k = 4294967297;
+EXPLAIN (COSTS OFF) UPDATE sr_cross_asc SET v = 2 WHERE k = 2::bigint;
+UPDATE sr_cross_asc SET v = 2 WHERE k = 2::bigint;
+SELECT * FROM sr_cross_asc ORDER BY k;
+
+-- A value that needs no conversion is the key as is: a varchar column with
+-- text values, and a domain column with values of the domain's base type.
+CREATE TABLE sr_cross_varchar (k varchar PRIMARY KEY, v int);
+INSERT INTO sr_cross_varchar VALUES ('a', 0), ('b', 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_varchar SET v = 1 WHERE k = 'a';
+UPDATE sr_cross_varchar SET v = 1 WHERE k = 'a';
+SET plan_cache_mode = force_generic_plan;
+PREPARE sr_cross_pv(text) AS UPDATE sr_cross_varchar SET v = 2 WHERE k = $1;
+EXPLAIN (COSTS OFF) EXECUTE sr_cross_pv('b');
+EXECUTE sr_cross_pv('b');
+SELECT * FROM sr_cross_varchar ORDER BY k;
+DEALLOCATE sr_cross_pv;
+RESET plan_cache_mode;
+CREATE DOMAIN sr_cross_dom AS int;
+CREATE TABLE sr_cross_domain (k sr_cross_dom PRIMARY KEY, v int);
+INSERT INTO sr_cross_domain VALUES (1, 0), (2, 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_domain SET v = 1 WHERE k = 1;
+UPDATE sr_cross_domain SET v = 1 WHERE k = 1;
+SELECT * FROM sr_cross_domain ORDER BY k;
+
+-- Values of other types use the scan, which compares them as PostgreSQL does.
+-- A double column with real values (the real 0.1 is the double
+-- 0.10000000149011612), and a text column with name values.
+CREATE TABLE sr_cross_double (k float8 PRIMARY KEY, v int);
+INSERT INTO sr_cross_double VALUES (0.1, 0), (0.10000000149011612, 0), (1.5, 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_double SET v = 1 WHERE k = '0.1'::real;
+UPDATE sr_cross_double SET v = 1 WHERE k = '0.1'::real;
+SELECT * FROM sr_cross_double ORDER BY k;
+CREATE TABLE sr_cross_text (k text COLLATE "C" PRIMARY KEY, v int);
+INSERT INTO sr_cross_text VALUES ('abc', 0), ('bbbb', 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_text SET v = 1 WHERE k = 'bbbb'::name;
+UPDATE sr_cross_text SET v = 1 WHERE k = 'bbbb'::name;
+SELECT * FROM sr_cross_text ORDER BY k;
+
+-- A real column with double values: only a double that is a real matches.
+CREATE TABLE sr_cross_real (k real PRIMARY KEY, v int);
+INSERT INTO sr_cross_real VALUES (0.1, 0), (1.5, 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_real SET v = 1 WHERE k = 1.5::float8;
+UPDATE sr_cross_real SET v = 1 WHERE k = 1.5::float8;
+UPDATE sr_cross_real SET v = 1 WHERE k = 0.1::float8;
+SELECT * FROM sr_cross_real ORDER BY k;
+
+-- A date column with timestamp values: only a midnight matches.
+CREATE TABLE sr_cross_date (k date PRIMARY KEY, v int);
+INSERT INTO sr_cross_date VALUES ('2000-01-01', 0), ('2000-01-02', 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_date SET v = 1 WHERE k = '2000-01-02 00:00:00'::timestamp;
+UPDATE sr_cross_date SET v = 1 WHERE k = '2000-01-02 00:00:00'::timestamp;
+UPDATE sr_cross_date SET v = 1 WHERE k = '2000-01-01 00:00:00.000001'::timestamp;
+SELECT * FROM sr_cross_date ORDER BY k;
+
+-- A name column with text values.  A name holds 63 bytes, so a longer text
+-- matches no row.
+CREATE TABLE sr_cross_name (k name PRIMARY KEY, v int);
+INSERT INTO sr_cross_name VALUES ('abc', 0), (repeat('a', 63), 0);
+EXPLAIN (COSTS OFF) UPDATE sr_cross_name SET v = 1 WHERE k = 'abc'::text;
+UPDATE sr_cross_name SET v = 1 WHERE k = 'abc'::text;
+UPDATE sr_cross_name SET v = 1 WHERE k = repeat('a', 64);
+SELECT length(k), v FROM sr_cross_name ORDER BY k;
+
+-- Each single-row case above keeps the single-shard fast path.  Values that
+-- use the scan do not.
+CALL check_fast_path_txn('UPDATE sr_cross_int4 SET v = 6 WHERE k = 1::bigint', true);
+CALL check_fast_path_txn('UPDATE sr_cross_int4 SET v = 6 WHERE k = 1::smallint', true);
+CALL check_fast_path_txn('UPDATE sr_cross_int2 SET v = 6 WHERE k = 1::int', true);
+CALL check_fast_path_txn('UPDATE sr_cross_int2 SET v = 6 WHERE k = 1::bigint', true);
+CALL check_fast_path_txn('UPDATE sr_cross_int8 SET v = 6 WHERE k = 2::int', true);
+CALL check_fast_path_txn('UPDATE sr_cross_int8 SET v = 6 WHERE k = 2::smallint', true);
+CALL check_fast_path_txn('UPDATE sr_cross_part SET v = 6 WHERE k = 150::bigint', true);
+CALL check_fast_path_txn('UPDATE sr_cross_two SET v = 6 WHERE a = 1::bigint AND b = 1::bigint', true);
+CALL check_fast_path_txn('UPDATE sr_cross_mixed SET v = 6 WHERE a = 1::bigint AND b = 1::int AND c = ''x''::text', true);
+CALL check_fast_path_txn('UPDATE sr_cross_asc SET v = 6 WHERE k = 1::bigint', true);
+SET plan_cache_mode = force_generic_plan;
+PREPARE sr_cross_pf(bigint) AS UPDATE sr_cross_int4 SET v = 7 WHERE k = $1;
+CALL check_fast_path_txn('EXECUTE sr_cross_pf(1)', true);
+DEALLOCATE sr_cross_pf;
+PREPARE sr_cross_pwf(int) AS UPDATE sr_cross_int8 SET v = 7 WHERE k = $1;
+CALL check_fast_path_txn('EXECUTE sr_cross_pwf(2)', true);
+DEALLOCATE sr_cross_pwf;
+RESET plan_cache_mode;
+CALL check_fast_path_txn('UPDATE sr_cross_double SET v = 6 WHERE k = 1.5::real', false);
+CALL check_fast_path_txn('UPDATE sr_cross_text SET v = 6 WHERE k = ''abc''::name', false);
+CALL check_fast_path_txn('UPDATE sr_cross_real SET v = 6 WHERE k = 1.5::float8', false);
+CALL check_fast_path_txn('UPDATE sr_cross_date SET v = 6 WHERE k = ''2000-01-02''::timestamp', false);
+CALL check_fast_path_txn('UPDATE sr_cross_name SET v = 6 WHERE k = ''abc''::text', false);
+
+DROP TABLE sr_cross_int4, sr_cross_int2, sr_cross_int8, sr_cross_part, sr_cross_two,
+	sr_cross_mixed, sr_cross_asc, sr_cross_varchar, sr_cross_domain, sr_cross_double,
+	sr_cross_text, sr_cross_real, sr_cross_date, sr_cross_name;
+DROP DOMAIN sr_cross_dom;

@@ -55,6 +55,25 @@ typedef struct QueryDesc
 
 	/* This field is allocated by ExecutorStart if needed */
 	struct Instrumentation *query_instr;	/* query level instrumentation */
+
+	/*
+	 * YB_TODO_PG19MERGE: PG removed totaltime, added query_instr. Verify
+	 * if the YB comment below is still accurate and if any other changes are
+	 * needed.
+	 */
+	/*
+	 * YB: An additional instrumentation field to collect async RPC stats. This
+	 * needs to be a separate field because its life cycle is distinct from
+	 * that of 'totaltime'.
+	 */
+	struct NodeInstrumentation *yb_query_stats;
+
+	/*
+	 * YB: Set by PortalCleanup for PORTAL_ONE_SELECT to tell
+	 * standard_ExecutorFinish to skip its top-level session-stats capture.
+	 * The SELECT's stats were already captured at end of its ExecutorRun.
+	 */
+	bool		yb_skip_finish_capture;
 } QueryDesc;
 
 /* in pquery.c */
