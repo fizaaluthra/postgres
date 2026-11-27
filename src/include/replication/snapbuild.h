@@ -97,4 +97,6 @@ extern void SnapBuildSerializationPoint(SnapBuild *builder, XLogRecPtr lsn);
 
 extern bool SnapBuildSnapshotExists(XLogRecPtr lsn);
 
+/* YB */
+extern const char *YbSnapBuildExportSnapshotWithReadTime(uint64_t read_time);
 #endif							/* SNAPBUILD_H */

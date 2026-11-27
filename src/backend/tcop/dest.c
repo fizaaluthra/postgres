@@ -187,6 +187,7 @@ EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
 				pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
 			break;
 
+			yb_switch_fallthrough();
 		case DestNone:
 		case DestDebug:
 		case DestSPI:

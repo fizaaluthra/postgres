@@ -231,7 +231,9 @@ extern void logicalrep_write_update(StringInfo out, TransactionId xid,
 									Relation rel, TupleTableSlot *oldslot,
 									TupleTableSlot *newslot, bool binary,
 									Bitmapset *columns,
-									PublishGencolsType include_gencols_type);
+									PublishGencolsType include_gencols_type,
+									bool *yb_old_is_omitted,
+									bool *yb_new_is_omitted);
 extern LogicalRepRelId logicalrep_read_update(StringInfo in,
 											  bool *has_oldtuple, LogicalRepTupleData *oldtup,
 											  LogicalRepTupleData *newtup);

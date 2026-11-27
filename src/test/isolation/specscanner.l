@@ -77,6 +77,7 @@ session			{ return SESSION; }
 setup			{ return SETUP; }
 step			{ return STEP; }
 teardown		{ return TEARDOWN; }
+yb_never_waits	{ return YB_NEVER_WAITS; }
 
  /* Whitespace and comments */
 [\n]			{ yyline++; }
@@ -164,4 +165,15 @@ spec_yyerror(const char *message)
 {
 	fprintf(stderr, "%s at line %d\n", message, yyline);
 	exit(1);
+}
+
+void spec_scanner_finish(void)
+{
+	if (litbuf != NULL)
+	{
+		pfree(litbuf);
+		litbuf = NULL;
+		litbufpos = 0;
+		litbufsize = 0;
+	}
 }

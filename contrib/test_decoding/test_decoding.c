@@ -22,6 +22,9 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 PG_MODULE_MAGIC_EXT(
 					.name = "test_decoding",
 					.version = PG_VERSION
@@ -120,6 +123,11 @@ static void pg_decode_stream_truncate(LogicalDecodingContext *ctx,
 									  int nrelations, Relation relations[],
 									  ReorderBufferChange *change);
 
+
+static void yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid);
+
+static void yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity);
+
 void
 _PG_init(void)
 {
@@ -151,6 +159,12 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->stream_change_cb = pg_decode_stream_change;
 	cb->stream_message_cb = pg_decode_stream_message;
 	cb->stream_truncate_cb = pg_decode_stream_truncate;
+
+	if (IsYugaByteEnabled())
+	{
+		cb->yb_schema_change_cb = yb_pgoutput_schema_change;
+		cb->yb_support_yb_specifc_replica_identity_cb = yb_support_yb_specific_replica_identity;
+	}
 }
 
 
@@ -524,7 +538,8 @@ print_literal(StringInfo s, Oid typid, char *outputstr)
 
 /* print the tuple 'tuple' into the StringInfo s */
 static void
-tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_nulls)
+tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_nulls,
+					bool *yb_is_omitted)
 {
 	int			natt;
 
@@ -537,6 +552,8 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 		bool		typisvarlena;
 		Datum		origval;	/* possibly toasted Datum */
 		bool		isnull;		/* column is null? */
+
+		bool		yb_send_unchanged_toasted = false;
 
 		attr = TupleDescAttr(tupdesc, natt);
 
@@ -578,10 +595,14 @@ tuple_to_stringinfo(StringInfo s, TupleDesc tupdesc, HeapTuple tuple, bool skip_
 		/* print separator */
 		appendStringInfoChar(s, ':');
 
+		if (IsYugaByteEnabled())
+			yb_send_unchanged_toasted = yb_is_omitted && yb_is_omitted[natt];
+
 		/* print data */
-		if (isnull)
+		if (isnull && !yb_send_unchanged_toasted)
 			appendStringInfoString(s, "null");
-		else if (typisvarlena && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(origval)))
+		else if (yb_send_unchanged_toasted ||
+				 (typisvarlena && VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(origval))))
 			appendStringInfoString(s, "unchanged-toast-datum");
 		else if (!typisvarlena)
 			print_literal(s, typid,
@@ -644,7 +665,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			else
 				tuple_to_stringinfo(ctx->out, tupdesc,
 									change->data.tp.newtuple,
-									false);
+									false,
+									NULL /* yb_is_omitted */ );
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			appendStringInfoString(ctx->out, " UPDATE:");
@@ -653,7 +675,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				appendStringInfoString(ctx->out, " old-key:");
 				tuple_to_stringinfo(ctx->out, tupdesc,
 									change->data.tp.oldtuple,
-									true);
+									true,
+									NULL /* yb_is_omitted */ );
 				appendStringInfoString(ctx->out, " new-tuple:");
 			}
 
@@ -662,7 +685,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			else
 				tuple_to_stringinfo(ctx->out, tupdesc,
 									change->data.tp.newtuple,
-									false);
+									false,
+									change->data.tp.yb_new_is_omitted);
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
 			appendStringInfoString(ctx->out, " DELETE:");
@@ -674,7 +698,8 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			else
 				tuple_to_stringinfo(ctx->out, tupdesc,
 									change->data.tp.oldtuple,
-									true);
+									true,
+									NULL /* yb_is_omitted */ );
 			break;
 		default:
 			Assert(false);
@@ -1001,4 +1026,16 @@ pg_decode_stream_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	else
 		appendStringInfoString(ctx->out, "streaming truncate for transaction");
 	OutputPluginWrite(ctx, true);
+}
+
+static void
+yb_pgoutput_schema_change(LogicalDecodingContext *ctx, Oid relid)
+{
+	/* NOOP. */
+}
+
+static void
+yb_support_yb_specific_replica_identity(bool support_yb_specific_replica_identity)
+{
+	/* NOOP. */
 }

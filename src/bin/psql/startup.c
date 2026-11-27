@@ -1219,6 +1219,13 @@ hide_tableam_hook(const char *newval)
 	return ParseVariableBool(newval, "HIDE_TABLEAM", &pset.hide_tableam);
 }
 
+static bool
+yb_disable_error_prefix_hook(const char *newval)
+{
+	yb_set_should_log_filename(newval == NULL);
+	return true;
+}
+
 static void
 EstablishVariableSpace(void)
 {
@@ -1293,4 +1300,7 @@ EstablishVariableSpace(void)
 	SetVariableHooks(pset.vars, "WATCH_INTERVAL",
 					 watch_interval_substitute_hook,
 					 watch_interval_hook);
+	SetVariableHooks(pset.vars, "YB_DISABLE_ERROR_PREFIX",
+					 NULL,
+					 yb_disable_error_prefix_hook);
 }

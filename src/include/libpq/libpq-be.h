@@ -53,6 +53,9 @@ typedef struct
 #include "libpq/hba.h"
 #include "libpq/pqcomm.h"
 
+/* YB includes */
+#include "common/pg_yb_conn_mgr_protocol.h"
+
 
 /*
  * GSSAPI specific state information
@@ -163,6 +166,57 @@ typedef struct Port
 	 * Information that needs to be held during the authentication cycle.
 	 */
 	HbaLine    *hba;
+
+	/*
+	 * Whether yb-tserver to postgres authentication is used.  This information
+	 * needs to be saved separately from hba because hba gets deallocated after
+	 * the authentication cycle.
+	 */
+	bool		yb_is_tserver_auth_method;
+
+	/*
+	 * YB: To be used during Authentication, identifies whether authentication
+	 * is invoked due to Auth Passthrough Request packet.
+	 */
+	bool		yb_is_auth_passthrough_req;
+
+	/*
+	 * YB: Set to true once Authentication + GUC reporting is done,
+	 * regardless failure or success.
+	 * Skips remaining auth steps in case of failure and disables GUC reporting
+	 * during txn abort after auth attempt.
+	 */
+	bool		yb_has_auth_passthrough_finished;
+
+	/*
+	 * YB: To be used for the authentication of logical connections from the
+	 * connection manager either via auth passthrough or the special
+	 * authentication backend.
+	 * It identifies whether the logical connection is encrypted.
+	 */
+	bool		yb_is_ssl_enabled_in_logical_conn;
+
+	/*
+	 * YB: Set when a client certificate forwarded by the connection manager
+	 * (yb_ycm_internal_client_cert) fails to parse in be_tls_open_server().
+	 */
+	bool		yb_forwarded_cert_parse_failed;
+
+	/*
+	 * YB: tls-server-end-point hash of the certificate the connection manager
+	 * presented on the logical connection (yb_ycm_internal_server_cert_hash).
+	 * The length is 0 when it was not provided.  Stored inline since the
+	 * auth passthrough startup packet is parsed in a transaction context.
+	 */
+	uint8		yb_logical_conn_server_cert_hash[YB_SERVER_CERT_HASH_MAX_LEN];
+	int			yb_logical_conn_server_cert_hash_len;
+
+	/*
+	 * YB: W3C traceparent from the "yb_dist_traceparent" startup-packet param
+	 * (set by the tserver). Root span for backend init; read in InitPostgres.
+	 * NULL when absent.
+	 */
+	char	   *yb_dist_traceparent;
 
 	/*
 	 * TCP keepalive and user timeout settings.
@@ -292,9 +346,10 @@ extern int	be_tls_init(bool isServerStart);
 extern void be_tls_destroy(void);
 
 /*
- * Attempt to negotiate SSL connection.
+ * YB: Attempt to negotiate SSL connection. If yb_b64_client_cert_of_logical_conn is set,
+ * then only validate/parse the certificate of the logical connection created to conn mgr.
  */
-extern int	be_tls_open_server(Port *port);
+extern int	be_tls_open_server(Port *port, const char *yb_b64_client_cert_of_logical_conn);
 
 /*
  * Close SSL connection.

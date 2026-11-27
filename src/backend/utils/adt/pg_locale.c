@@ -56,6 +56,9 @@
 #include <shlwapi.h>
 #endif
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* Error triggered for locale-sensitive subroutines */
 #define		PGLOCALE_SUPPORT_ERROR(provider) \
 	elog(ERROR, "unsupported collprovider for %s: %c", __func__, provider)
@@ -82,6 +85,7 @@ extern pg_locale_t create_pg_locale_icu(Oid collid, MemoryContext context);
 /* pg_locale_libc.c */
 extern pg_locale_t create_pg_locale_libc(Oid collid, MemoryContext context);
 extern char *get_collation_actual_version_libc(const char *collcollate);
+extern void yb_set_libc_utf8_ctype(pg_locale_t locale, const char *ctype);
 
 /* GUC settings */
 char	   *locale_messages;
@@ -113,6 +117,26 @@ static struct pg_locale_struct c_locale = {
 	.deterministic = true,
 	.collate_is_c = true,
 	.ctype_is_c = true,
+};
+
+/*
+ * YB: On the PG side, the default locale has collate_is_c = true,
+ * ctype_is_c = false and the ctype methods point to the UTF-8 implementation.
+ * On the DocDB/YbGate side, init_database_collation() cannot be invoked (no syscache).
+ * This struct provides the equivalent default locale for DocDB so that
+ * DEFAULT_COLLATION_OID is safe for expression pushdown: C collate, and a
+ * libc UTF-8 ctype set up by YbgInitDefaultLocale() (falling back to C ctype
+ * if that locale is unavailable). PG only pushes down DEFAULT_COLLATION_OID
+ * expressions when the database uses the libc provider with C collate, a non-C
+ * ctype and UTF-8 encoding (see YBIsDbLocaleDefault). That check does not
+ * verify the ctype name, but libc databases can only use en_US.UTF-8 as a
+ * non-C ctype (see YbCheckUnsupportedLibcLocale).
+ */
+static struct pg_locale_struct yb_docdb_default_locale = {
+	.deterministic = true,
+	.collate_is_c = true,
+	.ctype_is_c = true,
+	.is_default = true,
 };
 
 /* Cache for collation-related knowledge */
@@ -1124,15 +1148,20 @@ create_pg_locale(Oid collid, MemoryContext context)
 	return result;
 }
 
-/*
- * Initialize default_locale with database locale settings.
- */
 void
 init_database_collation(void)
 {
 	HeapTuple	tup;
 	Form_pg_database dbform;
 	pg_locale_t result;
+
+	/*
+	 * YB: default_locale may already be set up on first use of the default
+	 * collation (see pg_newlocale_from_collation), e.g. during relcache
+	 * preloading.
+	 */
+	if (IsYugaByteEnabled() && default_locale != NULL)
+		return;
 
 	Assert(default_locale == NULL);
 
@@ -1191,6 +1220,16 @@ pg_newlocale_from_collation(Oid collid)
 	collation_cache_entry *cache_entry;
 	bool		found;
 
+	/*
+	 * YB: YbPresetDatabaseCollation runs before syscache lookups are safe, so
+	 * it cannot set up default_locale. Set it up on first use, which can be
+	 * before CheckMyDatabase, e.g. when relcache preloading builds the
+	 * partition descriptor of a table list-partitioned on a text column.
+	 */
+	if (IsYugaByteEnabled() && collid == DEFAULT_COLLATION_OID &&
+		default_locale == NULL && yb_default_collation_resolved)
+		init_database_collation();
+
 	if (collid == DEFAULT_COLLATION_OID)
 	{
 		/* should not happen: init_database_collation() not yet run */
@@ -1205,6 +1244,13 @@ pg_newlocale_from_collation(Oid collid)
 	 * access.
 	 */
 	if (collid == C_COLLATION_OID)
+		return &c_locale;
+
+	/*
+	 * YB: DocDB evaluates pushed-down expressions without catalog access.
+	 * POSIX behaves exactly like C, so resolve it the same way there.
+	 */
+	if (IsMultiThreadedMode() && collid == YB_POSIX_COLLATION_OID)
 		return &c_locale;
 
 	if (!OidIsValid(collid))
@@ -1225,8 +1271,18 @@ pg_newlocale_from_collation(Oid collid)
 	}
 
 	cache_entry = collation_cache_insert(CollationCache, collid, &found);
-	if (!found)
+
+	bool		yb_force_locale_lookup = yb_test_collation && YbIsClientYsqlConnMgr();
+
+	if (!found || yb_force_locale_lookup)
 	{
+		/*
+		 * YB: We leak a reference to the old cache_entry locale when yb_test_collation is true
+		 * as this flag is only a test flag and is visible to users and not supposed to be enabled
+		 * in regular usage. The only other way to hit this code path is on the first locale lookup,
+		 * when the cache_entry is not populated, so no risk of leaking any memory there.
+		 */
+
 		/*
 		 * Make sure cache entry is marked invalid, in case we fail before
 		 * setting things.
@@ -1263,6 +1319,27 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 	else if (collprovider == COLLPROVIDER_LIBC)
 		collversion = get_collation_actual_version_libc(collcollate);
 
+	/* MacOS specific YB change to make unit test results stable. */
+	if (IsYugaByteEnabled())
+	{
+#ifdef __APPLE__
+		if (!collversion &&
+			yb_test_collation &&
+			collprovider == COLLPROVIDER_LIBC &&
+			pg_strcasecmp("C", collcollate) != 0 &&
+			pg_strncasecmp("C.", collcollate, 2) != 0 &&
+			pg_strcasecmp("POSIX", collcollate) != 0)
+			collversion = "2.28";
+#endif
+	}
+
+	/*
+	 * Make unit test output stable across different OS types and versions.
+	 * The builtin provider's version does not depend on the OS, so leave it
+	 * as is.
+	 */
+	if (yb_test_collation && collprovider != COLLPROVIDER_BUILTIN)
+		return collversion ? "yb-test-2.28" : NULL;
 	return collversion;
 }
 
@@ -1967,4 +2044,29 @@ icu_validate_locale(const char *loc_str)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("ICU is not supported in this build")));
 #endif							/* not USE_ICU */
+}
+
+/*
+ * Point default_locale at yb_docdb_default_locale for DocDB/YbGate.
+ *
+ * The ctype matches the one YB initdb uses for databases (see setlocales in
+ * initdb.c), so that ctype-dependent ops such as UPPER give the same results
+ * whether evaluated in PG or pushed down to DocDB.
+ */
+void
+YbgInitDefaultLocale(void)
+{
+	Assert(IsMultiThreadedMode());
+	Assert(default_locale == NULL || default_locale == &yb_docdb_default_locale);
+
+	if (yb_docdb_default_locale.ctype_is_c)
+		yb_set_libc_utf8_ctype(&yb_docdb_default_locale, "en_US.UTF-8");
+	default_locale = &yb_docdb_default_locale;
+
+	/*
+	 * YbGate does not run InitializeGUCOptions(), so these GUC-backed
+	 * variables would otherwise stay NULL.  Assign their boot_val.
+	 */
+	locale_monetary = "C";
+	locale_numeric = "C";
 }

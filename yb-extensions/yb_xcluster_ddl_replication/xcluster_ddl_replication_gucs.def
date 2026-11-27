@@ -1,0 +1,48 @@
+/* Copyright (c) YugabyteDB, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ * use this file except in compliance with the License.  You may obtain a copy
+ * of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+/*
+ * List of GUC variables captured during xCluster DDL replication.
+ * These all need to be lowercase.
+ */
+
+/*
+ * This affects how unqualified names in the DDL are resolved (types, functions,
+ * operator classes, tables, ...), not just which schema new objects land in.
+ */
+X("search_path")
+/* This affects what tablespace a table is created in. */
+X("default_tablespace")
+/* This affects whether a table is range or hash started. */
+X("yb_use_hash_splitting_by_default")
+
+/* Settings that affect parsing of dates, times, and intervals. */
+X("datestyle")
+X("timezone")
+X("intervalstyle")
+/* Settings that affect parsing of function bodies. */
+X("check_function_bodies")
+
+/*
+ * This affects whether REFRESH MATERIALIZED VIEW rewrites the materialized
+ * view or updates it in place.
+ */
+X("yb_refresh_matview_in_place")
+
+/*
+ * This affects whether a typmod-only ALTER COLUMN TYPE reuses expression and
+ * partial indexes or rebuilds them with new relfilenodes.
+ */
+X("yb_alter_type_reuse_expr_and_partial_indexes")

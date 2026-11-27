@@ -43,6 +43,26 @@
 #define DATUM_SORT		2
 #define CLUSTER_SORT	3
 
+const char *
+yb_sort_type_name(int sort_type)
+{
+	switch (sort_type)
+	{
+		case YB_SORT_UNINITIALIZED:
+			return "uninitialized";
+		case HEAP_SORT:
+			return "heap";
+		case INDEX_SORT:
+			return "index";
+		case DATUM_SORT:
+			return "datum";
+		case CLUSTER_SORT:
+			return "cluster";
+		default:
+			return "unknown";
+	}
+}
+
 static void removeabbrev_heap(Tuplesortstate *state, SortTuple *stups,
 							  int count);
 static void removeabbrev_cluster(Tuplesortstate *state, SortTuple *stups,
@@ -190,6 +210,8 @@ tuplesort_begin_heap(TupleDesc tupDesc,
 	MemoryContext oldcontext;
 	int			i;
 
+	base->yb_sort_type = HEAP_SORT;
+
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 
 	Assert(nkeys > 0);
@@ -264,7 +286,10 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 	TuplesortClusterArg *arg;
 	int			i;
 
-	Assert(indexRel->rd_rel->relam == BTREE_AM_OID);
+	base->yb_sort_type = CLUSTER_SORT;
+
+	Assert(indexRel->rd_rel->relam == BTREE_AM_OID ||
+		   indexRel->rd_rel->relam == LSM_AM_OID);
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = palloc0_object(TuplesortClusterArg);
@@ -373,6 +398,8 @@ tuplesort_begin_index_btree(Relation heapRel,
 	MemoryContext oldcontext;
 	int			i;
 
+	base->yb_sort_type = INDEX_SORT;
+
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = palloc_object(TuplesortIndexBTreeArg);
 
@@ -454,6 +481,8 @@ tuplesort_begin_index_hash(Relation heapRel,
 	MemoryContext oldcontext;
 	TuplesortIndexHashArg *arg;
 
+	base->yb_sort_type = INDEX_SORT;
+
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = palloc_object(TuplesortIndexHashArg);
 
@@ -502,6 +531,8 @@ tuplesort_begin_index_gist(Relation heapRel,
 	MemoryContext oldcontext;
 	TuplesortIndexBTreeArg *arg;
 	int			i;
+
+	base->yb_sort_type = INDEX_SORT;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = palloc_object(TuplesortIndexBTreeArg);
@@ -677,6 +708,8 @@ tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 	MemoryContext oldcontext;
 	int16		typlen;
 	bool		typbyval;
+
+	base->yb_sort_type = DATUM_SORT;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
 	arg = palloc_object(TuplesortDatumArg);

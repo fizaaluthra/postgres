@@ -18,6 +18,18 @@
 #include "miscadmin.h"
 #include "utils/datum.h"
 
+/* YB includes */
+#include "nodes/ybbitmatrix.h"
+
+/*
+ * YB: YB node support is generated from the headers, except for
+ * YbUpdateAffectedEntities (YbBitMatrix) and YbBatchedNestLoop
+ * (hashClauseInfos, an array of non-node structs holding Exprs).  Their
+ * hand-written functions are here and in outfuncs.c and readfuncs.c;
+ * YbUpdateAffectedEntities also has one in equalfuncs.c (plan nodes are
+ * no_equal).
+ */
+
 
 /*
  * Macros to simplify copying of different kinds of fields.  Use these
@@ -166,6 +178,77 @@ _copyBitmapset(const Bitmapset *from)
 	return bms_copy(from);
 }
 
+/* YB: custom copy for YbUpdateAffectedEntities due to YbCopyBitMatrix */
+static YbUpdateAffectedEntities *
+_copyYbUpdateAffectedEntities(const YbUpdateAffectedEntities *from)
+{
+	YbUpdateAffectedEntities *newnode = makeNode(YbUpdateAffectedEntities);
+
+	COPY_POINTER_FIELD(entity_list, from->matrix.ncols * sizeof(struct YbUpdateEntity));
+	COPY_POINTER_FIELD(col_info_list, from->matrix.nrows * sizeof(struct YbUpdateColInfo));
+	YbCopyBitMatrix(&newnode->matrix, &from->matrix);
+
+	return newnode;
+}
+
+/*
+ * YB: custom copy for YbBatchedNestLoop due to pointer arrays needing deep copy.
+ * Inherited Plan/Join/NestLoop fields are listed by hand: keep them in sync
+ * with plannodes.h.
+ */
+static YbBatchedNestLoop *
+_copyYbBatchedNestLoop(const YbBatchedNestLoop *from)
+{
+	YbBatchedNestLoop *newnode = makeNode(YbBatchedNestLoop);
+
+	COPY_SCALAR_FIELD(nl.join.plan.disabled_nodes);
+	COPY_SCALAR_FIELD(nl.join.plan.startup_cost);
+	COPY_SCALAR_FIELD(nl.join.plan.total_cost);
+	COPY_SCALAR_FIELD(nl.join.plan.plan_rows);
+	COPY_SCALAR_FIELD(nl.join.plan.plan_width);
+	COPY_SCALAR_FIELD(nl.join.plan.parallel_aware);
+	COPY_SCALAR_FIELD(nl.join.plan.parallel_safe);
+	COPY_SCALAR_FIELD(nl.join.plan.async_capable);
+	COPY_SCALAR_FIELD(nl.join.plan.plan_node_id);
+	COPY_NODE_FIELD(nl.join.plan.targetlist);
+	COPY_NODE_FIELD(nl.join.plan.qual);
+	COPY_NODE_FIELD(nl.join.plan.lefttree);
+	COPY_NODE_FIELD(nl.join.plan.righttree);
+	COPY_NODE_FIELD(nl.join.plan.initPlan);
+	COPY_BITMAPSET_FIELD(nl.join.plan.extParam);
+	COPY_BITMAPSET_FIELD(nl.join.plan.allParam);
+	COPY_STRING_FIELD(nl.join.plan.ybHintAlias);
+	COPY_SCALAR_FIELD(nl.join.plan.ybUniqueId);
+	COPY_STRING_FIELD(nl.join.plan.ybInheritedHintAlias);
+	COPY_SCALAR_FIELD(nl.join.plan.ybIsHinted);
+	COPY_SCALAR_FIELD(nl.join.plan.ybHasHintedUid);
+	COPY_SCALAR_FIELD(nl.join.plan.ybReadAheadCapable);
+	COPY_SCALAR_FIELD(nl.join.jointype);
+	COPY_SCALAR_FIELD(nl.join.inner_unique);
+	COPY_NODE_FIELD(nl.join.joinqual);
+	COPY_NODE_FIELD(nl.nestParams);
+	COPY_SCALAR_FIELD(first_batch_size);
+	COPY_SCALAR_FIELD(num_hashClauseInfos);
+	if (from->num_hashClauseInfos > 0)
+		COPY_POINTER_FIELD(hashClauseInfos,
+						   from->num_hashClauseInfos * sizeof(YbBNLHashClauseInfo));
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].innerHashExpr =
+			(Expr *) copyObject(from->hashClauseInfos[i].innerHashExpr);
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].outerParamExpr =
+			(Expr *) copyObject(from->hashClauseInfos[i].outerParamExpr);
+	for (int i = 0; i < from->num_hashClauseInfos; i++)
+		newnode->hashClauseInfos[i].orig_expr =
+			(Expr *) copyObject(from->hashClauseInfos[i].orig_expr);
+	COPY_SCALAR_FIELD(numSortCols);
+	COPY_POINTER_FIELD(sortColIdx, from->numSortCols * sizeof(AttrNumber));
+	COPY_POINTER_FIELD(sortOperators, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(collations, from->numSortCols * sizeof(Oid));
+	COPY_POINTER_FIELD(nullsFirst, from->numSortCols * sizeof(bool));
+
+	return newnode;
+}
 
 /*
  * copyObjectImpl -- implementation of copyObject(); see nodes/nodes.h

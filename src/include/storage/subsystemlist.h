@@ -87,3 +87,9 @@ PG_SHMEM_SUBSYSTEM(LogicalDecodingCtlShmemCallbacks)
 
 /* AIO subsystem. This delegates to the method-specific callbacks */
 PG_SHMEM_SUBSYSTEM(AioShmemCallbacks)
+
+/* YB subsystems */
+PG_SHMEM_SUBSYSTEM(YbAshShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(YbQueryDiagnosticsShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(YbTerminatedQueriesShmemCallbacks)
+PG_SHMEM_SUBSYSTEM(YbQpmShmemCallbacks)

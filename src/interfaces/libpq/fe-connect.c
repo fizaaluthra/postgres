@@ -234,7 +234,8 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 		"Database-Host-IP-Address", "", 45,
 	offsetof(struct pg_conn, pghostaddr)},
 
-	{"port", "PGPORT", DEF_PGPORT_STR, NULL,
+	/* Use YugaByte default port */
+	{"port", "PGPORT", DEF_YBPORT_STR, NULL,
 		"Database-Port", "", 6,
 	offsetof(struct pg_conn, pgport)},
 
@@ -415,6 +416,24 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 	{"sslkeylogfile", NULL, NULL, NULL,
 		"SSL-Key-Log-File", "D", 64,
 	offsetof(struct pg_conn, sslkeylogfile)},
+
+	/*
+	 * Wire name of one of the YbInternalConnKind values (see
+	 * src/include/yb_internal_conn.h). The tserver sets this on connections
+	 * it opens to its own postgres so the backend knows which dedicated
+	 * BackendType to take on (and which preload/auth behavior to apply).
+	 */
+	{"yb_internal_conn_kind", NULL, NULL, NULL,
+		"YB-Internal-Conn-Kind", "", 32,
+	offsetof(struct pg_conn, yb_internal_conn_kind)},
+
+	/*
+	 * W3C traceparent set on any connection that carries a trace context, used
+	 * as the root span for backend init and queries.
+	 */
+	{"yb_dist_traceparent", NULL, NULL, NULL,
+		"YB-Dist-Traceparent", "", 64,
+	offsetof(struct pg_conn, yb_dist_traceparent)},
 
 	/* Terminating entry --- MUST BE LAST */
 	{NULL, NULL, NULL, NULL,
@@ -1337,6 +1356,10 @@ pqConnectOptions2(PGconn *conn)
 		{
 			free(ch->host);
 
+/* YugaByte use localhost instead of local socket */
+#pragma push_macro("HAVE_UNIX_SOCKETS")
+#undef HAVE_UNIX_SOCKETS
+
 			/*
 			 * This bit selects the default host location.  If you change
 			 * this, see also pg_regress.
@@ -1351,6 +1374,10 @@ pqConnectOptions2(PGconn *conn)
 				ch->host = strdup(DefaultHost);
 				ch->type = CHT_HOST_NAME;
 			}
+
+#pragma pop_macro("HAVE_UNIX_SOCKETS")
+/* YugaByte end */
+
 			if (ch->host == NULL)
 				goto oom_error;
 		}
@@ -1405,7 +1432,8 @@ pqConnectOptions2(PGconn *conn)
 	if (conn->pguser == NULL || conn->pguser[0] == '\0')
 	{
 		free(conn->pguser);
-		conn->pguser = pg_fe_getauthname(&conn->errorMessage);
+		/* YugaByte default username to "postgres" */
+		conn->pguser = strdup("postgres");
 		if (!conn->pguser)
 		{
 			conn->status = CONNECTION_BAD;
@@ -1419,7 +1447,7 @@ pqConnectOptions2(PGconn *conn)
 	if (conn->dbName == NULL || conn->dbName[0] == '\0')
 	{
 		free(conn->dbName);
-		conn->dbName = strdup(conn->pguser);
+		conn->dbName = strdup("yugabyte");
 		if (!conn->dbName)
 			goto oom_error;
 	}
@@ -2442,7 +2470,8 @@ emitHostIdentityInfo(PGconn *conn, const char *host_addr)
 			displayed_host = conn->connhost[conn->whichhost].host;
 		displayed_port = conn->connhost[conn->whichhost].port;
 		if (displayed_port == NULL || displayed_port[0] == '\0')
-			displayed_port = DEF_PGPORT_STR;
+			/* Use YugaByte default port */
+			displayed_port = DEF_YBPORT_STR;
 
 		/*
 		 * If the user did not supply an IP address using 'hostaddr', and
@@ -3049,7 +3078,8 @@ keep_going:						/* We will come back to here until there is
 
 		/* Figure out the port number we're going to use. */
 		if (ch->port == NULL || ch->port[0] == '\0')
-			thisport = DEF_PGPORT;
+			/* Use YugaByte default port */
+			thisport = DEF_YBPORT;
 		else
 		{
 			if (!pqParseIntParam(ch->port, &thisport, conn, "port"))
@@ -5144,6 +5174,8 @@ freePGconn(PGconn *conn)
 	free(conn->inBuffer);
 	free(conn->outBuffer);
 	free(conn->rowBuf);
+	free(conn->yb_internal_conn_kind);
+	free(conn->yb_dist_traceparent);
 	termPQExpBuffer(&conn->errorMessage);
 	termPQExpBuffer(&conn->workBuffer);
 
@@ -6752,7 +6784,18 @@ conninfo_add_defaults(PQconninfoOption *options, PQExpBuffer errorMessage)
 		 */
 		if (strcmp(option->keyword, "user") == 0)
 		{
-			option->val = pg_fe_getauthname(NULL);
+			/* Yugabyte default username to "yugabyte" */
+			option->val = strdup("yugabyte");
+			continue;
+		}
+
+		/*
+		 * YB: Special handling for "dbname" option.
+		 */
+		if (strcmp(option->keyword, "dbname") == 0)
+		{
+			/* Yugabyte default dbname to "yugabyte" */
+			option->val = strdup("yugabyte");
 			continue;
 		}
 	}
@@ -7970,7 +8013,8 @@ passwordFromFile(const char *hostname, const char *port,
 			hostname = DefaultHost;
 
 	if (port == NULL || port[0] == '\0')
-		port = DEF_PGPORT_STR;
+		/* Use YugaByte default port */
+		port = DEF_YBPORT_STR;
 
 	/* If password file cannot be opened, ignore it. */
 	fp = fopen(pgpassfile, "r");

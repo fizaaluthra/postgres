@@ -604,6 +604,7 @@ make_expanded_record_from_datum(Datum recorddatum, MemoryContext parentcontext)
 	ItemPointerSetInvalid(&(tmptup.t_self));
 	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = tuphdr;
+	HEAPTUPLE_YBCTID(&tmptup) = 0;
 
 	/* Composite datums must not contain out-of-line field values */
 	Assert(!HeapTupleHeaderHasExternal(tuphdr));

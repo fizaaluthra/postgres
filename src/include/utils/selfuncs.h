@@ -255,4 +255,16 @@ extern Selectivity scalararraysel_containment(PlannerInfo *root,
 											  Oid elemtype, bool isEquality, bool useOr,
 											  int varRelid);
 
+/* YB */
+extern double yb_estimate_num_groups(PlannerInfo *root, List *groupExprs,
+									 double input_rows, List **pgset,
+									 EstimationInfo *estinfo);
+extern int	yb_batch_expr_size(PlannerInfo *root,
+							   Index path_relid,
+							   Node *batched_expr);
+extern double yb_bnl_outer_skip_selectivity(PlannerInfo *root, Node *clause,
+											 Oid opfamily, CompareType cmptype,
+											 Relids outer_relids);
+double		get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids);
+
 #endif							/* SELFUNCS_H */

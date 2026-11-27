@@ -124,6 +124,16 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
+
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/util/ybc_guc.h"
+#include "yb/yql/pggate/util/ybc_util.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+#include <inttypes.h>
 
 
 /*
@@ -242,6 +252,13 @@ ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snap)
 	ResourceOwnerForget(owner, PointerGetDatum(snap), &snapshot_resowner_desc);
 }
 
+/* YB declarations */
+static void YbResetReadPoint(void);
+static YbcReadPointHandle YbGetOldestReadPointHandle(void);
+static void YbNoteReadPointAdded(YbOptionalReadPointHandle handle);
+static void YbNoteReadPointRemoved(YbOptionalReadPointHandle handle);
+static void YbPublishOldestReadPointIfChanged(void);
+
 /*
  * Snapshot fields to be serialized.
  *
@@ -257,7 +274,113 @@ typedef struct SerializedSnapshotData
 	bool		suboverflowed;
 	bool		takenDuringRecovery;
 	CommandId	curcid;
+	YbOptionalReadPointHandle yb_read_point_handle;
 } SerializedSnapshotData;
+
+void
+YBCheckSnapshotsAllowed(bool check_isolation_level)
+{
+	if (!yb_enable_pg_export_snapshot)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cannot export or import snapshot when "
+						"ysql_yb_enable_pg_export_snapshot is disabled.")));
+
+	if (check_isolation_level)
+	{
+		switch (XactIsoLevel)
+		{
+				/*
+				 * Currently in YSQL, export & import is allowed only in REPEATABLE READ.
+				 */
+			case XACT_READ_COMMITTED:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot export/import snapshot in READ COMMITTED Isolation Level")));
+				break;
+			case XACT_SERIALIZABLE:
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot export/import snapshot in SERIALIZABLE Isolation Level")));
+				break;
+		}
+	}
+
+	if (XactDeferrable)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export/import snapshot in DEFERRABLE transaction")));
+
+	if (YbIsBatchedExecution())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot export/import a snapshot in Batch Execution.")));
+}
+
+void
+YbInitSnapshot(Snapshot snap, YbOptionalReadPointHandle read_point_handle)
+{
+	snap->xmin = FirstNormalTransactionId;
+	snap->xmax = FirstNormalTransactionId;
+	snap->xcnt = 0;
+	snap->subxcnt = 0;
+	snap->suboverflowed = false;
+	snap->takenDuringRecovery = false;
+	snap->snapshot_type = SNAPSHOT_MVCC;
+	snap->yb_read_point_handle = read_point_handle;
+	snap->yb_is_built_for_export = false;
+}
+
+static int
+YbSnapshotMgmtLogLevel()
+{
+	return yb_debug_log_snapshot_mgmt ? LOG : DEBUG2;
+}
+
+static void
+YBCOnActiveSnapshotChange()
+{
+	const SnapshotData *snap = ActiveSnapshot ? ActiveSnapshot->as_snap : NULL;
+
+	if (snap &&
+		snap->yb_read_point_handle.has_value)
+	{
+		YbcReadPointHandle current_read_point = YBCPgGetCurrentReadPoint();
+
+		if (snap->yb_read_point_handle.value == current_read_point)
+		{
+			elog(YbSnapshotMgmtLogLevel(),
+				 "Avoid restoring read point since it is already set to %" PRIu64, current_read_point);
+			return;
+		}
+		HandleYBStatus(YBCPgRestoreReadPoint(snap->yb_read_point_handle.value));
+	}
+}
+
+void
+YbLogSnapshotData(const char *msg, const SnapshotData *snap, bool log_stack_trace)
+{
+	elog(YbSnapshotMgmtLogLevel(),
+		 "%s %s read point: %" PRIu64 ", effective isolation level: %d. %s",
+		 msg,
+		 snap->yb_is_catalog_snapshot ? "(catalog)" : "(regular)",
+		 snap->yb_read_point_handle.has_value ? snap->yb_read_point_handle.value : 0,
+		 YBGetEffectivePggateIsolationLevel(),
+		 log_stack_trace ? YBCGetStackTrace() : "");
+}
+
+static void
+YbLogActiveSnapshot(const char *msg, ActiveSnapshotElt *active_snapshot, bool log_stack_trace)
+{
+	if (!active_snapshot)
+	{
+		elog(YbSnapshotMgmtLogLevel(), "%s: <none>", msg);
+		return;
+	}
+
+	elog(YbSnapshotMgmtLogLevel(), "Snapshot operation at level: %d", active_snapshot->as_level);
+	YbLogSnapshotData(msg, active_snapshot->as_snap, log_stack_trace);
+}
 
 /*
  * GetTransactionSnapshot
@@ -326,9 +449,14 @@ GetTransactionSnapshot(void)
 			/* Mark it as "registered" in FirstXactSnapshot */
 			FirstXactSnapshot->regd_count++;
 			pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+			YbNoteReadPointAdded(FirstXactSnapshot->yb_read_point_handle);
+			YbPublishOldestReadPointIfChanged();
 		}
 		else
 			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+		elog(YbSnapshotMgmtLogLevel(),
+			"Creating first snapshot in txn (snapshot read point: %" PRIu64 ", catalog read point: %" PRIu64 ")",
+			CurrentSnapshot->yb_read_point_handle.value, CatalogSnapshotData.yb_read_point_handle.value);
 
 		FirstSnapshotSet = true;
 		return CurrentSnapshot;
@@ -341,6 +469,9 @@ GetTransactionSnapshot(void)
 	InvalidateCatalogSnapshot();
 
 	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+	elog(YbSnapshotMgmtLogLevel(),
+		"Recreating snapshot for next statement in txn (snapshot read point: %" PRIu64 ", catalog read point: %" PRIu64 ")",
+		CurrentSnapshot->yb_read_point_handle.value, CatalogSnapshotData.yb_read_point_handle.value);
 
 	return CurrentSnapshot;
 }
@@ -391,6 +522,7 @@ GetCatalogSnapshot(Oid relid)
 	 * This is the primary reason for needing to reset the system caches after
 	 * finishing decoding.
 	 */
+	elog(YbSnapshotMgmtLogLevel(), "GetCatalogSnapshot: relid: %d", relid);
 	if (HistoricSnapshotActive())
 		return HistoricSnapshot;
 
@@ -421,6 +553,7 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 	if (CatalogSnapshot == NULL)
 	{
 		/* Get new snapshot. */
+		CatalogSnapshotData.yb_is_catalog_snapshot = true;
 		CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData);
 
 		/*
@@ -436,6 +569,8 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 		 * CatalogSnapshot pointer is already valid.
 		 */
 		pairingheap_add(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
+		YbNoteReadPointAdded(CatalogSnapshot->yb_read_point_handle);
+		YbPublishOldestReadPointIfChanged();
 	}
 
 	return CatalogSnapshot;
@@ -454,11 +589,17 @@ GetNonHistoricCatalogSnapshot(Oid relid)
 void
 InvalidateCatalogSnapshot(void)
 {
+	elog(YbSnapshotMgmtLogLevel(), "InvalidateCatalogSnapshot %s",
+		yb_debug_log_snapshot_mgmt_stack_trace ? YBCGetStackTrace() : "");
 	if (CatalogSnapshot)
 	{
+		YbOptionalReadPointHandle yb_read_point = CatalogSnapshot->yb_read_point_handle;
+
 		pairingheap_remove(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
 		CatalogSnapshot = NULL;
 		SnapshotResetXmin();
+		YbNoteReadPointRemoved(yb_read_point);
+		YbPublishOldestReadPointIfChanged();
 		INJECTION_POINT("invalidate-catalog-snapshot-end", NULL);
 	}
 }
@@ -549,6 +690,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 	/* NB: curcid should NOT be copied, it's a local matter */
 
 	CurrentSnapshot->snapXactCompletionCount = 0;
+	CurrentSnapshot->yb_read_point_handle = sourcesnap->yb_read_point_handle;
 
 	/*
 	 * Now we have to fix what GetSnapshotData did with MyProc->xmin and
@@ -569,7 +711,14 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 					 errmsg("could not import the requested snapshot"),
 					 errdetail("The source transaction is not running anymore.")));
 	}
-	else if (!ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcevxid))
+	/*
+	 * YB: ProcArrayInstallImportedXmin sets MyProc->xmin and also checks if
+	 * exporting snapshot is alive. In YugabyteDB, we do not need to set xmin
+	 * and also expiry of the exported snapshot has to be checked via an rpc to
+	 * master. So this step is skipped for YugabyteDB.
+	 */
+	else if (!IsYugaByteEnabled() &&
+			 !ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcevxid))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("could not import the requested snapshot"),
@@ -592,6 +741,8 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
 		/* Mark it as "registered" in FirstXactSnapshot */
 		FirstXactSnapshot->regd_count++;
 		pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+		YbNoteReadPointAdded(FirstXactSnapshot->yb_read_point_handle);
+		YbPublishOldestReadPointIfChanged();
 	}
 
 	FirstSnapshotSet = true;
@@ -718,6 +869,11 @@ PushActiveSnapshotWithLevel(Snapshot snapshot, int snap_level)
 	newactive->as_snap->active_count++;
 
 	ActiveSnapshot = newactive;
+	YbLogActiveSnapshot("Pushed new active snapshot: ",
+						ActiveSnapshot, yb_debug_log_snapshot_mgmt_stack_trace);
+	YBCOnActiveSnapshotChange();
+	YbNoteReadPointAdded(ActiveSnapshot->as_snap->yb_read_point_handle);
+	YbPublishOldestReadPointIfChanged();
 }
 
 /*
@@ -776,9 +932,18 @@ PopActiveSnapshot(void)
 {
 	ActiveSnapshotElt *newstack;
 
+	/* YB declarations */
+	YbOptionalReadPointHandle yb_read_point;
+
 	newstack = ActiveSnapshot->as_next;
 
 	Assert(ActiveSnapshot->as_snap->active_count > 0);
+
+	YbLogActiveSnapshot("Pop active snapshot: ",
+						ActiveSnapshot, yb_debug_log_snapshot_mgmt_stack_trace);
+
+	/* Read before the snapshot can be freed below. */
+	yb_read_point = ActiveSnapshot->as_snap->yb_read_point_handle;
 
 	ActiveSnapshot->as_snap->active_count--;
 
@@ -789,7 +954,19 @@ PopActiveSnapshot(void)
 	pfree(ActiveSnapshot);
 	ActiveSnapshot = newstack;
 
+	YbLogActiveSnapshot("Active snapshot after pop: ", ActiveSnapshot, false /* log_stack_trace */ );
+
 	SnapshotResetXmin();
+	YBCOnActiveSnapshotChange();
+	YbNoteReadPointRemoved(yb_read_point);
+	YbPublishOldestReadPointIfChanged();
+}
+
+void
+PopAllActiveSnapshots()
+{
+	while (ActiveSnapshot)
+		PopActiveSnapshot();
 }
 
 /*
@@ -850,7 +1027,14 @@ RegisterSnapshotOnOwner(Snapshot snapshot, ResourceOwner owner)
 	ResourceOwnerRememberSnapshot(owner, snap);
 
 	if (snap->regd_count == 1)
+	/*
+	 * YB: Update read point after registering snapshot.
+	 */
+	{
 		pairingheap_add(&RegisteredSnapshots, &snap->ph_node);
+		YbNoteReadPointAdded(snap->yb_read_point_handle);
+		YbPublishOldestReadPointIfChanged();
+	}
 
 	return snap;
 }
@@ -893,7 +1077,14 @@ UnregisterSnapshotNoOwner(Snapshot snapshot)
 
 	snapshot->regd_count--;
 	if (snapshot->regd_count == 0)
+	/*
+	 * YB: Update read point after unregistering snapshot.
+	 */
+	{
 		pairingheap_remove(&RegisteredSnapshots, &snapshot->ph_node);
+		YbNoteReadPointRemoved(snapshot->yb_read_point_handle);
+		YbPublishOldestReadPointIfChanged();
+	}
 
 	if (snapshot->regd_count == 0 && snapshot->active_count == 0)
 	{
@@ -988,12 +1179,17 @@ AtSubAbort_Snapshot(int level)
 
 		next = ActiveSnapshot->as_next;
 
+		YbNoteReadPointRemoved(ActiveSnapshot->as_snap->yb_read_point_handle);
+
 		/*
 		 * Decrement the snapshot's active count.  If it's still registered or
 		 * marked as active by an outer subtransaction, we can't free it yet.
 		 */
 		Assert(ActiveSnapshot->as_snap->active_count >= 1);
 		ActiveSnapshot->as_snap->active_count -= 1;
+
+		YbLogActiveSnapshot("Pop active snapshot for subtransaction abort",
+							ActiveSnapshot, yb_debug_log_snapshot_mgmt_stack_trace);
 
 		if (ActiveSnapshot->as_snap->active_count == 0 &&
 			ActiveSnapshot->as_snap->regd_count == 0)
@@ -1003,9 +1199,13 @@ AtSubAbort_Snapshot(int level)
 		pfree(ActiveSnapshot);
 
 		ActiveSnapshot = next;
+		YbLogActiveSnapshot("Active after pop for subtransaction abort",
+							ActiveSnapshot, false /* log_stack_trace */ );
 	}
 
 	SnapshotResetXmin();
+	YBCOnActiveSnapshotChange();
+	YbPublishOldestReadPointIfChanged();
 }
 
 /*
@@ -1029,12 +1229,16 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 		Assert(FirstXactSnapshot->regd_count > 0);
 		Assert(!pairingheap_is_empty(&RegisteredSnapshots));
 		pairingheap_remove(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
+		YbNoteReadPointRemoved(FirstXactSnapshot->yb_read_point_handle);
 	}
 	FirstXactSnapshot = NULL;
 
 	/*
 	 * If we exported any snapshots, clean them up.
 	 */
+	if (IsYugaByteEnabled())
+		YBCPgClearExportedTxnSnapshots();
+
 	if (exportedSnapshots != NIL)
 	{
 		ListCell   *lc;
@@ -1060,6 +1264,7 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 
 			pairingheap_remove(&RegisteredSnapshots,
 							   &esnap->snapshot->ph_node);
+			YbNoteReadPointRemoved(esnap->snapshot->yb_read_point_handle);
 		}
 
 		exportedSnapshots = NIL;
@@ -1087,6 +1292,7 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 	 */
 	ActiveSnapshot = NULL;
 	pairingheap_reset(&RegisteredSnapshots);
+	YbResetReadPoint();
 
 	CurrentSnapshot = NULL;
 	SecondarySnapshot = NULL;
@@ -1102,14 +1308,31 @@ AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 		SnapshotResetXmin();
 
 	Assert(resetXmin || MyProc->xmin == 0);
+
+	YbPublishOldestReadPointIfChanged();
 }
 
+static char *
+YBCExportSnapshot(const YbcReadPointHandle *read_point)
+{
+	char	   *snapshot_id = NULL;
+	YbcPgTxnSnapshot snapshot =
+	{.db_id = MyDatabaseId,
+		.iso_level = XactIsoLevel,
+	.read_only = XactReadOnly};
+
+	HandleYBStatus(YBCPgExportSnapshot(&snapshot, &snapshot_id, read_point));
+	return snapshot_id;
+}
 
 /*
  * ExportSnapshot
  *		Export the snapshot to a file so that other backends can import it.
  *		Returns the token (the file name) that can be used to import this
  *		snapshot.
+ *
+ * YB Note:
+ * Returns snapshot_id that can be used to import this snapshot.
  */
 char *
 ExportSnapshot(Snapshot snapshot)
@@ -1127,6 +1350,9 @@ ExportSnapshot(Snapshot snapshot)
 	MemoryContext oldcxt;
 	char		path[MAXPGPATH];
 	char		pathtmp[MAXPGPATH];
+
+	if (IsYugaByteEnabled())
+		YBCheckSnapshotsAllowed(true /* check_isolation_level */ );
 
 	/*
 	 * It's tempting to call RequireTransactionBlock here, since it's not very
@@ -1157,6 +1383,10 @@ ExportSnapshot(Snapshot snapshot)
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("cannot export a snapshot from a subtransaction")));
 
+	if (IsYugaByteEnabled())
+		return YBCExportSnapshot(snapshot->yb_is_built_for_export &&
+								 snapshot->yb_read_point_handle.has_value ?
+								 &snapshot->yb_read_point_handle.value : NULL);
 	/*
 	 * We do however allow previous committed subtransactions to exist.
 	 * Importers of the snapshot must see them as still running, so get their
@@ -1214,6 +1444,8 @@ ExportSnapshot(Snapshot snapshot)
 
 	snapshot->regd_count++;
 	pairingheap_add(&RegisteredSnapshots, &snapshot->ph_node);
+	YbNoteReadPointAdded(snapshot->yb_read_point_handle);
+	YbPublishOldestReadPointIfChanged();
 
 	/*
 	 * Fill buf with a text serialization of the snapshot, plus identification
@@ -1439,6 +1671,9 @@ ImportSnapshot(const char *idstr)
 	bool		src_readonly;
 	SnapshotData snapshot;
 
+	if (IsYugaByteEnabled())
+		YBCheckSnapshotsAllowed(true /* check_isolation_level */ );
+
 	/*
 	 * Must be at top level of a fresh transaction.  Note in particular that
 	 * we check we haven't acquired an XID --- if we have, it's conceivable
@@ -1461,109 +1696,133 @@ ImportSnapshot(const char *idstr)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("a snapshot-importing transaction must have isolation level SERIALIZABLE or REPEATABLE READ")));
 
-	/*
-	 * Verify the identifier: only 0-9, A-F and hyphens are allowed.  We do
-	 * this mainly to prevent reading arbitrary files.
-	 */
-	if (strspn(idstr, "0123456789ABCDEF-") != strlen(idstr))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
 
-	/* OK, read the file */
-	snprintf(path, MAXPGPATH, SNAPSHOT_EXPORT_DIR "/%s", idstr);
-
-	f = AllocateFile(path, PG_BINARY_R);
-	if (!f)
+	if (IsYugaByteEnabled())
 	{
 		/*
-		 * If file is missing while identifier has a correct format, avoid
-		 * system errors.
+		 * Verify the identifier: only 0-9, a-f and hyphens are allowed.  We do
+		 * this mainly to prevent reading arbitrary snapshot names.
 		 */
-		if (errno == ENOENT)
+		if (strspn(idstr, "0123456789abcdef-") != strlen(idstr))
 			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("snapshot \"%s\" does not exist", idstr)));
-		else
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open file \"%s\" for reading: %m",
-							path)));
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
+
+		YbcPgTxnSnapshot yb_snapshot = {};
+
+		HandleYBStatus(YBCPgImportSnapshot(idstr, &yb_snapshot));
+		src_dbid = yb_snapshot.db_id;
+		src_isolevel = yb_snapshot.iso_level;
+		src_readonly = yb_snapshot.read_only;
+		memset(&snapshot, 0, sizeof(snapshot));
+		YbInitSnapshot(&snapshot, YbBuildCurrentReadPointHandle());
 	}
-
-	/* get the size of the file so that we know how much memory we need */
-	if (fstat(fileno(f), &stat_buf))
-		elog(ERROR, "could not stat file \"%s\": %m", path);
-
-	/* and read the file into a palloc'd string */
-	filebuf = (char *) palloc(stat_buf.st_size + 1);
-	if (fread(filebuf, stat_buf.st_size, 1, f) != 1)
-		elog(ERROR, "could not read file \"%s\": %m", path);
-
-	filebuf[stat_buf.st_size] = '\0';
-
-	FreeFile(f);
-
-	/*
-	 * Construct a snapshot struct by parsing the file content.
-	 */
-	memset(&snapshot, 0, sizeof(snapshot));
-
-	parseVxidFromText("vxid:", &filebuf, path, &src_vxid);
-	src_pid = parseIntFromText("pid:", &filebuf, path);
-	/* we abuse parseXidFromText a bit here ... */
-	src_dbid = parseXidFromText("dbid:", &filebuf, path);
-	src_isolevel = parseIntFromText("iso:", &filebuf, path);
-	src_readonly = parseIntFromText("ro:", &filebuf, path);
-
-	snapshot.snapshot_type = SNAPSHOT_MVCC;
-
-	snapshot.xmin = parseXidFromText("xmin:", &filebuf, path);
-	snapshot.xmax = parseXidFromText("xmax:", &filebuf, path);
-
-	snapshot.xcnt = xcnt = parseIntFromText("xcnt:", &filebuf, path);
-
-	/* sanity-check the xid count before palloc */
-	if (xcnt < 0 || xcnt > GetMaxSnapshotXidCount())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid snapshot data in file \"%s\"", path)));
-
-	snapshot.xip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
-	for (i = 0; i < xcnt; i++)
-		snapshot.xip[i] = parseXidFromText("xip:", &filebuf, path);
-
-	snapshot.suboverflowed = parseIntFromText("sof:", &filebuf, path);
-	snapshot.subxcnt = xcnt = parseIntFromText("sxcnt:", &filebuf, path);
-	snapshot.subxip = NULL;
-
-	if (snapshot.subxcnt)
+	else
 	{
+		/*
+		 * Verify the identifier: only 0-9, A-F and hyphens are allowed.  We do
+		 * this mainly to prevent reading arbitrary files.
+		 */
+		if (strspn(idstr, "0123456789ABCDEF-") != strlen(idstr))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
+
+		/* OK, read the file */
+		snprintf(path, MAXPGPATH, SNAPSHOT_EXPORT_DIR "/%s", idstr);
+
+		f = AllocateFile(path, PG_BINARY_R);
+		if (!f)
+		{
+			/*
+			 * If file is missing while identifier has a correct format, avoid
+			 * system errors.
+			 */
+			if (errno == ENOENT)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("snapshot \"%s\" does not exist", idstr)));
+			else
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not open file \"%s\" for reading: %m",
+								path)));
+		}
+
+		/* get the size of the file so that we know how much memory we need */
+		if (fstat(fileno(f), &stat_buf))
+			elog(ERROR, "could not stat file \"%s\": %m", path);
+
+		/* and read the file into a palloc'd string */
+		filebuf = (char *) palloc(stat_buf.st_size + 1);
+		if (fread(filebuf, stat_buf.st_size, 1, f) != 1)
+			elog(ERROR, "could not read file \"%s\": %m", path);
+
+		filebuf[stat_buf.st_size] = '\0';
+
+		FreeFile(f);
+
+		/*
+		 * Construct a snapshot struct by parsing the file content.
+		 */
+		memset(&snapshot, 0, sizeof(snapshot));
+
+		parseVxidFromText("vxid:", &filebuf, path, &src_vxid);
+		src_pid = parseIntFromText("pid:", &filebuf, path);
+		/* we abuse parseXidFromText a bit here ... */
+		src_dbid = parseXidFromText("dbid:", &filebuf, path);
+		src_isolevel = parseIntFromText("iso:", &filebuf, path);
+		src_readonly = parseIntFromText("ro:", &filebuf, path);
+
+		snapshot.snapshot_type = SNAPSHOT_MVCC;
+
+		snapshot.xmin = parseXidFromText("xmin:", &filebuf, path);
+		snapshot.xmax = parseXidFromText("xmax:", &filebuf, path);
+
+		snapshot.xcnt = xcnt = parseIntFromText("xcnt:", &filebuf, path);
+
 		/* sanity-check the xid count before palloc */
-		if (xcnt < 0 || xcnt > GetMaxSnapshotSubxidCount())
+		if (xcnt < 0 || xcnt > GetMaxSnapshotXidCount())
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid snapshot data in file \"%s\"", path)));
 
-		snapshot.subxip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
+		snapshot.xip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
 		for (i = 0; i < xcnt; i++)
-			snapshot.subxip[i] = parseXidFromText("sxp:", &filebuf, path);
+			snapshot.xip[i] = parseXidFromText("xip:", &filebuf, path);
+
+		snapshot.suboverflowed = parseIntFromText("sof:", &filebuf, path);
+		snapshot.subxcnt = xcnt = parseIntFromText("sxcnt:", &filebuf, path);
+		snapshot.subxip = NULL;
+
+		if (snapshot.subxcnt)
+		{
+			/* sanity-check the xid count before palloc */
+			if (xcnt < 0 || xcnt > GetMaxSnapshotSubxidCount())
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid snapshot data in file \"%s\"", path)));
+
+			snapshot.subxip = (TransactionId *) palloc(xcnt * sizeof(TransactionId));
+			for (i = 0; i < xcnt; i++)
+				snapshot.subxip[i] = parseXidFromText("sxp:", &filebuf, path);
+		}
+
+		snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
+
+		/*
+		 * Do some additional sanity checking, just to protect ourselves.  We
+		 * don't trouble to check the array elements, just the most critical
+		 * fields.
+		 */
+		if (!VirtualTransactionIdIsValid(src_vxid) ||
+			!OidIsValid(src_dbid) ||
+			!TransactionIdIsNormal(snapshot.xmin) ||
+			!TransactionIdIsNormal(snapshot.xmax))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+					 errmsg("invalid snapshot data in file \"%s\"", path)));
 	}
-
-	snapshot.takenDuringRecovery = parseIntFromText("rec:", &filebuf, path);
-
-	/*
-	 * Do some additional sanity checking, just to protect ourselves.  We
-	 * don't trouble to check the array elements, just the most critical
-	 * fields.
-	 */
-	if (!VirtualTransactionIdIsValid(src_vxid) ||
-		!OidIsValid(src_dbid) ||
-		!TransactionIdIsNormal(snapshot.xmin) ||
-		!TransactionIdIsNormal(snapshot.xmax))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid snapshot data in file \"%s\"", path)));
 
 	/*
 	 * If we're serializable, the source transaction must be too, otherwise
@@ -1608,6 +1867,9 @@ ImportSnapshot(const char *idstr)
 bool
 XactHasExportedSnapshots(void)
 {
+	if (IsYugaByteEnabled())
+		return YBCPgHasExportedSnapshots();
+
 	return (exportedSnapshots != NIL);
 }
 
@@ -1782,6 +2044,7 @@ SerializeSnapshot(Snapshot snapshot, char *start_address)
 	serialized_snapshot.suboverflowed = snapshot->suboverflowed;
 	serialized_snapshot.takenDuringRecovery = snapshot->takenDuringRecovery;
 	serialized_snapshot.curcid = snapshot->curcid;
+	serialized_snapshot.yb_read_point_handle = snapshot->yb_read_point_handle;
 
 	/*
 	 * Ignore the SubXID array if it has overflowed, unless the snapshot was
@@ -1855,6 +2118,7 @@ RestoreSnapshot(char *start_address)
 	snapshot->takenDuringRecovery = serialized_snapshot.takenDuringRecovery;
 	snapshot->curcid = serialized_snapshot.curcid;
 	snapshot->snapXactCompletionCount = 0;
+	snapshot->yb_read_point_handle = serialized_snapshot.yb_read_point_handle;
 
 	/* Copy XIDs, if present. */
 	if (serialized_snapshot.xcnt > 0)
@@ -2003,4 +2267,186 @@ static void
 ResOwnerReleaseSnapshot(Datum res)
 {
 	UnregisterSnapshotNoOwner((Snapshot) DatumGetPointer(res));
+}
+
+YbcReadPointHandle
+YbGetCatalogSnapshotReadPoint(YbcPgOid table_oid, bool create_if_not_exists)
+{
+	if (create_if_not_exists)
+		GetCatalogSnapshot(table_oid);
+	/*
+	 * InvalidateCatalogSnapshot() leaves CatalogSnapshotData as is, so check
+	 * CatalogSnapshot to avoid returning the read point of an invalidated
+	 * snapshot.
+	 */
+	return CatalogSnapshot && CatalogSnapshot->yb_read_point_handle.has_value ?
+		CatalogSnapshot->yb_read_point_handle.value : YbcInvalidReadPointHandle;
+}
+
+/*
+ * Walk a pairing heap subtree (a node and all its siblings/descendants),
+ * tracking the smallest read-point handle across the snapshots it contains.
+ */
+static YbcReadPointHandle
+YbMinReadPointInSnapshotHeap(pairingheap_node *node, YbcReadPointHandle oldest)
+{
+	for (; node != NULL; node = node->next_sibling)
+	{
+		SnapshotData *snap = pairingheap_container(SnapshotData, ph_node, node);
+
+		if (snap->yb_read_point_handle.has_value &&
+			(oldest == YbcInvalidReadPointHandle ||
+			 snap->yb_read_point_handle.value < oldest))
+			oldest = snap->yb_read_point_handle.value;
+		oldest = YbMinReadPointInSnapshotHeap(node->first_child, oldest);
+	}
+	return oldest;
+}
+
+/*
+ * YbComputeOldestReadPointHandle
+ *
+ *		Walks the active snapshot stack and the registered snapshots to find the
+ *		read-point handle (read time serial number) of the oldest snapshot still
+ *		referenced by this backend.
+ *
+ *		Returns YbcInvalidReadPointHandle when no live snapshot carries a read
+ *		point. Unlike GetOldestSnapshot(), which orders by LSN, this compares
+ *		read-point handles directly.
+ */
+static YbcReadPointHandle
+YbComputeOldestReadPointHandle(void)
+{
+	YbcReadPointHandle oldest = YbcInvalidReadPointHandle;
+	ActiveSnapshotElt *elt;
+
+	for (elt = ActiveSnapshot; elt != NULL; elt = elt->as_next)
+	{
+		Snapshot	snap = elt->as_snap;
+
+		if (snap->yb_read_point_handle.has_value &&
+			(oldest == YbcInvalidReadPointHandle ||
+			 snap->yb_read_point_handle.value < oldest))
+			oldest = snap->yb_read_point_handle.value;
+	}
+
+	if (!pairingheap_is_empty(&RegisteredSnapshots))
+		oldest = YbMinReadPointInSnapshotHeap(RegisteredSnapshots.ph_root, oldest);
+
+	return oldest;
+}
+
+/*
+ * Oldest read-point handle across the live snapshots, or
+ * YbcInvalidReadPointHandle when it has to be recomputed by walking them.
+ *
+ * Read-point handles are serial numbers, so a snapshot joining the live set can
+ * only lower the oldest handle, which is a Min() against the tracked value, and
+ * a snapshot leaving can only raise it, and only if it carried the oldest handle
+ * itself. That keeps the walk off the push / pop / register / unregister path.
+ * Recomputation is deferred to the next read rather than done when the oldest
+ * handle leaves, so that a backend which publishes no pin (see
+ * YbShouldPublishDbHistoryRetentionPin) never walks the snapshot structures at all.
+ */
+static YbcReadPointHandle yb_oldest_read_point = YbcInvalidReadPointHandle;
+
+static void
+YbNoteReadPointAdded(YbOptionalReadPointHandle handle)
+{
+	if (handle.has_value &&
+		yb_oldest_read_point != YbcInvalidReadPointHandle &&
+		handle.value < yb_oldest_read_point)
+		yb_oldest_read_point = handle.value;
+}
+
+static void
+YbNoteReadPointRemoved(YbOptionalReadPointHandle handle)
+{
+	if (handle.has_value && handle.value == yb_oldest_read_point)
+		yb_oldest_read_point = YbcInvalidReadPointHandle;
+}
+
+static void
+YbResetReadPoint(void)
+{
+	yb_oldest_read_point = YbcInvalidReadPointHandle;
+}
+
+/*
+ * YbGetOldestReadPointHandle
+ *
+ * Returns the read-point handle of the oldest snapshot still referenced by
+ * this backend, walking the live snapshots only when the previous oldest
+ * handle has since been removed.
+ */
+static YbcReadPointHandle
+YbGetOldestReadPointHandle(void)
+{
+	if (yb_oldest_read_point == YbcInvalidReadPointHandle)
+		yb_oldest_read_point = YbComputeOldestReadPointHandle();
+
+	return yb_oldest_read_point;
+}
+
+/*
+ * Last value published to session shared memory. Avoids redundant SHMEM stores when
+ * push/pop/register/unregister does not change the oldest live read-point handle.
+ */
+static YbcReadPointHandle yb_published_oldest_read_point = YbcInvalidReadPointHandle;
+
+/*
+ * Pin when yb_db_history_retention_pin_mode is all, or ddl_only while a DDL is in progress.
+ */
+static bool
+YbShouldPublishDbHistoryRetentionPin(void)
+{
+	return yb_db_history_retention_pin_mode == YB_DB_HISTORY_RETENTION_PIN_MODE_ALL ||
+		(yb_db_history_retention_pin_mode == YB_DB_HISTORY_RETENTION_PIN_MODE_DDL_ONLY &&
+		 YBCPgIsDdlMode());
+}
+
+/*
+ * YbPublishOldestReadPointIfChanged
+ *
+ *		When history retention pinning is enabled for this backend, recompute the
+ *		oldest live read-point handle and publish it into session shared memory.
+ *		When pinning is not enabled, publish invalid without walking the snapshot
+ *		structures. The tserver heartbeat maps a non-zero serial to a HybridTime
+ *		and aggregates per-database history retention pins.
+ */
+static void
+YbPublishOldestReadPointIfChanged(void)
+{
+	YbcReadPointHandle oldest;
+
+	if (!IsYugaByteEnabled())
+		return;
+
+	/*
+	 * Skip the oldest-snapshot walk when this backend should not contribute a
+	 * pin; still publish invalid so the tserver can clear a stale pin after a
+	 * mode / DDL-state transition.
+	 */
+	if (!YbShouldPublishDbHistoryRetentionPin())
+		oldest = YbcInvalidReadPointHandle;
+	else
+		oldest = YbGetOldestReadPointHandle();
+
+	if (oldest == yb_published_oldest_read_point)
+		return;
+
+	yb_published_oldest_read_point = oldest;
+	YBCPgPublishOldestReadPointHandle(oldest);
+}
+
+void
+YbInvalidateCatalogSnapshot(void)
+{
+	if (YBCIsLegacyModeForCatalogOps())
+	{
+		YBCPgResetCatalogReadTime();
+		return;
+	}
+
+	InvalidateCatalogSnapshot();
 }

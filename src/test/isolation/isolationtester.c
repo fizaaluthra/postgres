@@ -16,6 +16,9 @@
 #include "pg_getopt.h"
 #include "pqexpbuffer.h"
 
+/* YB includes */
+#include <stdio.h>
+
 #define PREP_WAITING "isolationtester_waiting"
 
 /*
@@ -60,6 +63,12 @@ static void run_permutation(TestSpec *testspec, int nsteps,
 #define STEP_NONBLOCK	0x1		/* return as soon as cmd waits for a lock */
 #define STEP_RETRY		0x2		/* this is a retry of a previously-waiting cmd */
 
+/*
+ * YB: Skip the YB_NUM_SECONDS_TO_WAIT_TO_ASSUME_SESSION_BLOCKED (4-second) blocking detection wait
+ * and immediately assume step is blocked.
+ */
+#define YB_STEP_SKIP_WAIT	0x4
+
 static int	try_complete_steps(TestSpec *testspec, PermutationStep **waiting,
 							   int nwaiting, int flags);
 static bool try_complete_step(TestSpec *testspec, PermutationStep *pstep,
@@ -72,6 +81,14 @@ static bool step_has_blocker(PermutationStep *pstep);
 static void printResultSet(PGresult *res);
 static void isotesterNoticeProcessor(void *arg, const char *message);
 static void blackholeNoticeProcessor(void *arg, const char *message);
+
+/* YB declarations */
+static bool yb_step_never_waits(PermutationStep *pstep);
+static bool yb_step_may_block(TestSpec *testspec, PermutationStep **steps,
+							  int i);
+
+/* This is YB specific logic. See usage for description */
+#define YB_NUM_SECONDS_TO_WAIT_TO_ASSUME_SESSION_BLOCKED 4
 
 static void
 disconnect_atexit(void)
@@ -137,6 +154,9 @@ main(int argc, char **argv)
 	spec_yyparse();
 	testspec = &parseresult;
 
+	/* YB: Release the scanner memory */
+	spec_scanner_finish();
+
 	/* Perform post-parse checking, and fill in linking fields */
 	check_testspec(testspec);
 
@@ -150,6 +170,23 @@ main(int argc, char **argv)
 	conns = pg_malloc0_array(IsoConnInfo, nconns);
 	atexit(disconnect_atexit);
 
+	/* YB: Get the list of host-ports from the comma separated env YBHOSTPORTLIST. */
+	char *host_port_list[256];
+	int num_hosts = 0;
+
+	char *yb_host_port_list = getenv("YBHOSTPORTLIST");
+	if (yb_host_port_list)
+	{
+		char *list_copy = strdup(yb_host_port_list);
+		char *token = strtok(list_copy, ",");
+		while (token && num_hosts < 256)
+		{
+			host_port_list[num_hosts++] = strdup(token);
+			token = strtok(NULL, ",");
+		}
+		free(list_copy);
+	}
+
 	for (i = 0; i < nconns; i++)
 	{
 		const char *sessionname;
@@ -160,6 +197,19 @@ main(int argc, char **argv)
 			sessionname = testspec->sessions[i - 1]->name;
 
 		conns[i].sessionname = sessionname;
+
+		/* YB: Split the host and port from host_port_list[i % num_hosts] */
+		if (num_hosts > 0)
+		{
+			char *host_port = host_port_list[i % num_hosts];
+			char *colon = strchr(host_port, ':');
+			char *host = strndup(host_port, colon - host_port);
+			char *port = strdup(colon + 1);
+			setenv("PGHOST", host, 1);
+			setenv("PGPORT", port, 1);
+			free(host);
+			free(port);
+		}
 
 		conns[i].conn = PQconnectdb(conninfo);
 		if (PQstatus(conns[i].conn) != CONNECTION_OK)
@@ -204,10 +254,17 @@ main(int argc, char **argv)
 			exit(1);
 		}
 
+		PQclear(res);			/* YB: Clear res to avoid asan memory leak
+								 * failure */
+
 		/* Save each connection's backend PID for subsequent use. */
 		conns[i].backend_pid = PQbackendPID(conns[i].conn);
 		conns[i].backend_pid_str = psprintf("%d", conns[i].backend_pid);
 	}
+
+	/* YB: free host port list */
+	for (i = 0; i < num_hosts; i++)
+		free(host_port_list[i]);
 
 	/*
 	 * Build the query we'll use to detect lock contention among sessions in
@@ -338,7 +395,8 @@ check_testspec(TestSpec *testspec)
 				PermutationStepBlocker *blocker = pstep->blockers[k];
 				int			n;
 
-				if (blocker->blocktype == PSB_ONCE)
+				if (blocker->blocktype == PSB_ONCE ||
+					blocker->blocktype == PSB_YB_NEVER_WAITS)
 					continue;	/* nothing to link to */
 
 				blocker->step = NULL;
@@ -684,8 +742,18 @@ run_permutation(TestSpec *testspec, int nsteps, PermutationStep **steps)
 					conns[blocker->step->session + 1].total_notices;
 		}
 
-		/* Try to complete this step without blocking.  */
-		mustwait = try_complete_step(testspec, pstep, STEP_NONBLOCK);
+		/*
+		 * Try to complete this step without blocking.  YB: except for the last
+		 * step of the permutation when nothing else is in flight -- no later
+		 * step can unblock it -- and except when no other session can be
+		 * holding a conflicting lock.  Either way just wait for the step
+		 * instead of letting the assume-session-blocked timeout report a
+		 * merely slow step as waiting.
+		 */
+		mustwait = try_complete_step(testspec, pstep,
+									 ((i == nsteps - 1 && nwaiting == 0) ||
+									  !yb_step_may_block(testspec, steps, i)) ?
+									 0 : STEP_NONBLOCK);
 
 		/* Check for completion of any steps that were previously waiting. */
 		nwaiting = try_complete_steps(testspec, waiting, nwaiting,
@@ -758,6 +826,13 @@ try_complete_steps(TestSpec *testspec, PermutationStep **waiting,
 	int			old_nwaiting;
 	bool		have_blocker;
 
+	/*
+	 * YB: Optimization to avoid waiting for changes to propagate before moving onto next step if
+	 * we already did the YB_NUM_SECONDS_TO_WAIT_TO_ASSUME_SESSION_BLOCKED wait earlier and
+	 * haven't completed any step after that wait
+	 */
+	bool		already_waited_this_iteration;
+
 	do
 	{
 		int			w = 0;
@@ -768,16 +843,30 @@ try_complete_steps(TestSpec *testspec, PermutationStep **waiting,
 		/* Likewise, these variables reset for each retry. */
 		old_nwaiting = nwaiting;
 		have_blocker = false;
+		already_waited_this_iteration = false;	/* YB: Reset for each
+												 * iteration */
 
 		/* Scan the array, try to complete steps. */
 		while (w < nwaiting)
 		{
-			if (try_complete_step(testspec, waiting[w], flags))
+			int			step_flags = flags;
+
+			/*
+			 * YB: Add YB_STEP_SKIP_WAIT flag based on whether we already
+			 * waited
+			 */
+			if (already_waited_this_iteration)
+				step_flags |= YB_STEP_SKIP_WAIT;
+
+			if (try_complete_step(testspec, waiting[w], step_flags))
 			{
 				/* Still blocked, leave it alone. */
 				if (waiting[w]->nblockers > 0)
 					have_blocker = true;
 				w++;
+
+				/* YB: We waited for this step */
+				already_waited_this_iteration = true;
 			}
 			else
 			{
@@ -786,6 +875,13 @@ try_complete_steps(TestSpec *testspec, PermutationStep **waiting,
 					memmove(&waiting[w], &waiting[w + 1],
 							(nwaiting - (w + 1)) * sizeof(PermutationStep *));
 				nwaiting--;
+
+				/*
+				 * YB: The step completed, which may have released some waiters,
+				 * so next waiter should wait on block for completed step's
+				 * changes to propagate and unblock this waiter.
+				 */
+				already_waited_this_iteration = false;
 			}
 		}
 
@@ -851,6 +947,14 @@ try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
 		}
 	}
 
+	/*
+	 * YB: A step annotated with (yb_never_waits) is simply waited for, however
+	 * slow it is, rather than being misreported as waiting by the
+	 * YB_NUM_SECONDS_TO_WAIT_TO_ASSUME_SESSION_BLOCKED heuristic.
+	 */
+	if (yb_step_never_waits(pstep))
+		flags &= ~STEP_NONBLOCK;
+
 	if (sock < 0)
 	{
 		fprintf(stderr, "invalid socket: %s", PQerrorMessage(conn));
@@ -879,9 +983,18 @@ try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
 			struct timeval current_time;
 			int64		td;
 
+			/* YB: Figure out how long we've been waiting for this step. */
+			gettimeofday(&current_time, NULL);
+			td = (int64) current_time.tv_sec - (int64) start_time.tv_sec;
+			td *= USECS_PER_SEC;
+			td += (int64) current_time.tv_usec - (int64) start_time.tv_usec;
 			/* If it's OK for the step to block, check whether it has. */
 			if (flags & STEP_NONBLOCK)
 			{
+				/* YB: If we already waited this iteration, skip the wait */
+				if (flags & YB_STEP_SKIP_WAIT)
+					return true;
+
 				bool		waiting;
 
 				res = PQexecPrepared(conns[0].conn, PREP_WAITING, 1,
@@ -927,13 +1040,25 @@ try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
 					return true;
 				}
 				/* else, not waiting */
-			}
 
-			/* Figure out how long we've been waiting for this step. */
-			gettimeofday(&current_time, NULL);
-			td = (int64) current_time.tv_sec - (int64) start_time.tv_sec;
-			td *= USECS_PER_SEC;
-			td += (int64) current_time.tv_usec - (int64) start_time.tv_usec;
+				/*
+				 * Yugabyte specific logic: Since we don't use pg_locks, we can't
+				 * determine if a session is blocked on another session using the
+				 * PREP_WAITING function above. So, we instead assume that waiting
+				 * for >= 4 second means the session is blocked on another session.
+				 *
+				 * This is not a perfect check but good enough for now.
+				 *
+				 * TODO(Piyush): Replace this by a deterministic check when
+				 * blocking information is exposed via Pg locks (#12168).
+				 */
+				if (td > YB_NUM_SECONDS_TO_WAIT_TO_ASSUME_SESSION_BLOCKED * USECS_PER_SEC && !canceled)
+				{
+					if (!(flags & STEP_RETRY))
+						printf("step %s: %s <waiting ...>\n", step->name, step->sql);
+					return true;
+				}
+			}
 
 			/*
 			 * After max_step_wait microseconds, try to cancel the query.
@@ -1039,6 +1164,15 @@ try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
 		PQclear(res);
 	}
 
+	/*
+	 * YB: It takes longer to deliver the notifications in YB, hence, sleep
+	 * before checking for notifications. This is required to match the
+	 * PG's expected output for isolation test async-notify.
+	 */
+	const char *yb_wait_for_notifs = getenv("YB_ISOLATION_TEST_WAIT_FOR_NOTIFS_MS");
+	if (yb_wait_for_notifs != NULL)
+		pg_usleep(atol(yb_wait_for_notifs) * 1000);
+
 	/* Report any available NOTIFY messages, too */
 	PQconsumeInput(conn);
 	while ((notify = PQnotifies(conn)) != NULL)
@@ -1104,7 +1238,52 @@ step_has_blocker(PermutationStep *pstep)
 				if (iconn->total_notices < blocker->target_notices)
 					return true;
 				break;
+			case PSB_YB_NEVER_WAITS:
+				/* Ignore; try_complete_step handles this specially */
+				break;
 		}
+	}
+	return false;
+}
+
+/*
+ * YB: Detect whether any session other than the one running steps[i] can
+ * already hold a lock conflicting with it, which is the precondition for the
+ * YB_NUM_SECONDS_TO_WAIT_TO_ASSUME_SESSION_BLOCKED heuristic to mean anything.
+ * Such a session must have taken those locks in its setup SQL or in an earlier
+ * step of this permutation.
+ */
+static bool
+yb_step_may_block(TestSpec *testspec, PermutationStep **steps, int i)
+{
+	int			session = steps[i]->step->session;
+	int			j;
+
+	for (j = 0; j < testspec->nsessions; j++)
+	{
+		if (j != session && testspec->sessions[j]->setupsql)
+			return true;
+	}
+
+	for (j = 0; j < i; j++)
+	{
+		if (steps[j]->step->session != session)
+			return true;
+	}
+
+	return false;
+}
+
+/* YB: Detect whether a step is annotated with (yb_never_waits) */
+static bool
+yb_step_never_waits(PermutationStep *pstep)
+{
+	int			i;
+
+	for (i = 0; i < pstep->nblockers; i++)
+	{
+		if (pstep->blockers[i]->blocktype == PSB_YB_NEVER_WAITS)
+			return true;
 	}
 	return false;
 }

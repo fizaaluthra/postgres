@@ -81,7 +81,15 @@ CATALOG_HEADERS := \
 	pg_publication_namespace.h \
 	pg_publication_rel.h \
 	pg_subscription.h \
-	pg_subscription_rel.h
+	pg_subscription_rel.h \
+	pg_yb_catalog_version.h \
+	pg_yb_migration.h \
+	pg_yb_profile.h \
+	pg_yb_role_profile.h \
+	pg_yb_tablegroup.h \
+	pg_yb_logical_client_version.h \
+	pg_yb_invalidation_messages.h \
+	pg_yb_password_history.h
 
 GENERATED_HEADERS := $(CATALOG_HEADERS:%.h=%_d.h)
 
@@ -113,7 +121,11 @@ POSTGRES_BKI_DATA = \
 	pg_ts_dict.dat \
 	pg_ts_parser.dat \
 	pg_ts_template.dat \
-	pg_type.dat
+	pg_type.dat \
+	pg_yb_catalog_version.dat \
+	pg_yb_logical_client_version.dat \
+	pg_yb_migration.dat \
+	pg_yb_tablegroup.dat
 
 GENBKI_OUTPUT_FILES = \
 	$(GENERATED_HEADERS) \
@@ -128,7 +140,7 @@ all: generated-headers
 
 .PHONY: generated-headers
 
-generated-headers: bki-stamp
+generated-headers: bki-stamp yb_bki-stamp
 
 # bki-stamp records the last time we ran genbki.pl.  We don't rely on
 # the timestamps of the individual output files, because the Perl script
@@ -143,8 +155,14 @@ bki-stamp: $(top_srcdir)/src/backend/catalog/genbki.pl $(top_srcdir)/src/backend
 		--set-version=$(MAJORVERSION) $(POSTGRES_BKI_SRCS)
 	touch $@
 
+yb_bki-stamp: $(top_srcdir)/src/backend/catalog/yb_genbki.pl $(top_srcdir)/src/backend/catalog/Catalog.pm $(POSTGRES_BKI_SRCS) $(POSTGRES_BKI_DATA) $(top_srcdir)/configure.ac
+	$(PERL) $< --include-path=$(top_srcdir)/src/include/ \
+		--set-version=$(MAJORVERSION) $(POSTGRES_BKI_SRCS)
+	touch $@
+
 install: all installdirs
 	$(INSTALL_DATA) postgres.bki '$(DESTDIR)$(datadir)/postgres.bki'
+	$(INSTALL_DATA) yb_postgres.bki '$(DESTDIR)$(datadir)/yb_postgres.bki'
 	$(INSTALL_DATA) system_constraints.sql '$(DESTDIR)$(datadir)/system_constraints.sql'
 # In non-vpath builds, src/include/Makefile already installs all headers.
 ifeq ($(vpath_build),yes)
@@ -161,11 +179,11 @@ installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(datadir)' '$(DESTDIR)$(includedir_server)'
 
 uninstall:
-	rm -f $(addprefix '$(DESTDIR)$(datadir)'/, postgres.bki system_constraints.sql)
+	rm -f $(addprefix '$(DESTDIR)$(datadir)'/, postgres.bki yb_postgres.bki system_constraints.sql)
 	rm -f $(addprefix '$(DESTDIR)$(includedir_server)'/catalog/, schemapg.h syscache_ids.h syscache_info.h system_fk_info.h $(GENERATED_HEADERS))
 
 clean:
-	rm -f bki-stamp $(GENBKI_OUTPUT_FILES)
+	rm -f bki-stamp yb_bki-stamp yb_postgres.bki $(GENBKI_OUTPUT_FILES)
 
 # 'make reformat-dat-files' is a convenience target for rewriting the
 # catalog data files in our standard format.  This includes collapsing

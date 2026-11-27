@@ -15,6 +15,9 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
+	yb_decode.o \
+	yb_virtual_wal_client.o \
+	\
 	applyparallelworker.o \
 	conflict.o \
 	decode.o \

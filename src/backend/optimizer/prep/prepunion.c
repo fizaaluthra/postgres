@@ -40,6 +40,9 @@
 #include "port/pg_bitutils.h"
 #include "utils/selfuncs.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 static RelOptInfo *recurse_set_operations(Node *setOp, PlannerInfo *root,
 										  SetOperationStmt *parentOp,
@@ -239,6 +242,15 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 
 		/* Build a RelOptInfo for this leaf subquery. */
 		rel = build_simple_rel(root, rtr->rtindex, NULL);
+
+		if (IsYugaByteEnabled())
+		{
+			/*
+			 * These blocks cannot be hinted so set the hint aliases to NULL.
+			 */
+			rel->ybHintAlias = NULL;
+			rte->ybHintAlias = NULL;
+		}
 
 		/* plan_params should not be in use in current query level */
 		Assert(root->plan_params == NIL);

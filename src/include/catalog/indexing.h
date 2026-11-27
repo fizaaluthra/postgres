@@ -39,16 +39,19 @@ extern CatalogIndexState CatalogOpenIndexes(Relation heapRel);
 extern void CatalogCloseIndexes(CatalogIndexState indstate);
 extern void CatalogTupleInsert(Relation heapRel, HeapTuple tup);
 extern void CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
-									   CatalogIndexState indstate);
+									   CatalogIndexState indstate, bool yb_shared_insert);
 extern void CatalogTuplesMultiInsertWithInfo(Relation heapRel,
 											 TupleTableSlot **slot,
 											 int ntuples,
-											 CatalogIndexState indstate);
+											 CatalogIndexState indstate,
+											 bool yb_shared_insert);
 extern void CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid,
 							   HeapTuple tup);
 extern void CatalogTupleUpdateWithInfo(Relation heapRel,
 									   const ItemPointerData *otid, HeapTuple tup,
 									   CatalogIndexState indstate);
-extern void CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid);
+extern void CatalogTupleDelete(Relation heapRel, HeapTuple tup);
+
+extern void YBCatalogTupleInsert(Relation heapRel, HeapTuple tup, bool yb_shared_insert);
 
 #endif							/* INDEXING_H */

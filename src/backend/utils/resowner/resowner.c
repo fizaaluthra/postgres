@@ -55,6 +55,9 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * ResourceElem represents a reference associated with a resource owner.
  *
@@ -209,6 +212,7 @@ static void ResourceOwnerReleaseInternal(ResourceOwner owner,
 										 bool isCommit,
 										 bool isTopLevel);
 static void ReleaseAuxProcessResourcesCallback(int code, Datum arg);
+
 
 
 /*****************************************************************************
@@ -678,6 +682,13 @@ ResourceOwnerRelease(ResourceOwner owner,
 		narray_lookups = 0;
 		nhash_lookups = 0;
 	}
+#endif
+
+	/* YB Note: Assert that local lock table is empty on txn finish */
+#ifdef USE_ASSERT_CHECKING
+	if (isTopLevel && phase == RESOURCE_RELEASE_LOCKS &&
+		YBGetObjectLockMode() == YB_OBJECT_LOCK_ENABLED)
+		Assert(YbGetNumTxnLocks() == 0);
 #endif
 }
 

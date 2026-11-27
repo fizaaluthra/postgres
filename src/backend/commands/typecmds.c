@@ -74,6 +74,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "commands/extension.h"
+#include "pg_yb_utils.h"
+
 
 /* result structure for get_rels_with_domain() */
 typedef struct
@@ -217,11 +221,15 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 	 * superuserness anyway.  We're just making doubly sure here.
 	 *
 	 * XXX re-enable NOT_USED code sections below if you remove this test.
+	 *
+	 * In YB mode, we allow users with the yb_extension role who are in the
+	 * midst of creating an extension to create a base type.
 	 */
-	if (!superuser())
+	if (!(IsYbExtensionUser(GetUserId()) && creating_extension) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to create a base type")));
+				 errmsg("must be superuser or a member of the yb_extension "
+						"role to create a base type")));
 
 	/* Convert list of names to a name and namespace */
 	typeNamespace = QualifiedNameGetCreationNamespace(names, &typeName);
@@ -604,7 +612,8 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array Dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   collation);	/* type's collation */
+				   collation,	/* type's collation */
+				   false);		/* whether relation is shared (n/a here) */
 	Assert(typoid == address.objectId);
 
 	/*
@@ -646,7 +655,8 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   collation);		/* type's collation */
+			   collation,		/* type's collation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(array_type);
 
@@ -668,7 +678,7 @@ RemoveTypeById(Oid typeOid)
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for type %u", typeOid);
 
-	CatalogTupleDelete(relation, &tup->t_self);
+	CatalogTupleDelete(relation, tup);
 
 	/*
 	 * If it is an enum, delete the pg_enum entries too; we don't bother with
@@ -935,7 +945,8 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 						 */
 						defaultValue =
 							deparse_expression(defaultExpr,
-											   NIL, false, false);
+											   NIL, false, false,
+											   false, false); /* yb_pretty, yb_maskconstants */
 						defaultValueBin = nodeToString(defaultExpr);
 					}
 				}
@@ -1102,7 +1113,8 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 				   basetypeMod, /* typeMod value */
 				   typNDims,	/* Array dimensions for base type */
 				   typNotNull,	/* Type NOT NULL */
-				   domaincoll); /* type's collation */
+				   domaincoll,	/* type's collation */
+				   false);		/* whether relation is shared (n/a here) */
 
 	/*
 	 * Create the array type that goes with it.
@@ -1143,7 +1155,8 @@ DefineDomain(ParseState *pstate, CreateDomainStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   domaincoll);		/* type's collation */
+			   domaincoll,		/* type's collation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(domainArrayName);
 
@@ -1271,7 +1284,8 @@ DefineEnum(CreateEnumStmt *stmt)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   InvalidOid); /* type's collation */
+				   InvalidOid,	/* type's collation */
+				   false);		/* whether relation is shared (n/a here) */
 
 	/* Enter the enum's values into pg_enum */
 	EnumValuesCreate(enumTypeAddr.objectId, stmt->vals);
@@ -1312,7 +1326,8 @@ DefineEnum(CreateEnumStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   InvalidOid);		/* type's collation */
+			   InvalidOid,		/* type's collation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(enumArrayName);
 
@@ -1641,7 +1656,8 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   InvalidOid); /* type's collation (ranges never have one) */
+				   InvalidOid,	/* type's collation (ranges never have one) */
+				   false);		/* whether relation is shared (n/a here) */
 	Assert(typoid == InvalidOid || typoid == address.objectId);
 	typoid = address.objectId;
 
@@ -1708,7 +1724,8 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   InvalidOid); /* type's collation (ranges never have one) */
+				   InvalidOid,	/* type's collation (ranges never have one) */
+				   false);		/* whether relation is shared (n/a here) */
 	Assert(multirangeOid == mltrngaddress.objectId);
 
 	/*
@@ -1747,7 +1764,8 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   InvalidOid);		/* typcollation */
+			   InvalidOid,		/* typcollation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(rangeArrayName);
 
@@ -1786,7 +1804,8 @@ DefineRange(ParseState *pstate, CreateRangeStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   InvalidOid);		/* typcollation */
+			   InvalidOid,		/* typcollation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	/* Ensure these new types are visible to ProcedureCreate */
 	CommandCounterIncrement();
@@ -2392,7 +2411,7 @@ findRangeSubOpclass(List *opcname, Oid subtype)
 
 	if (opcname != NIL)
 	{
-		opcid = get_opclass_oid(BTREE_AM_OID, opcname, false);
+		opcid = get_opclass_oid(IsYugaByteEnabled() ? LSM_AM_OID : BTREE_AM_OID, opcname, false);
 
 		/*
 		 * Verify that the operator class accepts this datatype. Note we will
@@ -2408,7 +2427,7 @@ findRangeSubOpclass(List *opcname, Oid subtype)
 	}
 	else
 	{
-		opcid = GetDefaultOpClass(subtype, BTREE_AM_OID);
+		opcid = GetDefaultOpClass(subtype, IsYugaByteEnabled() ? LSM_AM_OID : BTREE_AM_OID);
 		if (!OidIsValid(opcid))
 		{
 			/* We spell the error message identically to ResolveOpClass */
@@ -2518,7 +2537,7 @@ AssignTypeArrayOid(void)
 	Oid			type_array_oid;
 
 	/* Use binary-upgrade override for pg_type.typarray? */
-	if (IsBinaryUpgrade)
+	if ((IsBinaryUpgrade || yb_binary_restore) && !yb_extension_upgrade)
 	{
 		if (!OidIsValid(binary_upgrade_next_array_pg_type_oid))
 			ereport(ERROR,
@@ -2551,7 +2570,7 @@ AssignTypeMultirangeOid(void)
 	Oid			type_multirange_oid;
 
 	/* Use binary-upgrade override for pg_type.oid? */
-	if (IsBinaryUpgrade)
+	if (IsBinaryUpgrade || yb_binary_restore)
 	{
 		if (!OidIsValid(binary_upgrade_next_mrng_pg_type_oid))
 			ereport(ERROR,
@@ -2584,7 +2603,7 @@ AssignTypeMultirangeArrayOid(void)
 	Oid			type_multirange_array_oid;
 
 	/* Use binary-upgrade override for pg_type.oid? */
-	if (IsBinaryUpgrade)
+	if (IsBinaryUpgrade || yb_binary_restore)
 	{
 		if (!OidIsValid(binary_upgrade_next_mrng_array_pg_type_oid))
 			ereport(ERROR,
@@ -2756,8 +2775,9 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 			 * require a valid textual representation (mainly to make life
 			 * easier for pg_dump).
 			 */
-			defaultValue = deparse_expression(defaultExpr,
-											  NIL, false, false);
+		defaultValue = deparse_expression(defaultExpr,
+										  NIL, false, false,
+										  false, false); /* yb_pretty, yb_maskconstants */
 
 			/*
 			 * Form an updated tuple with the new default and write it back.
@@ -2793,7 +2813,9 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 							 false, /* a domain isn't an implicit array */
 							 false, /* nor is it any kind of dependent type */
 							 false, /* don't touch extension membership */
-							 true); /* We do need to rebuild dependencies */
+							 true,	/* We do need to rebuild dependencies */
+							 false, /* not a system relation rowtype */
+							 false);	/* not a shared relation rowtype */
 
 	InvokeObjectPostAlterHook(TypeRelationId, domainoid, 0);
 
@@ -4721,7 +4743,9 @@ AlterTypeRecurse(Oid typeOid, bool isImplicitArray,
 							 isImplicitArray,	/* it might be an array */
 							 isImplicitArray,	/* dependent iff it's array */
 							 false, /* don't touch extension membership */
-							 true);
+							 true,
+							 false, /* not a system relation rowtype */
+							 false);	/* not a shared relation rowtype */
 
 	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
 

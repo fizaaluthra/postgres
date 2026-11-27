@@ -39,6 +39,9 @@ volatile sig_atomic_t TransactionTimeoutPending = false;
 volatile sig_atomic_t IdleSessionTimeoutPending = false;
 volatile sig_atomic_t ProcSignalBarrierPending = false;
 volatile sig_atomic_t LogMemoryContextPending = false;
+volatile sig_atomic_t YbLogCatcacheStatsPending = false;
+volatile sig_atomic_t LogHeapSnapshotPending = false;
+volatile sig_atomic_t LogHeapSnapshotPeakHeap = false;
 volatile sig_atomic_t IdleStatsUpdateTimeoutPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
@@ -99,6 +102,25 @@ Oid			MyDatabaseTableSpace = InvalidOid;
 
 bool		MyDatabaseHasLoginEventTriggers = false;
 
+bool		MyDatabaseColocated = false;
+
+/*
+ * The OID of the database used as a namespace to allocate a new object
+ * identifier.
+ */
+Oid			YbDatabaseIdForNewObjectId = InvalidOid;
+
+/*
+ * Before we fully deprecate legacy colocated databases, we need this extra
+ * variable to tell whether a colocated database is a legacy colocated
+ * database or a colocated database based on new Colocation GA implementation.
+ */
+bool		MyColocatedDatabaseLegacy = true;
+
+bool		YbTablegroupCatalogExists = false;
+
+bool		YbLoginProfileCatalogsExist = false;
+
 /*
  * DatabasePath is the path (relative to DataDir) of my database's
  * primary directory, ie, its directory in the default tablespace.
@@ -121,6 +143,8 @@ pid_t		PostmasterPid = 0;
 bool		IsPostmasterEnvironment = false;
 bool		IsUnderPostmaster = false;
 bool		IsBinaryUpgrade = false;
+
+bool		IsYsqlUpgrade = false;
 
 bool		ExitOnAnyError = false;
 
@@ -168,3 +192,8 @@ int			notify_buffers = 16;
 int			serializable_buffers = 32;
 int			subtransaction_buffers = 0;
 int			transaction_buffers = 0;
+
+char        *YbSystemDbName = "yb_system";
+char        *PgYbNotificationsTableName = "pg_yb_notifications";
+char        *PgYbNotificationsPublicationName = "pg_yb_notifications_publication";
+char        *YbNotificationsSlotPrefix = "yb_notifications_";

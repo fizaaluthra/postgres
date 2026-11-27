@@ -23,6 +23,9 @@
 #include "catalog/pg_constraint_d.h"	/* IWYU pragma: export */
 #include "nodes/pg_list.h"
 
+/* YB includes */
+#include "utils/catcache.h"
+
 /* ----------------
  *		pg_constraint definition.  cpp turns this into
  *		typedef struct FormData_pg_constraint
@@ -187,6 +190,7 @@ DECLARE_UNIQUE_INDEX_PKEY(pg_constraint_oid_index, 2667, ConstraintOidIndexId, p
 DECLARE_INDEX(pg_constraint_conparentid_index, 2579, ConstraintParentIndexId, pg_constraint, btree(conparentid oid_ops));
 
 MAKE_SYSCACHE(CONSTROID, pg_constraint_oid_index, 16);
+MAKE_SYSCACHE(YBCONSTRAINTRELIDTYPIDNAME, pg_constraint_conrelid_contypid_conname_index, 16);
 
 /* conkey can contain zero (InvalidAttrNumber) if a whole-row Var is used */
 DECLARE_ARRAY_FOREIGN_KEY_OPT((conrelid, conkey), pg_attribute, (attrelid, attnum));
