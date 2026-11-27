@@ -66,8 +66,15 @@ extern Query *inline_function_in_from(PlannerInfo *root,
 
 extern Bitmapset *pull_paramids(Expr *expr);
 
+<<<<<<< HEAD
 extern bool expression_has_grouping_conflict(Node *expr,
 											 grouping_eqop_callback get_eqop,
 											 void *context);
 
+||||||| 90630ec4293
+=======
+/* YB */
+extern Node *yb_get_saop_left_op(const Expr *clause);
+
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 #endif							/* CLAUSES_H */

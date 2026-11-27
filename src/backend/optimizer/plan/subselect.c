@@ -2749,6 +2749,12 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			context.paramids = bms_add_members(context.paramids, scan_params);
 			break;
 
+		case T_YbSeqScan:
+			finalize_primnode((Node *) ((YbSeqScan *) plan)->yb_pushdown.quals,
+							  &context);
+			context.paramids = bms_add_members(context.paramids, scan_params);
+			break;
+
 		case T_SampleScan:
 			finalize_primnode((Node *) ((SampleScan *) plan)->tablesample,
 							  &context);
@@ -2759,6 +2765,10 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			finalize_primnode((Node *) ((IndexScan *) plan)->indexqual,
 							  &context);
 			finalize_primnode((Node *) ((IndexScan *) plan)->indexorderby,
+							  &context);
+			finalize_primnode((Node *) ((IndexScan *) plan)->yb_rel_pushdown.quals,
+							  &context);
+			finalize_primnode((Node *) ((IndexScan *) plan)->yb_idx_pushdown.quals,
 							  &context);
 
 			/*
@@ -2775,6 +2785,8 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			finalize_primnode((Node *) ((IndexOnlyScan *) plan)->recheckqual,
 							  &context);
 			finalize_primnode((Node *) ((IndexOnlyScan *) plan)->indexorderby,
+							  &context);
+			finalize_primnode((Node *) ((IndexOnlyScan *) plan)->yb_pushdown.quals,
 							  &context);
 
 			/*
@@ -2793,12 +2805,39 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			 */
 			break;
 
+		case T_YbBitmapIndexScan:
+			finalize_primnode((Node *) ((YbBitmapIndexScan *) plan)->indexqual,
+							  &context);
+
+			/*
+			 * we need not look at indexqualorig, since it will have the same
+			 * param references as indexqual.
+			 */
+			break;
+
 		case T_BitmapHeapScan:
 			finalize_primnode((Node *) ((BitmapHeapScan *) plan)->bitmapqualorig,
 							  &context);
 			context.paramids = bms_add_members(context.paramids, scan_params);
 			break;
 
+		case T_YbBitmapTableScan:
+			{
+				YbBitmapTableScan *bitmapscan = (YbBitmapTableScan *) plan;
+
+				finalize_primnode((Node *) bitmapscan->rel_pushdown.quals,
+								  &context);
+				finalize_primnode((Node *) bitmapscan->recheck_pushdown.quals,
+								  &context);
+				finalize_primnode((Node *) bitmapscan->recheck_local_quals,
+								  &context);
+				finalize_primnode((Node *) bitmapscan->fallback_pushdown.quals,
+								  &context);
+				finalize_primnode((Node *) bitmapscan->fallback_local_quals,
+								  &context);
+				context.paramids = bms_add_members(context.paramids, scan_params);
+				break;
+			}
 		case T_TidScan:
 			finalize_primnode((Node *) ((TidScan *) plan)->tidquals,
 							  &context);
@@ -3049,6 +3088,7 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			break;
 
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 			{
 				finalize_primnode((Node *) ((Join *) plan)->joinqual,
 								  &context);
@@ -3057,8 +3097,14 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 				{
 					NestLoopParam *nlp = (NestLoopParam *) lfirst(l);
 
-					nestloop_params = bms_add_member(nestloop_params,
-													 nlp->paramno);
+					int			batch_size = nlp->yb_batch_size;
+
+					for (size_t i = 0; i < batch_size; i++)
+					{
+						nestloop_params =
+							bms_add_member(nestloop_params,
+										   nlp->paramno + i);
+					}
 				}
 			}
 			break;

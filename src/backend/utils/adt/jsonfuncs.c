@@ -144,6 +144,36 @@ typedef struct JHashState
 	JsonTokenType saved_token_type;
 } JHashState;
 
+/* YB: state for json_validate_object_keys */
+typedef struct YbValidateOkeysState
+{
+	JsonLexContext *lex;
+	/* The set of keys the json object should contain */
+	char	  **required_keys;
+
+	/*
+	 * For 'i' such that 'expected_keys' was found in the
+	 * json object being processed, found_key[i] will be set
+	 * to true, false otherwise.
+	 */
+	bool	   *found_key;
+
+	/* Number of keys in 'required_keys' */
+	int			num_required_keys;
+
+	/* The set of keys the json object can contain */
+	char	  **optional_keys;
+
+	/* Number of keys in 'optional_keys' */
+	int			num_optional_keys;
+
+	/*
+	 * The actual json being processed, convenience object for printing
+	 * descriptive error messages
+	 */
+	char	   *json_text;
+} YbValidateOkeysState;
+
 /* hashtable element */
 typedef struct JsonHashEntry
 {
@@ -345,6 +375,20 @@ static int	report_json_context(JsonLexContext *lex);
 static JsonParseErrorType okeys_object_field_start(void *state, char *fname, bool isnull);
 static JsonParseErrorType okeys_array_start(void *state);
 static JsonParseErrorType okeys_scalar(void *state, char *token, JsonTokenType tokentype);
+
+/* YB: semantic action functions for json_validate_object_keys */
+
+/* YB: Invoked whenever the parser encounters the start of a json object */
+static JsonParseErrorType validate_okeys_object_field_start(void *state, char *fname, bool isnull);
+
+/* YB: Invoked whenever the parser encounters a json array */
+static JsonParseErrorType validate_okeys_array_start(void *state);
+
+/* YB: Invoked whenever a json scalar is encountered by the parser */
+static JsonParseErrorType validate_okeys_scalar(void *state, char *token, JsonTokenType tokentype);
+
+/* YB: Invoked whenever a json object has been processed completely by the parser */
+static JsonParseErrorType validate_okeys_object_end(void *state);
 
 /* semantic action functions for json_get* functions */
 static JsonParseErrorType get_object_start(void *state);
@@ -834,6 +878,99 @@ okeys_scalar(void *state, char *token, JsonTokenType tokentype)
 						"json_object_keys")));
 
 	return JSON_SUCCESS;
+}
+
+static JsonParseErrorType
+validate_okeys_object_field_start(void *state, char *fname, bool isnull)
+{
+	YbValidateOkeysState *_state = (YbValidateOkeysState *) state;
+
+	/* only verifying keys for the top level object */
+	if (_state->lex->lex_level != 1)
+		return JSON_SUCCESS;
+
+	/* Verify whether fname matches a key in required_keys */
+	for (int i = 0; i < _state->num_required_keys; i++)
+	{
+		if (strcmp(fname, _state->required_keys[i]) == 0)
+		{
+			/* This is a valid key. Mark that this key is found */
+			_state->found_key[i] = true;
+			return JSON_SUCCESS;
+		}
+	}
+
+	/* Verify whether fname matches a key in optional_keys */
+	for (int i = 0; i < _state->num_optional_keys; i++)
+	{
+		if (strcmp(fname, _state->optional_keys[i]) == 0)
+		{
+			/* This is a valid key */
+			return JSON_SUCCESS;
+		}
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("invalid key \"%s\" found in json object %s", fname, _state->json_text)));
+	return JSON_SUCCESS;
+
+}
+
+static JsonParseErrorType
+validate_okeys_object_end(void *state)
+{
+	YbValidateOkeysState *_state = (YbValidateOkeysState *) state;
+
+	/* Nothing to do for nested objects */
+	if (_state->lex->lex_level > 0)
+		return JSON_SUCCESS;
+
+	/*
+	 * Since the entire object has been processed, check whether all required
+	 * keys have been found
+	 */
+	for (int i = 0; i < _state->num_required_keys; i++)
+	{
+		if (!_state->found_key[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("required key \"%s\" not specified in json object %s",
+							_state->required_keys[i],
+							_state->json_text)));
+	}
+	return JSON_SUCCESS;
+
+}
+
+static JsonParseErrorType
+validate_okeys_array_start(void *state)
+{
+	YbValidateOkeysState *_state = (YbValidateOkeysState *) state;
+
+	/* top level must be a json object */
+	if (_state->lex->lex_level == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("found unexpected JSON array in json object %s",
+						_state->json_text)));
+	return JSON_SUCCESS;
+
+}
+
+static JsonParseErrorType
+validate_okeys_scalar(void *state, char *token, JsonTokenType tokentype)
+{
+	YbValidateOkeysState *_state = (YbValidateOkeysState *) state;
+
+	/* top level must be a json object */
+	if (_state->lex->lex_level == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("found unexpected JSON scalar in json object %s",
+						_state->json_text)));
+	return JSON_SUCCESS;
+
 }
 
 /*
@@ -6094,3 +6231,330 @@ json_categorize_type(Oid typoid, bool is_jsonb,
 			break;
 	}
 }
+<<<<<<< HEAD
+||||||| 90630ec4293
+
+/*
+ * Check whether a type conversion to JSON or JSONB involves any mutable
+ * functions.  This recurses into container types (arrays, composites,
+ * ranges, multiranges, domains) to check their element/sub types.
+ *
+ * The caller must initialize *has_mutable to false before calling.
+ * If any mutable function is found, *has_mutable is set to true.
+ */
+void
+json_check_mutability(Oid typoid, bool is_jsonb, bool *has_mutable)
+{
+	char		att_typtype = get_typtype(typoid);
+	JsonTypeCategory tcategory;
+	Oid			outfuncoid;
+
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	Assert(has_mutable != NULL);
+
+	if (*has_mutable)
+		return;
+
+	if (att_typtype == TYPTYPE_DOMAIN)
+	{
+		json_check_mutability(getBaseType(typoid), is_jsonb, has_mutable);
+		return;
+	}
+	else if (att_typtype == TYPTYPE_COMPOSITE)
+	{
+		/*
+		 * For a composite type, recurse into its attributes.  Use the
+		 * typcache to avoid opening the relation directly.
+		 */
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc(typoid, -1);
+
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+			if (attr->attisdropped)
+				continue;
+
+			json_check_mutability(attr->atttypid, is_jsonb, has_mutable);
+			if (*has_mutable)
+				break;
+		}
+		ReleaseTupleDesc(tupdesc);
+		return;
+	}
+	else if (att_typtype == TYPTYPE_RANGE)
+	{
+		json_check_mutability(get_range_subtype(typoid), is_jsonb,
+							  has_mutable);
+		return;
+	}
+	else if (att_typtype == TYPTYPE_MULTIRANGE)
+	{
+		json_check_mutability(get_multirange_range(typoid), is_jsonb,
+							  has_mutable);
+		return;
+	}
+	else
+	{
+		Oid			att_typelem = get_element_type(typoid);
+
+		if (OidIsValid(att_typelem))
+		{
+			/* recurse into array element type */
+			json_check_mutability(att_typelem, is_jsonb, has_mutable);
+			return;
+		}
+	}
+
+	json_categorize_type(typoid, is_jsonb, &tcategory, &outfuncoid);
+
+	switch (tcategory)
+	{
+		case JSONTYPE_NULL:
+		case JSONTYPE_BOOL:
+		case JSONTYPE_NUMERIC:
+			break;
+
+		case JSONTYPE_DATE:
+		case JSONTYPE_TIMESTAMP:
+		case JSONTYPE_TIMESTAMPTZ:
+			*has_mutable = true;
+			break;
+
+		case JSONTYPE_JSON:
+		case JSONTYPE_JSONB:
+		case JSONTYPE_ARRAY:
+		case JSONTYPE_COMPOSITE:
+			break;
+
+		case JSONTYPE_CAST:
+		case JSONTYPE_OTHER:
+			if (func_volatile(outfuncoid) != PROVOLATILE_IMMUTABLE)
+				*has_mutable = true;
+			break;
+	}
+}
+=======
+
+/*
+ * Check whether a type conversion to JSON or JSONB involves any mutable
+ * functions.  This recurses into container types (arrays, composites,
+ * ranges, multiranges, domains) to check their element/sub types.
+ *
+ * The caller must initialize *has_mutable to false before calling.
+ * If any mutable function is found, *has_mutable is set to true.
+ */
+void
+json_check_mutability(Oid typoid, bool is_jsonb, bool *has_mutable)
+{
+	char		att_typtype = get_typtype(typoid);
+	JsonTypeCategory tcategory;
+	Oid			outfuncoid;
+
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	Assert(has_mutable != NULL);
+
+	if (*has_mutable)
+		return;
+
+	if (att_typtype == TYPTYPE_DOMAIN)
+	{
+		json_check_mutability(getBaseType(typoid), is_jsonb, has_mutable);
+		return;
+	}
+	else if (att_typtype == TYPTYPE_COMPOSITE)
+	{
+		/*
+		 * For a composite type, recurse into its attributes.  Use the
+		 * typcache to avoid opening the relation directly.
+		 */
+		TupleDesc	tupdesc = lookup_rowtype_tupdesc(typoid, -1);
+
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+			if (attr->attisdropped)
+				continue;
+
+			json_check_mutability(attr->atttypid, is_jsonb, has_mutable);
+			if (*has_mutable)
+				break;
+		}
+		ReleaseTupleDesc(tupdesc);
+		return;
+	}
+	else if (att_typtype == TYPTYPE_RANGE)
+	{
+		json_check_mutability(get_range_subtype(typoid), is_jsonb,
+							  has_mutable);
+		return;
+	}
+	else if (att_typtype == TYPTYPE_MULTIRANGE)
+	{
+		json_check_mutability(get_multirange_range(typoid), is_jsonb,
+							  has_mutable);
+		return;
+	}
+	else
+	{
+		Oid			att_typelem = get_element_type(typoid);
+
+		if (OidIsValid(att_typelem))
+		{
+			/* recurse into array element type */
+			json_check_mutability(att_typelem, is_jsonb, has_mutable);
+			return;
+		}
+	}
+
+	json_categorize_type(typoid, is_jsonb, &tcategory, &outfuncoid);
+
+	switch (tcategory)
+	{
+		case JSONTYPE_NULL:
+		case JSONTYPE_BOOL:
+		case JSONTYPE_NUMERIC:
+			break;
+
+		case JSONTYPE_DATE:
+		case JSONTYPE_TIMESTAMP:
+		case JSONTYPE_TIMESTAMPTZ:
+			*has_mutable = true;
+			break;
+
+		case JSONTYPE_JSON:
+		case JSONTYPE_JSONB:
+		case JSONTYPE_ARRAY:
+		case JSONTYPE_COMPOSITE:
+			break;
+
+		case JSONTYPE_CAST:
+		case JSONTYPE_OTHER:
+			if (func_volatile(outfuncoid) != PROVOLATILE_IMMUTABLE)
+				*has_mutable = true;
+			break;
+	}
+}
+
+/*
+ * Simple JSON text manipulation functions to be used as utility to parse
+ * json strings.
+ */
+
+int
+json_get_int_value(text *json, char *key)
+{
+	text	   *value = json_get_value(json, key);
+
+	if (value == NULL)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("required key \"%s\" not found", key)));
+	}
+
+	char	   *int_str = text_to_cstring(value);
+	const int	ret_value = atoi(int_str);
+
+	if (ret_value <= 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid value for \"%s\" key", key),
+				 errdetail("Found %s but %s value should be an integer > 0.",
+						   int_str, key)));
+	}
+	return ret_value;
+}
+
+/*
+ * This differs from json_get_value in that the string it returns does not do
+ * character escaping.
+ */
+text *
+json_get_denormalized_value(text *json, char *key)
+{
+	return get_worker(json, &key, NULL, 1, true);
+}
+
+text *
+json_get_value(text *json, char *key)
+{
+	return get_worker(json, &key, NULL, 1, false);
+}
+
+text *
+get_json_array_element(text *json, int index)
+{
+	return get_worker(json, NULL, &index, 1, true);
+}
+
+int
+get_json_array_length(text *json)
+{
+	/* Create a dummy fcinfo to invoke json_array_length */
+	LOCAL_FCINFO(fcinfo, 1);
+	InitFunctionCallInfoData(*fcinfo, NULL, 1, InvalidOid, NULL, NULL);
+	fcinfo->args[0].value = PointerGetDatum(json);
+	fcinfo->args[0].isnull = false;
+	Datum		result = json_array_length(fcinfo);
+
+	return DatumGetInt32(result);
+}
+
+void
+validate_json_object_keys(text *json, char **required_keys, int num_required_keys, char **optional_keys, int num_optional_keys)
+{
+	YbValidateOkeysState *state;
+	JsonLexContext *lex;
+	JsonSemAction *sem;
+
+	lex = makeJsonLexContext(NULL, json, true);
+	state = palloc0(sizeof(YbValidateOkeysState));
+	sem = palloc0(sizeof(JsonSemAction));
+
+	state->lex = lex;
+	state->required_keys = required_keys;
+	state->found_key = (bool *) palloc0(num_required_keys * sizeof(bool));
+	state->num_required_keys = num_required_keys;
+	state->optional_keys = optional_keys;
+	state->num_optional_keys = num_optional_keys;
+	state->json_text = text_to_cstring(json);
+
+	sem->semstate = (void *) state;
+	/*
+	 * When arrays are encountered, throw error if it is a top level element
+	 * Only a JSON object is expected as of now
+	 */
+	sem->array_start = validate_okeys_array_start;
+
+	/* Throw error if top level json object is just a scalar */
+	sem->scalar = validate_okeys_scalar;
+
+	/*
+	 * When an object field is encountered, check whether the key
+	 * is part of 'expected_keys'
+	 */
+	sem->object_field_start = validate_okeys_object_field_start;
+
+	/*
+	 * When the top level object is completely processed,
+	 * check whether all the expected keys have been found.
+	 */
+	sem->object_end = validate_okeys_object_end;
+
+	pg_parse_json_or_ereport(lex, sem);
+
+	pfree(lex->strval->data);
+	pfree(lex->strval);
+	pfree(lex);
+	pfree(sem);
+	pfree(state->found_key);
+	pfree(state);
+}
+>>>>>>> yb-pg19-squash-ed28db9cdd6

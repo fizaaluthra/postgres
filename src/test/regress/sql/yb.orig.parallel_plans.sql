@@ -1,0 +1,371 @@
+SET client_min_messages = 'warning';
+
+DROP DATABASE IF EXISTS colocated_db WITH (force);
+
+CREATE DATABASE colocated_db WITH colocation = on;
+
+ALTER DATABASE colocated_db SET yb_enable_optimizer_statistics = on;
+ALTER DATABASE colocated_db SET yb_enable_base_scans_cost_model = on;
+ALTER DATABASE colocated_db SET yb_fetch_row_limit = 0;
+ALTER DATABASE colocated_db SET yb_fetch_size_limit = '1MB';
+ALTER DATABASE colocated_db SET yb_parallel_range_rows = 10000;
+ALTER DATABASE colocated_db SET yb_parallel_range_size = '1MB';
+
+\c colocated_db
+
+SET client_min_messages = 'warning';
+
+-- Create a table with the same value appearing 100 times each in column
+-- k1, k2 and k3.  Each column’s values are independently shuffled to
+-- prevent correlations between columns or with the indexes.
+
+CREATE TABLE t1m (id int, k1 int, k2 int, k3 int, v char(1536),
+    PRIMARY KEY (id ASC)) WITH (COLOCATION = on);
+
+CREATE INDEX NONCONCURRENTLY t1m_k1k2k3 ON t1m (k1 ASC, k2 ASC, k3 ASC);
+
+
+-- To avoid temporary file limit error, store shuffled column values in separate
+-- temp tables first then join them together.
+
+CREATE TEMPORARY TABLE tmp1 (id int, v int, PRIMARY KEY (id));
+CREATE TEMPORARY TABLE tmp2 (id int, v int, PRIMARY KEY (id));
+CREATE TEMPORARY TABLE tmp3 (id int, v int, PRIMARY KEY (id));
+
+SELECT setseed(0.777);
+
+SET work_mem = '256MB';
+
+-- k1, k2, k3: Each distinct value repeats 100 times each
+INSERT INTO tmp1
+  SELECT row_number() OVER (ORDER BY random()) AS id,
+         i % (1000000 / 100) + 1 AS v FROM generate_series(1, 1000000) i;
+
+INSERT INTO tmp2
+  SELECT row_number() OVER (ORDER BY random()) AS id,
+         i % (1000000 / 100) + 1 AS v FROM generate_series(1, 1000000) i;
+
+INSERT INTO tmp3
+  SELECT row_number() OVER (ORDER BY random()) AS id,
+         i % (1000000 / 100) + 1 AS v FROM generate_series(1, 1000000) i;
+
+ANALYZE tmp1, tmp2, tmp3;
+
+-- Load t1m non-transactionally; the provisional records the transactional path
+-- writes for this much data exhaust the test cluster's tserver memory limit,
+-- which then gets the ANALYZE below rejected for memory pressure.
+SET yb_disable_transactional_writes = true;
+
+/*+
+  Leading(((tmp1 tmp2) tmp3))
+  MergeJoin(tmp1 tmp2)
+  MergeJoin(tmp1 tmp2 tmp3)
+*/
+INSERT INTO t1m
+  SELECT row_number() OVER (), tmp1.v, tmp2.v, tmp3.v,
+      lpad(sha512((tmp1.v#tmp2.v#tmp3.v)::bpchar::bytea)::bpchar, 1536, '-')
+  FROM tmp1 JOIN tmp2 USING (id) JOIN tmp3 USING(id);
+
+SET yb_disable_transactional_writes = false;
+
+ALTER TABLE t1m ALTER COLUMN k1 SET STATISTICS 500;
+ALTER TABLE t1m ALTER COLUMN k2 SET STATISTICS 500;
+ALTER TABLE t1m ALTER COLUMN k3 SET STATISTICS 500;
+
+ANALYZE t1m;
+
+-- Create t10k here rather than next to its use below: the first non-temp
+-- CREATE TABLE of a session scans pg_class for relfilenodes, and after the
+-- reconnect that scan races the commits of explain_filters.sql, yielding a read
+-- restart CREATE TABLE cannot retry.  This session's scan is already cached.
+CREATE TABLE t10k (id int, k1 int, k2 int, k3 int, v char(1536),
+    PRIMARY KEY (id ASC)) WITH (COLOCATION = on);
+INSERT INTO t10k SELECT * FROM t1m WHERE id <= 10000;
+
+
+\c colocated_db
+
+--
+-- Should choose SERIAL seq scan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1 FROM t1m t;
+
+
+--
+-- Should choose SERIAL index scan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t WHERE id BETWEEN 500000-(100/2-1) AND 500000+(100/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t WHERE id BETWEEN 500000-(400/2-1) AND 500000+(400/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE id BETWEEN 500000-(100/2-1) AND 500000+(100/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE id BETWEEN 500000-(400/2-1) AND 500000+(400/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE id BETWEEN 500000-(20000/2-1) AND 500000+(20000/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE id BETWEEN 500000-(50000/2-1) AND 500000+(50000/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT 0 FROM t1m t WHERE id BETWEEN 500000-(20000/2-1) AND 500000+(20000/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT 0 FROM t1m t WHERE id BETWEEN 500000-(50000/2-1) AND 500000+(50000/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT 0 FROM t1m t WHERE id BETWEEN 500000-(100000/2-1) AND 500000+(100000/2);
+
+
+--
+-- Should choose SERIAL index only scan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE k1 = 5000;
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE k1 BETWEEN 5000-(4/2 - 1) AND 5000+(4/2);
+
+
+--
+-- Should choose SERIAL append plan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3, count(*)
+FROM (
+    SELECT id, k1, k2, k3 FROM t1m t1 WHERE id BETWEEN 500000-(10/2-1) AND 500000+(10/2)
+    UNION ALL
+    SELECT -1, k1, k2, k3 FROM t1m t2 WHERE k1 <= 50
+    UNION ALL
+    SELECT -2, k1, k2, k3 FROM t1m t3 WHERE k1 IN (100, 200, 1000, 2000, 5000, 8000)
+    UNION ALL
+    SELECT -3, k1, k2, k3 FROM t1m t4 WHERE k1 IN (1000, 3000, 5000, 6000, 7000)
+) v
+GROUP BY k1, k2, k3
+ORDER BY k1, k2, k3;
+
+
+--
+-- Should choose PARALLEL seq scan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t;
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3, length(v) FROM t1m t WHERE k1 >= 1000 ORDER BY k3;
+
+--
+-- Should choose PARALLEL index scan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t WHERE k1 BETWEEN 5000-(200/2 - 1) AND 5000+(200/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t WHERE k2 BETWEEN 5000-(500/2 - 1) AND 5000+(500/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t WHERE k1 BETWEEN 5000-(1000/2 - 1) AND 5000+(1000/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t WHERE k2 BETWEEN 5000-(1000/2 - 1) AND 5000+(1000/2);
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t ORDER BY id;
+
+
+--
+-- Should choose PARALLEL index only scan
+--
+
+-- An expensive skip scan on the 3rd key column makes this parallel-worthy, but
+-- the matching row count must stay moderate to keep the gather cost low.
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t WHERE k3 BETWEEN 5000-(400/2 - 1) AND 5000+(400/2);
+
+
+--
+-- Should choose PARALLEL append + gather plan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3, count(*)
+FROM (
+    SELECT id, k1, k2, k3 FROM t1m t1 WHERE id BETWEEN 500000-(10/2-1) AND 500000+(10/2)
+    UNION ALL
+    SELECT -1, k1, k2, k3 FROM t1m t2 WHERE k3 = 5000
+    UNION ALL
+    SELECT -2, k1, k2, k3 FROM t1m t3 WHERE k2 = 2000
+    UNION ALL
+    SELECT -3, k1, k2, k3 FROM t1m t4 WHERE k1 = 3000
+) v
+GROUP BY k1, k2, k3
+ORDER BY k1, k2, k3;
+
+
+--
+-- Should choose PARALLEL append + partial agg + gather MERGE plan
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k3, count(*), avg(length(v))
+FROM (
+    SELECT id, k1, k2, k3, v FROM t1m t1 WHERE id BETWEEN 500000-(10000/2-1) AND 500000+(10000/2)
+    UNION ALL
+    SELECT id, k1, k2, k3, v FROM t1m t2 WHERE k3 <= 100
+    UNION ALL
+    SELECT id, k1, k2, k3, v FROM t1m t3 WHERE k2 <= 100
+    UNION ALL
+    SELECT id, k1, k2, k3, v FROM t1m t4 WHERE k1 <= 100
+) v
+GROUP BY k3, id
+ORDER BY k3, id;
+
+
+--
+-- Should choose index only scan by default, and should be parallelized
+-- with parallel_tuple_cost set to 0.01.  These queries run faster in parallel
+-- but only marginally, so it's better not to parallelize them by default.
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t;
+/*+ Set(parallel_tuple_cost 0.01) */
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, k3 FROM t1m t;
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT 0 FROM t1m t;
+/*+ Set(parallel_tuple_cost 0.01) */
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT 0 FROM t1m t;
+
+
+--
+-- Should choose SERIAL batched nested loop join.  A parallel BNL divides
+-- the outer row estimate, and with it the inner batch count, by the
+-- parallel divisor (#32653); at this size that win does not pay for
+-- parallel_setup_cost, which #33413 calibrated against the division.
+--
+
+-- Keep the self-join on the primary key from being eliminated.
+SET enable_self_join_elimination = off;
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT a.id, b.k2 FROM t1m a JOIN t1m b ON b.id = a.id
+WHERE a.k1 BETWEEN 5000-(160/2-1) AND 5000+(160/2);
+
+-- Undercharging the setup cost (the pre-#33413 default of 1700) flips it.
+/*+ Set(parallel_setup_cost 1700) */
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT a.id, b.k2 FROM t1m a JOIN t1m b ON b.id = a.id
+WHERE a.k1 BETWEEN 5000-(160/2-1) AND 5000+(160/2);
+
+
+--
+-- Should choose SERIAL plans under a small LIMIT.  A serial scan's first
+-- read request is trimmed to the pushed-down bound, so one small RPC
+-- satisfies the LIMIT, while parallel workers fetch whole parallel ranges
+-- with the fetch limits lifted regardless of any LIMIT
+-- (yb_scan_apply_next_parallel_range), each range costing far more than the
+-- whole serial plan (#33137: 438s parallel vs 2.3s serial for LIMIT 50
+-- OFFSET 100).
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t LIMIT 5000;
+
+-- The PK provides the requested order: the pushed-down bound satisfies the
+-- query in one RPC; the parallel alternative is Gather Merge over full-range
+-- fetches.
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t ORDER BY id LIMIT 100;
+
+-- Presorted index plus a storage filter, LIMIT+OFFSET needing a few rows:
+-- the pushed-down bound (count + offset) satisfies the query in one trimmed
+-- RPC.
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, id FROM t1m t WHERE id <= 100000
+ORDER BY k1, k2, k3 OFFSET 100 LIMIT 50;
+
+-- DISTINCT resolved by a Unique over the index order passes the bound
+-- through to the scan (#32804).
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT DISTINCT k1, k2, k3 FROM t1m t WHERE id % 499 = 232
+ORDER BY k1 LIMIT 10;
+
+
+--
+-- Should choose PARALLEL batched nested loop join: with twice the rows the
+-- divided batch work exceeds the setup cost.  Flips serial if the outer
+-- row estimate loses its parallel-divisor division.
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT a.id, b.k2 FROM t1m a JOIN t1m b ON b.id = a.id
+WHERE a.k1 BETWEEN 5000-(330/2-1) AND 5000+(330/2);
+
+RESET enable_self_join_elimination;
+
+
+--
+-- Should still choose PARALLEL plans when the LIMIT takes most of the table,
+-- or when the consumer needs rows past the pushed-down bound: the first-batch
+-- startup charge must not push scans that gain from parallelism to serial
+-- plans.
+--
+
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT id, k1, k2, k3, length(v) FROM t1m t LIMIT 900000;
+
+-- An Incremental Sort reads past the bound to close its last group, and the
+-- scan's second request is default-sized; with the size-limited fetches
+-- here that request costs more than a parallel range per worker.
+EXPLAIN (COSTS off, SUMMARY off)
+SELECT k1, k2, id FROM t1m t WHERE id % 499 = 232
+ORDER BY k1, id OFFSET 100 LIMIT 50;
+
+
+--
+-- Correctness tests
+--
+
+/*
+ * Check sanity of cost values (not NaN, +/-Inf, etc.) with very small
+ * yb_parallel_range_size.
+ *
+ * The following function borrowed from explain.sql.
+ */
+\getenv abs_srcdir PG_ABS_SRCDIR
+\set filename :abs_srcdir '/yb_commands/explain_filters.sql'
+\i :filename
+
+-- Ensure no stats even if we start auto-analyzing in the future.
+SELECT yb_reset_analyze_statistics('t10k'::regclass);
+
+BEGIN;
+  SET LOCAL yb_parallel_range_size = 10;
+  SET LOCAL yb_parallel_range_rows = 1;
+  SET LOCAL yb_enable_base_scans_cost_model = on;
+
+  SET LOCAL parallel_setup_cost = 0;
+  SET LOCAL parallel_tuple_cost = 0;
+  SET LOCAL enable_bitmapscan = off;
+
+  SELECT explain_filter_to_json('EXPLAIN (FORMAT json, SUMMARY off) SELECT * FROM t10k WHERE v LIKE ''Value_9'' ORDER BY k2 DESC') #> '{0, "Plan", "Total Cost"}';
+
+ROLLBACK;
+
+
+DROP TABLE t1m, t10k;

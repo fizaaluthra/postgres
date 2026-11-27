@@ -1,0 +1,10 @@
+# Dependency for yb.orig.insert_on_conflict.
+test: yb.orig.create_function
+
+test: yb.orig.insert_on_conflict
+test: yb.orig.insert_on_conflict_multiplan
+test: yb.orig.insert_on_conflict_with
+test: yb.orig.insert_on_conflict_with_spi
+test: yb.orig.insert_on_conflict_with_explain
+test: yb.orig.insert_on_conflict_pushdown
+test: yb.orig.insert_on_conflict_batch_size_change

@@ -47,6 +47,11 @@
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/sysattr.h"
+#include "commands/yb_analyze.h"
+#include "optimizer/cost.h"
+
 /*
  * To avoid consuming too much memory during analysis and/or too much space
  * in the resulting pg_statistic rows, we ignore varlena datums that are wider
@@ -100,6 +105,7 @@ static StatsBuildData *make_build_data(Relation rel, StatExtEntry *stat,
 									   int numrows, HeapTuple *rows,
 									   VacAttrStats **stats, int stattarget);
 
+<<<<<<< HEAD
 static inline void
 report_ext_stats_not_computed(Relation onerel, StatExtEntry *stat)
 {
@@ -112,6 +118,12 @@ report_ext_stats_not_computed(Relation onerel, StatExtEntry *stat)
 						RelationGetRelationName(onerel)),
 				 errtable(onerel)));
 }
+||||||| 90630ec4293
+=======
+/* YB declarations */
+static bool yb_reads_full_values(StatExtEntry *stat);
+
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 
 /*
  * Compute requested extended stats, using the rows sampled for the plain
@@ -314,7 +326,8 @@ HasRelationExtStatistics(Relation onerel)
  */
 int
 ComputeExtStatisticsRows(Relation onerel,
-						 int natts, VacAttrStats **vacattrstats)
+						 int natts, VacAttrStats **vacattrstats,
+						 Bitmapset **yb_full_value_cols)
 {
 	Relation	pg_stext;
 	ListCell   *lc;
@@ -352,6 +365,29 @@ ComputeExtStatisticsRows(Relation onerel,
 
 		if (!stats)
 			continue;
+
+		/* YB: collect the columns if the object reads them in full */
+		if (yb_full_value_cols)
+		{
+			/* the caller keeps the set, and cxt is deleted below */
+			MemoryContextSwitchTo(oldcxt);
+
+			if (yb_reads_full_values(stat))
+			{
+				int			x = -1;
+
+				/* match pull_varattnos()'s offset */
+				while ((x = bms_next_member(stat->columns, x)) >= 0)
+					*yb_full_value_cols =
+						bms_add_member(*yb_full_value_cols,
+									   x - FirstLowInvalidHeapAttributeNumber);
+			}
+
+			/* collect the columns an expression reads */
+			pull_varattnos((Node *) stat->exprs, 1, yb_full_value_cols);
+
+			MemoryContextSwitchTo(cxt);
+		}
 
 		/*
 		 * Compute statistics target, based on what's set for the statistic
@@ -1144,6 +1180,9 @@ build_sorted_items(StatsBuildData *data, int *nitems,
 					toowide = true;
 					break;
 				}
+
+				/* YB: stand-ins are wider than this, so none gets here */
+				Assert(!YbIsAnalyzeStandin(DatumGetPointer(value)));
 
 				value = PointerGetDatum(PG_DETOAST_DATUM(value));
 			}
@@ -2053,6 +2092,9 @@ statext_clauselist_selectivity(PlannerInfo *root, List *clauses, int varRelid,
 {
 	Selectivity sel;
 
+	if (rel->is_yb_relation && yb_ignore_stats)
+		return 1.0;
+
 	/* First, try estimating clauses using a multivariate MCV list. */
 	sel = statext_mcv_clauselist_selectivity(root, clauses, varRelid, jointype,
 											 sjinfo, rel, estimatedclauses, is_or);
@@ -2514,6 +2556,7 @@ statext_expressions_load(Oid stxoid, bool inh, int idx)
 	ItemPointerSetInvalid(&(tmptup.t_self));
 	tmptup.t_tableOid = InvalidOid;
 	tmptup.t_data = td;
+	HEAPTUPLE_YBCTID(&tmptup) = 0;
 
 	tup = heap_copytuple(&tmptup);
 
@@ -2638,6 +2681,12 @@ make_build_data(Relation rel, StatExtEntry *stat, int numrows, HeapTuple *rows,
 												  result->stats[idx]->tupDesc,
 												  &result->nulls[idx][i]);
 
+			/* YB: an object that reads its columns in full gets no stand-in */
+			Assert(result->nulls[idx][i] ||
+				   result->stats[idx]->attrtype->typlen != -1 ||
+				   !yb_reads_full_values(stat) ||
+				   !YbIsAnalyzeStandin(DatumGetPointer(result->values[idx][i])));
+
 			idx++;
 		}
 	}
@@ -2701,4 +2750,25 @@ make_build_data(Relation rel, StatExtEntry *stat, int numrows, HeapTuple *rows,
 	FreeExecutorState(estate);
 
 	return result;
+}
+
+/*
+ * YB: whether the object reads every value of its columns in full.  Only mcv
+ * and dependencies skip the wide values themselves, and expressions
+ * statistics read only the expressions.
+ */
+static bool
+yb_reads_full_values(StatExtEntry *stat)
+{
+	ListCell   *lc;
+
+	foreach(lc, stat->types)
+	{
+		char		kind = (char) lfirst_int(lc);
+
+		if (kind != STATS_EXT_MCV && kind != STATS_EXT_DEPENDENCIES &&
+			kind != STATS_EXT_EXPRESSIONS)
+			return true;
+	}
+	return false;
 }

@@ -47,6 +47,9 @@
 #include "utils/syscache.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* max sleep time between cycles (3min) */
 #define DEFAULT_NAPTIME_PER_CYCLE 180000L
 
@@ -1639,11 +1642,25 @@ CreateConflictDetectionSlot(void)
 	if (MyReplicationSlot)
 		return;
 
+	/*
+	 * YB: CREATE and ALTER SUBSCRIPTION reject retain_dead_tuples, so no
+	 * subscription should get here.  Fail before ReplicationSlotCreate, which
+	 * would create a CDC stream that this physical slot cannot use.
+	 */
+	if (IsYugaByteEnabled())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("retain_dead_tuples is not supported in YugabyteDB")));
+
 	ereport(LOG,
 			errmsg("creating replication conflict detection slot"));
 
 	ReplicationSlotCreate(CONFLICT_DETECTION_SLOT, false, RS_PERSISTENT, false,
-						  false, false, false);
+						  false, false, false,
+						  NULL /* yb_plugin_name */ , CRS_NOEXPORT_SNAPSHOT,
+						  NULL /* yb_consistent_snapshot_time */ ,
+						  CRS_SEQUENCE, YB_CRS_TRANSACTION,
+						  NULL /* yb_publication_name */ );
 
 	reset_conflict_slot_xmin_to_safe_horizon();
 }

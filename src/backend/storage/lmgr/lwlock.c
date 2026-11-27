@@ -1022,10 +1022,20 @@ LWLockQueueSelf(LWLock *lock, LWLockMode mode)
 	 * should never occur, since MyProc should only be null during shared
 	 * memory initialization.
 	 */
-	if (MyProc == NULL)
+	PGPROC	   *proc = MyProc;
+
+	/* YB */
+	if (!IsUnderPostmaster && proc == NULL)
+	{
+		if (KilledProcToClean == NULL)
+			elog(PANIC, "postmaster cannot wait without a killed process struct");
+		proc = KilledProcToClean;
+	}
+
+	if (proc == NULL)
 		elog(PANIC, "cannot wait without a PGPROC structure");
 
-	if (MyProc->lwWaiting != LW_WS_NOT_WAITING)
+	if (proc->lwWaiting != LW_WS_NOT_WAITING)
 		elog(PANIC, "queueing for lock while waiting on another one");
 
 	LWLockWaitListLock(lock);
@@ -1033,14 +1043,14 @@ LWLockQueueSelf(LWLock *lock, LWLockMode mode)
 	/* setting the flag is protected by the spinlock */
 	pg_atomic_fetch_or_u32(&lock->state, LW_FLAG_HAS_WAITERS);
 
-	MyProc->lwWaiting = LW_WS_WAITING;
-	MyProc->lwWaitMode = mode;
+	proc->lwWaiting = LW_WS_WAITING;
+	proc->lwWaitMode = mode;
 
 	/* LW_WAIT_UNTIL_FREE waiters are always at the front of the queue */
 	if (mode == LW_WAIT_UNTIL_FREE)
-		proclist_push_head(&lock->waiters, MyProcNumber, lwWaitLink);
+		proclist_push_head(&lock->waiters, GetNumberFromPGProc(proc), lwWaitLink);
 	else
-		proclist_push_tail(&lock->waiters, MyProcNumber, lwWaitLink);
+		proclist_push_tail(&lock->waiters, GetNumberFromPGProc(proc), lwWaitLink);
 
 	/* Can release the mutex now */
 	LWLockWaitListUnlock(lock);
@@ -1061,6 +1071,16 @@ static void
 LWLockDequeueSelf(LWLock *lock)
 {
 	bool		on_waitlist;
+	PGPROC	   *proc = MyProc;
+
+	/* YB */
+	if (proc == NULL)
+	{
+		Assert(!IsUnderPostmaster);
+		if (KilledProcToClean == NULL)
+			elog(PANIC, "postmaster cannot wait without a killed process struct");
+		proc = KilledProcToClean;
+	}
 
 #ifdef LWLOCK_STATS
 	lwlock_stats *lwstats;
@@ -1077,9 +1097,9 @@ LWLockDequeueSelf(LWLock *lock)
 	 * The removal happens with the wait list lock held, so there's no race in
 	 * this check.
 	 */
-	on_waitlist = MyProc->lwWaiting == LW_WS_WAITING;
+	on_waitlist = proc->lwWaiting == LW_WS_WAITING;
 	if (on_waitlist)
-		proclist_delete(&lock->waiters, MyProcNumber, lwWaitLink);
+		proclist_delete(&lock->waiters, GetNumberFromPGProc(proc), lwWaitLink);
 
 	if (proclist_is_empty(&lock->waiters) &&
 		(pg_atomic_read_u32(&lock->state) & LW_FLAG_HAS_WAITERS) != 0)
@@ -1092,7 +1112,7 @@ LWLockDequeueSelf(LWLock *lock)
 
 	/* clear waiting state again, nice for debugging */
 	if (on_waitlist)
-		MyProc->lwWaiting = LW_WS_NOT_WAITING;
+		proc->lwWaiting = LW_WS_NOT_WAITING;
 	else
 	{
 		int			extraWaits = 0;
@@ -1115,8 +1135,8 @@ LWLockDequeueSelf(LWLock *lock)
 		 */
 		for (;;)
 		{
-			PGSemaphoreLock(MyProc->sem);
-			if (MyProc->lwWaiting == LW_WS_NOT_WAITING)
+			PGSemaphoreLock(proc->sem);
+			if (proc->lwWaiting == LW_WS_NOT_WAITING)
 				break;
 			extraWaits++;
 		}
@@ -1125,7 +1145,7 @@ LWLockDequeueSelf(LWLock *lock)
 		 * Fix the process wait semaphore's count for any absorbed wakeups.
 		 */
 		while (extraWaits-- > 0)
-			PGSemaphoreUnlock(MyProc->sem);
+			PGSemaphoreUnlock(proc->sem);
 	}
 
 #ifdef LOCK_DEBUG
@@ -1158,6 +1178,9 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	lwstats = get_lwlock_stats_entry(lock);
 #endif
 
+	if (!IsUnderPostmaster && MyProc == NULL && KilledProcToClean != NULL)
+		proc = KilledProcToClean;
+
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
 	PRINT_LWDEBUG("LWLockAcquire", lock, mode);
@@ -1180,6 +1203,20 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	/* Ensure we will have room to remember the lock */
 	if (num_held_lwlocks >= MAX_SIMUL_LWLOCKS)
 		elog(ERROR, "too many LWLocks taken");
+
+	/*
+	 * lwlock_acquired is true when a postgres backend has acquired one or more
+	 * LWLocks. lwlock_acquired is false if and only if a backend does not hold
+	 * any LWLock.
+	 *
+	 * lwlock_acquired is set to true when the backend starts the process of
+	 * acquiring a LWLock. If a postgres backend dies at a point when
+	 * lwlock_acquired is true, the postmaster issues a full restart. This is
+	 * because during the acquisition of LWLocks by postgres backends, they are
+	 * prone to modify shared memory. At this time, if the backend dies there is
+	 * a chance of shared memory being corrupted.
+	 */
+	YbMyProcState->lwlock_acquired = true;
 
 	/*
 	 * Lock out cancel/die interrupts until we exit the code section protected
@@ -1337,11 +1374,18 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 	 */
 	HOLD_INTERRUPTS();
 
+	/* YB */
+	YbMyProcState->lwlock_acquired = true;
+
 	/* Check for the lock */
 	mustwait = LWLockAttemptLock(lock, mode);
 
 	if (mustwait)
 	{
+		/* YB */
+		if (!num_held_lwlocks)
+			YbMyProcState->lwlock_acquired = false;
+
 		/* Failed to get lock, so release interrupt holdoff */
 		RESUME_INTERRUPTS();
 
@@ -1400,6 +1444,9 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 	 * manipulations of data structures in shared memory.
 	 */
 	HOLD_INTERRUPTS();
+
+	/* YB */
+	YbMyProcState->lwlock_acquired = true;
 
 	/*
 	 * NB: We're using nearly the same twice-in-a-row lock acquisition
@@ -1826,6 +1873,16 @@ LWLockRelease(LWLock *lock)
 		LOG_LWDEBUG("LWLockRelease", lock, "releasing waiters");
 		LWLockWakeup(lock);
 	}
+
+	/*
+	 * lwlock_acquired is true when the current backend is holding any of the
+	 * shared LWLock. Similarly, lwlock_acquired is false when it is holding 0
+	 * (zero) LWLocks. Hence, in situations where a backend acquires multiple
+	 * LWLocks, lwlock_acquired is set to false only when the number of acquired
+	 * LWLocks is 0.
+	 */
+	if (!num_held_lwlocks)
+		YbMyProcState->lwlock_acquired = false;
 
 	/*
 	 * Now okay to allow cancel/die interrupts.

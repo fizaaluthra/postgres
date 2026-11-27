@@ -55,6 +55,11 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "access/yb_cost.h"
+#include "pg_yb_utils.h"
+#include "utils/catcache.h"
+
 /* GUC parameter */
 int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
 
@@ -86,6 +91,7 @@ static void set_baserel_partition_key_exprs(Relation relation,
 											RelOptInfo *rel);
 static void set_baserel_partition_constraint(Relation relation,
 											 RelOptInfo *rel);
+static void yb_prefetch_column_stats(Relation relation);
 
 
 /*
@@ -158,7 +164,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary or unlogged relations during recovery")));
 
-	rel->min_attr = FirstLowInvalidHeapAttributeNumber + 1;
+	rel->min_attr = YBGetFirstLowInvalidAttributeNumber(relation) + 1;
 	rel->max_attr = RelationGetNumberOfAttributes(relation);
 	rel->reltablespace = RelationGetForm(relation)->reltablespace;
 
@@ -179,6 +185,17 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	 */
 	if (!inhparent || relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		rel->notnullattnums = find_relation_notnullatts(root, relationObjectId);
+
+	/*
+	 * YB: When the cost model (CBO) is enabled, costing a scan reads one
+	 * pg_statistic row per column on a cold backend -- get_attavgwidth() is
+	 * called over the relation's full-row width -- so a wide table is a burst of
+	 * one catalog RPC per column.  Warm them all with a single batched list
+	 * lookup first so those per-column lookups hit cache.
+	 */
+	if (IsYugaByteEnabled() && yb_prefetch_column_statistics &&
+		yb_enable_base_scans_cost_model)
+		yb_prefetch_column_stats(relation);
 
 	/*
 	 * Estimate relation size --- unless it's an inheritance parent, in which
@@ -205,6 +222,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 		hasindex = false;
 	else
 		hasindex = relation->rd_rel->relhasindex;
+
+	if (IsYugaByteEnabled())
+		rel->ybRelationName = pstrdup(RelationGetRelationName(relation));
 
 	if (hasindex)
 	{
@@ -247,9 +267,23 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * are constructing is only used by the planner --- the executor
 			 * still needs to insert into "invalid" indexes, if they're marked
 			 * indisready.
+			 *
+			 * YB note: Proceed to load the index's expressions and predicate
+			 * for YB-backed relations into the index's relcache entry even
+			 * if the index is invalid. This information will be used by the
+			 * planner to optimize UPDATE queries, much before the execution
+			 * layer has had a chance to load it. Skip populating the index's
+			 * optimizer info so that the planner recognizes that the index is
+			 * not ready for scans.
 			 */
 			if (!index->indisvalid)
 			{
+				if (IsYBRelation(relation))
+				{
+					(void) RelationGetIndexExpressions(indexRelation);
+					(void) RelationGetIndexPredicate(indexRelation);
+				}
+
 				index_close(indexRelation, NoLock);
 				continue;
 			}
@@ -276,6 +310,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->rel = rel;
 			info->ncolumns = ncolumns = index->indnatts;
 			info->nkeycolumns = nkeycolumns = index->indnkeyatts;
+			info->nhashcolumns = 0;
 
 			info->indexkeys = palloc_array(int, ncolumns);
 			info->indexcollations = palloc_array(Oid, nkeycolumns);
@@ -314,9 +349,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->amhasgettuple = (amroutine->amgettuple != NULL);
 				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
 					relation->rd_tableam->scan_bitmap_next_tuple != NULL;
+				info->yb_amhasgetbitmap = (amroutine->yb_amgetbitmap != NULL);
 				info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
 									  amroutine->amrestrpos != NULL);
 				info->amcostestimate = amroutine->amcostestimate;
+				info->yb_amiscopartitioned = amroutine->yb_amiscopartitioned;
+				info->yb_cached_ybctid_size = 0;
 				Assert(info->amcostestimate != NULL);
 
 				/* Fetch index opclass options */
@@ -370,8 +408,17 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 						Oid			opcintype;
 						CompareType cmptype;
 
-						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
-						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+						if (IsYBRelation(relation) && (opt & INDOPTION_HASH) != 0)
+						{
+							info->nhashcolumns++;
+							info->reverse_sort[i] = false;
+							info->nulls_first[i] = false;
+						}
+						else
+						{
+							info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
+							info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+						}
 
 						ltopr = get_opfamily_member_for_cmptype(info->opfamily[i],
 																info->opcintype[i],
@@ -414,8 +461,11 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->amcanparallel = false;
 				info->amhasgettuple = false;
 				info->amhasgetbitmap = false;
+				info->yb_amhasgetbitmap = false;
 				info->amcanmarkpos = false;
 				info->amcostestimate = NULL;
+				info->yb_amiscopartitioned = false;
+				info->yb_cached_ybctid_size = 0;
 
 				info->sortopfamily = NULL;
 				info->reverse_sort = NULL;
@@ -457,6 +507,63 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			/* Build targetlist using the completed indexprs data */
 			info->indextlist = build_index_tlist(root, info, relation);
 
+			/*
+			 * YB: Check if this is an LSM secondary index. If it is, append the base
+			 * table's primary key columns as decodable from ybidxbasectid.
+			 */
+			if (IsYBRelation(relation) && !index->indisprimary &&
+				info->relam == LSM_AM_OID &&
+				yb_enable_primary_key_decode_from_index)
+			{
+				Bitmapset  *pk_bms = YBGetTablePrimaryKeyBms(relation);
+
+				if (pk_bms != NULL)
+				{
+					int			bms_idx = -1;
+					int			missing_pk_count = 0;
+					AttrNumber	missing_pk_attnums[INDEX_MAX_KEYS];
+					Bitmapset  *idx_keys_bms = NULL;
+
+					/* Only check through user columns (attnum > 0), skip system columns. */
+					for (int j = 0; j < ncolumns; j++)
+						if (info->indexkeys[j] > 0)
+							idx_keys_bms = bms_add_member(idx_keys_bms, info->indexkeys[j]);
+
+					/* Scan for primary keys not in the index. */
+					while ((bms_idx = bms_next_member(pk_bms, bms_idx)) >= 0)
+					{
+						AttrNumber	pk_attnum = bms_idx +
+							YBGetFirstLowInvalidAttributeNumber(relation);
+
+						if (!bms_is_member(pk_attnum, idx_keys_bms) &&
+							missing_pk_count < INDEX_MAX_KEYS - ncolumns)
+							missing_pk_attnums[missing_pk_count++] = pk_attnum;
+					}
+					bms_free(idx_keys_bms);
+
+					/* Rebuild indextlist with the extra columns. */
+					if (missing_pk_count > 0)
+					{
+						int			new_ncols = ncolumns + missing_pk_count;
+
+						info->indexkeys = (int *)
+							repalloc(info->indexkeys, sizeof(int) * new_ncols);
+						info->canreturn = (bool *)
+							repalloc(info->canreturn, sizeof(bool) * new_ncols);
+
+						for (int j = 0; j < missing_pk_count; j++)
+						{
+							info->indexkeys[ncolumns + j] = missing_pk_attnums[j];
+							info->canreturn[ncolumns + j] = true;
+						}
+
+						info->ncolumns = new_ncols;
+						info->yb_num_decoded_pk_cols = missing_pk_count;
+						info->indextlist = build_index_tlist(root, info, relation);
+					}
+				}
+			}
+
 			info->indrestrictinfo = NIL;	/* set later, in indxpath.c */
 			info->predOK = false;	/* set later, in indxpath.c */
 			info->unique = index->indisunique;
@@ -474,7 +581,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 */
 			if (indexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 			{
-				if (info->indpred == NIL)
+				if (info->indpred == NIL && !IsYBRelation(indexRelation))
 				{
 					info->pages = RelationGetNumberOfBlocks(indexRelation);
 					info->tuples = rel->tuples;
@@ -509,6 +616,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->tuples = 0.0;
 				info->tree_height = -1;
 			}
+
+			if (IsYugaByteEnabled())
+				info->ybIndexName = pstrdup(RelationGetRelationName(indexRelation));
 
 			index_close(indexRelation, NoLock);
 
@@ -1314,7 +1424,25 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	BlockNumber relallvisible;
 	double		density;
 
-	if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
+	/*
+	 * YB: TODO We don't support forwarding size estimates to postgres yet.
+	 * Use whatever is in pg_class.
+	 */
+	if (IsYBRelation(rel))
+	{
+		if (rel->rd_rel->reltuples < 0 || yb_ignore_stats)
+		{
+			*tuples = YBC_DEFAULT_NUM_ROWS;
+		}
+		else
+		{
+			*tuples = rel->rd_rel->reltuples;
+		}
+
+		*pages = rel->rd_rel->relpages;
+		*allvisfrac = 0;
+	}
+	else if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 	{
 		table_relation_estimate_size(rel, attr_widths, pages, tuples,
 									 allvisfrac);
@@ -1485,6 +1613,72 @@ get_relation_data_width(Oid relid, int32 *attr_widths)
 	table_close(relation, NoLock);
 
 	return result;
+}
+
+/*
+ * yb_prefetch_column_stats
+ *		Warm the catalog cache with all of a relation's pg_statistic rows in one
+ *		batched list lookup, so the planner's per-column pg_statistic lookups
+ *		hit warm cache instead of issuing a catalog RPC each.
+ *
+ * The list lookup only runs when some column's entry is missing.  Any
+ * pg_statistic invalidation drops every list in the cache, so relying on the
+ * list itself would re-read the stats of every relation after an ANALYZE of
+ * any one of them; the per-column entries of relations that were not
+ * analyzed survive it.
+ */
+static void
+yb_prefetch_column_stats(Relation relation)
+{
+	Oid			relid = RelationGetRelid(relation);
+	TupleDesc	tupdesc = RelationGetDescr(relation);
+	Datum	   *keys;
+	int			nkeys = 0;
+	bool		inh_values[2];
+	int			ninh_values = 0;
+	int			i;
+	int			j;
+
+	switch (relation->rd_rel->relkind)
+	{
+		case RELKIND_RELATION:
+		case RELKIND_MATVIEW:
+		case RELKIND_PARTITIONED_TABLE:
+		case RELKIND_FOREIGN_TABLE:
+			break;
+		default:
+			/* No column statistics to prefetch for this relation kind. */
+			return;
+	}
+
+	/*
+	 * Use the keys the planner looks up: get_attavgwidth() reads
+	 * stainherit = false rows, and examine_variable() reads
+	 * stainherit = true rows for a parent with children.  A partitioned
+	 * table only has stainherit = true rows, and so does an empty
+	 * inheritance parent.  The list lookup caches the rows of every column
+	 * with both stainherit values.
+	 */
+	if (relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		inh_values[ninh_values++] = false;
+	if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		relation->rd_rel->relhassubclass)
+		inh_values[ninh_values++] = true;
+	keys = palloc(tupdesc->natts * ninh_values * 3 * sizeof(Datum));
+	for (j = 0; j < ninh_values; j++)
+	{
+		for (i = 1; i <= tupdesc->natts; i++)
+		{
+			if (TupleDescAttr(tupdesc, i - 1)->attisdropped)
+				continue;
+			keys[nkeys * 3] = ObjectIdGetDatum(relid);
+			keys[nkeys * 3 + 1] = Int16GetDatum(i);
+			keys[nkeys * 3 + 2] = BoolGetDatum(inh_values[j]);
+			nkeys++;
+		}
+	}
+	YbSysCachePrefetchList(STATRELATTINH, ObjectIdGetDatum(relid), nkeys, keys);
+	pfree(keys);
 }
 
 
@@ -2638,19 +2832,35 @@ has_stored_generated_columns(PlannerInfo *root, Index rti)
  * that depend on any column listed in target_cols.  Both the input and
  * result bitmapsets contain column numbers offset by
  * FirstLowInvalidHeapAttributeNumber.
+ *
+ * YB note: The out param yb_generated_cols_source contains a set of columns
+ * that the returned generated columns depend on. These independent columns may
+ * not be a part of target_cols.
+ * YB note: either of root/rti OR yb_relation must be passed.
  */
 Bitmapset *
 get_dependent_generated_columns(PlannerInfo *root, Index rti,
-								Bitmapset *target_cols)
+								Bitmapset *target_cols,
+								Bitmapset **yb_generated_cols_source,
+								Relation yb_relation)
 {
 	Bitmapset  *dependentCols = NULL;
-	RangeTblEntry *rte = planner_rt_fetch(rti, root);
 	Relation	relation;
 	TupleDesc	tupdesc;
 	TupleConstr *constr;
+	AttrNumber	min_attr;
 
-	/* Assume we already have adequate lock */
-	relation = table_open(rte->relid, NoLock);
+	if (!yb_relation)
+	{
+		RangeTblEntry *rte = planner_rt_fetch(rti, root);
+
+		/* Assume we already have adequate lock */
+		relation = table_open(rte->relid, NoLock);
+	}
+	else
+		relation = yb_relation;
+
+	min_attr = YBGetFirstLowInvalidAttributeNumber(relation);
 
 	tupdesc = RelationGetDescr(relation);
 	constr = tupdesc->constr;
@@ -2669,15 +2879,22 @@ get_dependent_generated_columns(PlannerInfo *root, Index rti,
 
 			/* identify columns this generated column depends on */
 			expr = stringToNode(defval->adbin);
-			pull_varattnos(expr, 1, &attrs_used);
+			pull_varattnos_min_attr(expr, 1, &attrs_used, min_attr + 1);
 
 			if (bms_overlap(target_cols, attrs_used))
+			{
 				dependentCols = bms_add_member(dependentCols,
-											   defval->adnum - FirstLowInvalidHeapAttributeNumber);
+											   defval->adnum - min_attr);
+
+				if (yb_generated_cols_source)
+					*yb_generated_cols_source = bms_add_members(*yb_generated_cols_source,
+																attrs_used);
+			}
 		}
 	}
 
-	table_close(relation, NoLock);
+	if (!yb_relation)
+		table_close(relation, NoLock);
 
 	return dependentCols;
 }

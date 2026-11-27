@@ -362,6 +362,10 @@ toast_fetch_datum(varlena *attr)
 	/* Must copy to access aligned fields */
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 
+	/* YB: a real on-disk TOAST pointer always names its TOAST table */
+	if (toast_pointer.va_toastrelid == InvalidOid)
+		elog(ERROR, "toast pointer has no toast table");
+
 	attrsize = VARATT_EXTERNAL_GET_EXTSIZE(toast_pointer);
 
 	result = (varlena *) palloc(attrsize + VARHDRSZ);
@@ -415,6 +419,10 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 
 	/* Must copy to access aligned fields */
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+
+	/* YB: a real on-disk TOAST pointer always names its TOAST table */
+	if (toast_pointer.va_toastrelid == InvalidOid)
+		elog(ERROR, "toast pointer has no toast table");
 
 	/*
 	 * It's nonsense to fetch slices of a compressed datum unless when it's a

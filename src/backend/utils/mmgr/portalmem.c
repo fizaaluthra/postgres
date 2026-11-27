@@ -30,6 +30,9 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Estimate of the maximum number of open portals a user would have,
  * used in initially sizing the PortalHashTable in EnablePortalManager().
@@ -199,6 +202,14 @@ CreatePortal(const char *name, bool allowDup, bool dupSilent)
 	portal = (Portal) MemoryContextAllocZero(TopPortalContext, sizeof *portal);
 
 	/* initialize portal context; typically it won't store much */
+	/*
+	 * YB:
+	 * - portalContext lasts for the lifetime of the portal thru multiple portal runs.
+	 * - runContext only lasts for the lifetime of one portal run, and one portal may run many
+	 *   times. When SELECT is fetches in multiple batches, each batch is associated with one
+	 *   portal run.  Some memory allocated in the portal run should only last till the end of
+	 *   each run and should be allocated by runContext.
+	 */
 	portal->portalContext = AllocSetContextCreate(TopPortalContext,
 												  "PortalContext",
 												  ALLOCSET_SMALL_SIZES);
@@ -1252,6 +1263,21 @@ ThereAreNoReadyPortals(void)
 	}
 
 	return true;
+}
+
+/*
+ * YB: invoke callback on every existing portal.
+ */
+void
+YbForEachPortal(void (*callback) (Portal portal))
+{
+	HASH_SEQ_STATUS status;
+	PortalHashEnt *hentry;
+
+	hash_seq_init(&status, PortalHashTable);
+
+	while ((hentry = (PortalHashEnt *) hash_seq_search(&status)) != NULL)
+		callback(hentry->portal);
 }
 
 /*

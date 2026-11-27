@@ -19,12 +19,19 @@
 
 #include "postgres_fe.h"
 
+<<<<<<< HEAD
 #include "common/int.h"
 
 pg_noreturn static pg_noinline void add_size_error(Size s1, Size s2);
 pg_noreturn static pg_noinline void mul_size_error(Size s1, Size s2);
 
 
+||||||| 90630ec4293
+=======
+/* YB includes */
+#include "yb/util/debug/leak_annotations.h"
+
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 static inline void *
 pg_malloc_internal(size_t size, int flags)
 {
@@ -46,6 +53,8 @@ pg_malloc_internal(size_t size, int flags)
 
 	if ((flags & MCXT_ALLOC_ZERO) != 0)
 		MemSet(tmp, 0, size);
+
+	__lsan_ignore_object(tmp);
 	return tmp;
 }
 
@@ -104,6 +113,7 @@ pg_strdup(const char *in)
 		fprintf(stderr, _("out of memory\n"));
 		exit(EXIT_FAILURE);
 	}
+	__lsan_ignore_object(tmp);
 	return tmp;
 }
 

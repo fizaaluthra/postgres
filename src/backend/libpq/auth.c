@@ -41,16 +41,27 @@
 #include "tcop/backend_startup.h"
 #include "utils/memutils.h"
 
+/* YB includes */
+#include "access/htup_details.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "commands/yb_profile.h"
+#include "pg_yb_utils.h"
+#include "utils/builtins.h"		/* TODO: may not be needed */
+#include "utils/syscache.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb_internal_conn.h"
+
 /*----------------------------------------------------------------
  * Global authentication functions
  *----------------------------------------------------------------
  */
 static void auth_failed(Port *port, int elevel, int status,
-						const char *logdetail);
+						const char *logdetail,
+						bool yb_role_is_locked_out);
 static char *recv_password_packet(Port *port);
 static bool md5_password_warning_enabled(void);
 static void queue_md5_password_warning(void);
-
 
 /*----------------------------------------------------------------
  * Password-based authentication methods (password, md5, and scram-sha-256)
@@ -62,6 +73,7 @@ static int	CheckPWChallengeAuth(Port *port, const char **logdetail);
 static int	CheckMD5Auth(Port *port, char *shadow_pass,
 						 const char **logdetail);
 
+static int	CheckYbTserverKeyAuth(Port *port, const char **logdetail);
 
 /*----------------------------------------------------------------
  * Ident authentication
@@ -149,6 +161,8 @@ static int	CheckBSDAuth(Port *port, char *user);
 
 static int	CheckLDAPAuth(Port *port);
 
+static char *get_ldap_password(char *ldapbindpasswd);
+
 /* LDAP_OPT_DIAGNOSTIC_MESSAGE is the newer spelling */
 #ifndef LDAP_OPT_DIAGNOSTIC_MESSAGE
 #define LDAP_OPT_DIAGNOSTIC_MESSAGE LDAP_OPT_ERROR_STRING
@@ -205,6 +219,11 @@ static int	pg_SSPI_make_upn(char *accountname,
 							 bool update_accountname);
 #endif
 
+/*----------------------------------------------------------------
+ * JWT Authentication
+ *----------------------------------------------------------------
+ */
+static int	YbCheckJwtAuth(Port *port);
 
 /*----------------------------------------------------------------
  * Global authentication functions
@@ -233,13 +252,26 @@ ClientAuthentication_hook_type ClientAuthentication_hook = NULL;
  * when the elevel allows.
  */
 static void
-auth_failed(Port *port, int elevel, int status, const char *logdetail)
+auth_failed(Port *port, int elevel, int status, const char *logdetail,
+			bool yb_role_is_locked_out)
 {
 	const char *errstr;
 	char	   *cdetail;
 	int			errcode_return = ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION;
 
 	Assert(elevel >= FATAL);	/* we must exit here */
+
+	bool		yb_is_auth_passthrough = YbIsAuthPassthroughInProgress(port);
+
+	/*
+	 * YB: When using Auth Passthrough mode of connection manager, mark the
+	 * current auth attempt as finished so that the control backend knows to
+	 * abort auth and reset to its base state. The fact that we are in a call to
+	 * `auth_failed()` is sufficient to conclude that auth has failed.
+	 */
+
+	if (yb_is_auth_passthrough)
+		port->yb_has_auth_passthrough_finished = true;
 
 	/*
 	 * If we failed due to EOF from client, just quit; there's no point in
@@ -250,9 +282,22 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 	 * send.  We'll get a useless log entry for every psql connection under
 	 * password auth, even if it's perfectly successful, if we log STATUS_EOF
 	 * events.)
+	 *
+	 * YB: When conn mgr is enabled and in auth passthrough mode, avoid calling
+	 * proc_exit here, instead returning a failure result by setting
+	 * port->yb_has_auth_passthrough_finished.
 	 */
 	if (status == STATUS_EOF)
-		proc_exit(0);
+	{
+		if (yb_is_auth_passthrough)
+		{
+			return;
+		}
+		else
+		{
+			proc_exit(0);
+		}
+	}
 
 	switch (port->hba->auth_method)
 	{
@@ -276,6 +321,10 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 			/* We use it to indicate if a .pgpass password failed. */
 			errcode_return = ERRCODE_INVALID_PASSWORD;
 			break;
+		case uaYbTserverKey:
+			errstr = gettext_noop("tserver key authentication failed for user \"%s\"");
+			errcode_return = ERRCODE_INVALID_PASSWORD;
+			break;
 		case uaGSS:
 			errstr = gettext_noop("GSSAPI authentication failed for user \"%s\"");
 			break;
@@ -297,26 +346,48 @@ auth_failed(Port *port, int elevel, int status, const char *logdetail)
 		case uaOAuth:
 			errstr = gettext_noop("OAuth bearer authentication failed for user \"%s\"");
 			break;
+
+		case uaYbJWT:
+			errstr = gettext_noop("JWT authentication failed for user \"%s\"");
+			break;
+
 		default:
 			errstr = gettext_noop("authentication failed for user \"%s\": invalid authentication method");
 			break;
 	}
 
+	char	   *line_to_print = port->hba->maskedline;
+
+	if (!line_to_print)
+		line_to_print = port->hba->rawline;
+
 	cdetail = psprintf(_("Connection matched file \"%s\" line %d: \"%s\""),
 					   port->hba->sourcefile, port->hba->linenumber,
-					   port->hba->rawline);
+					   line_to_print);
 	if (logdetail)
 		logdetail = psprintf("%s\n%s", logdetail, cdetail);
 	else
 		logdetail = cdetail;
 
-	ereport(elevel,
+	if (yb_is_auth_passthrough)
+		YbSendFatalForLogicalConnectionPacket();
+
+	ereport(YbAuthFailedErrorLevel(yb_is_auth_passthrough),
 			(errcode(errcode_return),
-			 errmsg(errstr, port->user_name),
-			 logdetail ? errdetail_log("%s", logdetail) : 0));
+			 (yb_role_is_locked_out ?
+			  errmsg("role \"%s\" is locked. Contact your database administrator.",
+					 port->user_name) :
+			  errmsg(errstr, port->user_name)),
+			 (logdetail ? errdetail_log("%s", logdetail) : 0)));
 
 	/* doesn't return */
-	pg_unreachable();
+	/*
+	 * YB: This function does in fact return when the Auth Passthrough mode of
+	 * Connection Manager is enabled. The relevant codepath changes for this
+	 * change in behaviour are all under the `yb_ai_auth_passthrough` flag.
+	 */
+	if (!yb_is_auth_passthrough)
+		pg_unreachable();
 }
 
 
@@ -353,7 +424,18 @@ set_authn_id(Port *port, const char *id)
 							   MyClientConnectionInfo.authn_id, id)));
 	}
 
-	MyClientConnectionInfo.authn_id = MemoryContextStrdup(TopMemoryContext, id);
+	/*
+	 * YB: When handling an incoming auth request in Auth Passthrough mode,
+	 * the authn_id of the incoming client is not required after auth finishes.
+	 * Thus there is no need to store it in TopMemoryContext; and allocating in
+	 * TopMemoryContext here leads to a memory leak in this scenario (requiring
+	 * an explicit pfree elsewhere). So, we continue allocating in the txn
+	 * MemoryContext spawned specifically for Auth Passthrough auth attempts.
+	 */
+	if (YbIsAuthPassthroughInProgress(port))
+		MyClientConnectionInfo.authn_id = pstrdup(id);
+	else
+		MyClientConnectionInfo.authn_id = MemoryContextStrdup(TopMemoryContext, id);
 	MyClientConnectionInfo.auth_method = port->hba->auth_method;
 
 	if (log_connections & LOG_CONNECTION_AUTHENTICATION)
@@ -371,12 +453,33 @@ set_authn_id(Port *port, const char *id)
 /*
  * Client authentication starts here.  If there is an error, this
  * function does not return and the backend process is terminated.
+ *
+ * YB: This function *does* return in case connection manager is active and this
+ * is a control backend being used for authentication with auth passthrough mode
+ * enabled.
+ * If auth fails, `port->yb_has_auth_passthrough_finished` is used to signal
+ * authentication failure. This is set in the call to `auth_failed()`. Else it
+ * must be set manually where auth_failed is not called before returning.
  */
 void
 ClientAuthentication(Port *port)
 {
 	int			status = STATUS_ERROR;
 	const char *logdetail = NULL;
+
+	bool		yb_auth_passthrough = YbIsAuthPassthroughInProgress(port);
+
+	/*
+	 * YB: True when the client reached us through the connection manager, so
+	 * that the TLS session, and with it the client certificate, belongs to the
+	 * conn mgr rather than to this backend.
+	 */
+	bool		yb_auth_via_conn_mgr = YbIsClientYsqlConnMgr() &&
+		(yb_auth_passthrough || yb_is_auth_backend);
+
+	/* Auth Passthrough can be enabled only for Ysql Connection Manager */
+	if (yb_auth_passthrough)
+		Assert(YbIsClientYsqlConnMgr());
 
 	/*
 	 * "Abandoned" is a SASL-specific state similar to STATUS_EOF, in that we
@@ -398,14 +501,55 @@ ClientAuthentication(Port *port)
 	CHECK_FOR_INTERRUPTS();
 
 	/*
+	 * Every registered YB internal-connection kind (see yb_internal_conn.h),
+	 * including auto-analyze, must use yb-tserver-key authentication, since the
+	 * tserver opens these over the local unix socket. Tests that need to pose
+	 * as a kind go through CreateInternalPGConnBuilder with the tserver's
+	 * shared-memory postgres auth key as password, matching the hardcoded
+	 *
+	 *     local all postgres yb-tserver-key
+	 *
+	 * HBA rule.
+	 */
+	if (IsYugaByteEnabled() && YbIsInternalConnBackendType(MyBackendType) &&
+		port->hba->auth_method != uaYbTserverKey)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("yb_internal_conn_kind can only be set if the "
+						"authentication method is yb-tserver-key")));
+
+	/*
+	 * YB: Reject unconditionally if the cert forwarded by logical connection
+	 * via conn mgr failed to parse in be_tls_open_server(). Upstream drops the TLS
+	 * session for bad cert; on the AP path, the TLS session lives at the conn mgr,
+	 * so the equivalent fail-close has to happen here.
+	 */
+	if (port->yb_forwarded_cert_parse_failed)
+	{
+		auth_failed(port, FATAL, STATUS_ERROR,
+					"could not parse client certificate forwarded by the connection manager",
+					false /* yb_role_is_locked_out */ );
+		return;
+	}
+
+	/*
 	 * This is the first point where we have access to the hba record for the
 	 * current connection, so perform any verifications based on the hba
 	 * options field that should be done *before* the authentication here.
 	 */
 	if (port->hba->clientcert != clientCertOff)
 	{
-		/* If we haven't loaded a root certificate store, fail */
-		if (!secure_loaded_verify_locations())
+		/*
+		 * If we haven't loaded a root certificate store, fail.
+		 *
+		 * YB: Under Connection Manager the client's TLS session terminates at
+		 * the conn mgr, which verified the certificate against its own root
+		 * store and forwarded the leaf so that the identity can be derived
+		 * here. This backend's own root store is therefore irrelevant, and
+		 * requiring one would break cert auth on deployments that only
+		 * configure TLS on the conn mgr.
+		 */
+		if (!yb_auth_via_conn_mgr && !secure_loaded_verify_locations())
 			ereport(FATAL,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("client certificates can only be checked if a root certificate store is available")));
@@ -417,9 +561,20 @@ ClientAuthentication(Port *port)
 		 * already if it didn't verify ok.
 		 */
 		if (!port->peer_cert_valid)
-			ereport(FATAL,
+		{
+			if (yb_auth_passthrough)
+			{
+				YbSendFatalForLogicalConnectionPacket();
+				port->yb_has_auth_passthrough_finished = true;
+			}
+
+			ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("connection requires a valid client certificate")));
+
+			/* YB: not FATAL with conn mgr. Use above method to signal failure. */
+			return;
+		}
 	}
 
 	/*
@@ -453,7 +608,10 @@ ClientAuthentication(Port *port)
 					(port->gss && port->gss->enc) ? _("GSS encryption") :
 #endif
 #ifdef USE_SSL
-					port->ssl_in_use ? _("SSL encryption") :
+					((YbIsClientYsqlConnMgr() &&
+					(port->yb_is_auth_passthrough_req || yb_is_auth_backend)) ?
+					port->yb_is_ssl_enabled_in_logical_conn :
+					port->ssl_in_use) ? _("SSL encryption") :
 #endif
 					_("no encryption");
 
@@ -465,13 +623,22 @@ ClientAuthentication(Port *port)
 									hostinfo, port->user_name,
 									encryption_state)));
 				else
-					ereport(FATAL,
+				{
+					if (yb_auth_passthrough)
+					{
+						YbSendFatalForLogicalConnectionPacket();
+						port->yb_has_auth_passthrough_finished = true;
+					}
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					/* translator: last %s describes encryption state */
 							 errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
 									hostinfo, port->user_name,
 									port->database_name,
 									encryption_state)));
+					return;
+				}
 				break;
 			}
 
@@ -499,7 +666,10 @@ ClientAuthentication(Port *port)
 					(port->gss && port->gss->enc) ? _("GSS encryption") :
 #endif
 #ifdef USE_SSL
-					port->ssl_in_use ? _("SSL encryption") :
+					((YbIsClientYsqlConnMgr() &&
+					(port->yb_is_auth_passthrough_req || yb_is_auth_backend)) ?
+					port->yb_is_ssl_enabled_in_logical_conn :
+					port->ssl_in_use) ? _("SSL encryption") :
 #endif
 					_("no encryption");
 
@@ -533,7 +703,14 @@ ClientAuthentication(Port *port)
 									encryption_state),
 							 HOSTNAME_LOOKUP_DETAIL(port)));
 				else
-					ereport(FATAL,
+				{
+					if (yb_auth_passthrough)
+					{
+						YbSendFatalForLogicalConnectionPacket();
+						port->yb_has_auth_passthrough_finished = true;
+					}
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					/* translator: last %s describes encryption state */
 							 errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\", %s",
@@ -541,6 +718,8 @@ ClientAuthentication(Port *port)
 									port->database_name,
 									encryption_state),
 							 HOSTNAME_LOOKUP_DETAIL(port)));
+					return;
+				}
 				break;
 			}
 
@@ -599,6 +778,21 @@ ClientAuthentication(Port *port)
 			status = CheckPasswordAuth(port, &logdetail);
 			break;
 
+		case uaYbTserverKey:
+			Assert(IsYugaByteEnabled());
+
+			if (YbIsAuthPassthroughInProgress(port))
+			{
+				auth_failed(port, FATAL, status,
+							"YbTserverKey authentication is not supported "
+							"in auth passthrough",
+							false);
+				return;
+			}
+
+			status = CheckYbTserverKeyAuth(port, &logdetail);
+			break;
+
 		case uaPAM:
 #ifdef USE_PAM
 			status = CheckPAMAuth(port, port->user_name, "");
@@ -630,6 +824,10 @@ ClientAuthentication(Port *port)
 		case uaOAuth:
 			status = CheckSASLAuth(&pg_be_oauth_mech, port, NULL, &logdetail,
 								   &abandoned);
+			break;
+
+		case uaYbJWT:
+			status = YbCheckJwtAuth(port);
 			break;
 	}
 
@@ -667,13 +865,61 @@ ClientAuthentication(Port *port)
 	if (ClientAuthentication_hook)
 		(*ClientAuthentication_hook) (port, status);
 
+	/*
+	 * YB: If conditions are met, update the role's profile entry.  Specific
+	 * authentication methods are isolated from profile handling.
+	 */
+	if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist &&
+		IsProfileHandlingRequired(port->hba->auth_method))
+	{
+		bool		profile_is_disabled = false;
+		HeapTuple	roleTuple,
+					profileTuple = NULL;
+		Oid			roleid = InvalidOid;
+
+		/* Get role info from pg_authid */
+		roleTuple = SearchSysCache1(AUTHNAME, PointerGetDatum(port->user_name));
+		if (HeapTupleIsValid(roleTuple))
+		{
+			roleid = ((Form_pg_authid) GETSTRUCT(roleTuple))->oid;
+			profileTuple = yb_get_role_profile_tuple_by_role_oid(roleid);
+			if (HeapTupleIsValid(profileTuple))
+			{
+				Form_pg_yb_role_profile rolprfform = (Form_pg_yb_role_profile) GETSTRUCT(profileTuple);
+
+				if (rolprfform->rolprfstatus != YB_ROLPRFSTATUS_OPEN)
+					profile_is_disabled = true;
+			}
+			ReleaseSysCache(roleTuple);
+		}
+
+		if (status == STATUS_OK && !profile_is_disabled)
+		{
+			if (roleid != InvalidOid)
+				YbResetFailedAttemptsIfAllowed(roleid);
+			sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
+		}
+		else
+		{
+			/* Do not increment login attempts if no password was supplied */
+			if (roleid != InvalidOid && status != STATUS_EOF)
+				profile_is_disabled =
+					YbMaybeIncFailedAttemptsAndDisableProfile(roleid);
+			auth_failed(port, FATAL, status, logdetail, profile_is_disabled);
+		}
+		return;
+	}
+
 	if (status == STATUS_OK)
+	{
 		sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
+	}
 	else
 		auth_failed(port,
 					abandoned ? FATAL_CLIENT_ONLY : FATAL,
 					status,
-					logdetail);
+					logdetail,
+					false /* yb_role_is_locked_out */ );
 }
 
 
@@ -765,11 +1011,31 @@ recv_password_packet(Port *port)
 	 * this check here, to prevent an empty password from being used with
 	 * authentication methods that check the password against an external
 	 * system, like PAM and LDAP.
+	 *
+	 * YB: In the case of auth passthrough mode of connection manager, we want
+	 * to avoid terminating the backend process if possible. In this case, we
+	 * forward a FATAL packet through conn mgr to the client and abort auth, but
+	 * do not push an ERROR level log and kill the backend (using WARNING
+	 * instead).
 	 */
 	if (buf.len == 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PASSWORD),
-				 errmsg("empty password returned by client")));
+	{
+		if (YbIsAuthPassthroughInProgress(port))
+		{
+			YbSendFatalForLogicalConnectionPacket();
+			ereport(YbAuthFailedErrorLevel(true /* auth_passthrough */ ),
+					(errcode(ERRCODE_INVALID_PASSWORD),
+					 errmsg("empty password returned by client")));
+
+			return NULL;		/* YB: Added return NULL as per above comment */
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PASSWORD),
+					 errmsg("empty password returned by client")));
+		}
+	}
 
 	/* Do not echo password to logs, for security. */
 	elog(DEBUG5, "received password packet");
@@ -927,6 +1193,7 @@ CheckMD5Auth(Port *port, char *shadow_pass, const char **logdetail)
 	return result;
 }
 
+<<<<<<< HEAD
 static bool
 md5_password_warning_enabled(void)
 {
@@ -949,6 +1216,44 @@ queue_md5_password_warning(void)
 	MemoryContextSwitchTo(oldcontext);
 }
 
+||||||| 90630ec4293
+=======
+/*
+ * Yugabyte internal tserver to postgres key authentication.
+ */
+static int
+CheckYbTserverKeyAuth(Port *port, const char **logdetail)
+{
+	char	   *passwd;
+	uint64_t	client_key;
+
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	passwd = recv_password_packet(port);
+	if (passwd == NULL)
+		return STATUS_EOF;		/* client wouldn't send password */
+	else
+	{
+		/* Convert client-supplied password string to uint64 key */
+		char	   *end;
+
+		errno = 0;
+		client_key = strtou64(passwd, &end, 10);
+		if (!(*passwd != '\0' && *end == '\0') || errno == ERANGE)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("auth key must be uint64")));
+		pfree(passwd);
+	}
+
+	uint64_t	auth_key;
+
+	return yb_get_role_password(port->user_name, logdetail, &auth_key)
+		? yb_plain_key_verify(port->user_name, auth_key, client_key, logdetail)
+		: STATUS_ERROR;
+}
+
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 
 /*----------------------------------------------------------------
  * GSSAPI authentication system
@@ -2578,9 +2883,13 @@ CheckLDAPAuth(Port *port)
 		 * Bind with a pre-defined username/password (if available) for
 		 * searching. If none is specified, this turns into an anonymous bind.
 		 */
+		char	   *hba_password = get_ldap_password(port->hba->ldapbindpasswd);
+
 		r = ldap_simple_bind_s(ldap,
 							   port->hba->ldapbinddn ? port->hba->ldapbinddn : "",
-							   port->hba->ldapbindpasswd ? ldap_password_hook(port->hba->ldapbindpasswd) : "");
+							   hba_password);
+		pfree(hba_password);
+
 		if (r != LDAP_SUCCESS)
 		{
 			ereport(LOG,
@@ -2722,6 +3031,24 @@ errdetail_for_ldap(LDAP *ldap)
 	return 0;
 }
 
+static char *
+get_ldap_password(char *ldapbindpasswd)
+{
+	/* Return password stored in YSQL_LDAP_BIND_PWD_ENV env var */
+	if (strncmp(ldapbindpasswd, "YSQL_LDAP_BIND_PWD_ENV", 22) == 0)
+	{
+		if (getenv("YSQL_LDAP_BIND_PWD_ENV") != NULL)
+		{
+			return pstrdup(getenv("YSQL_LDAP_BIND_PWD_ENV"));
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("expected env variable YSQL_LDAP_BIND_PWD_ENV to be defined, got NULL")));
+	}
+
+	/* Return password as defined in hba.conf */
+	return pstrdup(ldapbindpasswd);
+}
 #endif							/* USE_LDAP */
 
 
@@ -2736,7 +3063,7 @@ CheckCertAuth(Port *port)
 	int			status_check_usermap = STATUS_ERROR;
 	char	   *peer_username = NULL;
 
-	Assert(port->ssl);
+	Assert(port->ssl || port->yb_is_ssl_enabled_in_logical_conn);
 
 	/* select the correct field to compare */
 	switch (port->hba->clientcertname)
@@ -2810,3 +3137,185 @@ CheckCertAuth(Port *port)
 	return status_check_usermap;
 }
 #endif
+
+/*----------------------------------------------------------------
+ * JWT authentication
+ *----------------------------------------------------------------
+ */
+
+static char *ybReadFile(const char *outer_filename, const char *inc_filename,
+						int elevel);
+
+static char *ybReadFromUrl(const char *url);
+
+static void
+ybGetJwtAuthOptionsFromPortAndJwks(Port *port, char *jwks,
+								   YbcPgJwtAuthOptions *opt)
+{
+	HbaLine    *hba_line = port->hba;
+
+	opt->jwks = jwks;
+	opt->usermap = hba_line->usermap;
+	opt->username = port->user_name;
+
+	/* Use "sub" as the default matching claim key */
+	opt->matching_claim_key = hba_line->yb_jwt_matching_claim_key ? : "sub";
+
+	opt->allowed_issuers = (char **)
+		YbPtrListToArray(hba_line->yb_jwt_issuers,
+						 &opt->allowed_issuers_length);
+
+	opt->allowed_audiences = (char **)
+		YbPtrListToArray(hba_line->yb_jwt_audiences,
+						 &opt->allowed_audiences_length);
+}
+
+static int
+YbCheckJwtAuth(Port *port)
+{
+	char	   *jwt;
+	char	   *jwks;
+	int			auth_result;
+
+	/*
+	 * Read the jwks file before the password prompt so that we fail fast if we
+	 * fail to read the jwks file or the content is invalid.
+	 * Check if jwt_jwks_url is provided then use that otherwise use jwt_jwks_path
+	 */
+	if (port->hba->yb_jwt_jwks_url)
+		jwks = ybReadFromUrl(port->hba->yb_jwt_jwks_url);
+	else
+		jwks = ybReadFile(HbaFileName, port->hba->yb_jwt_jwks_path, LOG);
+	if (jwks == NULL)
+		return STATUS_ERROR;
+
+	/* Send regular password request to client, and get the response */
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	/* Interpret password as jwt */
+	jwt = recv_password_packet(port);
+	if (jwt == NULL)
+		return STATUS_EOF;		/* client didn't send jwt */
+
+	/*
+	 * We are allocating a temporary array of char* for audiences and issuers
+	 * entries. We do that since there is no easy way to send the PG List to the
+	 * C++ layer.
+	 */
+	YbcPgJwtAuthOptions jwt_auth_options;
+
+	ybGetJwtAuthOptionsFromPortAndJwks(port, jwks, &jwt_auth_options);
+
+	YbcStatus	s = YBCValidateJWT(jwt, &jwt_auth_options);
+
+	auth_result = (s) ? STATUS_ERROR : STATUS_OK;
+	if (s)						/* !ok */
+	{
+		ereport(LOG,
+				(errmsg("JWT login failed with error: %s",
+						YBCStatusMessageBegin(s))));
+		YBCFreeStatus(s);
+	}
+
+	/* Free up the temporary arrays we made in YbJwtAuthOptionsFromHba */
+	pfree(jwt_auth_options.allowed_audiences);
+	pfree(jwt_auth_options.allowed_issuers);
+
+	pfree(jwks);
+	pfree(jwt);
+	return auth_result;
+}
+
+/*
+ * Reads the contents of the given file path. If the file path is a relative
+ * path, it is treated as relative to the directory of the provided
+ * outer_filename.
+ *
+ * An error is reported at elevel LOG if the file path is invalid,
+ * inaccessible or the contents are not in the database encoding.
+ *
+ * This function is derived from the tokenize_inc_file function from the
+ * src/postgres/src/backend/libpq/hba.c file. The tokenize_inc_file tokenizes
+ * the hba lines from an included file while this function just reads them.
+ */
+static char *
+ybReadFile(const char *outer_filename, const char *inc_filename, int elevel)
+{
+	char	   *file_fullname;
+	char	   *file_contents;
+	int			len;
+
+	if (is_absolute_path(inc_filename))
+	{
+		/* absolute path is taken as-is */
+		file_fullname = pstrdup(inc_filename);
+	}
+	else
+	{
+		/*
+		 * relative path is relative to dir of file from which the path was
+		 * referenced.
+		 */
+		file_fullname =
+			(char *) palloc(strlen(outer_filename) + 1 + strlen(inc_filename) + 1);
+		strcpy(file_fullname, outer_filename);
+		get_parent_directory(file_fullname);
+		join_path_components(file_fullname, file_fullname, inc_filename);
+		canonicalize_path(file_fullname);
+	}
+
+	file_contents = YbReadWholeFile(file_fullname, &len, elevel);
+	if (file_contents == NULL)
+	{
+		pfree(file_fullname);
+		return NULL;
+	}
+
+	/*
+	 * Make sure the contents are valid.
+	 *
+	 * We use noError as true because we want to have control over the ereport
+	 * elevel in case of invalid file contents.
+	 */
+	if (!pg_verifymbstr(file_contents, len, /* noError */ true))
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("invalid encoding of file \"%s\"", inc_filename)));
+		pfree(file_fullname);
+		return NULL;
+	}
+
+	pfree(file_fullname);
+	return file_contents;
+}
+
+static char *
+ybReadFromUrl(const char *url)
+{
+	char	   *url_contents = NULL;
+	int			len;
+	YbcStatus	status;
+
+	status = YBCFetchFromUrl(url, &url_contents);
+	if (status)					/* !ok */
+	{
+		ereport(LOG,
+				(errmsg("fetching from JWT_JWKS_URL failed with error: %s",
+						YBCStatusMessageBegin(status))));
+		YBCFreeStatus(status);
+		return NULL;
+	}
+	if (!url_contents)
+		return NULL;
+
+	len = strlen(url_contents);
+	if (!pg_verifymbstr(url_contents, len, true))
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("invalid encoding of contents at \"%s\"", url)));
+		return NULL;
+	}
+	return url_contents;
+}

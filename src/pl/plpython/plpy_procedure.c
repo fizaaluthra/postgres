@@ -209,6 +209,7 @@ PLy_procedure_create(PLyProcedure *proc,
 		proc->globals = NULL;
 		proc->calldepth = 0;
 		proc->argstack = NULL;
+		proc->yb_catalog_version = YBGetActiveCatalogCacheVersion();
 
 		/*
 		 * get information required for output conversion of the return value,
@@ -421,6 +422,45 @@ PLy_procedure_delete(PLyProcedure *proc)
 	MemoryContextDelete(proc->mcxt);
 }
 
+<<<<<<< HEAD
+||||||| 90630ec4293
+/*
+ * Decide whether a cached PLyProcedure struct is still valid
+ */
+static bool
+PLy_procedure_valid(PLyProcedure *proc, HeapTuple procTup)
+{
+	if (proc == NULL)
+		return false;
+
+	/* If the pg_proc tuple has changed, it's not valid */
+	if (!(proc->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
+		  ItemPointerEquals(&proc->fn_tid, &procTup->t_self)))
+		return false;
+
+	return true;
+}
+
+=======
+/*
+ * Decide whether a cached PLyProcedure struct is still valid
+ */
+static bool
+PLy_procedure_valid(PLyProcedure *proc, HeapTuple procTup)
+{
+	if (proc == NULL)
+		return false;
+
+	/* If the pg_proc tuple has changed, it's not valid */
+	if (!(IsYugaByteEnabled() ? proc->yb_catalog_version == YBGetActiveCatalogCacheVersion() :
+		  proc->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
+		  ItemPointerEquals(&proc->fn_tid, &procTup->t_self)))
+		return false;
+
+	return true;
+}
+
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 static char *
 PLy_procedure_munge_source(const char *name, const char *src)
 {

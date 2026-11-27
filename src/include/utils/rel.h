@@ -29,6 +29,9 @@
 #include "utils/relcache.h"
 #include "utils/reltrigger.h"
 
+/* YB includes */
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 /*
  * LockRelId and LockInfo really belong to lmgr.h, but it's more convenient
@@ -253,6 +256,23 @@ typedef struct RelationData
 	bool		pgstat_enabled; /* should relation stats be counted */
 	/* use "struct" here to avoid needing to include pgstat.h: */
 	struct PgStat_TableStatus *pgstat_info; /* statistics collection area */
+
+	/* YB */
+	YbcTableProperties yb_table_properties; /* NULL if not loaded */
+	/* contains all except yb system primary keys of the relation. */
+	Bitmapset  *primary_key_bms;	/* NULL if not initialized */
+	/* contains all primary keys of the relation, including yb system columns. */
+	Bitmapset  *full_primary_key_bms;	/* NULL if not initialized */
+	bool belongs_to_yb_system_db;		/* true for relations in the yb_system
+										 * db which are accessible by all databases.
+										 * When this relation is accessed by a db
+										 * other than yb_system, the Relation object
+										 * needs to be manually created (it is not
+										 * part of relcache). While doing so, this
+										 * field should be set to true (for example,
+										 * see ybNotificationsRel()). For all other
+										 * cases, this field should be false.
+										 */
 } RelationData;
 
 
@@ -286,6 +306,9 @@ typedef struct ForeignKeyCacheInfo
 
 	/* Is enforced ? */
 	bool		conenforced;
+
+	/* YB: oid of index supporting the FK constraint */
+	Oid			ybconindid;
 
 	/*
 	 * these arrays each have nkeys valid entries:
@@ -340,6 +363,17 @@ typedef enum StdRdOptIndexCleanup
 	STDRD_OPTION_VACUUM_INDEX_CLEANUP_ON,
 } StdRdOptIndexCleanup;
 
+/* Per-table overrides for the YB auto analyze service. */
+typedef struct YbAutoAnalyzeOpts
+{
+	bool		enabled;
+	int			threshold;
+	float8		scale_factor;
+	float8		cooldown_scale_factor;
+	int			min_cooldown_ms;
+	int			max_cooldown_ms;
+} YbAutoAnalyzeOpts;
+
 typedef struct StdRdOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
@@ -356,6 +390,15 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+
+	/* YB additions. */
+	bool		colocated;
+	Oid			tablegroup_oid;
+	Oid			colocation_id;
+	Oid			table_oid;
+	Oid			row_type_oid;
+	int			yb_presplit_offset;	/* Offset to presplit config string */
+	YbAutoAnalyzeOpts yb_auto_analyze;	/* YB auto analyze options */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -420,6 +463,24 @@ typedef enum ViewOptCheckOption
 } ViewOptCheckOption;
 
 /*
+ * RelationGetColocated
+ *		Returns the relation's colocated reloption setting.
+ *		Note multiple eval of argument!
+ */
+#define RelationGetColocated(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->colocated : false)
+
+/*
+ * RelationGetTableOid
+ *		Returns the relation's table_oid reloption setting.
+ *		Note multiple eval of argument!
+ */
+#define RelationGetTableOid(relation) \
+	((relation)->rd_options ? \
+	 ((StdRdOptions *) (relation)->rd_options)->table_oid : 0)
+
+/*
  * ViewOptions
  *		Contents of rd_options for views
  */
@@ -429,6 +490,9 @@ typedef struct ViewOptions
 	bool		security_barrier;
 	bool		security_invoker;
 	ViewOptCheckOption check_option;
+
+	bool		yb_use_initdb_acl;	/* initialize with default initdb-like
+									 * permissions */
 } ViewOptions;
 
 /*
@@ -727,5 +791,48 @@ RelationCloseSmgr(Relation relation)
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
+
+/*
+ * YbParitionedTableOptions
+ *		Contents of rd_options for partitioned tables.
+ */
+typedef struct YbParitionedTableOptions
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+
+	/* YB additions. */
+	Oid			colocation_id;
+	bool		colocation;
+	int			yb_presplit_offset;	/* Offset to presplit config string */
+} YbParitionedTableOptions;
+
+/*
+ * YbRelationGetPresplit
+ *		Returns the relation's yb_presplit reloption setting, or NULL if
+ *		unset.  The string is either a number (for SPLIT INTO N TABLETS)
+ *		or a split-point list (for SPLIT AT VALUES ((...),...)).
+ *
+ *		For RELKIND_PARTITIONED_TABLE, rd_options is a YbParitionedTableOptions;
+ *		for everything else (heap, matview, index, partitioned index) it is a
+ *		StdRdOptions.  Both structs put yb_presplit_offset at a different
+ *		location, so we must dispatch on relkind here.
+ */
+static inline const char *
+YbRelationGetPresplit(Relation relation)
+{
+	int			offset;
+
+	if (relation->rd_options == NULL)
+		return NULL;
+
+	if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		offset = ((YbParitionedTableOptions *) relation->rd_options)->yb_presplit_offset;
+	else
+		offset = ((StdRdOptions *) relation->rd_options)->yb_presplit_offset;
+
+	if (offset == 0)
+		return NULL;
+	return (const char *) relation->rd_options + offset;
+}
 
 #endif							/* REL_H */

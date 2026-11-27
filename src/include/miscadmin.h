@@ -28,6 +28,10 @@
 #include "datatype/timestamp.h" /* for TimestampTz */
 #include "pgtime.h"				/* for pg_time_t */
 
+/* YB includes */
+#include "storage/yb_proc_state.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 
 #define InvalidPid				(-1)
 
@@ -109,6 +113,7 @@ extern PGDLLIMPORT volatile uint32 CritSectionCount;
 
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(void);
+extern bool YBHasProcessableAbortInterrupt(void);
 
 /* Test whether an interrupt is pending */
 #ifndef WIN32
@@ -149,6 +154,7 @@ do { \
 	QueryCancelHoldoffCount--; \
 } while(0)
 
+#ifdef FRONTEND					/* YB */
 #define START_CRIT_SECTION()  (CritSectionCount++)
 
 #define END_CRIT_SECTION() \
@@ -156,6 +162,22 @@ do { \
 	Assert(CritSectionCount > 0); \
 	CritSectionCount--; \
 } while(0)
+
+#else							/* YB: !FRONTEND */
+#define START_CRIT_SECTION()  \
+do { \
+	YbMyProcState->entered_crit_section = true; \
+	CritSectionCount++; \
+} while(0)
+
+#define END_CRIT_SECTION() \
+do { \
+	Assert(CritSectionCount > 0); \
+	CritSectionCount--; \
+	if (CritSectionCount == 0) \
+		YbMyProcState->entered_crit_section = false; \
+} while(0)
+#endif							/* YB: FRONTEND */
 
 
 /*****************************************************************************
@@ -291,6 +313,11 @@ extern PGDLLIMPORT double VacuumCostDelay;
 extern PGDLLIMPORT int VacuumCostBalance;
 extern PGDLLIMPORT bool VacuumCostActive;
 
+extern PGDLLIMPORT char *YbSystemDbName;
+extern PGDLLIMPORT char *PgYbNotificationsTableName;
+extern PGDLLIMPORT char *PgYbNotificationsPublicationName;
+extern PGDLLIMPORT char *YbNotificationsSlotPrefix;
+
 
 /* in utils/misc/stack_depth.c */
 
@@ -375,9 +402,28 @@ typedef enum BackendType
 	 * entry.
 	 */
 	B_LOGGER,
+	YB_YSQL_CONN_MGR,
+	YB_YSQL_CONN_MGR_WAL_SENDER,
+	YB_YSQL_CONN_MGR_CTRL,
+	YB_AUTO_ANALYZE_BACKEND,
+	YB_INDEX_BACKFILL_DDL,
+	YB_MATVIEW_REFRESH_DDL,
+	YB_RELCACHE_INIT_BACKEND,
+	YB_GLOBAL_VIEW_BACKEND,
+	YB_XCLUSTER_DDL_QUEUE_BACKEND,
+	YB_XCLUSTER_SETUP_BACKEND,
+	YB_OSC_BACKFILL_BACKEND,
 } BackendType;
 
-#define BACKEND_NUM_TYPES (B_LOGGER + 1)
+/*
+ * YB: include YB_* values appended after B_LOGGER.  log_min_messages[] and
+ * other per-BackendType arrays are indexed by MyBackendType and built from
+ * postmaster/proctypelist.h.
+ * postmaster.c's BackendTypeMask is a uint32 bitmask, and requires
+ * BACKEND_NUM_TYPES < 32. So the mask needs widening before another type is
+ * added.
+ */
+#define BACKEND_NUM_TYPES (YB_OSC_BACKFILL_BACKEND + 1)
 
 extern PGDLLIMPORT BackendType MyBackendType;
 
@@ -510,10 +556,25 @@ extern void InitPostgres(const char *in_dbname, Oid dboid,
 						 const char *username, Oid useroid,
 						 uint32 flags,
 						 char *out_dbname);
+
+extern void YbInitPostgres(const char *in_dbname, Oid dboid,
+						   const char *username, Oid useroid,
+						   uint32 flags,
+						   char *out_dbname,
+						   const YbcPgInitPostgresInfo *yb_info);
+extern long YbGetAuthorizedConnections();
+extern void YbLogAuthPassthroughConnReceived(struct Port *port);
+extern void YbLogAuthPassthroughConnAuthenticated(struct Port *port);
+
 extern void BaseInit(void);
 typedef bool (*ConnectionWarningFilter) (void);
 extern void StoreConnectionWarning(char *msg, char *detail,
 								   ConnectionWarningFilter filter);
+
+extern void YbCheckMyDatabase(const char *name, bool am_superuser,
+							  bool override_allow_connections, Oid db_oid);
+extern void YbAuthPassthroughSetupGUCAndReport(Oid dboid);
+extern void YbResetAuthPassthroughConnectionWarnings(void);
 
 /* in utils/init/miscinit.c */
 extern PGDLLIMPORT bool IgnoreSystemIndexes;
@@ -546,5 +607,17 @@ extern void RestoreClientConnectionInfo(char *conninfo);
 
 /* in executor/nodeHash.c */
 extern size_t get_hash_memory_limit(void);
+
+/* YB */
+extern PGDLLIMPORT volatile sig_atomic_t YbLogCatcacheStatsPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPeakHeap;
+extern PGDLLIMPORT volatile sig_atomic_t LogHeapSnapshotPeakHeap;
+extern bool IsYsqlUpgrade;
+extern PGDLLIMPORT bool MyDatabaseColocated;
+extern PGDLLIMPORT Oid YbDatabaseIdForNewObjectId;
+extern PGDLLIMPORT bool MyColocatedDatabaseLegacy;
+extern PGDLLIMPORT bool YbTablegroupCatalogExists;
+extern PGDLLIMPORT bool YbLoginProfileCatalogsExist;
 
 #endif							/* MISCADMIN_H */

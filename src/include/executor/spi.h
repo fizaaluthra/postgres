@@ -52,6 +52,7 @@ typedef struct SPIExecuteOptions
 	uint64		tcount;
 	DestReceiver *dest;
 	ResourceOwner owner;
+	bool		yb_reuse_existing_snapshot_in_read_committed;
 } SPIExecuteOptions;
 
 /* Optional arguments for SPI_cursor_parse_open */
@@ -203,5 +204,9 @@ extern void SPI_rollback_and_chain(void);
 extern void AtEOXact_SPI(bool isCommit);
 extern void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid);
 extern bool SPI_inside_nonatomic_context(void);
+
+extern int YbGetSPIStackDepth(void);
+
+extern bool YbProcRetryBlocked(void);
 
 #endif							/* SPI_H */

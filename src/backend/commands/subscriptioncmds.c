@@ -58,6 +58,9 @@
 #include "utils/pg_lsn.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /*
  * Options that can be specified by the user in CREATE/ALTER SUBSCRIPTION
  * command.
@@ -179,8 +182,10 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->refresh = true;
 	if (IsSet(supported_opts, SUBOPT_BINARY))
 		opts->binary = false;
+
+	/* YB: Use the PG15 default; parallel streaming (PG19's default) is not supported. */
 	if (IsSet(supported_opts, SUBOPT_STREAMING))
-		opts->streaming = LOGICALREP_STREAM_PARALLEL;
+		opts->streaming = IsYugaByteEnabled() ? LOGICALREP_STREAM_OFF : LOGICALREP_STREAM_PARALLEL;
 	if (IsSet(supported_opts, SUBOPT_TWOPHASE_COMMIT))
 		opts->twophase = false;
 	if (IsSet(supported_opts, SUBOPT_DISABLE_ON_ERR))
@@ -294,6 +299,16 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 
 			opts->specified_opts |= SUBOPT_STREAMING;
 			opts->streaming = defGetStreamingMode(defel);
+
+			/*
+			 * YB: The Parallel Apply worker is currently not a whitelisted background worker.
+			 * TODO: Validate whether streaming  = "any" can be supported.
+			 */
+			if (IsYugaByteEnabled() && opts->streaming == LOGICALREP_STREAM_PARALLEL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("parallel streaming is not supported in YugabyteDB"),
+						 errhint("Use \"streaming\" = \"on\" or \"off\".")));
 		}
 		else if (IsSet(supported_opts, SUBOPT_TWOPHASE_COMMIT) &&
 				 strcmp(defel->defname, "two_phase") == 0)
@@ -348,6 +363,16 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 
 			opts->specified_opts |= SUBOPT_RETAIN_DEAD_TUPLES;
 			opts->retaindeadtuples = defGetBoolean(defel);
+
+			/*
+			 * YB: Retaining dead tuples needs the conflict detection slot,
+			 * which holds back the xmin horizon of a physical slot.  DocDB has
+			 * no such horizon, and YB replication slots are CDC streams.
+			 */
+			if (IsYugaByteEnabled() && opts->retaindeadtuples)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("retain_dead_tuples is not supported in YugabyteDB")));
 		}
 		else if (IsSet(supported_opts, SUBOPT_MAX_RETENTION_DURATION) &&
 				 strcmp(defel->defname, "max_retention_duration") == 0)
@@ -647,6 +672,12 @@ ObjectAddress
 CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 				   bool isTopLevel)
 {
+	if (IsYugaByteEnabled() && !yb_enable_pg_subscription)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("CREATE SUBSCRIPTION is unavailable"),
+				 errdetail("yb_enable_pg_subscription is false")));
+
 	Relation	rel;
 	ObjectAddress myself;
 	Oid			subid;
@@ -1533,6 +1564,12 @@ ObjectAddress
 AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 				  bool isTopLevel)
 {
+	if (IsYugaByteEnabled() && !yb_enable_pg_subscription)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ALTER SUBSCRIPTION is unavailable"),
+				 errdetail("yb_enable_pg_subscription is false")));
+
 	Relation	rel;
 	ObjectAddress myself;
 	bool		nulls[Natts_pg_subscription];
@@ -2250,7 +2287,19 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 							errmsg("%s is not allowed for disabled subscriptions",
 								   "ALTER SUBSCRIPTION ... REFRESH SEQUENCES"));
 
+<<<<<<< HEAD
 				AlterSubscription_refresh_seq(sub, orig_conninfo);
+||||||| 90630ec4293
+				AlterSubscription_refresh_seq(sub);
+=======
+				/* YB: The Sequence Sync worker is currently not a whitelisted background worker. */
+				if (IsYugaByteEnabled())
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("ALTER SUBSCRIPTION ... REFRESH SEQUENCES is not supported in YugabyteDB")));
+
+				AlterSubscription_refresh_seq(sub);
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 
 				break;
 			}
@@ -2415,6 +2464,12 @@ construct_subserver_conninfo(Oid subserver, Oid subowner, char **err)
 void
 DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 {
+	if (IsYugaByteEnabled() && !yb_enable_pg_subscription)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("DROP SUBSCRIPTION is unavailable"),
+				 errdetail("yb_enable_pg_subscription is false")));
+
 	Relation	rel;
 	ObjectAddress myself;
 	HeapTuple	tup;
@@ -2520,7 +2575,7 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	EventTriggerSQLDropAddObject(&myself, true, true);
 
 	/* Remove the tuple from catalog. */
-	CatalogTupleDelete(rel, &tup->t_self);
+	CatalogTupleDelete(rel, tup);
 
 	ReleaseSysCache(tup);
 
@@ -2846,6 +2901,12 @@ AlterSubscriptionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 ObjectAddress
 AlterSubscriptionOwner(const char *name, Oid newOwnerId)
 {
+	if (IsYugaByteEnabled() && !yb_enable_pg_subscription)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ALTER SUBSCRIPTION OWNER is unavailable"),
+				 errdetail("yb_enable_pg_subscription is false")));
+
 	Oid			subid;
 	HeapTuple	tup;
 	Relation	rel;
@@ -2882,6 +2943,12 @@ AlterSubscriptionOwner(const char *name, Oid newOwnerId)
 void
 AlterSubscriptionOwner_oid(Oid subid, Oid newOwnerId)
 {
+	if (IsYugaByteEnabled() && !yb_enable_pg_subscription)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ALTER SUBSCRIPTION OWNER is unavailable"),
+				 errdetail("yb_enable_pg_subscription is false")));
+
 	HeapTuple	tup;
 	Relation	rel;
 	Form_pg_subscription form;

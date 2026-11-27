@@ -27,6 +27,10 @@
 /* Avoid including clog.h here */
 typedef int XidStatus;
 
+/* YB includes */
+#include "storage/yb_proc_state.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
  * for non-aborted subtransactions of its current top transaction.  These
@@ -382,6 +386,34 @@ typedef struct PGPROC
 	 ************************************************************************/
 
 	uint32		wait_event_info;	/* proc's wait information */
+
+	/************************************************************************
+	 * YB-specific fields
+	 ************************************************************************/
+
+	/*
+	 *YB: Per-process state that the postmaster reads after a backend dies, to
+	 * decide between cleaning up after it and a full restart.
+	 */
+	YbProcState ybProcState;
+
+	/*
+	 * yb_ash_metadata is protected by yb_ash_metadata_lock instead of backendLock.
+	 * TODO: Investigate if yb_ash_metadata_lock is really needed, or can we
+	 * use backendLock itself if there is no significant drop in performance.
+	 */
+	LWLock		yb_ash_metadata_lock;
+	YbcAshMetadata yb_ash_metadata;
+	bool		yb_is_ash_metadata_set;
+
+	/*
+	 * YB: Auxiliary value of the wait event this backend is in, which tells apart
+	 * the waits sharing one wait event. The actual meaning of aux value depends on
+	 * the associated wait event.
+	 */
+	uint32		yb_wait_event_aux;
+
+	YbcPgSharedDataPlaceholder yb_shared_data;
 }
 PGPROC;
 
@@ -498,6 +530,10 @@ typedef struct PROC_HDR
 	int			spins_per_delay;
 	/* Buffer id of the buffer that Startup process waits for pin on, or -1 */
 	int			startupBufferPinWaitBufId;
+
+	/* YB fields */
+	/* Number of connections rejected for exceeding the connection limit */
+	int			yb_too_many_conn;
 } PROC_HDR;
 
 extern PGDLLIMPORT PROC_HDR *ProcGlobal;
@@ -581,5 +617,15 @@ extern PGPROC *AuxiliaryPidGetProc(int pid);
 
 extern void BecomeLockGroupLeader(void);
 extern bool BecomeLockGroupMember(PGPROC *leader, int pid);
+
+/* YB */
+extern PGPROC *KilledProcToClean;
+extern int	RetryMaxBackoffMsecs;
+extern int	RetryMinBackoffMsecs;
+extern double RetryBackoffMultiplier;
+extern int	yb_max_query_layer_retries;
+extern void YbRemoveLockGroupLeader(PGPROC *proc);
+extern void YbReleaseProcToFreeList(PGPROC *proc);
+extern bool YbIsAuxiliaryProc(PGPROC *proc);
 
 #endif							/* _PROC_H_ */

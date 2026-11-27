@@ -94,6 +94,40 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "catalog/index.h"
+#include "catalog/pg_aggregate_d.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_cast.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_db_role_setting.h"
+#include "catalog/pg_enum.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_operator.h"
+#include "catalog/pg_partitioned_table.h"
+#include "catalog/pg_policy.h"
+#include "catalog/pg_range_d.h"
+#include "catalog/pg_statistic_d.h"
+#include "catalog/pg_statistic_ext_data.h"
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/yb_catalog_version.h"
+#include "commands/dbcommands.h"
+#include "commands/yb_cmds.h"
+#include "partitioning/partdesc.h"
+#include "postmaster/postmaster.h"
+#include "tcop/backend_startup.h"
+#include "utils/catcache.h"
+#include "utils/partcache.h"
+#include "utils/relcache.h"
+#include "utils/varlena.h"
+#include "utils/yb_inheritscache.h"
+#include "utils/yb_tuplecache.h"
+#include "yb/yql/pggate/util/ybc_guc.h"
+#include "yb/yql/pggate/ybc_gflags.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
+#include <inttypes.h>
+
 #define RELCACHE_INIT_FILEMAGIC		0x573266	/* version ID value */
 
 /*
@@ -123,6 +157,9 @@ static const FormData_pg_attribute Desc_pg_index[Natts_pg_index] = {Schema_pg_in
 static const FormData_pg_attribute Desc_pg_shseclabel[Natts_pg_shseclabel] = {Schema_pg_shseclabel};
 static const FormData_pg_attribute Desc_pg_subscription[Natts_pg_subscription] = {Schema_pg_subscription};
 static const FormData_pg_attribute Desc_pg_parameter_acl[Natts_pg_parameter_acl] = {Schema_pg_parameter_acl};
+
+static const FormData_pg_attribute Desc_pg_yb_profile[Natts_pg_yb_profile] = {Schema_pg_yb_profile};
+static const FormData_pg_attribute Desc_pg_yb_role_profile[Natts_pg_yb_role_profile] = {Schema_pg_yb_role_profile};
 
 /*
  *		Hash tables that index the relation cache
@@ -157,6 +194,16 @@ bool		criticalSharedRelcachesBuilt = false;
  * might already be obsolete.
  */
 static long relcacheInvalsReceived = 0L;
+
+static long YbNumRelCachePreloads = 0L;
+static long YbNumRelCacheInitFileRevalidated = 0L;
+static long YbNumRelCacheInitFileRevalidationFailed = 0L;
+
+/*
+ * Set only when this is a pg auth backend that needs to rebuild the relcache
+ * init file.
+ */
+static bool YbNeedNewCacheFileForPgAuthBackend = false;
 
 /*
  * in_progress_list is a stack of ongoing RelationBuildDesc() calls.  CREATE
@@ -256,6 +303,143 @@ do { \
 			 (RELATION)->rd_id); \
 } while(0)
 
+/*
+ * YBIsDBCatalogVersionMode() implies IsYugaByteEnabled(). When in per-db
+ * catalog version mode, each database maintains a separate catalog version
+ * that applies to both shared relations and non-shared relations. We can
+ * no longer store only one shared init file for all databases as we do in
+ * the global catalog version mode where there is only one catalog version.
+ * Just like for non-shared relations, for shared relations each database
+ * also needs a separate shared init file. From a shared init file for a
+ * specific database, we read the stored per-db catalog version. We also
+ * read the stored per-db catalog version from a non-shared init file. They
+ * are compared with each other and also against the catalog version read
+ * from other sources (e.g., master). The newest per-db version will be used.
+ * If shared or non-shared init file is found obsolete it will be unlinked.
+ * Note that in per-db catalog version mode, ".db" suffix is appended to
+ * the file name so when we switch between two modes we will not mix up
+ * their cache init files.
+ */
+#define RelCacheInitFileName(filename, shared) \
+do { \
+	if (shared) \
+	{ \
+		if (YBIsDBCatalogVersionMode()) \
+			snprintf(filename, sizeof(filename), "global/%d_%s.db", \
+				MyDatabaseId, RELCACHE_INIT_FILENAME); \
+		else \
+			snprintf(filename, sizeof(filename), "global/%s", \
+				RELCACHE_INIT_FILENAME); \
+	} \
+	else \
+	{ \
+		if (IsYugaByteEnabled()) \
+		{ \
+			if (YBIsDBCatalogVersionMode()) \
+				snprintf(filename, sizeof(filename), "%d_%s.db", \
+						 MyDatabaseId, RELCACHE_INIT_FILENAME); \
+			else \
+				snprintf(filename, sizeof(filename), "%d_%s", \
+						 MyDatabaseId, RELCACHE_INIT_FILENAME); \
+		} \
+		else \
+		{ \
+			snprintf(filename, sizeof(filename), "%s/%s", \
+					 DatabasePath, RELCACHE_INIT_FILENAME); \
+		} \
+	} \
+} while (0)
+
+#define RelCacheInitTempFileName(filename, shared) \
+do { \
+	if (shared) \
+	{ \
+		snprintf(filename, sizeof(filename), "global/%s.%d", \
+				 RELCACHE_INIT_FILENAME, MyProcPid); \
+	} \
+	else \
+	{ \
+		if (IsYugaByteEnabled()) \
+		{ \
+			snprintf(filename, sizeof(filename), "%d_%s.%d", \
+					 MyDatabaseId, RELCACHE_INIT_FILENAME, MyProcPid); \
+		} \
+		else \
+		{ \
+			snprintf(filename, sizeof(filename), "%s/%s.%d", \
+					 DatabasePath, RELCACHE_INIT_FILENAME, MyProcPid); \
+		} \
+	} \
+} while (0)
+
+/*
+ * Derived from RelationCacheInsert. Used in per-database catalog version
+ * mode to only allow new shared relations or to replace fake nailed
+ * shared relation entries.
+ * Background: in per-database catalog version mode, there is one shared
+ * relcache init file for each database. As a result, even if the shared
+ * relcache init file for MyDatabaseId already exists, when it is attempted
+ * to be read by Postgres before MyDatabaseId is resolved, we do not know
+ * which shared relcache init file to read from. The current Postgres flow
+ * will think the shared relcache init file does not exist, and therefore
+ * will insert some fake nailed shared relation entries into the relcache
+ * (see those calls to formrdesc, relowner == InvalidOid means a fake entry).
+ * Later after we resolve MyDatabaseId, we attempt to read the appropriate
+ * shared relcache init file. In case it succeeds, the relcache already has
+ * faked nailed shared relation entries from the previous attempt that failed,
+ * so they need to be replaced by the real entries read from the init file.
+ */
+#define YbRelationCacheReinsert(RELATION, shared, yb_retry)	\
+do { \
+	Assert(!IsBootstrapProcessingMode()); \
+	RelIdCacheEnt *hentry; bool found; \
+	hentry = (RelIdCacheEnt *) hash_search(RelationIdCache, \
+										   (void *) &((RELATION)->rd_id), \
+										   HASH_ENTER, &found); \
+	if (found) \
+	{ \
+		Relation _old_rel = hentry->reldesc; \
+		hentry->reldesc = (RELATION); \
+		/* We should only find fake nailed shared relation cache entries the first time. */ \
+		Assert(_old_rel->rd_isnailed || yb_retry); \
+		if (shared) \
+			Assert(_old_rel->rd_rel->relisshared); \
+		else \
+			Assert(!_old_rel->rd_rel->relisshared); \
+		if (_old_rel->rd_isnailed) \
+			Assert(_old_rel->rd_refcnt == 1); \
+		else \
+			Assert(_old_rel->rd_refcnt == 0); \
+		/*
+		 * On a retry, we may have already loaded an entry successfully last time.
+		 * In that case the entry is valid and therefore has a valid relowner.
+		 */ \
+		Assert(!OidIsValid(_old_rel->rd_rel->relowner) || yb_retry); \
+		/*
+		 * Calling RelationDecrementReferenceCount on a fake nailed
+		 * relation hits assertion failure because it expects a resource
+		 * owner, but a fake entry's relowner is InvalidOid. Simply set
+		 * rd_refcnt to 0 for RelationDestroyRelation to work.
+		 */ \
+		if (_old_rel->rd_isnailed) \
+			_old_rel->rd_refcnt = 0; \
+		RelationDestroyRelation(_old_rel, false); \
+		/* The new relation must be valid relation */ \
+		Assert(RELATION->rd_isnailed || yb_retry); \
+		if (shared) \
+			Assert(RELATION->rd_rel->relisshared); \
+		else \
+			Assert(!RELATION->rd_rel->relisshared); \
+		if (RELATION->rd_isnailed) \
+			Assert(RELATION->rd_refcnt == 1); \
+		else \
+			Assert(RELATION->rd_refcnt == 0); \
+		Assert(OidIsValid(RELATION->rd_rel->relowner)); \
+	} \
+	else \
+		hentry->reldesc = (RELATION); \
+	Assert(RELATION->rd_id < FirstNormalObjectId); \
+} while(0)
 
 /*
  * Special cache for opclass-related information
@@ -294,8 +478,9 @@ static void AssertPendingSyncConsistency(Relation relation);
 static void AtEOXact_cleanup(Relation relation, bool isCommit);
 static void AtEOSubXact_cleanup(Relation relation, bool isCommit,
 								SubTransactionId mySubid, SubTransactionId parentSubid);
-static bool load_relcache_init_file(bool shared);
+static bool load_relcache_init_file(bool shared, bool yb_retry);
 static void write_relcache_init_file(bool shared);
+static void YbResetRelationCacheAfterPreloadFailure(void);
 static void write_item(const void *data, Size len, FILE *fp);
 
 static void formrdesc(const char *relationName, Oid relationReltype,
@@ -324,7 +509,11 @@ static void IndexSupportInitialize(oidvector *indclass,
 static OpClassCacheEnt *LookupOpclassInfo(Oid operatorClassOid,
 										  StrategyNumber numSupport);
 static void RelationCacheInitFileRemoveInDir(const char *tblspcpath);
+static void YbRelationCacheInitFileRemoveInDir(const char *initfiledir);
 static void unlink_initfile(const char *initfilename, int elevel);
+
+/* YB declarations */
+static bool YbIndexAttHasOptionsProc(Relation indexrel, AttrNumber attnum);
 
 
 /*
@@ -432,6 +621,11 @@ AllocateRelationDesc(Form_pg_class relp)
 	/* make sure relation is marked as having no open file yet */
 	relation->rd_smgr = NULL;
 
+	/* YB properties will be loaded lazily */
+	relation->yb_table_properties = NULL;
+	relation->primary_key_bms = NULL;
+	relation->full_primary_key_bms = NULL;
+
 	/*
 	 * Copy the relation tuple form
 	 *
@@ -455,6 +649,9 @@ AllocateRelationDesc(Form_pg_class relp)
 	relation->rd_att = CreateTemplateTupleDesc(relationForm->relnatts);
 	/* which we mark as a reference-counted tupdesc */
 	relation->rd_att->tdrefcount = 1;
+
+	/* YB: See struct field's comment for explanation. */
+	relation->belongs_to_yb_system_db = false;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -590,7 +787,7 @@ RelationBuildTupleDesc(Relation relation)
 			elog(ERROR, "invalid attribute number %d for relation \"%s\"",
 				 attp->attnum, RelationGetRelationName(relation));
 
-		memcpy(TupleDescAttr(relation->rd_att, attnum - 1),
+		memcpy(TupleDescAttr(relation->rd_att, attp->attnum - 1),
 			   attp,
 			   ATTRIBUTE_FIXED_PART_SIZE);
 
@@ -780,6 +977,182 @@ RelationBuildTupleDesc(Relation relation)
 	}
 
 	TupleDescFinalize(relation->rd_att);
+}
+
+/*
+ * A special version of RelationBuildRuleLock (initializes rewrite rules for a relation).
+ *
+ * Its only difference from the original is that instead of doing a direct scan
+ * on RewriteRelationId, it uses partial query against RULERELNAME cache
+ * (which we pre-initialized in YBPreloadRelCache).
+ */
+static void
+YBRelationBuildRuleLock(Relation relation)
+{
+	MemoryContext rulescxt;
+	MemoryContext oldcxt;
+	Relation	rewrite_desc;
+	TupleDesc	rewrite_tupdesc;
+	RuleLock   *rulelock;
+	int			numlocks;
+	RewriteRule **rules;
+	int			maxlocks;
+
+	/*
+	 * Make the private context.  Assume it'll not contain much data.
+	 */
+	rulescxt = AllocSetContextCreate(CacheMemoryContext,
+									 "relation rules",
+									 ALLOCSET_SMALL_SIZES);
+	relation->rd_rulescxt = rulescxt;
+	MemoryContextCopyAndSetIdentifier(rulescxt,
+									  RelationGetRelationName(relation));
+
+	/*
+	 * allocate an array to hold the rewrite rules (the array is extended if
+	 * necessary)
+	 */
+	maxlocks = 4;
+	rules = (RewriteRule **)
+		MemoryContextAlloc(rulescxt, sizeof(RewriteRule *) * maxlocks);
+	numlocks = 0;
+
+	/*
+	 * # ORIGINAL POSTGRES COMMENT:
+	 *
+	 * open pg_rewrite and begin a scan
+	 *
+	 * Note: since we scan the rules using RewriteRelRulenameIndexId, we will
+	 * be reading the rules in name order, except possibly during
+	 * emergency-recovery operations (ie, IgnoreSystemIndexes). This in turn
+	 * ensures that rules will be fired in name order.
+	 *
+	 *
+	 * # YB NOTE (alex):
+	 *
+	 * Instead of full scan, we're doing partial cache lookup. This cache is also using
+	 * RewriteRelRulenameIndexId, so the order persists.
+	 */
+	rewrite_desc = table_open(RewriteRelationId, AccessShareLock);
+	rewrite_tupdesc = RelationGetDescr(rewrite_desc);
+
+	CatCList   *rewrite_list = SearchSysCacheList1(RULERELNAME,
+												   ObjectIdGetDatum(RelationGetRelid(relation)));
+
+	for (int i = 0; i < rewrite_list->n_members; i++)
+	{
+		HeapTuple	rewrite_tuple = &rewrite_list->members[i]->tuple;
+		Form_pg_rewrite rewrite_form = (Form_pg_rewrite) GETSTRUCT(rewrite_tuple);
+
+		bool		isnull;
+		Datum		rule_datum;
+		char	   *rule_str;
+		RewriteRule *rule;
+		Oid			check_as_user;
+
+		rule = (RewriteRule *) MemoryContextAlloc(rulescxt,
+												  sizeof(RewriteRule));
+
+		rule->ruleId = rewrite_form->oid;
+
+		rule->event = rewrite_form->ev_type - '0';
+		rule->enabled = rewrite_form->ev_enabled;
+		rule->isInstead = rewrite_form->is_instead;
+
+		/*
+		 * Must use heap_getattr to fetch ev_action and ev_qual.  Also, the
+		 * rule strings are often large enough to be toasted.  To avoid
+		 * leaking memory in the caller's context, do the detoasting here so
+		 * we can free the detoasted version.
+		 */
+		rule_datum = heap_getattr(rewrite_tuple,
+								  Anum_pg_rewrite_ev_action,
+								  rewrite_tupdesc,
+								  &isnull);
+		Assert(!isnull);
+		rule_str = TextDatumGetCString(rule_datum);
+		oldcxt = MemoryContextSwitchTo(rulescxt);
+		rule->actions = (List *) stringToNode(rule_str);
+		MemoryContextSwitchTo(oldcxt);
+		pfree(rule_str);
+
+		rule_datum = heap_getattr(rewrite_tuple,
+								  Anum_pg_rewrite_ev_qual,
+								  rewrite_tupdesc,
+								  &isnull);
+		Assert(!isnull);
+		rule_str = TextDatumGetCString(rule_datum);
+		oldcxt = MemoryContextSwitchTo(rulescxt);
+		rule->qual = (Node *) stringToNode(rule_str);
+		MemoryContextSwitchTo(oldcxt);
+		pfree(rule_str);
+
+		/*
+		 * If this is a SELECT rule defining a view, and the view has
+		 * "security_invoker" set, we must perform all permissions checks on
+		 * relations referred to by the rule as the invoking user.
+		 *
+		 * In all other cases (including non-SELECT rules on security invoker
+		 * views), perform the permissions checks as the relation owner.
+		 */
+		if (rule->event == CMD_SELECT &&
+			relation->rd_rel->relkind == RELKIND_VIEW &&
+			RelationHasSecurityInvoker(relation))
+			check_as_user = InvalidOid;
+		else
+			check_as_user = relation->rd_rel->relowner;
+
+		/*
+		 * Scan through the rule's actions and set the checkAsUser field on
+		 * all rtable entries. We have to look at the qual as well, in case it
+		 * contains sublinks.
+		 *
+		 * The reason for doing this when the rule is loaded, rather than when
+		 * it is stored, is that otherwise ALTER TABLE OWNER would have to
+		 * grovel through stored rules to update checkAsUser fields. Scanning
+		 * the rule tree during load is relatively cheap (compared to
+		 * constructing it in the first place), so we do it here.
+		 */
+		setRuleCheckAsUser((Node *) rule->actions, check_as_user);
+		setRuleCheckAsUser(rule->qual, check_as_user);
+
+		if (numlocks >= maxlocks)
+		{
+			maxlocks *= 2;
+			rules = (RewriteRule **)
+				repalloc(rules, sizeof(RewriteRule *) * maxlocks);
+		}
+		rules[numlocks++] = rule;
+	}
+
+	/*
+	 * We don't use those preloaded pg_rewrite partial-match lists anywhere else in the code,
+	 * so there's no point of keeping them in memory.
+	 * We mark them dead so that ReleaseCatCacheList would evict them.
+	 */
+	rewrite_list->dead = true;
+	ReleaseCatCacheList(rewrite_list);
+	table_close(rewrite_desc, AccessShareLock);
+
+	/*
+	 * there might not be any rules (if relhasrules is out-of-date)
+	 */
+	if (numlocks == 0)
+	{
+		relation->rd_rules = NULL;
+		relation->rd_rulescxt = NULL;
+		MemoryContextDelete(rulescxt);
+		return;
+	}
+
+	/*
+	 * form a RuleLock and insert into relation
+	 */
+	rulelock = (RuleLock *) MemoryContextAlloc(rulescxt, sizeof(RuleLock));
+	rulelock->numLocks = numlocks;
+	rulelock->rules = rules;
+
+	relation->rd_rules = rulelock;
 }
 
 /*
@@ -1096,6 +1469,3006 @@ equalRSDesc(RowSecurityDesc *rsdesc1, RowSecurityDesc *rsdesc2)
 	return true;
 }
 
+static bool
+YbIsNonAlterableRelation(Relation rel)
+{
+	/* Non-view system relations cannot currently be altered. */
+	return IsSystemRelation(rel) && rel->rd_rel->relkind != RELKIND_VIEW;
+}
+
+typedef struct YbUpdateRelationCacheState
+{
+	bool		sys_relations_update_required;
+	bool		sys_relations_only;
+	bool		has_partitioned_tables;
+	bool		has_relations_with_trigger;
+	bool		has_relations_with_row_security;
+	YbTupleCache pg_attrdef_cache;
+	YbTupleCache pg_constraint_cache;
+	YbTupleCache pg_trigger_cache;
+	YbTupleCache pg_policy_cache;
+} YbUpdateRelationCacheState;
+
+static void
+YbCleanupUpdateRelationCacheState(YbUpdateRelationCacheState *state)
+{
+	YbCleanupTupleCache(&state->pg_attrdef_cache);
+	YbCleanupTupleCache(&state->pg_constraint_cache);
+	YbCleanupTupleCache(&state->pg_trigger_cache);
+	YbCleanupTupleCache(&state->pg_policy_cache);
+}
+
+/*
+ * A scratch context for one row of a relcache preload scan, reset by
+ * YbSystableGetNextInContext.  The scans may also process their rows in it:
+ * everything a relcache entry keeps is allocated explicitly in
+ * CacheMemoryContext (or a child of it), the same as when RelationBuildDesc
+ * runs in a throwaway workspace context.
+ */
+static MemoryContext
+YbCreatePreloadRowContext(void)
+{
+	return AllocSetContextCreate(CurrentMemoryContext,
+								 "relcache preload row",
+								 ALLOCSET_DEFAULT_SIZES);
+}
+
+/*
+ * YugaByte-mode only utility used to load up the relcache on initialization
+ * to minimize the number on YB-master queries needed.
+ * It is based on (and similar to) RelationBuildDesc but does all relations
+ * at once.
+ * It works in three steps:
+ *  1. Load up all the data pg_class using one full scan iteration. The
+ *  relations after this point will all be loaded but incomplete (e.g. no
+ *  attribute info set).
+ *  2. Load all the data from pg_attribute using one full scan. Then update
+ *  each corresponding relation once all attributes for it were retrieved.
+ *  3. Load all the data from pg_partitioned_table using one full scan. Then
+ *  update each corresponding relation with the attributes fetched during
+ *  the second phase. This is because updating the partition information requires attribute
+ *  information to be loaded for pg_partitioned_table, pg_type etc.
+ *
+ *  If YbUseMinimalCatalogCachePreload is in operation, this will only prepare
+ *  relcache entries for system relations because only those entries are prefetched.
+ *  Note: We assume that any error happening here will fatal so as to not end
+ *  up with partial information in the cache.
+ */
+static void
+YBLoadRelations(YbUpdateRelationCacheState *state)
+{
+	Relation	pg_class_desc = table_open(RelationRelationId, AccessShareLock);
+	SysScanDesc scandesc = systable_beginscan(pg_class_desc,
+											  InvalidOid,
+											  false /* indexOk */ ,
+											  NULL,
+											  0,
+											  NULL);
+
+	HeapTuple	pg_class_tuple;
+	int			num_tuples = 0;
+	MemoryContext row_cxt = YbCreatePreloadRowContext();
+	MemoryContext oldcxt = MemoryContextSwitchTo(row_cxt);
+
+	while (HeapTupleIsValid(pg_class_tuple =
+							YbSystableGetNextInContext(scandesc, row_cxt)))
+	{
+		/* get information from the pg_class_tuple */
+		Form_pg_class relp = (Form_pg_class) GETSTRUCT(pg_class_tuple);
+		Oid			relid = relp->oid;
+
+		if (state->sys_relations_only && !IsSystemClass(relid, relp))
+			continue;
+
+		/*
+		 * Indexes on temp tables use PostgreSQL's access methods, whose
+		 * opclasses can have options.  Loading those looks up ATTNUM and the
+		 * options function's PROCOID, which yb_test_catalog_preload_cache_list
+		 * may leave unfilled, so such indexes are built on demand instead.
+		 */
+		if (YbCatalogPreloadCacheListIsSet() &&
+			relp->relpersistence == RELPERSISTENCE_TEMP &&
+			(relp->relkind == RELKIND_INDEX ||
+			 relp->relkind == RELKIND_PARTITIONED_INDEX))
+			continue;
+
+		++num_tuples;
+
+		/*
+		 * Insert newly created relation into relcache hash table if needed:
+		 * a. If it's not already there (e.g. new table or initialization).
+		 * b. If it's a regular (non-system) table it could be changed (e.g. by
+		 *    an 'ALTER').
+		 * c. If it's a system view it could still be changed, either via YSQL
+		 *    upgrade or manually.
+		 */
+		Relation	existing_rel;
+
+		RelationIdCacheLookup(relid, existing_rel);
+
+		if (existing_rel)
+		{
+			if (YbIsNonAlterableRelation(existing_rel))
+				continue;
+			/* It is expected that cache doesn't contain alterable entries */
+			Assert(false);
+		}
+
+		/*
+		 * allocate storage for the relation descriptor, and copy pg_class_tuple
+		 * to relation->rd_rel.
+		 */
+		Relation	relation = AllocateRelationDesc(relp);
+
+		/* initialize the relation's relation id (relation->rd_id) */
+		RelationGetRelid(relation) = relid;
+
+		/*
+		 * normal relations are not nailed into the cache; nor can a pre-existing
+		 * relation be new.  It could be temp though.  (Actually, it could be new
+		 * too, but it's okay to forget that fact if forced to flush the entry.)
+		 */
+		relation->rd_refcnt = 0;
+		relation->rd_isnailed = false;
+		relation->rd_createSubid = InvalidSubTransactionId;
+		relation->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
+		switch (relation->rd_rel->relpersistence)
+		{
+			case RELPERSISTENCE_UNLOGGED:
+			case RELPERSISTENCE_PERMANENT:
+				relation->rd_backend = INVALID_PROC_NUMBER;
+				relation->rd_islocaltemp = false;
+				break;
+			case RELPERSISTENCE_TEMP:
+				if (isTempOrTempToastNamespace(relation->rd_rel->relnamespace))
+				{
+					relation->rd_backend = ProcNumberForTempRelations();
+					relation->rd_islocaltemp = true;
+				}
+				else
+				{
+					/*
+					 * If it's a temp table, but not one of ours,
+					 * we set rd_backend to the invalid backend id.
+					 */
+					relation->rd_backend = INVALID_PROC_NUMBER;
+					relation->rd_islocaltemp = false;
+				}
+				break;
+			default:
+				elog(ERROR, "invalid relpersistence: %c", relation->rd_rel->relpersistence);
+				break;
+		}
+
+		/* foreign key data is not loaded till asked for */
+		relation->rd_fkeylist = NIL;
+		relation->rd_fkeyvalid = false;
+
+		/*
+		 * For now, update all partition information to be null, this will
+		 * be populated later for partitioned tables
+		 */
+		relation->rd_partkeycxt = NULL;
+		relation->rd_partkey = NULL;
+		relation->rd_partdesc = NULL;
+		relation->rd_pdcxt = NULL;
+
+		/*
+		 * initialize access method information
+		 */
+		if (relation->rd_rel->relkind == RELKIND_INDEX ||
+			relation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
+		{
+			/*
+			 * We don't preload indexes on user-defined AM's for now. Doing so
+			 * results in an issue where we try to load the user-defined AM.
+			 * This AM's handler might not be loaded as pg_proc might not be
+			 * loaded.
+			 */
+			if (relation->rd_rel->relam >= FirstNormalObjectId)
+			{
+				--num_tuples;
+				continue;
+			}
+
+			RelationInitIndexAccessInfo(relation);
+		}
+		else if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) ||
+				 relation->rd_rel->relkind == RELKIND_SEQUENCE)
+			RelationInitTableAccessMethod(relation);
+		else
+			Assert(relation->rd_rel->relam == InvalidOid);
+
+		/* extract reloptions if any */
+		RelationParseRelOptions(relation, pg_class_tuple);
+
+		/* initialize the relation lock manager information */
+		RelationInitLockInfo(relation); /* see lmgr.c */
+
+		/* initialize physical addressing information for the relation */
+		RelationInitPhysicalAddr(relation);
+
+		/* make sure relation is marked as having no open file yet */
+		relation->rd_smgr = NULL;
+
+		if (yb_debug_log_catcache_events)
+			elog(LOG, "Insert relcache entry %p for %s (oid %u)", relation,
+				 RelationGetRelationName(relation), relid);
+		RelationCacheInsert(relation, true);
+
+		/* It's fully valid */
+		relation->rd_isvalid = true;
+
+		/*
+		 * Sys relation update is required in case at least one new sys
+		 * relation has been loaded.
+		 */
+		state->sys_relations_update_required |= IsSystemRelation(relation);
+
+		state->has_relations_with_trigger |= relation->rd_rel->relhastriggers;
+
+		state->has_relations_with_row_security |=
+			relation->rd_rel->relrowsecurity;
+
+		state->has_partitioned_tables |= (relation->rd_rel->relkind ==
+										  RELKIND_PARTITIONED_TABLE);
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(row_cxt);
+
+	if (yb_debug_log_catcache_events)
+		elog(LOG, "Inserted %d entries into relcache", num_tuples);
+
+	systable_endscan(scandesc);
+	table_close(pg_class_desc, AccessShareLock);
+	/* Check relation cache doesn't contain old entries */
+	Assert(hash_get_num_entries(RelationIdCache) == num_tuples);
+}
+
+/*
+ * YbAttrDefaultFetch performs same action as PG's AttrDefaultFetch
+ * but with using in memory tuple cache instead of relation scan.
+ * Most code is borrowed from PG's AttrDefaultFetch.
+ *
+ * attrdef holds an entry, with a NULL adbin, for each of the ndef columns
+ * with atthasdef.  Like AttrDefaultFetch, it only warns about a missing
+ * pg_attrdef record or a null adbin, and installs the array only once it is
+ * valid, with only the entries found: a NULL adbin left in it would crash
+ * FreeTupleDesc when the entry is freed, for example by the relcache preload
+ * retry or by the next catalog cache refresh (#37715).
+ */
+static void
+YbAttrDefaultFetch(Relation relation, AttrDefault *attrdef, int ndef,
+				   const YbTupleCache *pg_attrdef_cache)
+{
+	Relation	adrel = pg_attrdef_cache->rel;
+
+	Oid			relid = RelationGetRelid(relation);
+	const YbTupleCacheEntry *entry = hash_search(pg_attrdef_cache->data,
+												 &relid, HASH_FIND, NULL);
+
+	ListCell   *cell;
+
+	foreach(cell, entry ? entry->tuples : NULL)
+	{
+		HeapTuple	htup = lfirst(cell);
+
+		Form_pg_attrdef adform = (Form_pg_attrdef) GETSTRUCT(htup);
+		Form_pg_attribute attr = TupleDescAttr(relation->rd_att,
+											   adform->adnum - 1);
+
+		int			i = 0;
+
+		for (; i < ndef; ++i)
+		{
+			if (adform->adnum != attrdef[i].adnum)
+				continue;
+			if (attrdef[i].adbin != NULL)
+				elog(WARNING,
+					 "multiple attrdef records found for attr %s of rel %s",
+					 NameStr(attr->attname), RelationGetRelationName(relation));
+
+			bool		isnull = false;
+			Datum		val = fastgetattr(htup, Anum_pg_attrdef_adbin,
+										  adrel->rd_att, &isnull);
+
+			if (isnull)
+				elog(WARNING, "null adbin for attr %s of rel %s",
+					 NameStr(attr->attname), RelationGetRelationName(relation));
+			else
+			{
+				/* detoast and convert to cstring in caller's context */
+				char	   *s = TextDatumGetCString(val);
+
+				attrdef[i].adbin = MemoryContextStrdup(CacheMemoryContext, s);
+				pfree(s);
+			}
+			break;
+		}
+
+		if (i >= ndef)
+			elog(WARNING,
+				 "unexpected attrdef record found for attr %d of rel %s",
+				 adform->adnum, RelationGetRelationName(relation));
+	}
+
+	int			found = 0;
+
+	for (int i = 0; i < ndef; ++i)
+	{
+		if (attrdef[i].adbin != NULL)
+			attrdef[found++] = attrdef[i];
+	}
+
+	if (found != ndef)
+		elog(WARNING, "%d pg_attrdef record(s) missing for relation \"%s\"",
+			 ndef - found, RelationGetRelationName(relation));
+
+	/* Install array only after it's fully valid */
+	relation->rd_att->constr->defval = attrdef;
+	relation->rd_att->constr->num_defval = found;
+}
+
+/*
+ * YbCheckNNConstraintFetch performs the same actions as PG's
+ * CheckNNConstraintFetch but using the in-memory tuple cache instead of a
+ * relation scan.  Most code is borrowed from PG's CheckNNConstraintFetch.
+ *
+ * Like CheckNNConstraintFetch, it only warns when the CHECK rows don't match
+ * relchecks, and installs the array only once it is fully valid, with
+ * num_check set to the number of entries found.  So, as with
+ * RelationBuildDesc, a mismatch fails neither a connection's relcache preload
+ * nor a catalog cache refresh.  When CHECK rows are missing, the executor
+ * refuses writes to the relation (ExecRelCheck); when there are more than
+ * relchecks, the ones that don't fit are not enforced, and writes succeed.
+ */
+static void
+YbCheckNNConstraintFetch(Relation relation, const YbTupleCache *pg_constraint_cache)
+{
+	ConstrCheck *check;
+	int			ncheck = relation->rd_rel->relchecks;
+	Relation	conrel = pg_constraint_cache->rel;
+	int			found = 0;
+
+	/* Allocate array with room for as many entries as expected, if needed */
+	if (ncheck > 0)
+		check = (ConstrCheck *)
+			MemoryContextAllocZero(CacheMemoryContext,
+								   ncheck * sizeof(ConstrCheck));
+	else
+		check = NULL;
+
+	Oid			relid = RelationGetRelid(relation);
+	const YbTupleCacheEntry *entry = hash_search(pg_constraint_cache->data,
+												 &relid, HASH_FIND, NULL);
+
+	ListCell   *cell;
+
+	foreach(cell, entry ? entry->tuples : NULL)
+	{
+		HeapTuple	htup = (HeapTuple) lfirst(cell);
+		Form_pg_constraint conform = (Form_pg_constraint) GETSTRUCT(htup);
+
+		/*
+		 * If this is a not-null constraint, then only look at it if it's
+		 * invalid, and if so, mark the TupleDesc entry as known invalid.
+		 * Otherwise move on.  We'll mark any remaining columns that are still
+		 * in UNKNOWN state as known valid later.  This allows us not to have
+		 * to extract the attnum from this constraint tuple in the vast
+		 * majority of cases.
+		 */
+		if (conform->contype == CONSTRAINT_NOTNULL)
+		{
+			if (!conform->convalidated)
+			{
+				AttrNumber	attnum = extractNotNullColumn(htup);
+
+				Assert(relation->rd_att->compact_attrs[attnum - 1].attnullability ==
+					   ATTNULLABLE_UNKNOWN);
+				relation->rd_att->compact_attrs[attnum - 1].attnullability =
+					ATTNULLABLE_INVALID;
+			}
+
+			continue;
+		}
+
+		/* For what follows, consider check constraints only */
+		if (conform->contype != CONSTRAINT_CHECK)
+			continue;
+
+		/* protect limited size of array */
+		if (found >= ncheck)
+		{
+			elog(WARNING, "unexpected pg_constraint record found for relation \"%s\"",
+				 RelationGetRelationName(relation));
+			break;
+		}
+
+		bool		isnull = false;
+
+		/* Grab and test conbin is actually set */
+		Datum		val = fastgetattr(htup, Anum_pg_constraint_conbin,
+									  RelationGetDescr(conrel), &isnull);
+
+		if (isnull)
+			elog(WARNING, "null conbin for relation \"%s\"",
+				 RelationGetRelationName(relation));
+		else
+		{
+			/* detoast and convert to cstring in caller's context */
+			char	   *s = TextDatumGetCString(val);
+
+			/* Fill the slot only for a kept row, so nothing leaks */
+			check[found].ccenforced = conform->conenforced;
+			check[found].ccvalid = conform->convalidated;
+			check[found].ccnoinherit = conform->connoinherit;
+			check[found].ccname =
+				MemoryContextStrdup(CacheMemoryContext, NameStr(conform->conname));
+			check[found].ccbin = MemoryContextStrdup(CacheMemoryContext, s);
+			pfree(s);
+			found++;
+		}
+	}
+
+	if (found != ncheck)
+		elog(WARNING, "%d pg_constraint record(s) missing for relation \"%s\"",
+			 ncheck - found, RelationGetRelationName(relation));
+
+	/* Sort the records so that CHECKs are applied in a deterministic order */
+	if (found > 1)
+		qsort(check, found, sizeof(ConstrCheck), CheckConstraintCmp);
+
+	/* Install array only after it's fully valid */
+	relation->rd_att->constr->check = check;
+	relation->rd_att->constr->num_check = found;
+}
+
+typedef struct YbRelationAttrsProcessingState
+{
+	Oid			relid;
+	Relation	relation;
+	int			need;
+	int			ndef;
+	TupleConstr *constr;
+	AttrDefault *attrdef;
+	AttrMissing *attrmiss;
+} YbRelationAttrsProcessingState;
+
+typedef struct YbAttrProcessorState
+{
+	YbRelationAttrsProcessingState processing;
+	const YbTupleCache *pg_attrdef_cache;
+	const YbTupleCache *pg_constraint_cache;
+	const YbTupleCache *pg_trigger_cache;
+	const YbTupleCache *pg_policy_cache;
+} YbAttrProcessorState;
+
+static inline bool
+YbIsAttrProcessingStarted(const YbAttrProcessorState *state)
+{
+	return OidIsValid(state->processing.relid);
+}
+
+static inline bool
+YbIsAttrProcessingRequired(const YbAttrProcessorState *state)
+{
+	return state->processing.relation;
+}
+
+static bool
+YbApplyAttr(YbAttrProcessorState *state, Relation attrel, HeapTuple htup)
+{
+	YbRelationAttrsProcessingState *processing = &state->processing;
+	Form_pg_attribute attp = (Form_pg_attribute) GETSTRUCT(htup);
+
+	if (!YbIsAttrProcessingStarted(state) || processing->relid != attp->attrelid)
+		return false;
+	if (!YbIsAttrProcessingRequired(state))
+		return true;
+	/* Skip system attributes */
+	if (attp->attnum <= 0)
+		return true;
+
+	Relation	relation = processing->relation;
+
+	if (attp->attnum > relation->rd_rel->relnatts)
+		elog(ERROR,
+			 "invalid attribute number %d for %s",
+			 attp->attnum,
+			 RelationGetRelationName(relation));
+
+	memcpy(TupleDescAttr(relation->rd_att, attp->attnum - 1), attp, ATTRIBUTE_FIXED_PART_SIZE);
+
+	populate_compact_attribute(relation->rd_att, attp->attnum - 1);
+
+	/* Update constraint/default info */
+	if (attp->attnotnull)
+		processing->constr->has_not_null = true;
+	if (attp->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		processing->constr->has_generated_stored = true;
+
+	if (attp->atthasdef)
+	{
+		if (processing->attrdef == NULL)
+			processing->attrdef = (AttrDefault *)
+				MemoryContextAllocZero(CacheMemoryContext,
+									   (relation->rd_rel->relnatts *
+										sizeof(AttrDefault)));
+
+		AttrDefault *attrdef = processing->attrdef;
+
+		attrdef[processing->ndef].adnum = attp->attnum;
+		attrdef[processing->ndef].adbin = NULL;
+		++processing->ndef;
+	}
+
+	/* Likewise for a missing value */
+	if (attp->atthasmissing)
+	{
+		bool		missingNull;
+
+		/* Do we have a missing value? */
+		Datum		missingval = heap_getattr(htup,
+											  Anum_pg_attribute_attmissingval,
+											  attrel->rd_att,
+											  &missingNull);
+
+		if (!missingNull)
+		{
+			/* Yes, fetch from the array */
+			if (processing->attrmiss == NULL)
+				processing->attrmiss = (AttrMissing *)
+					MemoryContextAllocZero(CacheMemoryContext,
+										   (relation->rd_rel->relnatts *
+											sizeof(AttrMissing)));
+			bool		is_null;
+			int			one = 1;
+			Datum		missval = array_get_element(missingval, 1, &one, -1,
+													attp->attlen, attp->attbyval,
+													attp->attalign, &is_null);
+
+			Assert(!is_null);
+
+			AttrMissing *attrmiss = processing->attrmiss;
+
+			if (attp->attbyval)
+			{
+				/* for copy by val just copy the datum direct */
+				attrmiss[attp->attnum - 1].am_value = missval;
+			}
+			else
+			{
+				/* otherwise copy in the correct context */
+				MemoryContext oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+
+				attrmiss[attp->attnum - 1].am_value = datumCopy(missval,
+																attp->attbyval,
+																attp->attlen);
+				MemoryContextSwitchTo(oldcxt);
+			}
+			attrmiss[attp->attnum - 1].am_present = true;
+		}
+	}
+	--processing->need;
+	return true;
+}
+
+static void
+YbStartNewAttrProcessing(YbAttrProcessorState *state,
+						 bool sys_rel_update_required,
+						 Relation attrel,
+						 HeapTuple htup)
+{
+	Assert(!YbIsAttrProcessingStarted(state));
+	YbRelationAttrsProcessingState *processing = &state->processing;
+	Form_pg_attribute attp = (Form_pg_attribute) GETSTRUCT(htup);
+
+	Assert(OidIsValid(attp->attrelid));
+	processing->relid = attp->attrelid;
+	Relation	relation;
+
+	RelationIdCacheLookup(processing->relid, relation);
+	if (!relation || (!sys_rel_update_required && IsSystemRelation(relation)))
+		return;
+
+	processing->relation = relation;
+	processing->need = processing->relation->rd_rel->relnatts;
+	processing->constr = (TupleConstr *)
+		MemoryContextAllocZero(CacheMemoryContext, sizeof(TupleConstr));
+	bool		applied = YbApplyAttr(state, attrel, htup);
+
+	Assert(applied);
+	(void) applied;
+}
+
+static void
+YbCompleteAttrProcessingImpl(const YbAttrProcessorState *state)
+{
+	const YbRelationAttrsProcessingState *processing = &state->processing;
+
+	if (processing->need != 0)
+		elog(ERROR, "catalog is missing %d attribute(s) for relid %u",
+			 processing->need, processing->relid);
+
+	Relation	relation = processing->relation;
+	TupleConstr *constr = processing->constr;
+	AttrDefault *attrdef = processing->attrdef;
+	AttrMissing *attrmiss = processing->attrmiss;
+	int			ndef = processing->ndef;
+
+	/* copy some fields from pg_class row to rd_att */
+	relation->rd_att->tdtypeid = relation->rd_rel->reltype;
+	relation->rd_att->tdtypmod = -1;	/* unnecessary, but... */
+
+	/*
+	 * However, we can easily set the attcacheoff value for the first
+	 * attribute: it must be zero.  This eliminates the need for special cases
+	 * for attnum=1 that used to exist in fastgetattr() and index_getattr().
+	 */
+	if (RelationGetNumberOfAttributes(relation) > 0)
+		TupleDescCompactAttr(RelationGetDescr(relation), 0)->attcacheoff = 0;
+
+	/* Set up constraint/default info */
+	if (constr->has_not_null || ndef > 0 || attrmiss || relation->rd_rel->relchecks)
+	{
+		bool		is_catalog = IsCatalogRelation(relation);
+
+		if (relation->rd_att->constr)
+			pfree(relation->rd_att->constr);
+		relation->rd_att->constr = constr;
+
+		if (ndef > 0)			/* DEFAULTs */
+		{
+			if (ndef < RelationGetNumberOfAttributes(relation))
+				attrdef = (AttrDefault *) repalloc(attrdef, ndef * sizeof(AttrDefault));
+			YbAttrDefaultFetch(relation, attrdef, ndef, state->pg_attrdef_cache);
+		}
+		else
+			constr->num_defval = 0;
+
+		constr->missing = attrmiss;
+
+		/* CHECK and NOT NULLs */
+		if (relation->rd_rel->relchecks > 0 ||
+			(!is_catalog && constr->has_not_null))
+			YbCheckNNConstraintFetch(relation, state->pg_constraint_cache);
+		else
+			constr->num_check = 0;
+
+		/*
+		 * Any not-null constraint that wasn't marked invalid by
+		 * YbCheckNNConstraintFetch must necessarily be valid; make it so in the
+		 * CompactAttribute array.
+		 */
+		if (!is_catalog)
+		{
+			for (int i = 0; i < relation->rd_rel->relnatts; i++)
+			{
+				CompactAttribute *attr = TupleDescCompactAttr(relation->rd_att, i);
+
+				if (attr->attnullability == ATTNULLABLE_UNKNOWN)
+					attr->attnullability = ATTNULLABLE_VALID;
+				else
+					Assert(attr->attnullability == ATTNULLABLE_INVALID ||
+						   attr->attnullability == ATTNULLABLE_UNRESTRICTED);
+			}
+		}
+	}
+	else
+	{
+		pfree(constr);
+		relation->rd_att->constr = NULL;
+	}
+
+	TupleDescFinalize(relation->rd_att);
+
+	/* Fetch rules and triggers that affect this relation */
+	if (relation->rd_rel->relhasrules)
+		YBRelationBuildRuleLock(relation);
+	else
+	{
+		relation->rd_rules = NULL;
+		relation->rd_rulescxt = NULL;
+	}
+
+	if (relation->rd_rel->relhastriggers)
+	{
+		Assert(state->pg_trigger_cache != NULL);
+		RelationBuildTriggers(relation, state->pg_trigger_cache);
+	}
+	else
+		relation->trigdesc = NULL;
+
+	if (relation->rd_rel->relrowsecurity)
+	{
+		Assert(state->pg_policy_cache != NULL);
+		RelationBuildRowSecurity(relation, state->pg_policy_cache);
+	}
+	else
+		relation->rd_rsdesc = NULL;
+}
+
+static void
+YbCompleteAttrProcessing(YbAttrProcessorState *state)
+{
+	if (!YbIsAttrProcessingStarted(state))
+		return;
+
+	if (YbIsAttrProcessingRequired(state))
+		YbCompleteAttrProcessingImpl(state);
+	state->processing = (struct YbRelationAttrsProcessingState)
+	{
+		0
+	};
+}
+
+static void
+YBUpdateRelationsAttributes(const YbUpdateRelationCacheState *cache_update_state)
+{
+	/*
+	 * Open pg_attribute and begin a scan.  Force heap scan if we haven't yet
+	 * built the critical relcache entries (this includes initdb and startup
+	 * without a pg_internal.init file).
+	 * We are scanning through the entire pg_attribute table to get all the attributes (columns)
+	 * for all the relations. All the attributes for a relation are contiguous, so we maintain the
+	 * current relation and, when we finish processing its attributes (detected when we read a
+	 * different relation_id which is first range key of pg_attribute), we load up the retrieved
+	 * info into the Relation entry, which among other things, sets up then constraint and default
+	 * info.
+	 */
+	Relation	attrel = table_open(AttributeRelationId, AccessShareLock);
+	SysScanDesc scandesc = systable_beginscan(attrel, InvalidOid,
+											  false /* indexOk */ , NULL, 0,
+											  NULL);
+
+	YbAttrProcessorState state = {0};
+
+	state.pg_attrdef_cache = &cache_update_state->pg_attrdef_cache;
+	state.pg_constraint_cache = &cache_update_state->pg_constraint_cache;
+	state.pg_trigger_cache = &cache_update_state->pg_trigger_cache;
+	state.pg_policy_cache = &cache_update_state->pg_policy_cache;
+
+	const bool	sys_rel_update_required = cache_update_state->sys_relations_update_required;
+
+	HeapTuple	htup;
+	MemoryContext row_cxt = YbCreatePreloadRowContext();
+	MemoryContext oldcxt = MemoryContextSwitchTo(row_cxt);
+
+	while (HeapTupleIsValid(htup = YbSystableGetNextInContext(scandesc,
+															  row_cxt)))
+	{
+		if (!YbApplyAttr(&state, attrel, htup))
+		{
+			YbCompleteAttrProcessing(&state);
+			YbStartNewAttrProcessing(&state, sys_rel_update_required, attrel,
+									 htup);
+		}
+	}
+	YbCompleteAttrProcessing(&state);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(row_cxt);
+	systable_endscan(scandesc);
+	table_close(attrel, AccessShareLock);
+}
+
+static void
+YBUpdateRelationsPartitioning(const YbUpdateRelationCacheState *state)
+{
+	Relation	partrel = table_open(PartitionedRelationId, AccessShareLock);
+	SysScanDesc scandesc = systable_beginscan(partrel, InvalidOid,
+											  false /* indexOk */ , NULL, 0,
+											  NULL);
+
+	HeapTuple	htup;
+	MemoryContext row_cxt = YbCreatePreloadRowContext();
+	MemoryContext oldcxt = MemoryContextSwitchTo(row_cxt);
+
+	while (HeapTupleIsValid(htup = YbSystableGetNextInContext(scandesc,
+															  row_cxt)))
+	{
+		Form_pg_partitioned_table part_table_form = (Form_pg_partitioned_table) GETSTRUCT(htup);
+		Relation	relation;
+
+		RelationIdCacheLookup(part_table_form->partrelid, relation);
+
+		if (relation &&
+			relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE &&
+			(state->sys_relations_update_required ||
+			 !IsSystemRelation(relation)))
+		{
+			/* Initialize key and partition descriptor info */
+			RelationBuildPartitionKey(relation);
+			RelationBuildPartitionDesc(relation, true /* omit_detached */ );
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(row_cxt);
+
+	systable_endscan(scandesc);
+	table_close(partrel, AccessShareLock);
+}
+
+typedef struct YbIndiciesHTABEntryData
+{
+	Relation	relation;
+	List	   *result;
+	Oid			pkeyIndex;
+	Oid			candidateIndex;
+} YbIndiciesHTABEntryData;
+
+typedef struct YbIndiciesHTABEntry
+{
+	Oid			key;
+	YbIndiciesHTABEntryData data;
+} YbIndiciesHTABEntry;
+
+static void
+YbProcessIndexTuple(HeapTuple htup, HTAB *indicies, bool sys_rel_update_required)
+{
+	Form_pg_index index	 = (Form_pg_index) GETSTRUCT(htup);
+
+	/*
+	 * Ignore any indexes that are currently being dropped.  This will
+	 * prevent them from being searched, inserted into, or considered in
+	 * HOT-safety decisions.  It's unsafe to touch such an index at all
+	 * since its catalog entries could disappear at any instant.
+	 */
+	if (!index->indislive)
+		return;
+
+	bool found = false;
+	YbIndiciesHTABEntry *entry = hash_search(indicies, &index->indrelid, HASH_ENTER, &found);
+	YbIndiciesHTABEntryData *data = &entry->data;
+	if (!found)
+	{
+		Relation rel;
+		RelationIdCacheLookup(index->indrelid, rel);
+		if (rel && !sys_rel_update_required && IsSystemRelation(rel))
+			rel = NULL;
+		*data = (YbIndiciesHTABEntryData) {.relation = rel};
+	}
+	if (!data->relation)
+		return;
+
+	/* Further code is copy-paste from the RelationGetIndexList function */
+
+	/* add index's OID to result list */
+	data->result = lappend_oid(data->result, index->indexrelid);
+
+	/*
+	 * Invalid, non-unique, non-immediate or predicate indexes aren't
+	 * interesting for either oid indexes or replication identity indexes,
+	 * so don't check them.
+	 */
+	if (!index->indisvalid || !index->indisunique ||
+		!index->indimmediate ||
+		!heap_attisnull(htup, Anum_pg_index_indpred, NULL))
+		return;
+
+	/* remember primary key index if any */
+	if (index->indisprimary)
+		data->pkeyIndex = index->indexrelid;
+
+	/* remember explicitly chosen replica index */
+	if (index->indisreplident)
+		data->candidateIndex = index->indexrelid;
+}
+
+static void
+YbApplyIndex(const YbIndiciesHTABEntryData *data, bool indicies_are_oid_ordered)
+{
+	if (!data->relation)
+		return;
+
+	if (!indicies_are_oid_ordered)
+	{
+		/* Sort the result list into OID order, per API spec. */
+		list_sort(data->result, list_oid_cmp);
+	}
+
+	Relation	relation = data->relation;
+	Oid			pkeyIndex = data->pkeyIndex;
+	Oid			candidateIndex = data->candidateIndex;
+	List	   *result = data->result;
+	char		replident = relation->rd_rel->relreplident;
+
+	/* Further code is copy-paste from the RelationGetIndexList function */
+
+	/* Now save a copy of the completed list in the relcache entry. */
+	MemoryContext oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+	List	   *oldlist = relation->rd_indexlist;
+
+	relation->rd_indexlist = list_copy(result);
+	relation->rd_pkindex = pkeyIndex;
+	/* YB: In replica identity CHANGE, we always get the primary key of the row. */
+	if ((replident == REPLICA_IDENTITY_DEFAULT ||
+		 replident == YB_REPLICA_IDENTITY_CHANGE) && OidIsValid(pkeyIndex))
+		relation->rd_replidindex = pkeyIndex;
+	else if (replident == REPLICA_IDENTITY_INDEX && OidIsValid(candidateIndex))
+		relation->rd_replidindex = candidateIndex;
+	else
+		relation->rd_replidindex = InvalidOid;
+	relation->rd_indexvalid = 1;
+	MemoryContextSwitchTo(oldcxt);
+
+	/* Don't leak the old list, if there is one */
+	list_free(oldlist);
+}
+
+/*
+ * YBUpdateRelationsIndicies updates the rd_indexlist field for all relations.
+ * The result of calling this function is identical to call the
+ * RelationGetIndexList postgres' native function for each relation.
+ * But such implementation is not an optimal due to system table preloading
+ * mechanism.
+ * The RelationGetIndexList function updates the rd_indexlist field for
+ * particular relation and it make a search for entries in the rd_index system
+ * table by specifying relation's id as a key. But due to system table
+ * preloading mechanism search in rd_index system will return all the rows from
+ * pg_index and YSQL layer will filter rows which much
+ * specified key (i.e. relation's id).
+ * As a result in case we have M relation and N rows in pg_index YSQL will have
+ * to build and process M * N tuples.
+ * The current implementation processes all the rows in pg_index once.
+ * As a result the complexity is O(N) instead of O(N * M).
+ */
+static void
+YBUpdateRelationsIndicies(const YbUpdateRelationCacheState *cache_update_state)
+{
+	MemoryContext ctx = AllocSetContextCreate(CurrentMemoryContext,
+											  "update rel indicies",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldctx = MemoryContextSwitchTo(ctx);
+	MemoryContext row_ctx = YbCreatePreloadRowContext();
+	Relation indrel = table_open(IndexRelationId, AccessShareLock);
+	/*
+	 * Fetch tuples from IndexRelationId in PK order (ordered by index oid).
+	 * Note: Prefetcher internally might use secondary index, so runtime check is required to make
+	 *       sure desired order is preserved.
+	 * TODO: Remove runtime check after fixing #34746.
+	 */
+	SysScanDesc scan = systable_beginscan(indrel, InvalidOid, false /* indexOk */ , NULL, 0, NULL);
+	HeapTuple htup;
+	HASHCTL ctl = {0};
+	ctl.hcxt = ctx;
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(YbIndiciesHTABEntry);
+	HTAB *indicies = hash_create("indicies hash", 256, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	Oid prev_index_oid = InvalidOid;
+	bool indicies_are_oid_ordered = true;
+
+	while (HeapTupleIsValid(htup = YbSystableGetNextInContext(scan, row_ctx)))
+	{
+		YbProcessIndexTuple(htup, indicies, cache_update_state->sys_relations_update_required);
+		if (indicies_are_oid_ordered)
+		{
+			const Oid index_oid	= ((Form_pg_index) GETSTRUCT(htup))->indexrelid;
+			if (prev_index_oid != InvalidOid && index_oid <= prev_index_oid)
+				indicies_are_oid_ordered = false;
+			prev_index_oid = index_oid;
+		}
+	}
+
+	HASH_SEQ_STATUS seq;
+	YbIndiciesHTABEntry *entry;
+	hash_seq_init(&seq, indicies);
+	while ((entry = hash_seq_search(&seq)) != NULL)
+	{
+		YbApplyIndex(&entry->data, indicies_are_oid_ordered);
+	}
+	hash_destroy(indicies);
+	systable_endscan(scan);
+	table_close(indrel, AccessShareLock);
+	MemoryContextSwitchTo(oldctx);
+	MemoryContextDelete(ctx);
+}
+
+static void
+YbRaiseInvalidDBConnectionError()
+{
+	ereport(FATAL,
+			(errcode(ERRCODE_CONNECTION_FAILURE),
+			 errmsg("could not reconnect to database"),
+			 errhint("Database may have been dropped and recreated. "
+					 "Ensure your client connection pool or metadata cache "
+					 "is refreshed to pick up the new database OID.")));
+}
+
+typedef enum YbPFetchTable
+{
+	YB_PFETCH_TABLE_FIRST = 0,
+
+	YB_PFETCH_TABLE_PG_AGGREGATE = YB_PFETCH_TABLE_FIRST,
+	YB_PFETCH_TABLE_PG_AM,
+	YB_PFETCH_TABLE_PG_AMOP,
+	YB_PFETCH_TABLE_PG_AMPROC,
+	YB_PFETCH_TABLE_PG_ATTRDEF,
+	YB_PFETCH_TABLE_PG_ATTRIBUTE,
+	YB_PFETCH_TABLE_PG_AUTH_MEMBERS,
+	YB_PFETCH_TABLE_PG_AUTHID,
+	YB_PFETCH_TABLE_PG_CAST,
+	YB_PFETCH_TABLE_PG_CLASS,
+	YB_PFETCH_TABLE_PG_COLLATION,
+	YB_PFETCH_TABLE_PG_CONSTRAINT,
+	YB_PFETCH_TABLE_PG_DATABASE,
+	YB_PFETCH_TABLE_PG_DB_ROLE_SETTINGS,
+	YB_PFETCH_TABLE_PG_ENUM,
+	YB_PFETCH_TABLE_PG_INDEX,
+	YB_PFETCH_TABLE_PG_INHERITS,
+	YB_PFETCH_TABLE_PG_NAMESPACE,
+	YB_PFETCH_TABLE_PG_OPCLASS,
+	YB_PFETCH_TABLE_PG_OPERATOR,
+	YB_PFETCH_TABLE_PG_PARTITIONED_TABLE,
+	YB_PFETCH_TABLE_PG_POLICY,
+	YB_PFETCH_TABLE_PG_PROC,
+	YB_PFETCH_TABLE_PG_RANGE,
+	YB_PFETCH_TABLE_PG_REWRITE,
+	YB_PFETCH_TABLE_PG_STATISTIC,
+	YB_PFETCH_TABLE_PG_STATISTIC_EXT,
+	YB_PFETCH_TABLE_PG_STATISTIC_EXT_DATA,
+	YB_PFETCH_TABLE_PG_TABLESPACE,
+	YB_PFETCH_TABLE_PG_TRIGGER,
+	YB_PFETCH_TABLE_PG_TYPE,
+	YB_PFETCH_TABLE_YB_PG_PROFILE,
+	YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE,
+
+	YB_PFETCH_TABLE_LAST
+} YbPFetchTable;
+
+enum YbPFetchTablesCount
+{
+	YB_PFETCH_TABLES_COUNT = YB_PFETCH_TABLE_LAST - YB_PFETCH_TABLE_FIRST
+};
+
+typedef struct YbCatalogNameToPfTableId
+{
+	const char *name;
+	YbPFetchTable pfetchTable;
+} YbCatNamePfId;
+
+/*
+ * Comparator for binary searching the YbCatalogNamesPfIds array.
+ */
+static int
+YbBinSearchCatNamesComp(const void *a, const void *b)
+{
+	return pg_strcasecmp(((YbCatNamePfId *) a)->name, ((YbCatNamePfId *) b)->name);
+}
+
+/*
+ * This is an incomplete mapping between PG catalog names to Prefetch tables.
+ * However, it is extensible as needed to accommodate different use cases.
+ * This list must be sorted in alpabetical order.
+ * NOTE: Not all catalogs can be preloaded as part of additional catalogs to
+ * preload. Please validate whether a catalog can be preloaded before using it
+ * in production.
+ */
+static const YbCatNamePfId YbCatalogNamesPfIds[] = {
+	{"pg_aggregate", YB_PFETCH_TABLE_PG_AGGREGATE},
+	{"pg_am", YB_PFETCH_TABLE_PG_AM},
+	{"pg_amop", YB_PFETCH_TABLE_PG_AMOP},
+	{"pg_amproc", YB_PFETCH_TABLE_PG_AMPROC},
+	{"pg_attrdef", YB_PFETCH_TABLE_PG_ATTRDEF},
+	{"pg_attribute", YB_PFETCH_TABLE_PG_ATTRIBUTE},
+	{"pg_auth_members", YB_PFETCH_TABLE_PG_AUTH_MEMBERS},
+	{"pg_authid", YB_PFETCH_TABLE_PG_AUTHID},
+	{"pg_cast", YB_PFETCH_TABLE_PG_CAST},
+	{"pg_class", YB_PFETCH_TABLE_PG_CLASS},
+	{"pg_collation", YB_PFETCH_TABLE_PG_COLLATION},
+	{"pg_constraint", YB_PFETCH_TABLE_PG_CONSTRAINT},
+	{"pg_database", YB_PFETCH_TABLE_PG_DATABASE},
+	{"pg_db_role_setting", YB_PFETCH_TABLE_PG_DB_ROLE_SETTINGS},
+	{"pg_enum", YB_PFETCH_TABLE_PG_ENUM},
+	{"pg_index", YB_PFETCH_TABLE_PG_INDEX},
+	{"pg_inherits", YB_PFETCH_TABLE_PG_INHERITS},
+	{"pg_namespace", YB_PFETCH_TABLE_PG_NAMESPACE},
+	{"pg_opclass", YB_PFETCH_TABLE_PG_OPCLASS},
+	{"pg_operator", YB_PFETCH_TABLE_PG_OPERATOR},
+	{"pg_partitioned_table", YB_PFETCH_TABLE_PG_PARTITIONED_TABLE},
+	{"pg_policy", YB_PFETCH_TABLE_PG_POLICY},
+	{"pg_proc", YB_PFETCH_TABLE_PG_PROC},
+	{"pg_range", YB_PFETCH_TABLE_PG_RANGE},
+	{"pg_rewrite", YB_PFETCH_TABLE_PG_REWRITE},
+	{"pg_statistic", YB_PFETCH_TABLE_PG_STATISTIC},
+	{"pg_statistic_ext", YB_PFETCH_TABLE_PG_STATISTIC_EXT},
+	{"pg_statistic_ext_data", YB_PFETCH_TABLE_PG_STATISTIC_EXT_DATA},
+	{"pg_tablespace", YB_PFETCH_TABLE_PG_TABLESPACE},
+	{"pg_trigger", YB_PFETCH_TABLE_PG_TRIGGER},
+	{"pg_type", YB_PFETCH_TABLE_PG_TYPE},
+	{"pg_yb_profile", YB_PFETCH_TABLE_YB_PG_PROFILE},
+	{"pg_yb_role_profile", YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE},
+};
+
+typedef enum YbPFetchTableState
+{
+	YB_PFETCH_STATE_EMPTY = 0,
+	YB_PFETCH_STATE_REGISTERED,
+	YB_PFETCH_STATE_LOADED,
+	YB_PFETCH_STATE_CACHE_FILLED,
+} YbPFetchTableState;
+
+typedef enum YbTableCacheType
+{
+	YB_TABLE_CACHE_TYPE_NO_CACHE = 0,
+	YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,
+	YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,
+	YB_TABLE_CACHE_TYPE_CUSTOM_CACHE
+} YbTableCacheType;
+
+typedef struct YbCatCacheInfo
+{
+	int			id;
+	int			index_id;
+} YbCatCacheInfo;
+
+typedef void (*YbCustomCache) ();
+
+typedef struct YbTableCacheInfo
+{
+	YbTableCacheType type;
+	union
+	{
+		YbCatCacheInfo cat_cache;
+		YbCustomCache custom_loader;
+	};
+} YbTableCacheInfo;
+
+typedef struct YbPFetchTableInfo
+{
+	Oid			relation_oid;
+	YbTableCacheInfo cache;
+} YbPFetchTableInfo;
+
+typedef struct YbTablePrefetcherState
+{
+	YbPFetchTableState tables[YB_PFETCH_TABLES_COUNT];
+	YbPFetchTableState tables_end;
+	/*
+	 * Tables the relcache build registered for its own use, such as for
+	 * partitioned tables.  All their caches are filled whatever
+	 * yb_test_catalog_preload_cache_list says.
+	 */
+	bool		prefill_needed[YB_PFETCH_TABLES_COUNT];
+	/* The catalog caches filled so far. */
+	bool		cache_filled[SysCacheSize];
+} YbTablePrefetcherState;
+
+static const YbPFetchTableInfo *
+YbGetPrefetchableTableInfo(YbPFetchTable table)
+{
+	static YbPFetchTableInfo tables[YB_PFETCH_TABLES_COUNT] = {
+		[YB_PFETCH_TABLE_PG_AGGREGATE] =
+		(YbPFetchTableInfo) {AggregateRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {AGGFNOID}}},
+		[YB_PFETCH_TABLE_PG_AM] =
+		(YbPFetchTableInfo) {AccessMethodRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {AMOID, AMNAME}}},
+		[YB_PFETCH_TABLE_PG_AMOP] =
+		(YbPFetchTableInfo) {AccessMethodOperatorRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {AMOPOPID, AMOPSTRATEGY}}},
+		[YB_PFETCH_TABLE_PG_AMPROC] =
+		(YbPFetchTableInfo) {AccessMethodProcedureRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {AMPROCNUM}}},
+		[YB_PFETCH_TABLE_PG_ATTRDEF] =
+		(YbPFetchTableInfo) {AttrDefaultRelationId},
+		[YB_PFETCH_TABLE_PG_ATTRIBUTE] =
+		(YbPFetchTableInfo) {AttributeRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {ATTNAME, ATTNUM}}},
+		[YB_PFETCH_TABLE_PG_AUTH_MEMBERS] =
+		(YbPFetchTableInfo) {AuthMemRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {AUTHMEMMEMROLE, AUTHMEMROLEMEM}}},
+		[YB_PFETCH_TABLE_PG_AUTHID] =
+		(YbPFetchTableInfo) {AuthIdRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {AUTHOID, AUTHNAME}}},
+		[YB_PFETCH_TABLE_PG_CAST] =
+		(YbPFetchTableInfo) {CastRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {CASTSOURCETARGET}}},
+		[YB_PFETCH_TABLE_PG_CLASS] =
+		(YbPFetchTableInfo) {RelationRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {RELOID, RELNAMENSP}}},
+		[YB_PFETCH_TABLE_PG_COLLATION] =
+		(YbPFetchTableInfo) {CollationRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {COLLOID, COLLNAMEENCNSP}}},
+		[YB_PFETCH_TABLE_PG_CONSTRAINT] =
+		(YbPFetchTableInfo) {ConstraintRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {CONSTROID, YBCONSTRAINTRELIDTYPIDNAME}}},
+		[YB_PFETCH_TABLE_PG_DATABASE] =
+		(YbPFetchTableInfo) {DatabaseRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {DATABASEOID}}},
+		[YB_PFETCH_TABLE_PG_DB_ROLE_SETTINGS] =
+		(YbPFetchTableInfo) {DbRoleSettingRelationId},
+		[YB_PFETCH_TABLE_PG_ENUM] =
+		(YbPFetchTableInfo) {EnumRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {ENUMOID, ENUMTYPOIDNAME}}},
+		[YB_PFETCH_TABLE_PG_INDEX] =
+		(YbPFetchTableInfo) {IndexRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {INDEXRELID}}},
+		[YB_PFETCH_TABLE_PG_INHERITS] =
+		(YbPFetchTableInfo) {InheritsRelationId, {YB_TABLE_CACHE_TYPE_CUSTOM_CACHE,.custom_loader = &YbPreloadPgInheritsCache}},
+		[YB_PFETCH_TABLE_PG_NAMESPACE] =
+		(YbPFetchTableInfo) {NamespaceRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {NAMESPACEOID, NAMESPACENAME}}},
+		[YB_PFETCH_TABLE_PG_OPCLASS] =
+		(YbPFetchTableInfo) {OperatorClassRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {CLAOID, CLAAMNAMENSP}}},
+		[YB_PFETCH_TABLE_PG_OPERATOR] =
+		(YbPFetchTableInfo) {OperatorRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {OPEROID, OPERNAMENSP}}},
+		[YB_PFETCH_TABLE_PG_PARTITIONED_TABLE] =
+		(YbPFetchTableInfo) {PartitionedRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {PARTRELID}}},
+		[YB_PFETCH_TABLE_PG_POLICY] =
+		(YbPFetchTableInfo) {PolicyRelationId},
+		[YB_PFETCH_TABLE_PG_PROC] =
+		(YbPFetchTableInfo) {ProcedureRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {PROCOID, PROCNAMEARGSNSP}}},
+		[YB_PFETCH_TABLE_PG_RANGE] =
+		(YbPFetchTableInfo) {RangeRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {RANGETYPE,RANGEMULTIRANGE}}},
+		[YB_PFETCH_TABLE_PG_REWRITE] =
+		(YbPFetchTableInfo) {RewriteRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {RULERELNAME}}},
+		[YB_PFETCH_TABLE_PG_STATISTIC] =
+		(YbPFetchTableInfo) {StatisticRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {STATRELATTINH}}},
+		[YB_PFETCH_TABLE_PG_STATISTIC_EXT] =
+		(YbPFetchTableInfo) {StatisticExtRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {STATEXTOID, STATEXTNAMENSP}}},
+		[YB_PFETCH_TABLE_PG_STATISTIC_EXT_DATA] =
+		(YbPFetchTableInfo) {StatisticExtDataRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {STATEXTDATASTXOID}}},
+		[YB_PFETCH_TABLE_PG_TABLESPACE] =
+		(YbPFetchTableInfo) {TableSpaceRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX,.cat_cache = {TABLESPACEOID}}},
+		[YB_PFETCH_TABLE_PG_TRIGGER] =
+		(YbPFetchTableInfo) {TriggerRelationId},
+		[YB_PFETCH_TABLE_PG_TYPE] =
+		(YbPFetchTableInfo) {TypeRelationId, {YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX,.cat_cache = {TYPEOID, TYPENAMENSP}}},
+		[YB_PFETCH_TABLE_YB_PG_PROFILE] =
+		(YbPFetchTableInfo) {YbProfileRelationId},
+		[YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE] =
+		(YbPFetchTableInfo) {YbRoleProfileRelationId},
+	};
+
+	return tables + table;
+}
+
+static void
+YbRegisterTable(YbTablePrefetcherState *prefetcher, YbPFetchTable table)
+{
+	YbPFetchTableState *ts = prefetcher->tables + table;
+
+	if (*ts == YB_PFETCH_STATE_EMPTY)
+	{
+		YbRegisterSysTableForPrefetching(YbGetPrefetchableTableInfo(table)->relation_oid);
+		*ts = YB_PFETCH_STATE_REGISTERED;
+	}
+}
+
+static void
+YbRegisterTables(YbTablePrefetcherState *prefetcher,
+				 const YbPFetchTable *table,
+				 size_t count)
+{
+	for (const YbPFetchTable *end = table + count; table != end; ++table)
+	{
+		if (*table != YB_PFETCH_TABLE_LAST)
+			YbRegisterTable(prefetcher, *table);
+	}
+}
+
+/*
+ * Register tables the relcache build needs for its own use.  See the
+ * prefill_needed field of YbTablePrefetcherState.
+ */
+static void
+YbRegisterTablesForPrefill(YbTablePrefetcherState *prefetcher,
+						   const YbPFetchTable *table,
+						   size_t count)
+{
+	for (const YbPFetchTable *end = table + count; table != end; ++table)
+	{
+		YbPFetchTableState *ts = prefetcher->tables + *table;
+
+		YbRegisterTable(prefetcher, *table);
+		prefetcher->prefill_needed[*table] = true;
+		/*
+		 * If yb_test_catalog_preload_cache_list selected only some of its
+		 * caches, the next YbFillCaches fills the rest.
+		 */
+		if (*ts == YB_PFETCH_STATE_CACHE_FILLED)
+			*ts = YB_PFETCH_STATE_LOADED;
+	}
+}
+
+/*
+ * Catalog caches the preload looks up while the prefetcher is active, in the
+ * relcache build and right after it.  They are always filled, because each
+ * lookup in an unfilled cache scans all prefetched rows of its table.  The
+ * pg_inherits cache, which is not a catalog cache, is always filled for the
+ * same reason.
+ *
+ * Besides the caches the build looks up for every relation, these are
+ * TYPEOID and COLLOID for the partition keys and bounds of partitioned
+ * tables, and AUTHOID and NAMESPACENAME for the lookup of the user's
+ * namespace at the end of the preload.
+ */
+static const int yb_required_preload_caches[] = {
+	AMOID,
+	AMPROCNUM,
+	AUTHOID,
+	CLAOID,
+	COLLOID,
+	DATABASEOID,
+	INDEXRELID,
+	NAMESPACENAME,
+	PARTRELID,
+	RELOID,
+	RULERELNAME,
+	TYPEOID
+};
+
+/*
+ * Parsed yb_test_catalog_preload_cache_list: the catalog caches it names.
+ * NULL when the list is empty.
+ */
+typedef struct YbCatalogPreloadCacheList
+{
+	bool		selected[SysCacheSize];
+} YbCatalogPreloadCacheList;
+
+static const YbCatalogPreloadCacheList *yb_catalog_preload_cache_list = NULL;
+
+static const YbCatNamePfId *
+YbFindPrefetchTableByName(const char *name)
+{
+	YbCatNamePfId entry = {name, YB_PFETCH_TABLE_LAST};
+
+	return bsearch(&entry, YbCatalogNamesPfIds, YB_PFETCH_TABLE_LAST,
+				   sizeof(YbCatNamePfId), YbBinSearchCatNamesComp);
+}
+
+/*
+ * Get the catalog caches filled from a prefetched table, returning how many
+ * there are.
+ */
+static int
+YbGetPrefetchTableCacheIds(YbPFetchTable table, int cache_ids[2])
+{
+	const YbTableCacheInfo *cache = &YbGetPrefetchableTableInfo(table)->cache;
+
+	switch (cache->type)
+	{
+		case YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX:
+			cache_ids[0] = cache->cat_cache.id;
+			return 1;
+		case YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX:
+			cache_ids[0] = cache->cat_cache.id;
+			cache_ids[1] = cache->cat_cache.index_id;
+			return 2;
+		case YB_TABLE_CACHE_TYPE_NO_CACHE:
+		case YB_TABLE_CACHE_TYPE_CUSTOM_CACHE:
+			break;
+	}
+	return 0;
+}
+
+static YbPFetchTable
+YbGetCatalogCachePrefetchTable(int cache_id)
+{
+	for (YbPFetchTable table = YB_PFETCH_TABLE_FIRST;
+		 table < YB_PFETCH_TABLE_LAST;
+		 ++table)
+	{
+		int			cache_ids[2];
+		int			num_cache_ids = YbGetPrefetchTableCacheIds(table, cache_ids);
+
+		for (int i = 0; i < num_cache_ids; ++i)
+		{
+			if (cache_ids[i] == cache_id)
+				return table;
+		}
+	}
+	return YB_PFETCH_TABLE_LAST;
+}
+
+static bool
+YbIsRequiredPreloadCache(int cache_id)
+{
+	for (int i = 0; i < lengthof(yb_required_preload_caches); ++i)
+	{
+		if (yb_required_preload_caches[i] == cache_id)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Select the catalog caches named by an item of
+ * yb_test_catalog_preload_cache_list: a catalog table name (all its caches),
+ * a catalog cache name (ATTNAME), or the name of the index of a catalog cache
+ * (pg_attribute_relid_attnam_index), as the CatalogCacheMisses metric labels
+ * it.  Names are matched case-insensitively.
+ *
+ * An item that selects no catalog cache is ignored with a warning rather than
+ * rejected: the value comes from the configuration file, where an invalid
+ * value keeps postgres from starting.
+ */
+static void
+YbSelectCatalogPreloadItem(const char *name, YbCatalogPreloadCacheList *list)
+{
+	/*
+	 * The check hook runs in the postmaster and in every backend on each
+	 * reload, so warn only once, from the postmaster.
+	 */
+	const int	elevel = IsUnderPostmaster ? DEBUG2 : WARNING;
+	const YbCatNamePfId *table = YbFindPrefetchTableByName(name);
+
+	if (table)
+	{
+		const YbTableCacheInfo *cache =
+			&YbGetPrefetchableTableInfo(table->pfetchTable)->cache;
+		int			cache_ids[2];
+		int			num_cache_ids;
+
+		if (cache->type == YB_TABLE_CACHE_TYPE_NO_CACHE)
+		{
+			ereport(elevel,
+					(errmsg("ignoring \"%s\" in yb_test_catalog_preload_cache_list",
+							name),
+					 errdetail("Catalog \"%s\" has no catalog cache.", name)));
+			return;
+		}
+		if (cache->type == YB_TABLE_CACHE_TYPE_CUSTOM_CACHE)
+		{
+			ereport(elevel,
+					(errmsg("ignoring \"%s\" in yb_test_catalog_preload_cache_list",
+							name),
+					 errdetail("The cache of catalog \"%s\" is always filled.",
+							   name)));
+			return;
+		}
+		num_cache_ids = YbGetPrefetchTableCacheIds(table->pfetchTable, cache_ids);
+		for (int i = 0; i < num_cache_ids; ++i)
+			list->selected[cache_ids[i]] = true;
+		return;
+	}
+
+	for (int cache_id = 0; cache_id < SysCacheSize; ++cache_id)
+	{
+		if (pg_strcasecmp(name, YbGetCatalogCacheName(cache_id)) != 0 &&
+			pg_strcasecmp(name, YbGetCatalogCacheIndexName(cache_id)) != 0)
+			continue;
+
+		if (YbGetCatalogCachePrefetchTable(cache_id) == YB_PFETCH_TABLE_LAST)
+		{
+			ereport(elevel,
+					(errmsg("ignoring \"%s\" in yb_test_catalog_preload_cache_list",
+							name),
+					 errdetail("Catalog cache %s is on catalog \"%s\", which cannot be preloaded.",
+							   YbGetCatalogCacheName(cache_id),
+							   YbGetCatalogCacheTableNameFromCacheId(cache_id))));
+			return;
+		}
+
+		list->selected[cache_id] = true;
+		return;
+	}
+
+	ereport(elevel,
+			(errmsg("ignoring \"%s\" in yb_test_catalog_preload_cache_list", name),
+			 errdetail("\"%s\" is neither a preloadable catalog nor a catalog cache.",
+					   name)));
+}
+
+/*
+ * Parse yb_test_catalog_preload_cache_list into list, setting *is_empty if it
+ * names nothing, as a value of only whitespace does.
+ */
+static bool
+YbParseCatalogPreloadCacheList(const char *value, YbCatalogPreloadCacheList *list,
+							   bool *is_empty)
+{
+	char	   *rawstring = pstrdup(value);
+	List	   *items;
+	ListCell   *lc;
+	bool		result = true;
+
+	memset(list, 0, sizeof(*list));
+	if (!SplitGUCList(rawstring, ',', &items))
+	{
+		GUC_check_errdetail("List syntax is invalid.");
+		result = false;
+	}
+	*is_empty = items == NIL;
+	if (result)
+	{
+		foreach(lc, items)
+			YbSelectCatalogPreloadItem(lfirst(lc), list);
+	}
+	list_free(items);
+	pfree(rawstring);
+	return result;
+}
+
+bool
+yb_check_test_catalog_preload_cache_list(char **newval, void **extra,
+										 GucSource source)
+{
+	YbCatalogPreloadCacheList list;
+	YbCatalogPreloadCacheList *result;
+	bool		is_empty;
+
+	if (!YbParseCatalogPreloadCacheList(*newval, &list, &is_empty))
+		return false;
+	if (is_empty)
+		return true;
+
+	result = guc_malloc(LOG, sizeof(YbCatalogPreloadCacheList));
+	if (!result)
+		return false;
+	*result = list;
+	*extra = result;
+	return true;
+}
+
+void
+yb_assign_test_catalog_preload_cache_list(const char *newval, void *extra)
+{
+	yb_catalog_preload_cache_list = extra;
+}
+
+/*
+ * Whether yb_test_catalog_preload_cache_list is set.  It then replaces the
+ * ysql_catalog_preload_additional_tables and
+ * ysql_catalog_preload_additional_table_list gflags.
+ */
+bool
+YbCatalogPreloadCacheListIsSet(void)
+{
+	return yb_catalog_preload_cache_list != NULL;
+}
+
+/*
+ * Whether to fill a catalog cache when its table is prefetched.  If
+ * yb_test_catalog_preload_cache_list is not set, every catalog cache is
+ * filled.  If it is set, only the caches it names are filled, besides the
+ * required caches and those of tables the relcache build needs.
+ */
+static bool
+YbCatalogCachePreloadSelected(int cache_id, bool prefill_needed)
+{
+	const YbCatalogPreloadCacheList *list = yb_catalog_preload_cache_list;
+
+	return (!list || list->selected[cache_id] || prefill_needed ||
+			YbIsRequiredPreloadCache(cache_id));
+}
+
+static void
+YbRegisterCatalogPreloadCacheListTables(YbTablePrefetcherState *prefetcher)
+{
+	const YbCatalogPreloadCacheList *list = yb_catalog_preload_cache_list;
+
+	if (!list)
+		return;
+	for (YbPFetchTable table = YB_PFETCH_TABLE_FIRST;
+		 table < YB_PFETCH_TABLE_LAST;
+		 ++table)
+	{
+		int			cache_ids[2];
+		int			num_cache_ids = YbGetPrefetchTableCacheIds(table, cache_ids);
+
+		for (int i = 0; i < num_cache_ids; ++i)
+		{
+			if (list->selected[cache_ids[i]])
+			{
+				YbRegisterTable(prefetcher, table);
+				break;
+			}
+		}
+	}
+}
+
+static YbcStatus
+YbPrefetch(YbTablePrefetcherState *prefetcher, bool completes_connection_prefetch)
+{
+	bool		prefetched = false;
+
+	for (YbPFetchTableState *ts = prefetcher->tables;
+		 ts != &prefetcher->tables_end;
+		 ++ts)
+	{
+		if (*ts == YB_PFETCH_STATE_REGISTERED)
+		{
+			if (!prefetched)
+			{
+				YbcStatus	status =
+					YBCPrefetchRegisteredSysTables(completes_connection_prefetch);
+
+				if (status)
+					return status;
+				prefetched = true;
+			}
+			*ts = YB_PFETCH_STATE_LOADED;
+		}
+	}
+	return NULL;
+}
+
+static void
+YbFillCache(YbTablePrefetcherState *prefetcher, YbPFetchTable table)
+{
+	const YbPFetchTableInfo *info = YbGetPrefetchableTableInfo(table);
+	YbPFetchTableState *ts = prefetcher->tables + table;
+
+	if (*ts == YB_PFETCH_STATE_CACHE_FILLED)
+		return;
+	Assert(*ts == YB_PFETCH_STATE_LOADED);
+	switch (info->cache.type)
+	{
+		case YB_TABLE_CACHE_TYPE_NO_CACHE:
+			Assert(false);
+			break;
+		case YB_TABLE_CACHE_TYPE_CAT_CACHE_NO_INDEX:
+		case YB_TABLE_CACHE_TYPE_CAT_CACHE_WITH_INDEX:
+			{
+				const bool	prefill_needed = prefetcher->prefill_needed[table];
+				int			cache_ids[2];
+				int			num_cache_ids = YbGetPrefetchTableCacheIds(table, cache_ids);
+				int			selected[2];
+				int			num_selected = 0;
+
+				for (int i = 0; i < num_cache_ids; ++i)
+				{
+					if (!prefetcher->cache_filled[cache_ids[i]] &&
+						YbCatalogCachePreloadSelected(cache_ids[i], prefill_needed))
+					{
+						selected[num_selected++] = cache_ids[i];
+						prefetcher->cache_filled[cache_ids[i]] = true;
+					}
+				}
+				if (num_selected > 0)
+					YbPreloadCatalogCache(selected[0],
+										  num_selected > 1 ? selected[1] : -1);
+				break;
+			}
+		case YB_TABLE_CACHE_TYPE_CUSTOM_CACHE:
+			info->cache.custom_loader();
+			break;
+	}
+	*ts = YB_PFETCH_STATE_CACHE_FILLED;
+}
+
+static bool
+YbHasAssociatedCache(YbPFetchTable table)
+{
+	return YbGetPrefetchableTableInfo(table)->cache.type != YB_TABLE_CACHE_TYPE_NO_CACHE;
+}
+
+static void
+YbFillCaches(YbTablePrefetcherState *prefetcher)
+{
+	for (const YbPFetchTableState *ts = prefetcher->tables;
+		 ts != &prefetcher->tables_end;
+		 ++ts)
+	{
+		const YbPFetchTable table = ts - prefetcher->tables;
+
+		if (*ts != YB_PFETCH_STATE_EMPTY && YbHasAssociatedCache(table))
+			YbFillCache(prefetcher, table);
+	}
+}
+
+typedef struct YbRunWithPrefetcherContext
+{
+	YbTablePrefetcherState prefetcher;
+	bool		is_using_response_cache;
+
+	/*
+	 * Whether this prefetch belongs to a connection starting up: the only kind that reads an
+	 * older version back, and the only kind whose own prefetch is worth recording a version for.
+	 * See the last YbPrefetch in YbPrefetchRequiredDataImpl.
+	 */
+	bool		completes_connection_prefetch;
+} YbRunWithPrefetcherContext;
+
+typedef struct YbPrefetcherStarterFunctor
+{
+	bool		(*call) (struct YbPrefetcherStarterFunctor *);
+} YbPrefetcherStarterFunctor;
+
+static YbcStatus
+YbRunWithPrefetcherImpl(YbPrefetcherStarterFunctor *prefetcher_starter,
+						YbcStatus (*func) (YbRunWithPrefetcherContext *ctx),
+						bool keep_prefetcher,
+						bool completes_connection_prefetch)
+{
+	const bool	is_using_response_cache = prefetcher_starter->call(prefetcher_starter);
+	YbcStatus	result = NULL;
+
+	PG_TRY();
+	{
+		YbRunWithPrefetcherContext ctx = {};
+
+		ctx.is_using_response_cache = is_using_response_cache;
+		ctx.completes_connection_prefetch = completes_connection_prefetch;
+		result = func(&ctx);
+	}
+	PG_CATCH();
+	{
+		YBCStopSysTablePrefetching();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (!result && keep_prefetcher)
+		return NULL;
+
+	YBCStopSysTablePrefetching();
+
+	if (result && YBCStatusIsNotFound(result))
+		YbRaiseInvalidDBConnectionError();
+
+	return result;
+}
+
+typedef struct YbPrefetcherStarterWithCache
+{
+	/* YbPrefetcherStarterFunctor have to be the first field due to cast */
+	YbPrefetcherStarterFunctor functor;
+	const YbcPgLastKnownCatalogVersionInfo *version;
+	YbcPgSysTablePrefetcherCacheMode mode;
+	YbcPgSysTablePrefetchKind kind;
+	/* Cleared once this attempt has been sent away, so the next one runs without the ask. */
+	bool		send_away_if_fill_in_flight;
+	bool		part_of_connection_prefetch;
+} YbPrefetcherStarterWithCache;
+
+static bool
+YbPrefetcherStarterWithCacheCall(YbPrefetcherStarterFunctor *functor)
+{
+	const YbPrefetcherStarterWithCache *this = (const YbPrefetcherStarterWithCache *) functor;
+
+	YBCStartSysTablePrefetching(MyDatabaseId, *this->version, this->mode, this->kind,
+								this->send_away_if_fill_in_flight,
+								this->part_of_connection_prefetch);
+	return true;
+}
+
+static YbPrefetcherStarterWithCache
+MakeStarterWithCache(YbcPgSysTablePrefetcherCacheMode mode,
+					 const YbcPgLastKnownCatalogVersionInfo *version,
+					 YbcPgSysTablePrefetchKind kind,
+					 bool part_of_connection_prefetch)
+{
+	return (YbPrefetcherStarterWithCache)
+	{
+		.functor =
+		{
+			.call = &YbPrefetcherStarterWithCacheCall
+		},
+			.version = version,
+			.mode = mode,
+			.kind = kind,
+			.send_away_if_fill_in_flight = false,
+			.part_of_connection_prefetch = part_of_connection_prefetch,
+	};
+}
+
+typedef struct YbPrefetcherStarterNoCache
+{
+	/* YbPrefetcherStarterFunctor have to be the first field due to cast */
+	YbPrefetcherStarterFunctor functor;
+	YbcPgSysTablePrefetchKind kind;
+} YbPrefetcherStarterNoCache;
+
+static bool
+YbPrefetcherStarterNoCacheCall(YbPrefetcherStarterFunctor *functor)
+{
+	const YbPrefetcherStarterNoCache *this = (const YbPrefetcherStarterNoCache *) functor;
+
+	YBCStartSysTablePrefetchingNoCache(this->kind);
+	return false;
+}
+
+/*
+ * Whether a conn-mgr auth backend (or auth passthrough) should serve its
+ * connection-auth prefetch from the lifetime-bounded TRUST_CACHE_AUTH response
+ * cache. Combines the auth-backend/passthrough scoping with the (backend-type-
+ * agnostic) YbUseTserverResponseCacheForAuth gflag/precondition check. Shared by
+ * the two relcache-init call sites below.
+ */
+static bool
+YbAuthBackendUsesTserverResponseCache(uint64_t shared_catalog_version)
+{
+	return YbIsPerformingConnMgrAuth() &&
+		YbUseTserverResponseCacheForAuth(shared_catalog_version);
+}
+
+/*
+ * A connection that read the catalog at a version this node already had cached, and the
+ * invalidation messages that carry it to the version it would otherwise have read at.
+ * YbTryPrepareStaleCatalogPrefetch collects them, which is what establishes that a complete run
+ * exists and that this release can apply it; applying is deferred to a point in startup where
+ * removing a relcache entry is safe. They outlive RelationCacheInitializePhase3, so they are
+ * allocated in TopMemoryContext.
+ */
+static bool YbStaleCatalogPrefetchPending = false;
+static uint64_t YbStaleCatalogPrefetchTargetVersion = 0;
+static YbcCatalogMessageLists YbStaleCatalogPrefetchMessages = {0};
+
+static void
+YbReleaseStaleCatalogPrefetchMessages(void)
+{
+	for (int i = 0; i < YbStaleCatalogPrefetchMessages.num_lists; ++i)
+		if (YbStaleCatalogPrefetchMessages.message_lists[i].message_list)
+			pfree(YbStaleCatalogPrefetchMessages.message_lists[i].message_list);
+	if (YbStaleCatalogPrefetchMessages.message_lists)
+		pfree(YbStaleCatalogPrefetchMessages.message_lists);
+	YbStaleCatalogPrefetchMessages.message_lists = NULL;
+	YbStaleCatalogPrefetchMessages.num_lists = 0;
+}
+
+void
+YbFinishStaleCatalogPrefetch(void)
+{
+	if (!YbStaleCatalogPrefetchPending)
+		return;
+	YbStaleCatalogPrefetchPending = false;
+
+	/*
+	 * Invalidation messages cannot take effect while the prefetcher is alive, since it still
+	 * answers catalog reads out of the rows they supersede. What startup reads after this point
+	 * is mostly served by the catalog caches the prefetch already filled; anything else is an
+	 * ordinary catalog read.
+	 */
+	if (YBCIsSysTablePrefetchingStarted())
+		YBCStopSysTablePrefetching();
+
+	/*
+	 * The messages are applied here rather than by calling the refresh a running backend uses.
+	 * That path does a full catalog cache refresh when the messages are missing or cannot be
+	 * applied, and YBRefreshCache refuses to run inside a transaction, since it would leak
+	 * cache references for the relations that transaction has open. Its check does not fire
+	 * here: it reads postgres.c's xact_started, which InitPostgres does not set, so it cannot
+	 * see the transaction InitPostgres holds open across startup.
+	 */
+	YbResetNeedInvalidateAllTableCache();
+
+	/*
+	 * Applying a message can rebuild a relcache entry, which takes a lock, which runs
+	 * AcceptInvalidationMessages and arrives in YbMaybeRefreshCache. Every reason that function
+	 * has to decline is absent right here: the prefetcher has just been stopped, and this backend
+	 * still reports the older version, so it would start a refresh on top of the apply already
+	 * running. The two other places that apply messages hold this same flag against the same
+	 * reentrancy.
+	 */
+	yb_refresh_cache_in_progress = true;
+	PG_TRY();
+	{
+		if (!YbApplyInvalidationMessages(&YbStaleCatalogPrefetchMessages))
+		{
+			/*
+			 * Cannot happen: this applies the messages YbTryPrepareStaleCatalogPrefetch checked,
+			 * and whether they can be applied depends only on their bytes, which nothing has
+			 * touched since. It is reported rather than asserted because there is no way back
+			 * from here if it ever does -- the caches hold the older version, and a full refresh
+			 * is not available inside the transaction InitPostgres has open. Startup has no error
+			 * handler of its own, so if we ever reach here, this terminates the connection.
+			 */
+			elog(ERROR,
+				 "could not apply the invalidation messages this connection was started with");
+		}
+	}
+	PG_FINALLY();
+	{
+		yb_refresh_cache_in_progress = false;
+	}
+	PG_END_TRY();
+
+	YbUpdateCatalogCacheVersion(YbStaleCatalogPrefetchTargetVersion);
+	YbUpdatePggateTableCacheAfterApply();
+
+	YbReleaseStaleCatalogPrefetchMessages();
+
+	/*
+	 * Applying messages instead of refetching the catalog is an incremental refresh, the same
+	 * thing YbRefreshCacheUsingInvalMsgs counts when a live backend does it. Every connection
+	 * counted here is counted there too.
+	 */
+	YbIncrementCatCacheDeltaRefreshes();
+	YbIncrementStaleCatalogPrefetches();
+
+	/*
+	 * The backend now reports the version it caught up to, and the shared version may already
+	 * have moved past it. Startup takes more locks after this -- process_settings reads
+	 * pg_db_role_setting -- so AcceptInvalidationMessages can reach YbMaybeRefreshCache with
+	 * neither the prefetcher nor the flag above suppressing it. It refreshes incrementally, or
+	 * fully where that newer gap has no usable run of messages, discarding the catalog this just
+	 * assembled. Slower, not wrong: the YBCStopSysTablePrefetching above dropped the prefetcher's
+	 * read time with it, so the reads that rebuild the caches are not pinned to the older one.
+	 */
+}
+
+/*
+ * The part of YbTryPrepareStaleCatalogPrefetch that reads nothing and waits for nothing: whether
+ * this node holds a version older than the one being read for, and whether the gap is narrow
+ * enough that a run of messages could cover it. Says only that the older read is worth trying,
+ * not that it will work.
+ *
+ * Separate because a connection start that is not taking the older read still has to decide
+ * whether to ask the tserver for one if it finds a fill already under way. That decision is paid
+ * on every connection start, so it cannot afford the wait and the message fetch the full check
+ * makes, and being wrong costs no more than the attempt that follows.
+ *
+ * Fills last_prefetched and num_catalog_versions, which the caller that goes on to prepare the
+ * read needs anyway.
+ */
+static bool
+YbStaleCatalogPrefetchLooksPossible(const YbcPgLastKnownCatalogVersionInfo version,
+									uint64_t *last_prefetched,
+									uint32_t *num_catalog_versions)
+{
+	YbcStatus	status;
+
+	if (!yb_enable_stale_catalog_prefetch)
+		return false;
+
+	if (!YbIsInvalidationMessageEnabled())
+		return false;
+
+	if (version.version == YB_CATCACHE_VERSION_UNINITIALIZED || !OidIsValid(MyDatabaseId))
+		return false;
+
+	status = YBCGetSharedDbLastPrefetchedCatalogVersion(MyDatabaseId, last_prefetched);
+	if (status)
+	{
+		YBCFreeStatus(status);
+		return false;
+	}
+
+	/* Nothing cached for this database, or nothing older than what we were going to read anyway. */
+	if (*last_prefetched == 0 || *last_prefetched >= version.version)
+		return false;
+
+	/*
+	 * The tserver keeps a bounded number of message lists per database, so a gap wider than that
+	 * cannot have a complete run behind it.
+	 */
+	*num_catalog_versions = version.version - *last_prefetched;
+	if (*num_catalog_versions >
+		*YBCGetGFlags()->ysql_max_invalidation_message_queue_size)
+		return false;
+
+	return true;
+}
+
+/*
+ * Decide whether this backend can read the catalog at an older version from the local tserver's
+ * response cache, rather than fetching the whole catalog from the master leader. The backend
+ * reads at that older version and YbFinishStaleCatalogPrefetch later applies the invalidation
+ * messages collected here, which leaves it where a connection that had fetched from the leader
+ * would have been.
+ *
+ * The messages that bridge the gap are collected here rather than when they are applied: doing
+ * it before any catalog is read is what lets a refusal cost nothing, and it means the apply
+ * cannot later find the run gone and be left with no way forward.
+ *
+ * Whether the master leader's load permits reading an older version at all is the caller's to
+ * decide; this function does not look at it. The two callers answer it differently, and each
+ * says why where it calls.
+ *
+ * On success fills stale_version with the older version to read at and returns true. Every check
+ * is made before any catalog is read, so a refusal leaves nothing loaded to undo. It is not free,
+ * though: the wait below runs before the checks that follow it and is paid whether or not they
+ * pass.
+ */
+static bool
+YbTryPrepareStaleCatalogPrefetch(const YbcPgLastKnownCatalogVersionInfo version,
+								 YbcPgLastKnownCatalogVersionInfo *stale_version)
+{
+	uint64_t	last_prefetched = 0;
+	uint32_t	num_catalog_versions;
+	YbcStatus	status;
+	MemoryContext oldcxt;
+
+	if (!YbStaleCatalogPrefetchLooksPossible(version, &last_prefetched,
+											 &num_catalog_versions))
+		return false;
+
+	/*
+	 * The tserver only has the messages once its own shared catalog version has reached the one
+	 * being read for, so wait for that rather than refuse a run that is about to become
+	 * available. The version arrives on a heartbeat, so that is normally the length of the wait.
+	 * YbWaitForSharedCatalogVersionToCatchup gives up after ten heartbeats or a minute,
+	 * whichever is longer, which a connection reaches only once heartbeats have stopped coming
+	 * back -- a worse problem than this path is for.
+	 */
+	YbWaitForSharedCatalogVersionToCatchup(version.version);
+
+	Assert(!YbStaleCatalogPrefetchPending);
+
+	/* The message lists outlive the prefetch that follows, so not the current context. */
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	status = YBCGetTserverCatalogMessageLists(MyDatabaseId, last_prefetched,
+											  num_catalog_versions,
+											  &YbStaleCatalogPrefetchMessages);
+	MemoryContextSwitchTo(oldcxt);
+	if (status)
+	{
+		YBCFreeStatus(status);
+		return false;
+	}
+
+	/* No consecutive run of message lists covering the gap. */
+	if (YbStaleCatalogPrefetchMessages.num_lists == 0)
+		return false;
+
+	/* A message this release cannot apply leaves the gap no cheaper to close than a full fetch. */
+	if (yb_test_fail_stale_catalog_message_check ||
+		!YbCanApplyInvalidationMessages(&YbStaleCatalogPrefetchMessages))
+	{
+		YbReleaseStaleCatalogPrefetchMessages();
+		return false;
+	}
+
+	YbStaleCatalogPrefetchTargetVersion = version.version;
+	stale_version->version = last_prefetched;
+	stale_version->is_db_catalog_version_mode = version.is_db_catalog_version_mode;
+	elog(DEBUG1, "reading catalog at version %" PRIu64 ", %u versions behind %" PRIu64
+		 ", for database %u", last_prefetched, num_catalog_versions, version.version,
+		 MyDatabaseId);
+	return true;
+}
+
+static void
+YbRunWithPrefetcher(YbcStatus (*func) (YbRunWithPrefetcherContext *),
+					bool keep_prefetcher,
+					YbcPgSysTablePrefetchKind kind,
+					bool preload_rel_cache)
+{
+	YbcPgLastKnownCatalogVersionInfo catalog_version = {};
+	uint64_t	shared_catalog_version;
+
+	/*
+	 * A connection starting up that reads the whole catalog. Each condition rules out a
+	 * different prefetch:
+	 *
+	 * - the kind rules out a refresh on a live backend and the relcache-init backend, which
+	 *   both prefetch as YB_YQL_PREFETCH_KIND_HIGH_PRIORITY;
+	 * - the auth check rules out a backend authenticating for connection manager, which
+	 *   prefetches as a connection start and so is not caught by the kind;
+	 * - preload_rel_cache rules out a connection that reads only a few small tables, which was
+	 *   never going to make the large catalog read that this is all about.
+	 *
+	 * A connection of this kind either reads an older version out of the cache or goes to the
+	 * master leader and fills the cache itself, and the version it reads was filled by an earlier
+	 * connection of this kind.
+	 */
+	const bool	is_full_connection_start =
+		kind == YB_YQL_PREFETCH_KIND_CONNECTION_START && !YbIsPerformingConnMgrAuth() &&
+		preload_rel_cache;
+
+	HandleYBStatus(YBCGetSharedCatalogVersion(&shared_catalog_version));
+	/*
+	 * If YbNeedNewCacheFileForPgAuthBackend is set then this is a pg auth
+	 * backend that needs to preload rel cache in order to rebuild relcache
+	 * init file. Because relcache init file is also used by regular backends,
+	 * we want to rebuild it using the freshest catalog data based upon the
+	 * latest master catalog version instead of the shared catalog version.
+	 */
+	const bool	use_tserver_cache_for_auth =
+		YbAuthBackendUsesTserverResponseCache(shared_catalog_version) &&
+		!YbNeedNewCacheFileForPgAuthBackend;
+	YbcPgSysTablePrefetcherCacheMode trust_mode =
+		use_tserver_cache_for_auth ? YB_YQL_PREFETCHER_TRUST_CACHE_AUTH
+		: YB_YQL_PREFETCHER_TRUST_CACHE;
+	YbPrefetcherStarterWithCache trust_cache =
+		MakeStarterWithCache(trust_mode, &catalog_version, kind, is_full_connection_start);
+	YbPrefetcherStarterWithCache renew_soft =
+		MakeStarterWithCache(YB_YQL_PREFETCHER_RENEW_CACHE_SOFT, &catalog_version, kind,
+							 is_full_connection_start);
+	YbPrefetcherStarterWithCache renew_hard =
+		MakeStarterWithCache(YB_YQL_PREFETCHER_RENEW_CACHE_HARD, &catalog_version, kind,
+							 is_full_connection_start);
+	YbPrefetcherStarterNoCache no_cache = {
+		.functor =
+		{
+			.call = &YbPrefetcherStarterNoCacheCall
+		},
+			.kind = kind,
+	};
+
+	/*
+	 * Reading an older catalog version out of the local response cache instead of asking the
+	 * master leader for a fresh copy. Reached when the leader says it is loaded, or when the
+	 * tserver sends this connection away from a fill already under way, and in no other case: a
+	 * full prefetch is what advances the version the node has cached, and nothing would advance
+	 * it if every connection took this path.
+	 *
+	 * version_read_time is left unset. It only supplies a read time for rows a cache-trusting
+	 * prefetch still has to go and read, and a lookup-only prefetch reads nothing.
+	 */
+	YbcPgLastKnownCatalogVersionInfo stale_catalog_version = {};
+	YbPrefetcherStarterWithCache stale_cache =
+		MakeStarterWithCache(YB_YQL_PREFETCHER_TRUST_CACHE_LOOKUP_ONLY,
+							 &stale_catalog_version, kind, is_full_connection_start);
+
+	YbPrefetcherStarterFunctor *prefetcher_starters[] = {
+		&stale_cache.functor,
+		&trust_cache.functor,
+		&renew_soft.functor,
+		&renew_hard.functor,
+		&no_cache.functor
+	};
+
+	static const size_t kStartersCount = lengthof(prefetcher_starters);
+
+	/*
+	 * Positions in prefetcher_starters. The stale read is first in the array, followed by the
+	 * starters that read the catalog from the master leader. Which position a connection begins
+	 * at is decided below.
+	 */
+	static const size_t kStalePrefetchIdx = 0;
+	static const size_t kFirstFullPrefetchIdx = 1;
+
+	size_t		starter_idx = kStartersCount - 1;
+
+	/*
+	 * IsBinaryUpgrade=true indicates we are doing catalog restore during a major
+	 * version update. In this situation the only DDLs allowed are being performed
+	 * by the new-major-version ysqlsh and pg_restore process and they do not
+	 * increment catalog version. If we used response cache, because catalog version
+	 * does not change but these DDLs do change catalogs, the cached metadata will
+	 * become stale for subsequent connections used for restoring catalog metadata.
+	 * When a subsequent connection works with stale catalog metadata to do retore
+	 * work, it can lead to incorrect catalog restore result.
+	 *
+	 * yb_read_time != 0 indicates the session reads the catalog as of a point in
+	 * time in the past. The response cache key does not include yb_read_time, so
+	 * a cache hit would return rows as of the entry's fill time instead of
+	 * yb_read_time, while a cache miss reads at yb_read_time. Even if we fixed this,
+	 * it doesn't worth using the limited LRU cache in response_cache to hold
+	 * yb_read_time requests which likely don't reuse the read time often.
+	 */
+	if (!YBCIsInitDbModeEnvVarSet() &&
+		!IsBinaryUpgrade &&
+		yb_read_time == 0 &&
+		*YBCGetGFlags()->ysql_enable_read_request_caching)
+	{
+		if (use_tserver_cache_for_auth)
+		{
+			/*
+			 * yb_pgindent does not like struct assigned to struct, so assign
+			 * fields one-by-one.
+			 */
+			catalog_version.version = shared_catalog_version;
+			memset(&catalog_version.version_read_time,
+				   0,
+				   sizeof(catalog_version.version_read_time));
+			catalog_version.is_db_catalog_version_mode =
+				YBIsDBCatalogVersionMode();
+		}
+		else
+			catalog_version = YbGetCatalogCacheVersionForTablePrefetching();
+
+		starter_idx = kFirstFullPrefetchIdx;
+
+		if (is_full_connection_start)
+		{
+			/*
+			 * The older version is read unasked only while the master leader says it is turning
+			 * prefetches away. A full prefetch is what records a newer version for this node to
+			 * read back later, so a backend that always read the cached version instead would
+			 * stop anything recording one, and the gap would grow until the messages needed to
+			 * close it no longer exist.
+			 */
+			const bool	leader_is_shedding =
+				YBCGetSharedYsqlCatalogPrefetchLoad() >= YB_CATALOG_PREFETCH_LOAD_BUSY;
+
+			if (leader_is_shedding &&
+				YbTryPrepareStaleCatalogPrefetch(catalog_version, &stale_catalog_version))
+				starter_idx = kStalePrefetchIdx;
+			else if (!leader_is_shedding)
+			{
+				/*
+				 * The leader is not refusing prefetches, so read the current version as usual.
+				 * Ask the tserver not to queue this behind a fill another connection already has
+				 * under way, though: that wait is as long as the leader takes, and every
+				 * connection that arrives during it waits too. Being sent away costs an attempt
+				 * at the older read, which waits for this node's shared catalog version to reach
+				 * the one asked for -- normally a heartbeat, and bounded either way, against a
+				 * fill with no bound.
+				 *
+				 * Only the cheap checks here, since this is paid whether or not a fill turns out
+				 * to be under way. The wait and the message fetch come later, and only for a
+				 * connection that is actually sent away.
+				 *
+				 * Not asked for when the leader is shedding and the read above was refused: a
+				 * send-away does no more than try that read again, so it would end in the same
+				 * refusal a round trip later.
+				 */
+				uint64_t	last_prefetched;
+				uint32_t	num_catalog_versions;
+
+				trust_cache.send_away_if_fill_in_flight =
+					YbStaleCatalogPrefetchLooksPossible(catalog_version, &last_prefetched,
+														&num_catalog_versions);
+			}
+		}
+	}
+	for (;;)
+	{
+		const bool	is_stale_attempt = (starter_idx == kStalePrefetchIdx);
+
+		/* Both set by the send-away branch below, and read just after it. */
+		bool		sent_away = false;
+		bool		older_read_prepared = false;
+		YbcStatus	status = YbRunWithPrefetcherImpl(prefetcher_starters[starter_idx],
+													 func, keep_prefetcher,
+													 is_full_connection_start);
+
+		if (!status)
+		{
+			if (is_stale_attempt)
+			{
+				/*
+				 * This backend holds the catalog as of the older version, so that is the version
+				 * it reports until YbFinishStaleCatalogPrefetch carries it the rest of the way.
+				 * That cannot happen here: the critical system indexes are loaded further down in
+				 * RelationCacheInitializePhase3, from relcache entries an invalidation message is
+				 * allowed to remove, and load_critical_index does not rebuild what it cannot
+				 * find.
+				 *
+				 * Without a relcache preload nothing else would set the version, leaving the
+				 * backend claiming a version newer than the rows it just read.
+				 */
+				YbUpdateCatalogCacheVersion(stale_catalog_version.version);
+				YbStaleCatalogPrefetchPending = true;
+			}
+			break;
+		}
+		/*
+		 * Any failure of the stale read falls through to a full prefetch. Reading an older version
+		 * is an optimization, so nothing it does should turn a connection that the full prefetch
+		 * would have served into one that fails. Finding nothing in the tserver response cache is
+		 * the expected case and is not worth reporting; anything else is logged, since it is
+		 * either a bug or a case worth knowing about.
+		 */
+		if (is_stale_attempt)
+		{
+			/* The full prefetch reads the current version, so there is nothing left to bridge. */
+			YbReleaseStaleCatalogPrefetchMessages();
+			if (!YBCStatusIsResponseCacheMiss(status))
+				elog(LOG, "stale catalog prefetch for database %u failed, falling back to a full "
+					 "prefetch: %s", MyDatabaseId, YBCMessageAsCString(status));
+		}
+
+		/*
+		 * Sent away from a fill already under way in this database rather than queued behind
+		 * it. Read the version this node holds instead. The request is cleared first, so if
+		 * that read cannot be prepared or goes on to fail, the attempt after it runs as it
+		 * would have without the ask -- queueing behind the fill when it wants the entry being
+		 * filled, and starting one of its own when it does not -- so the two cannot send each
+		 * other back and forth.
+		 *
+		 * No leader check here, unlike the attempt above. What that check protects is that
+		 * something still records newer versions, and that is held instead by the gap: once a
+		 * node falls further behind than the message queue can bridge, no connection is sent
+		 * away and the next one reads the catalog in full. The fill this caller was sent away
+		 * from need not be the thing that records -- it may be a refresh on a live backend,
+		 * which records nothing.
+		 *
+		 * Only the cache miss means a fill was under way, and that test is load-bearing: any
+		 * other failure is a real one, and turning it into a stale read would hide it. No test
+		 * reaches it, since nothing makes the first attempt fail any other way.
+		 *
+		 * The starter test bounds this to the trust attempt: the flag it reads belongs to
+		 * trust_cache and survives into later starters.
+		 */
+		if (trust_cache.send_away_if_fill_in_flight &&
+			starter_idx == kFirstFullPrefetchIdx &&
+			YBCStatusIsResponseCacheMiss(status))
+		{
+			sent_away = true;
+			trust_cache.send_away_if_fill_in_flight = false;
+			older_read_prepared =
+				YbTryPrepareStaleCatalogPrefetch(catalog_version,
+												 &stale_catalog_version);
+		}
+
+		if (older_read_prepared)
+			starter_idx = kStalePrefetchIdx;
+		else if (!sent_away)
+		{
+			/*
+			 * A send-away leaves starter_idx alone, so the same starter runs again with the ask
+			 * cleared and this connection does what it would have without it. Advancing would raise
+			 * the Incomplete here, since it is neither a snapshot-too-old nor a stale attempt --
+			 * failing a connection the full prefetch would have served.
+			 */
+			if (++starter_idx == kStartersCount ||
+				!(YBCStatusIsSnapshotTooOld(status) || is_stale_attempt))
+			{
+				HandleYBStatus(status);
+				return;
+			}
+		}
+		YBCFreeStatus(status);
+
+		/*
+		 * Reset the caches before the next attempt. The relcache has to go too: a prefetch that
+		 * failed partway may already have run YBLoadRelations, and that function expects to find
+		 * no alterable entry for a relation it is about to build.
+		 *
+		 * Only while starting up. This loop is also reached by a refresh on a live backend
+		 * retrying a read whose snapshot was too old, and that backend holds relations open:
+		 * YbResetRelationCacheAfterPreloadFailure asserts a reference count of at most one and
+		 * then destroys the entry, so it is kept to connection startup here for the same reason
+		 * the preload's own recovery keeps it there.
+		 */
+		ResetCatalogCaches();
+		if (IsInitProcessingMode())
+			YbResetRelationCacheAfterPreloadFailure();
+	}
+}
+
+static Oid
+YbExtractAttrDefTupleCacheKey(HeapTuple htup)
+{
+	return ((Form_pg_attrdef) GETSTRUCT(htup))->adrelid;
+}
+
+static Oid
+YbExtractConstraintTupleCacheKey(HeapTuple htup)
+{
+	return ((Form_pg_constraint) GETSTRUCT(htup))->conrelid;
+}
+
+static Oid
+YbExtractTriggerTupleCacheKey(HeapTuple htup)
+{
+	return ((Form_pg_trigger) GETSTRUCT(htup))->tgrelid;
+}
+
+static Oid
+YbExtractPolicyTupleCacheKey(HeapTuple htup)
+{
+	return ((Form_pg_policy) GETSTRUCT(htup))->polrelid;
+}
+
+typedef struct YbStatExtListEntry
+{
+	Oid			stxrelid;		/* hash key, must be first */
+	List	   *stat_oids;		/* OIDs of the relation's pg_statistic_ext rows */
+} YbStatExtListEntry;
+
+/*
+ * YBUpdateRelationsStatExtLists populates the rd_statlist/rd_statvalid fields
+ * for all preloaded relations, the analogue of calling RelationGetStatExtList
+ * on each one but doing it in a single pass while pg_statistic_ext is still
+ * available from prefetched data.
+ *
+ * RelationGetStatExtList is otherwise invoked lazily by the planner
+ * (get_relation_info) the first time a relation is referenced in a query. By
+ * then the preload window has closed, so that scan of pg_statistic_ext turns
+ * into a master read for every relation in the query -- even though almost no
+ * relation has extended statistics. Precomputing the (usually empty) list here
+ * avoids those reads.
+ */
+static void
+YBUpdateRelationsStatExtLists(YbTablePrefetcherState *prefetcher)
+{
+	/*
+	 * pg_statistic_ext is not part of the core preload set; it is only fetched
+	 * when requested via ysql_catalog_preload_additional_tables. If it wasn't
+	 * prefetched, scanning it here would issue the very master reads we are
+	 * trying to avoid (just at connection setup instead of plan time), so leave
+	 * rd_statlist to be built lazily as upstream does.
+	 */
+	if (prefetcher->tables[YB_PFETCH_TABLE_PG_STATISTIC_EXT] ==
+		YB_PFETCH_STATE_EMPTY)
+		return;
+
+	/*
+	 * Collect the statistics object OIDs per relation with a single pass over
+	 * pg_statistic_ext. Extended statistics are uncommon, so this table is
+	 * usually empty and the map is never even created.
+	 *
+	 * This must be a sequential scan: the prefetcher only serves reads that
+	 * match how the table was fetched, and pg_statistic_ext is registered with
+	 * its name index, so a scan through any other index would bypass the
+	 * prefetched data (DFATAL in debug builds).
+	 */
+	HTAB	   *stat_lists = NULL;
+	Relation	statrel = table_open(StatisticExtRelationId, AccessShareLock);
+	SysScanDesc scan = systable_beginscan(statrel, InvalidOid,
+										  false /* indexOk */ , NULL, 0, NULL);
+	HeapTuple	htup;
+
+	while (HeapTupleIsValid(htup = systable_getnext(scan)))
+	{
+		Form_pg_statistic_ext staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
+		YbStatExtListEntry *entry;
+		bool		found;
+
+		if (stat_lists == NULL)
+		{
+			HASHCTL		ctl;
+
+			MemSet(&ctl, 0, sizeof(ctl));
+			ctl.keysize = sizeof(Oid);
+			ctl.entrysize = sizeof(YbStatExtListEntry);
+			ctl.hcxt = CurrentMemoryContext;
+			stat_lists = hash_create("YB stat ext list map", 32, &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		}
+
+		entry = hash_search(stat_lists, &staForm->stxrelid, HASH_ENTER, &found);
+		if (!found)
+			entry->stat_oids = NIL;
+		entry->stat_oids = lappend_oid(entry->stat_oids, staForm->oid);
+	}
+	systable_endscan(scan);
+	table_close(statrel, AccessShareLock);
+
+	/*
+	 * Stamp every relation that can carry extended statistics with its list
+	 * (empty in the common case) and mark it valid, so the planner's later
+	 * RelationGetStatExtList call returns immediately without a catalog scan.
+	 * A subsequent CREATE/DROP STATISTICS sends a relcache invalidation that
+	 * resets rd_statvalid, keeping this consistent.
+	 */
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+
+	hash_seq_init(&status, RelationIdCache);
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	relation = idhentry->reldesc;
+		char		relkind = relation->rd_rel->relkind;
+		List	   *stat_oids = NIL;
+
+		if (relation->rd_statvalid)
+			continue;
+
+		if (relkind != RELKIND_RELATION &&
+			relkind != RELKIND_MATVIEW &&
+			relkind != RELKIND_PARTITIONED_TABLE &&
+			relkind != RELKIND_FOREIGN_TABLE)
+			continue;
+
+		if (stat_lists != NULL)
+		{
+			YbStatExtListEntry *entry =
+				hash_search(stat_lists, &RelationGetRelid(relation),
+							HASH_FIND, NULL);
+
+			if (entry != NULL)
+				stat_oids = entry->stat_oids;
+		}
+
+		MemoryContext oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+
+		relation->rd_statlist = list_copy(stat_oids);
+		/* Keep the API contract that the list is sorted by OID. */
+		list_sort(relation->rd_statlist, list_oid_cmp);
+		relation->rd_statvalid = true;
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	if (stat_lists != NULL)
+		hash_destroy(stat_lists);
+}
+
+static void
+YbInitUpdateRelationCacheState(YbUpdateRelationCacheState *state)
+{
+	YbLoadTupleCache(&state->pg_attrdef_cache, AttrDefaultRelationId,
+					 &YbExtractAttrDefTupleCacheKey, "pg_attrdef local cache");
+	YbLoadTupleCache(&state->pg_constraint_cache, ConstraintRelationId,
+					 &YbExtractConstraintTupleCacheKey,
+					 "pg_constraint local cache");
+	YbLoadTupleCache(&state->pg_trigger_cache, TriggerRelationId,
+					 &YbExtractTriggerTupleCacheKey, "pg_trigger local cache");
+	YbLoadTupleCache(&state->pg_policy_cache, PolicyRelationId,
+					 &YbExtractPolicyTupleCacheKey, "pg_policy local cache");
+}
+
+static YbcStatus
+YbUpdateRelationCacheImpl(YbUpdateRelationCacheState *state,
+						  YbRunWithPrefetcherContext *ctx)
+{
+	if (yb_debug_log_catcache_events)
+		elog(LOG, "Updating relcache%s",
+			 (state->sys_relations_only || YbUseMinimalCatalogCachesPreload()) ? " (system-only)" : "");
+
+	YBLoadRelations(state);
+
+	YbTablePrefetcherState *prefetcher = &ctx->prefetcher;
+
+	/*
+	 * Preload other tables on demand.
+	 * This is the optimization to prevent master node from being overloaded
+	 * with lots of fat read requests (request which reads too much tables)
+	 * in case there are lots of opened connections.
+	 * Some of our tests has such setup. Reading all the tables in one
+	 * request on a debug build under heavy load may spend up to 5-6 secs.
+	 */
+	if (state->has_relations_with_trigger)
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_TRIGGER);
+
+	if (state->has_relations_with_row_security)
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_POLICY);
+
+	if (state->has_partitioned_tables)
+	{
+		/*
+		 * pg_range: sorting the bounds of a range-type key looks up the
+		 * RANGETYPE cache.
+		 */
+		static const YbPFetchTable tables[] = {
+			YB_PFETCH_TABLE_PG_CAST,
+			YB_PFETCH_TABLE_PG_PROC,
+			YB_PFETCH_TABLE_PG_RANGE,
+		};
+
+		YbRegisterTablesForPrefill(prefetcher, tables, lengthof(tables));
+	}
+
+	YbcStatus	status = YbPrefetch(prefetcher, false /* completes_connection_prefetch */ );
+
+	if (status)
+		return status;
+
+	YBUpdateRelationsAttributes(state);
+
+	/*
+	 * Fill pg_proc before building partition keys: an expression key looks
+	 * up PROCOID while it is simplified.  Filling scans the catalogs through
+	 * their relcache entries, whose tuple descriptors are built just above.
+	 */
+	YbFillCaches(prefetcher);
+
+	YBUpdateRelationsPartitioning(state);
+
+	YBUpdateRelationsIndicies(state);
+
+	YBUpdateRelationsStatExtLists(prefetcher);
+	return NULL;
+}
+
+static YbcStatus
+YbUpdateRelationCache(YbRunWithPrefetcherContext *ctx, bool sys_relations_only)
+{
+	MemoryContext own_mem_ctx = AllocSetContextCreate(CurrentMemoryContext,
+													  "UpdateRelationCacheContext",
+													  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old_mem_ctx = MemoryContextSwitchTo(own_mem_ctx);
+
+	YbUpdateRelationCacheState state = {0};
+
+	YbInitUpdateRelationCacheState(&state);
+	state.sys_relations_only = sys_relations_only;
+	YbcStatus	status = YbUpdateRelationCacheImpl(&state, ctx);
+
+	YbCleanupUpdateRelationCacheState(&state);
+
+	MemoryContextSwitchTo(old_mem_ctx);
+	MemoryContextDelete(own_mem_ctx);
+	return status;
+}
+
+/*
+ * Parse catalog names from gflag and fill up the prefetch_tables by looking up
+ * the YbCatalogNamesPfIds map.
+ */
+static void
+YbParseAdditionalCatalogList(YbPFetchTable **prefetch_tables,
+							 int *prefetch_count)
+{
+	const char *preload_cat_flag = YBCGetGFlags()->ysql_catalog_preload_additional_table_list;
+	const bool	preload_additional_tables = *YBCGetGFlags()->ysql_catalog_preload_additional_tables;
+	const char *default_additional_tables = "pg_am,pg_amproc,pg_cast,pg_inherits,pg_policy,pg_proc,pg_tablespace,pg_trigger";
+	const char *extra_tables = NULL;
+
+	if (!IS_NON_EMPTY_STR_FLAG(preload_cat_flag))
+	{
+		/* Neither gflag is set. */
+		if (!preload_additional_tables)
+			return;
+		/* Only the old boolean gflag is set. */
+		preload_cat_flag = default_additional_tables;
+	}
+	else if (preload_additional_tables)
+	{
+		/* Both gflags are set */
+		extra_tables = default_additional_tables;
+	}
+
+	/* strtok only takes non-const char* and will modify it. So make a copy. */
+	Size		length = strlen(preload_cat_flag) + 1;
+
+	if (extra_tables)
+		length += strlen(extra_tables) + 1;
+	char	   *preload_catstr = (char *) palloc(length);
+
+	/*
+	 * Excluded empty string case. There must be at least one token in
+	 * preload_cat_flag.
+	 */
+	int			d = 0,
+				s = 0,
+				cnt = 1;
+	char		c;
+
+	while ((c = preload_cat_flag[s++]) != '\0')
+	{
+		preload_catstr[d++] = c;
+		if (c == ',')
+			++cnt;
+	}
+	if (extra_tables)
+	{
+		s = 0;
+		preload_catstr[d++] = ',';
+		++cnt;
+		while ((c = extra_tables[s++]) != '\0')
+		{
+			preload_catstr[d++] = c;
+			if (c == ',')
+				++cnt;
+		}
+	}
+	preload_catstr[d] = '\0';
+
+#ifndef NDEBUG
+	/*
+	 * Check if the YbCatalogNamesPfIds array are sorted properly for searching.
+	 */
+	for (int i = YB_PFETCH_TABLE_FIRST; i < YB_PFETCH_TABLE_LAST - 1; ++i)
+		Assert(strcmp(YbCatalogNamesPfIds[i].name,
+					  YbCatalogNamesPfIds[i + 1].name) < 0);
+#endif
+
+	*prefetch_tables = (YbPFetchTable *) palloc0(sizeof(YbPFetchTable) * cnt);
+
+	int			filled = 0;
+
+	for (char *cattoken = strtok(preload_catstr, ","); cattoken != NULL;
+		 cattoken = strtok(NULL, ","))
+	{
+		const YbCatNamePfId *found = YbFindPrefetchTableByName(cattoken);
+
+		if (found)
+		{
+			(*prefetch_tables)[filled++] = found->pfetchTable;
+			ereport(DEBUG1, (errmsg("found catalog %s for additional preload",
+									cattoken)));
+		}
+		else
+			/* Don't fail the process on invalid pg_* tables. */
+			YBC_LOG_WARNING("Found unrecognized catalog \"%s\" in the flag. "
+							"Ignored.",
+							cattoken);
+	}
+
+	*prefetch_count = filled;
+	pfree(preload_catstr);
+
+	if (filled == 0)
+		YBC_LOG_WARNING("No valid PG catalog found for additional preload.");
+}
+
+/*
+ * Try to register addition catalogs if the catalog tables are present in the
+ * ysql_catalog_preload_additional_table_list flag.
+ */
+static void
+YbRegisterAdditionalCatalogs(YbTablePrefetcherState *prefetcher)
+{
+	YbPFetchTable *additional_tables = NULL;
+	int			count = 0;
+
+	YbParseAdditionalCatalogList(&additional_tables, &count);
+	if (count > 0)
+	{
+		YBC_LOG_INFO("YSQL is prefetching %d additional catalogs.", count);
+		Assert(additional_tables != NULL);
+		YbRegisterTables(prefetcher, additional_tables, count);
+	}
+
+	if (additional_tables)
+		pfree(additional_tables);
+}
+
+long
+YbGetRelCachePreloads()
+{
+	return YbNumRelCachePreloads;
+}
+
+long
+YbGetRelCacheInitFileRevalidated()
+{
+	return YbNumRelCacheInitFileRevalidated;
+}
+
+long
+YbGetRelCacheInitFileRevalidationFailed()
+{
+	return YbNumRelCacheInitFileRevalidationFailed;
+}
+
+static YbcStatus
+YbPreloadRelCacheImpl(YbRunWithPrefetcherContext *ctx)
+{
+	YbNumRelCachePreloads++;
+	int log_level =
+		(log_connections ||
+		 yb_debug_log_catcache_events ||
+		 *(YBCGetGFlags()->ysql_enable_relcache_init_optimization)) ? LOG : DEBUG1;
+	elog(log_level, "Preloading relcache for database %u, session user id: %u, yb_read_time: %" PRIu64,
+		 MyDatabaseId, GetSessionUserId(), yb_read_time);
+
+	/*
+	 * During relcache loading postgres reads the data from multiple sys tables.
+	 * It is reasonable to prefetch all these tables in one shot.
+	 */
+	static const YbPFetchTable core_tables[] = {
+		YB_PFETCH_TABLE_PG_AM,
+		YB_PFETCH_TABLE_PG_AMPROC,
+		YB_PFETCH_TABLE_PG_ATTRDEF,
+		YB_PFETCH_TABLE_PG_ATTRIBUTE,
+		YB_PFETCH_TABLE_PG_AUTHID,
+		YB_PFETCH_TABLE_PG_CLASS,
+		YB_PFETCH_TABLE_PG_COLLATION,
+		YB_PFETCH_TABLE_PG_CONSTRAINT,
+		YB_PFETCH_TABLE_PG_DATABASE,
+		YB_PFETCH_TABLE_PG_INDEX,
+		YB_PFETCH_TABLE_PG_INHERITS,
+		YB_PFETCH_TABLE_PG_NAMESPACE,
+		YB_PFETCH_TABLE_PG_OPCLASS,
+		YB_PFETCH_TABLE_PG_PARTITIONED_TABLE,
+		YB_PFETCH_TABLE_PG_POLICY,
+		YB_PFETCH_TABLE_PG_REWRITE,
+		YB_PFETCH_TABLE_PG_TRIGGER,
+		YB_PFETCH_TABLE_PG_TYPE
+	};
+	YbTablePrefetcherState *prefetcher = &ctx->prefetcher;
+
+	YbTryRegisterCatalogVersionTableForPrefetching();
+	YbRegisterTables(prefetcher, core_tables, lengthof(core_tables));
+
+	if (YbCatalogPreloadCacheListIsSet())
+		YbRegisterCatalogPreloadCacheListTables(prefetcher);
+	else
+		YbRegisterAdditionalCatalogs(prefetcher);
+
+	if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+	{
+		static const YbPFetchTable tables[] = {
+			YB_PFETCH_TABLE_YB_PG_PROFILE,
+			YB_PFETCH_TABLE_YB_PG_ROLE_PROFILE,
+			YB_PFETCH_TABLE_PG_CAST
+		};
+
+		YbRegisterTablesForPrefill(prefetcher, tables, lengthof(tables));
+	}
+
+	YbcStatus	status = YbPrefetch(prefetcher, false /* completes_connection_prefetch */ );
+
+	if (status)
+		return status;
+
+	/*
+	 * The preloading catalog cache before processing relations will help to
+	 * avoid sequential scans over prefetched data.
+	 * In case postgres tries to read row from the cache by a key and there is
+	 * no such row in it, postgres will sent request to read particular row
+	 * from a particular system table. But in case table was prefetched all the
+	 * rows will be returned from in-memory cache in spite of the fact only
+	 * single one was requested. And required row will be found by filtering out
+	 * all rows which doesn't match specified key (i.e. sequential scan).
+	 * In case particular table has N rows and it is required to load all of
+	 * them N * N tuples will be built and analyzed from already prefetched
+	 * data. The more effective approach is to build entire cache first.
+	 * In this case only N tuples will be built.
+	 * Note: Loading some caches in explicit order helps to reduce number of
+	 *       scaning of prefetched tables.
+	 */
+
+	YbFillCache(prefetcher, YB_PFETCH_TABLE_PG_INDEX);
+	YbFillCache(prefetcher, YB_PFETCH_TABLE_PG_REWRITE);
+	YbFillCache(prefetcher, YB_PFETCH_TABLE_PG_CLASS);
+	YbFillCache(prefetcher, YB_PFETCH_TABLE_PG_ATTRIBUTE);
+	YbFillCaches(prefetcher);
+
+	long		misses_before PG_USED_FOR_ASSERTS_ONLY = YbNumCatalogCacheMisses;
+
+	{
+		MemoryContext saved_context = CurrentMemoryContext;
+
+		PG_TRY();
+		{
+			status = YbUpdateRelationCache(ctx, false /* sys_relations_only */ );
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(saved_context);
+
+			/*
+			 * Only attempt recovery during connection setup (InitProcessing).
+			 * In normal operation (e.g. DDL-triggered relcache refresh),
+			 * propagate the error as-is.
+			 */
+			if (!IsInitProcessingMode())
+				PG_RE_THROW();
+
+			ErrorData  *edata = CopyErrorData();
+
+			if (edata->elevel >= FATAL)
+				PG_RE_THROW();
+
+			FlushErrorState();
+
+			ereport(WARNING,
+					(errcode(edata->sqlerrcode),
+					 errmsg("relcache preload failed, retrying with "
+							"system-only mode: %s",
+							edata->message),
+					 edata->detail ? errdetail("%s", edata->detail) : 0,
+					 edata->context ? errcontext("%s", edata->context) : 0));
+			FreeErrorData(edata);
+
+			YbResetRelationCacheAfterPreloadFailure();
+
+			status = YbUpdateRelationCache(ctx, true /* sys_relations_only */ );
+		}
+		PG_END_TRY();
+
+		if (status)
+			return status;
+	}
+
+	/*
+	 * DB connection is not valid anymore in case:
+	 * - The name is already dropped from the cache.
+	 * - The name is still in the cache, but it is not associated with
+	 *   MyDatabaseId anymore (i.e. invalid or new DB).
+	 *
+	 * Note: This check probably could be safely removed. Because in case of DB
+	 *       removing prefetcher will fail to read DB's system tables with the
+	 *       ObjectNotFound error and this line of code will not be reached.
+	 */
+	const char *dbname = get_database_name(MyDatabaseId);
+
+	if (dbname == NULL || get_database_oid(dbname, true) != MyDatabaseId)
+		YbRaiseInvalidDBConnectionError();
+
+	/*
+	 * The first request after the cache refresh will call the
+	 * recomputeNamespacePath function. And this function will try to find
+	 * namespace equal to username. In spite of the fact that we have already
+	 * loaded caches for the `pg_namespace` table such finding may initiate read
+	 * RPC to a master in case such namespace doesn't exists. In this case cache
+	 * will create negative entry. To avoid this RPC we try to find namespace
+	 * here. As far as data for the `pg_namespace` table is preloaded no RPC
+	 * will be sent a master and negative cache entry will be created for a
+	 * future use.
+	 *
+	 * Note: When minimal catalog caches preload is enabled, pg_namespace is
+	 * only partially preloaded (system namespaces only). Calling
+	 * get_namespace_oid here for a user namespace would result in a false
+	 * negative cache entry because the active prefetcher would intercept the
+	 * scan and return 0 rows. Therefore, we skip this optimization in that case.
+	 */
+	if (!YbUseMinimalCatalogCachesPreload())
+		get_namespace_oid(GetUserNameFromId(GetUserId(), false), true);
+
+	/*
+	 * The required caches must cover every catalog cache lookup above, so
+	 * that none of them scans the prefetched rows of a table.  Without
+	 * negative cache entries, the lookup of a user namespace that does not
+	 * exist misses even in a filled cache.
+	 */
+	Assert(!YbCatalogPreloadCacheListIsSet() ||
+		   !yb_enable_negative_catcache_entries ||
+		   YbNumCatalogCacheMisses == misses_before);
+
+	YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
+	elog(log_level, "Preloading relcache complete");
+	return NULL;
+}
+
+void
+YBPreloadRelCache()
+{
+	/*
+	 * Reached from a full catalog cache refresh on a connection that is already serving a
+	 * session. The master admits these ahead of prefetches from connections that are still
+	 * starting up: this backend cannot run anything until it has the data.
+	 */
+	YbRunWithPrefetcher(&YbPreloadRelCacheImpl, false /* keep_prefetcher */ ,
+						YB_YQL_PREFETCH_KIND_HIGH_PRIORITY,
+						true /* preload_rel_cache */ );
+}
+
+static YbcStatus
+YbPrefetchRequiredDataImpl(YbRunWithPrefetcherContext *ctx,
+						   bool preload_rel_cache)
+{
+	YbTablePrefetcherState *prefetcher = &ctx->prefetcher;
+
+	YbcStatus	status = NULL;
+
+	if (preload_rel_cache)
+	{
+		status = YbPreloadRelCacheImpl(ctx);
+
+		if (status)
+			return status;
+	}
+
+	if (YBCIsInitDbModeEnvVarSet())
+	{
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_CAST);
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_OPERATOR);
+		YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_PROC);
+	}
+
+	YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_AUTHID);
+	YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_AUTH_MEMBERS);
+	YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_DATABASE);
+	YbRegisterTable(prefetcher, YB_PFETCH_TABLE_PG_DB_ROLE_SETTINGS);
+
+	/*
+	 * YB: Prefetch the LCV table for AP specifically, as YbPrefetchRequiredData
+	 * is called by AP in postgres.c.
+	 * When called by regular backends in postinit.c via
+	 * RelationCacheInitializePhase3, the LCV has already been read from the
+	 * systable, so no need to prefetch it.
+	 */
+	if (YbIsAuthPassthroughInProgress(MyProcPort))
+		YbTryRegisterLogicalClientVersionTableForPrefetching();
+
+	/*
+	 * This YbPrefetch call is the last read of a connection start, so once it is cached this
+	 * node holds everything such a connection reads. That is what a recorded version promises,
+	 * and why only this call can record one: a connection reads every request back, so a
+	 * partial set would send it to the master leader anyway. Which prefetches are allowed to
+	 * record at all is decided by is_full_connection_start in YbRunWithPrefetcher.
+	 *
+	 * Beyond the core tables this round adds only pg_auth_members and pg_db_role_setting, and
+	 * both are names ysql_catalog_preload_additional_table_list accepts. An operator who lists
+	 * them leaves nothing registered here, YbPrefetch issues no request, and with no request
+	 * there is nothing to cache and no version recorded -- the stale read then stays unavailable
+	 * on that node, in the preload configuration it is meant for. Issuing the round regardless
+	 * would need pggate to accept a prefetch with no tables registered, which its Prefetch
+	 * DCHECKs against.
+	 */
+	status = YbPrefetch(prefetcher, ctx->completes_connection_prefetch);
+	if (status)
+		return status;
+	YbFillCaches(prefetcher);
+	return NULL;
+}
+
+static YbcStatus
+YbPrefetchRequiredDataWithoutRelCache(YbRunWithPrefetcherContext *ctx)
+{
+	return YbPrefetchRequiredDataImpl(ctx, false /* preload_rel_cache */ );
+}
+
+static YbcStatus
+YbPrefetchRequiredDataWithRelCache(YbRunWithPrefetcherContext *ctx)
+{
+	return YbPrefetchRequiredDataImpl(ctx, true /* preload_rel_cache */ );
+}
+
+void
+YbPrefetchRequiredData(bool preload_rel_cache)
+{
+	YbcPgSysTablePrefetchKind kind;
+
+	/*
+	 * The relcache-init builder backend produces the init file that every new
+	 * connection on this node waits for, so its prefetch is not one that can
+	 * afford to queue behind connections that are merely starting up. It is also
+	 * not the expensive one: that backend preloads minimally, taking system
+	 * catalog rows rather than user objects, and a deployment that preloads
+	 * additional catalog tables skips the init-file optimization entirely (see
+	 * catalog_preload_required in RelationCacheInitializePhase3) and does that
+	 * large preload on the connection itself, as a CONNECTION_START prefetch.
+	 */
+	if (MyBackendType == YB_RELCACHE_INIT_BACKEND)
+		kind = YB_YQL_PREFETCH_KIND_HIGH_PRIORITY;
+	else
+		kind = YB_YQL_PREFETCH_KIND_CONNECTION_START;
+
+	YbRunWithPrefetcher((preload_rel_cache ?
+						 &YbPrefetchRequiredDataWithRelCache :
+						 &YbPrefetchRequiredDataWithoutRelCache),
+						true /* keep_prefetcher */ ,
+						kind,
+						preload_rel_cache);
+}
+
 /*
  *		RelationBuildDesc
  *
@@ -1111,6 +4484,10 @@ equalRSDesc(RowSecurityDesc *rsdesc1, RowSecurityDesc *rsdesc2)
 static Relation
 RelationBuildDesc(Oid targetRelId, bool insertIt)
 {
+	instr_time	start;
+
+	if (yb_debug_log_catcache_events)
+		INSTR_TIME_SET_CURRENT(start);
 	int			in_progress_offset;
 	Relation	relation;
 	Oid			relid;
@@ -1309,12 +4686,12 @@ retry:
 	}
 
 	if (relation->rd_rel->relhastriggers)
-		RelationBuildTriggers(relation);
+		RelationBuildTriggers(relation, NULL);
 	else
 		relation->trigdesc = NULL;
 
 	if (relation->rd_rel->relrowsecurity)
-		RelationBuildRowSecurity(relation);
+		RelationBuildRowSecurity(relation, NULL);
 	else
 		relation->rd_rsdesc = NULL;
 
@@ -1378,6 +4755,17 @@ retry:
 	}
 #endif
 
+	if (yb_debug_log_catcache_events && insertIt)
+	{
+		instr_time	duration;
+
+		INSTR_TIME_SET_CURRENT(duration);
+		INSTR_TIME_SUBTRACT(duration, start);
+		elog(LOG, "Building relcache entry %p for %s (oid %u) took " INT64_FORMAT " us", relation,
+			 RelationGetRelationName(relation), RelationGetRelid(relation),
+			 INSTR_TIME_GET_MICROSEC(duration));
+	}
+
 	return relation;
 }
 
@@ -1405,6 +4793,9 @@ RelationInitPhysicalAddr(Relation relation)
 		relation->rd_locator.dbOid = InvalidOid;
 	else
 		relation->rd_locator.dbOid = MyDatabaseId;
+
+	if (IsYBRelation(relation))
+		return;
 
 	if (relation->rd_rel->relfilenode)
 	{
@@ -1787,7 +5178,9 @@ LookupOpclassInfo(Oid operatorClassOid,
 	 */
 	indexOK = criticalRelcachesBuilt ||
 		(operatorClassOid != OID_BTREE_OPS_OID &&
-		 operatorClassOid != INT2_BTREE_OPS_OID);
+		 operatorClassOid != INT2_BTREE_OPS_OID &&
+		 operatorClassOid != OID_LSM_OPS_OID &&
+		 operatorClassOid != INT2_LSM_OPS_OID);
 
 	/*
 	 * We have to fetch the pg_opclass row to determine its opfamily and
@@ -2099,6 +5492,9 @@ formrdesc(const char *relationName, Oid relationReltype,
 	 */
 	RelationCacheInsert(relation, false);
 
+	/* YB: See struct field's comment for explanation. */
+	relation->belongs_to_yb_system_db = false;
+
 	/* It's fully valid */
 	relation->rd_isvalid = true;
 }
@@ -2181,6 +5577,17 @@ RelationIdGetRelation(Oid relationId)
 		}
 		return rd;
 	}
+
+	/*
+	 * YB note:
+	 * These would lead to an infinite recursion and should never be possible.
+	 * See how RelationCacheInvalidate works.
+	 */
+	if (relationId == RelationRelationId)
+		elog(FATAL, "pg_class cache is queried before it's initalized!");
+
+	if (relationId == ClassOidIndexId)
+		elog(FATAL, "pg_class_oid_index is queried before it's initalized!");
 
 	/*
 	 * no reldesc in the cache, so have RelationBuildDesc() build one and add
@@ -2554,6 +5961,8 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
 		MemoryContextDelete(relation->rd_pddcxt);
 	if (relation->rd_partcheckcxt)
 		MemoryContextDelete(relation->rd_partcheckcxt);
+	if (relation->yb_table_properties)
+		pfree(relation->yb_table_properties);
 	pfree(relation);
 }
 
@@ -2606,6 +6015,10 @@ RelationClearRelation(Relation relation)
 
 	/* first mark it as invalid */
 	RelationInvalidateRelation(relation);
+
+	if (yb_debug_log_catcache_events)
+		elog(LOG, "Delete relcache entry %p for %s (oid %u)", relation,
+			 RelationGetRelationName(relation), RelationGetRelid(relation));
 
 	/* Remove it from the hash table */
 	RelationCacheDelete(relation);
@@ -2703,6 +6116,9 @@ RelationRebuildRelation(Relation relation)
 		bool		keep_policies;
 		bool		keep_partkey;
 
+		/* YB declarations */
+		bool		yb_keep_pgstats;
+
 		/* Build temporary entry, but don't link it into hashtable */
 		newrel = RelationBuildDesc(save_relid, false);
 
@@ -2741,8 +6157,38 @@ RelationRebuildRelation(Relation relation)
 		 * If we were to, again, have cases of the relkind of a relcache entry
 		 * changing, we would need to ensure that pgstats does not get
 		 * confused.
+		 *
+		 * YB: REFRESH MATERIALIZED VIEW is such a case.  It rebuilds the matview
+		 * contents in a transient heap that make_new_heap() creates as
+		 * RELKIND_RELATION, and swap_relation_files() (commands/repack.c) then
+		 * retags that heap as RELKIND_MATVIEW so that YB drops it correctly.  So
+		 * the transient relation's relcache entry really does change relkind
+		 * across the rebuild that follows the swap.  When the relkind changes,
+		 * the rebuilt entry must not inherit the old entry's pgstats
+		 * association: the two would disagree, with PgStat_TableStatus->relation
+		 * pointing at one Relation while some other Relation's pgstat_info
+		 * points back at that PgStat_TableStatus.  Unlink the stale pgstat entry
+		 * instead -- before the swap below, which must stay interrupt-free --
+		 * and keep the freshly built entry's pgstat state.  This is what
+		 * PostgreSQL itself did before commit cb2e7ddfe57 began assuming relkind
+		 * is stable across a rebuild.
 		 */
-		Assert(relation->rd_rel->relkind == newrel->rd_rel->relkind);
+		yb_keep_pgstats = (relation->rd_rel->relkind == newrel->rd_rel->relkind);
+		if (!yb_keep_pgstats)
+		{
+			/*
+			 * Only YB's REFRESH MATVIEW transient-heap retag (repack.c) should
+			 * get here.
+			 */
+			Assert(IsYugaByteEnabled() &&
+				   relation->rd_rel->relkind == RELKIND_RELATION &&
+				   newrel->rd_rel->relkind == RELKIND_MATVIEW);
+			pgstat_unlink_relation(relation);
+		}
+
+		if (yb_debug_log_catcache_events)
+			elog(LOG, "Rebuild relcache entry %p for %s (oid %u)", relation,
+				 RelationGetRelationName(relation), save_relid);
 
 		keep_tupdesc = equalTupleDescs(relation->rd_att, newrel->rd_att);
 		keep_rules = equalRuleLocks(relation->rd_rules, newrel->rd_rules);
@@ -2804,8 +6250,12 @@ RelationRebuildRelation(Relation relation)
 		/* toast OID override must be preserved */
 		SWAPFIELD(Oid, rd_toastoid);
 		/* pgstat_info / enabled must be preserved */
-		SWAPFIELD(struct PgStat_TableStatus *, pgstat_info);
-		SWAPFIELD(bool, pgstat_enabled);
+		/* YB: ... except when the relkind changed; see yb_keep_pgstats above. */
+		if (yb_keep_pgstats)
+		{
+			SWAPFIELD(struct PgStat_TableStatus *, pgstat_info);
+			SWAPFIELD(bool, pgstat_enabled);
+		}
 		/* preserve old partition key if we have one */
 		if (keep_partkey)
 		{
@@ -3146,6 +6596,74 @@ RelationCacheInvalidate(bool debug_discard)
 		/* Any RelationBuildDesc() on the stack must start over. */
 		for (i = 0; i < in_progress_list_len; i++)
 			in_progress_list[i].invalidated = true;
+}
+
+/*
+ * YbRelationCacheInvalidate removes all the entries from the cache which can be
+ * updated on cache reloading. Entries assumed as non-updatable (non-alterable)
+ * are preserved to avoid their rebuilding from scratch.
+ * Implementation is based on RelationCacheInvalidate.
+ */
+void
+YbRelationCacheInvalidate()
+{
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+
+	hash_seq_init(&status, RelationIdCache);
+
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	relation = idhentry->reldesc;
+
+		if (YbIsNonAlterableRelation(relation))
+			continue;
+
+		/* Must close all smgr references to avoid leaving dangling ptrs */
+		RelationCloseSmgr(relation);
+
+		Assert(RelationHasReferenceCountZero(relation));
+		Assert(!relation->rd_isnailed);
+		/* Delete this entry immediately */
+		RelationClearRelation(relation);
+	}
+}
+
+/*
+ * YbResetRelationCacheAfterPreloadFailure — tear down all non-nailed relcache
+ * entries after a failed relcache preload so that a retry can
+ * re-populate with system-only relations.
+ *
+ */
+static void
+YbResetRelationCacheAfterPreloadFailure(void)
+{
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+
+	hash_seq_init(&status, RelationIdCache);
+
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	relation = idhentry->reldesc;
+
+		if (relation->rd_isnailed)
+		{
+			Assert(relation->rd_refcnt <= 2);
+			if (relation->rd_refcnt == 2)
+				RelationDecrementReferenceCount(relation);
+			continue;
+		}
+
+		RelationCloseSmgr(relation);
+
+		Assert(relation->rd_refcnt <= 1);
+		if (relation->rd_refcnt == 1)
+			RelationDecrementReferenceCount(relation);
+
+		RelationCacheDelete(relation);
+		RelationDestroyRelation(relation, false);
+	}
 }
 
 static void
@@ -3596,6 +7114,8 @@ RelationBuildLocalRelation(const char *relname,
 		case AttributeRelationId:
 		case ProcedureRelationId:
 		case TypeRelationId:
+		case YbProfileRelationId:
+		case YbRoleProfileRelationId:
 			nailit = true;
 			break;
 		default:
@@ -3609,12 +7129,13 @@ RelationBuildLocalRelation(const char *relname,
 	 * probably need to fix IsSharedRelation() to match whatever you've done
 	 * to the set of shared relations.
 	 */
-	if (shared_relation != IsSharedRelation(relid))
+	if (shared_relation != IsSharedRelation(relid) && !yb_test_system_catalogs_creation)
 		elog(ERROR, "shared_relation flag for \"%s\" does not match IsSharedRelation(%u)",
 			 relname, relid);
 
-	/* Shared relations had better be mapped, too */
-	Assert(mapped_relation || !shared_relation);
+	/* (Non-YB) shared relations had better be mapped, too */
+	Assert(IsYugaByteEnabled() ||
+		   (mapped_relation || !shared_relation));
 
 	/*
 	 * switch to the cache context to create the relcache entry.
@@ -3725,7 +7246,50 @@ RelationBuildLocalRelation(const char *relname,
 		(relkind == RELKIND_RELATION ||
 		 relkind == RELKIND_MATVIEW ||
 		 relkind == RELKIND_PARTITIONED_TABLE))
-		rel->rd_rel->relreplident = REPLICA_IDENTITY_DEFAULT;
+	{
+		/*
+		 * YB NOTE: The default replica identity in case of user defined tables
+		 * is set to 'CHANGE'. The flag ysql_yb_default_replica_identity can be
+		 * used to change the default replica identity at the time of table
+		 * creation for user defined tables. In all other cases the default
+		 * behaviour of PG is used, i.e. 'DEFAULT' for relations in
+		 * information_schema and 'NOTHING' for tables in pg_catalog and for
+		 * non-table objects
+		 */
+		if (IsYugaByteEnabled() && relid >= FirstNormalObjectId)
+		{
+			const char *replica_identity_name = yb_default_replica_identity;
+			char		replica_identity = YB_REPLICA_IDENTITY_CHANGE;
+
+			if (strcmp(replica_identity_name, "FULL") == 0)
+			{
+				replica_identity = REPLICA_IDENTITY_FULL;
+			}
+			else if (strcmp(replica_identity_name, "DEFAULT") == 0)
+			{
+				replica_identity = REPLICA_IDENTITY_DEFAULT;
+			}
+			else if (strcmp(replica_identity_name, "NOTHING") == 0)
+			{
+				replica_identity = REPLICA_IDENTITY_NOTHING;
+			}
+			else if (strcmp(replica_identity_name, "CHANGE") == 0)
+			{
+				replica_identity = YB_REPLICA_IDENTITY_CHANGE;
+			}
+			else
+			{
+				/*
+				 * This should never happen since we check the guc value in
+				 * check_default_replica_identity.
+				 */
+				Assert(false);
+			}
+			rel->rd_rel->relreplident = replica_identity;
+		}
+		else
+			rel->rd_rel->relreplident = REPLICA_IDENTITY_DEFAULT;
+	}
 	else
 		rel->rd_rel->relreplident = REPLICA_IDENTITY_NOTHING;
 
@@ -3748,8 +7312,12 @@ RelationBuildLocalRelation(const char *relname,
 	if (mapped_relation)
 	{
 		rel->rd_rel->relfilenode = InvalidRelFileNumber;
-		/* Add it to the active mapping information */
-		RelationMapUpdateMap(relid, relfilenumber, shared_relation, true);
+
+		if (!IsYBRelation(rel))
+		{
+			/* Add it to the active mapping information */
+			RelationMapUpdateMap(relid, relfilenumber, shared_relation, true);
+		}
 	}
 	else
 		rel->rd_rel->relfilenode = relfilenumber;
@@ -3793,6 +7361,9 @@ RelationBuildLocalRelation(const char *relname,
 	 */
 	EOXactListAdd(rel);
 
+	/* YB: See struct field's comment for explanation. */
+	rel->belongs_to_yb_system_db = false;
+
 	/* It's fully valid */
 	rel->rd_isvalid = true;
 
@@ -3820,7 +7391,9 @@ RelationBuildLocalRelation(const char *relname,
  * Caller must already hold exclusive lock on the relation.
  */
 void
-RelationSetNewRelfilenumber(Relation relation, char persistence)
+RelationSetNewRelfilenumber(Relation relation, char persistence,
+							bool yb_copy_split_options,
+							YbOptSplit *preserved_index_split_options)
 {
 	RelFileNumber newrelfilenumber;
 	Relation	pg_class;
@@ -3831,7 +7404,7 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	TransactionId freezeXid = InvalidTransactionId;
 	RelFileLocator newrlocator;
 
-	if (!IsBinaryUpgrade)
+	if (!IsBinaryUpgrade || yb_binary_restore)
 	{
 		/* Allocate a new relfilenumber */
 		newrelfilenumber = GetNewRelFileNumber(relation->rd_rel->reltablespace,
@@ -3875,69 +7448,109 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	otid = tuple->t_self;
 	classform = (Form_pg_class) GETSTRUCT(tuple);
 
-	/*
-	 * Schedule unlinking of the old storage at transaction commit, except
-	 * when performing a binary upgrade, when we must do it immediately.
-	 */
-	if (IsBinaryUpgrade)
+	if (IsYBRelation(relation))
 	{
-		SMgrRelation srel;
+		/*
+		 * Currently, this function is only used during reindex/truncate in YB.
+		 */
+		Assert(relation->rd_rel->relkind == RELKIND_INDEX ||
+			   relation->rd_rel->relkind == RELKIND_RELATION ||
+			   relation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX ||
+			   relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE);
+
+		if ((relation->rd_rel->relkind == RELKIND_INDEX ||
+			 relation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX) &&
+			!relation->rd_index->indisprimary)
+			/*
+			 * Note: caller is responsible for dropping the old DocDB table
+			 * associated with the index, if required.
+			 * Create a new DocDB table for the secondary index.
+			 * This is not required for primary indexes, as they are
+			 * an implicit part of the base table.
+			 */
+			YbIndexSetNewRelfileNumber(relation, newrelfilenumber,
+									   yb_copy_split_options, preserved_index_split_options);
+		else if (relation->rd_rel->relkind == RELKIND_RELATION ||
+				 relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			/*
+			 * Drop the old DocDB table associated with this relation.
+			 * Note: The drop isn't finalized until after the txn
+			 * commits/aborts.
+			 */
+			YBCDropTable(relation);
+			/* Create a new DocDB table for the relation. */
+			YbRelationSetNewRelfileNumber(relation, newrelfilenumber,
+										  yb_copy_split_options,
+										  true /* is_truncate */ );
+		}
+	}
+	else
+	{
+		/*
+		 * Schedule unlinking of the old storage at transaction commit, except
+		 * when performing a binary upgrade, when we must do it immediately.
+		 */
+		if (IsBinaryUpgrade)
+		{
+			SMgrRelation srel;
+
+			/*
+			 * During a binary upgrade, we use this code path to ensure that
+			 * pg_largeobject and its index have the same relfilenumbers as in the
+			 * old cluster. This is necessary because pg_upgrade treats
+			 * pg_largeobject like a user table, not a system table. It is however
+			 * possible that a table or index may need to end up with the same
+			 * relfilenumber in the new cluster as what it had in the old cluster.
+			 * Hence, we can't wait until commit time to remove the old storage.
+			 *
+			 * In general, this function needs to have transactional semantics,
+			 * and removing the old storage before commit time surely isn't.
+			 * However, it doesn't really matter, because if a binary upgrade
+			 * fails at this stage, the new cluster will need to be recreated
+			 * anyway.
+			 */
+			srel = smgropen(relation->rd_locator, relation->rd_backend);
+			smgrdounlinkall(&srel, 1, false);
+			smgrclose(srel);
+		}
+		else
+		{
+			/* Not a binary upgrade, so just schedule it to happen later. */
+			RelationDropStorage(relation);
+		}
 
 		/*
-		 * During a binary upgrade, we use this code path to ensure that
-		 * pg_largeobject and its index have the same relfilenumbers as in the
-		 * old cluster. This is necessary because pg_upgrade treats
-		 * pg_largeobject like a user table, not a system table. It is however
-		 * possible that a table or index may need to end up with the same
-		 * relfilenumber in the new cluster as what it had in the old cluster.
-		 * Hence, we can't wait until commit time to remove the old storage.
+		 * Create storage for the main fork of the new relfilenumber.  If it's a
+		 * table-like object, call into the table AM to do so, which'll also
+		 * create the table's init fork if needed.
 		 *
-		 * In general, this function needs to have transactional semantics,
-		 * and removing the old storage before commit time surely isn't.
-		 * However, it doesn't really matter, because if a binary upgrade
-		 * fails at this stage, the new cluster will need to be recreated
-		 * anyway.
+		 * NOTE: If relevant for the AM, any conflict in relfilenumber value will
+		 * be caught here, if GetNewRelFileNumber messes up for any reason.
 		 */
-		srel = smgropen(relation->rd_locator, relation->rd_backend);
-		smgrdounlinkall(&srel, 1, false);
-		smgrclose(srel);
-	}
-	else
-	{
-		/* Not a binary upgrade, so just schedule it to happen later. */
-		RelationDropStorage(relation);
-	}
+		newrlocator = relation->rd_locator;
+		newrlocator.relNumber = newrelfilenumber;
 
-	/*
-	 * Create storage for the main fork of the new relfilenumber.  If it's a
-	 * table-like object, call into the table AM to do so, which'll also
-	 * create the table's init fork if needed.
-	 *
-	 * NOTE: If relevant for the AM, any conflict in relfilenumber value will
-	 * be caught here, if GetNewRelFileNumber messes up for any reason.
-	 */
-	newrlocator = relation->rd_locator;
-	newrlocator.relNumber = newrelfilenumber;
+		if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
+		{
+			table_relation_set_new_filelocator(relation, &newrlocator,
+											   persistence,
+											   &freezeXid, &minmulti);
+		}
+		else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
+		{
+			/* handle these directly, at least for now */
+			SMgrRelation srel;
 
-	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
-	{
-		table_relation_set_new_filelocator(relation, &newrlocator,
-										   persistence,
-										   &freezeXid, &minmulti);
-	}
-	else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
-	{
-		/* handle these directly, at least for now */
-		SMgrRelation srel;
-
-		srel = RelationCreateStorage(newrlocator, persistence, true);
-		smgrclose(srel);
-	}
-	else
-	{
-		/* we shouldn't be called for anything else */
-		elog(ERROR, "relation \"%s\" does not have storage",
-			 RelationGetRelationName(relation));
+			srel = RelationCreateStorage(newrlocator, persistence, true);
+			smgrclose(srel);
+		}
+		else
+		{
+			/* we shouldn't be called for anything else */
+			elog(ERROR, "relation \"%s\" does not have storage",
+				 RelationGetRelationName(relation));
+		}
 	}
 
 	/*
@@ -4099,10 +7712,14 @@ RelationCacheInitializePhase2(void)
 {
 	MemoryContext oldcxt;
 
-	/*
-	 * relation mapper needs initialized too
-	 */
-	RelationMapInitializePhase2();
+	/* We do not use a relation map file in YugaByte mode yet */
+	if (!IsYugaByteEnabled())
+	{
+		/*
+		 * relation mapper needs initialized too
+		 */
+		RelationMapInitializePhase2();
+	}
 
 	/*
 	 * In bootstrap mode, the shared catalogs aren't there yet anyway, so do
@@ -4120,7 +7737,7 @@ RelationCacheInitializePhase2(void)
 	 * Try to load the shared relcache cache file.  If unsuccessful, bootstrap
 	 * the cache with pre-made descriptors for the critical shared catalogs.
 	 */
-	if (!load_relcache_init_file(true))
+	if (!load_relcache_init_file(true, false /* yb_retry */ ))
 	{
 		formrdesc("pg_database", DatabaseRelation_Rowtype_Id, true,
 				  Natts_pg_database, Desc_pg_database);
@@ -4135,10 +7752,189 @@ RelationCacheInitializePhase2(void)
 		formrdesc("pg_parameter_acl", ParameterAclRelation_Rowtype_Id, true,
 				  Natts_pg_parameter_acl, Desc_pg_parameter_acl);
 
+<<<<<<< HEAD
 #define NUM_CRITICAL_SHARED_RELS	6	/* fix if you change list above */
+||||||| 90630ec4293
+#define NUM_CRITICAL_SHARED_RELS	5	/* fix if you change list above */
+=======
+		if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+		{
+			formrdesc("pg_yb_profile", YbProfileRelation_Rowtype_Id,
+					  true, Natts_pg_yb_profile, Desc_pg_yb_profile);
+			formrdesc("pg_yb_role_profile", YbRoleProfileRelation_Rowtype_Id,
+					  true, Natts_pg_yb_role_profile,
+					  Desc_pg_yb_role_profile);
+		}
+
+#define NUM_CRITICAL_SHARED_RELS	(*YBCGetGFlags()->ysql_enable_profile && \
+									 YbLoginProfileCatalogsExist \
+									 ? 7 \
+									 : 5)	/* fix if you change list above */
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 	}
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+static void
+YbTriggerInternalRelcacheBuild()
+{
+	const char *dbname = YBCGetDatabaseName(MyDatabaseId);
+	MemoryContext oldcxt;
+
+	int			i;
+	for (i = 0; i < 20; i++)
+	{
+		/* Trigger an internal connection to rebuild the relcache file. */
+		HandleYBStatus(YBCTriggerRelcacheInitConnection(dbname));
+
+		/*
+		 * Reload the relcache init files that are newly generated by the
+		 * internal connection.
+		 */
+		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+		if (load_relcache_init_file(true /* shared */, true /* yb_retry */ ) &&
+			load_relcache_init_file(false /* shared */, true /* yb_retry */ ))
+			return;
+
+		/*
+		 * Sometimes the newly generated relcache init files are already
+		 * stale. This can happen when this call to YBCTriggerRelcacheInitConnection
+		 * finds that the tserver already has an internal connection in progress
+		 * so it will not trigger another new one. But since the in progress internal
+		 * connection has already started earlier, it might have written a stale
+		 * relcache init file when there are back-to-back DDLs that have increased
+		 * catalog version multiple times.
+		 */
+		elog(LOG, "retry to load relcache init file for database %u, attempt: %d",
+			 MyDatabaseId, i + 1);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	elog(ERROR, "failed to load relcache init file for database %u", MyDatabaseId);
+}
+
+static bool
+YbTryRevalidateRelcacheFile(uint64_t stored_version, uint64_t catalog_version, int *reason)
+{
+	if (!YbIsInvalidationMessageEnabled())
+	{
+		*reason = 1;
+		return false;
+	}
+	if (IsBinaryUpgrade)
+	{
+		/*
+		 * IsBinaryUpgrade=true indicates we are doing catalog restore during a
+		 * major version update. In this case local tserver is actually yb-master
+		 * which has not implemented YBCGetTserverCatalogMessageLists.
+		 */
+		*reason = 2;
+		return false;
+	}
+
+	if (catalog_version - stored_version >
+		*YBCGetGFlags()->ysql_max_invalidation_message_queue_size)
+	{
+		/* We cannot get all the invalidation messages needed for revalidation. */
+		*reason = 3;
+		return false;
+	}
+
+	YbcCatalogMessageLists message_lists = {0};
+	uint32_t    num_catalog_versions = catalog_version - stored_version;
+	Assert(OidIsValid(MyDatabaseId));
+	/*
+	 * Let the new connection waits for the local tserver's shared memory catalog
+	 * version to catch up, making the invalidation messages more likely to be
+	 * available.
+	 */
+	YbWaitForSharedCatalogVersionToCatchup(catalog_version);
+	HandleYBStatus(YBCGetTserverCatalogMessageLists(MyDatabaseId,
+													stored_version,
+													num_catalog_versions,
+													&message_lists));
+	if (message_lists.num_lists == 0)
+	{
+		*reason = 4;
+		/* No match found, incremental refresh of relcache not possible. */
+		return false;
+	}
+
+	for (YbcCatalogMessageList *msglist = message_lists.message_lists;
+		 msglist < message_lists.message_lists + message_lists.num_lists;
+		 ++msglist)
+	{
+		/*
+		 * Each msglist represents the invalidation messages associated with
+		 * a new catalog version. Check the message list for the current new
+		 * catalog version at invalMessages.
+		 */
+		const SharedInvalidationMessage *invalMessages =
+			(const SharedInvalidationMessage *) msglist->message_list;
+
+		/*
+		 * We do not have the invalidation messages for this new version. This
+		 * can happen if we only incremented the catalog version without providing
+		 * the invalidation messages (UPDATE pg_yb_catalog_version SET current_version =
+		 * current_version + 1), or a DDL generated too many invalidation messages
+		 * that exceeded yb_max_num_invalidation_messages.
+		 */
+		if (!invalMessages)
+		{
+			*reason = 5;
+			return false;
+		}
+
+		/*
+		 * We have an empty message which means the new version does not invalidate
+		 * any cache at all. Just skip it.
+		 */
+		if (msglist->num_bytes == 0)
+			continue;
+
+		/*
+		 * Sanity check, this can happen when the messages are generated by a
+		 * different release. In this case we do not understand the new
+		 * messages.
+		 */
+		if (msglist->num_bytes % sizeof(SharedInvalidationMessage) != 0)
+		{
+			*reason = 6;
+			return false;
+		}
+
+		size_t		nmsgs = msglist->num_bytes / sizeof(SharedInvalidationMessage);
+
+		for (size_t i = 0; i < nmsgs; ++i)
+		{
+			const SharedInvalidationMessage *msg = invalMessages + i;
+			if (!YbCanApplyMessage(msg))
+			{
+				*reason = 7;
+				return false;
+			}
+			/* Only SHAREDINVALRELCACHE_ID can invalidate relcache. */
+			if (msg->id != SHAREDINVALRELCACHE_ID)
+				continue;
+			/* The entire relcache is invalidated. */
+			if (msg->rc.relId == InvalidOid)
+			{
+				*reason = 8;
+				return false;
+			}
+			/* A relation in the relcache init file is invalidated. */
+			if (RelationIdIsInInitFile(msg->rc.relId))
+			{
+				*reason = 9;
+				return false;
+			}
+		}
+	}
+	/*
+	 * No need to set *reason which is only meaningful when the function
+	 * returns false.
+	 */
+	return true;
 }
 
 /*
@@ -4163,15 +7959,38 @@ RelationCacheInitializePhase3(void)
 	MemoryContext oldcxt;
 	bool		needNewCacheFile = !criticalSharedRelcachesBuilt;
 
-	/*
-	 * relation mapper needs initialized too
-	 */
-	RelationMapInitializePhase3();
+	/* We do not use a relation map file in YugaByte mode yet */
+	if (!IsYugaByteEnabled())
+	{
+		/*
+		 * relation mapper needs initialized too
+		 */
+		RelationMapInitializePhase3();
+	}
 
 	/*
 	 * switch to cache memory context
 	 */
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+
+	if (YBIsDBCatalogVersionMode())
+	{
+		/*
+		 * load_relcache_init_file(true, false) has been called earlier when
+		 * MyDatabaseId is not known yet. That makes Postgres think
+		 * that the shared relcache init file does not exist and therefore
+		 * it sets needNewCacheFile to true.
+		 */
+		Assert(needNewCacheFile);
+
+		/*
+		 * Now that we know MyDatabaseId, call load_relcache_init_file(true, false)
+		 * again and re-compute needNewCacheFile.
+		 */
+		Assert(OidIsValid(MyDatabaseId));
+		needNewCacheFile = !load_relcache_init_file(true, false /* yb_retry */ ) &&
+						   !YbCatalogPreloadRequired();
+	}
 
 	/*
 	 * Try to load the local relcache cache file.  If unsuccessful, bootstrap
@@ -4179,7 +7998,7 @@ RelationCacheInitializePhase3(void)
 	 * catalogs.
 	 */
 	if (IsBootstrapProcessingMode() ||
-		!load_relcache_init_file(false))
+		!load_relcache_init_file(false, false /* yb_retry */ ))
 	{
 		needNewCacheFile = true;
 
@@ -4200,6 +8019,95 @@ RelationCacheInitializePhase3(void)
 	/* In bootstrap mode, the faked-up formrdesc info is all we'll have */
 	if (IsBootstrapProcessingMode())
 		return;
+
+	/*
+	 * In YB mode initialize the relache at the beginning so that we need
+	 * fewer cache lookups in steady state.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		Assert(!YBCIsSysTablePrefetchingStarted());
+
+		bool		catalog_preload_required = YBCIsInitDbModeEnvVarSet() ||
+											   YbCatalogPreloadRequired();
+		bool		preload_rel_cache = needNewCacheFile || catalog_preload_required;
+
+		if (preload_rel_cache)
+		{
+			uint64_t	shared_catalog_version;
+
+			HandleYBStatus(YBCGetSharedCatalogVersion(&shared_catalog_version));
+			/*
+			 * This branch is conn-mgr-auth-backend-specific: it either signals
+			 * "rebuild the init file from fresh master data" or skips the
+			 * relcache preload entirely (auth backends don't need a full
+			 * relcache).
+			 */
+			if (YbAuthBackendUsesTserverResponseCache(shared_catalog_version))
+			{
+				if (needNewCacheFile)
+					YbNeedNewCacheFileForPgAuthBackend = true;
+				else
+					/*
+					 * The relcache init file does not need to be rebuilt.
+					 * In this case we know the current backend is a pg auth
+					 * backend. We do not need to preload relcache (which
+					 * causes memory spike) for a pg auth backend to complete
+					 * the rest of its connection authentication work.
+					 */
+					preload_rel_cache = false;
+			}
+		}
+
+		bool enable_relcache_init_optimization =
+			*(YBCGetGFlags()->ysql_enable_relcache_init_optimization);
+
+		/*
+		 * If MaxConnections <= 3 and we have not reserved any backends, we are
+		 * very short of connections. Let's not bother with an extra internal
+		 * relcache init connection for the optimization.
+		 */
+		if (MaxConnections <= 3 && SuperuserReservedConnections == 0)
+			enable_relcache_init_optimization = false;
+
+		/*
+		 * If catalog_preload_required is true, this connection will incur a memory spike
+		 * on purpose anyway, no need to trigger an internal connection.
+		 * IsBinaryUpgrade=true indicates we are doing catalog restore during a
+		 * major version update. In this case local tserver is actually yb-master
+		 * which has not implemented YBCTriggerRelcacheInitConnection.
+		 * The dedicated relcache-init builder backend (YB_RELCACHE_INIT_BACKEND)
+		 * is exempted so it actually rebuilds the file itself; other internal
+		 * connections (e.g. xCluster DDL queue, call-home) still go through the
+		 * trigger and get a separate relcache-init connection spawned for them.
+		 */
+		if (enable_relcache_init_optimization &&
+			YBIsDBCatalogVersionMode() &&
+			needNewCacheFile &&
+			!catalog_preload_required &&
+			MyBackendType != YB_RELCACHE_INIT_BACKEND &&
+			!IsBinaryUpgrade)
+		{
+			YbTriggerInternalRelcacheBuild();
+			/* Resume preloading of the core catalog tables only. */
+			YbPrefetchRequiredData(false);
+
+			/*
+			 * Do not overwrite the relcache init file which is newly generated
+			 * by the internal connection.
+			 */
+			needNewCacheFile = false;
+		}
+		else
+			YbPrefetchRequiredData(preload_rel_cache);
+
+		Assert(YBCIsSysTablePrefetchingStarted());
+		Assert(YbCheckCatalogCacheIndexNameTable());
+		Assert(YbCheckSysCacheNames());
+
+		if (YbStaleCatalogPrefetchPending)
+			needNewCacheFile = false;
+	}
 
 	/*
 	 * If we didn't get the critical system indexes loaded into relcache, do
@@ -4377,7 +8285,7 @@ RelationCacheInitializePhase3(void)
 		}
 		if (relation->rd_rel->relhastriggers && relation->trigdesc == NULL)
 		{
-			RelationBuildTriggers(relation);
+			RelationBuildTriggers(relation, NULL);
 			if (relation->trigdesc == NULL)
 				relation->rd_rel->relhastriggers = false;
 			restart = true;
@@ -4392,7 +8300,7 @@ RelationCacheInitializePhase3(void)
 		 */
 		if (relation->rd_rel->relrowsecurity && relation->rd_rsdesc == NULL)
 		{
-			RelationBuildRowSecurity(relation);
+			RelationBuildRowSecurity(relation, NULL);
 
 			Assert(relation->rd_rsdesc != NULL);
 			restart = true;
@@ -4458,7 +8366,18 @@ load_critical_index(Oid indexoid, Oid heapoid)
 	 */
 	LockRelationOid(heapoid, AccessShareLock);
 	LockRelationOid(indexoid, AccessShareLock);
-	ird = RelationBuildDesc(indexoid, true);
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * The prefetcher must be started to ensure we do not accept any
+		 * invalidation messages which can remove relcache entries that we
+		 * have just built.
+		 */
+		Assert(YBCIsSysTablePrefetchingStarted());
+		RelationIdCacheLookup(indexoid, ird);
+	}
+	else
+		ird = RelationBuildDesc(indexoid, true);
 	if (ird == NULL)
 		ereport(PANIC,
 				errcode(ERRCODE_DATA_CORRUPTED),
@@ -4793,6 +8712,8 @@ RelationGetFKeyList(Relation relation)
 	HeapTuple	htup;
 	List	   *oldlist;
 	MemoryContext oldcxt;
+	YbCatCListIterator iterator;
+	bool		use_catcache;
 
 	/* Quick exit if we already computed the list. */
 	if (relation->rd_fkeyvalid)
@@ -4806,17 +8727,27 @@ RelationGetFKeyList(Relation relation)
 	 */
 	result = NIL;
 
-	/* Prepare to scan pg_constraint for entries having conrelid = this rel. */
-	ScanKeyInit(&skey,
-				Anum_pg_constraint_conrelid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(RelationGetRelid(relation)));
+	use_catcache = IsYugaByteEnabled() && yb_enable_fkey_catcache;
 
-	conrel = table_open(ConstraintRelationId, AccessShareLock);
-	conscan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
-								 NULL, 1, &skey);
-
-	while (HeapTupleIsValid(htup = systable_getnext(conscan)))
+	if (use_catcache)
+	{
+		iterator = YbCatCListIteratorBegin(SearchSysCacheList1(YBCONSTRAINTRELIDTYPIDNAME, RelationGetRelid(relation)));
+	}
+	else
+	{
+		/*
+		 * Prepare to scan pg_constraint for entries having conrelid = this
+		 * rel.
+		 */
+		ScanKeyInit(&skey,
+					Anum_pg_constraint_conrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(RelationGetRelid(relation)));
+		conrel = table_open(ConstraintRelationId, AccessShareLock);
+		conscan = systable_beginscan(conrel, ConstraintRelidTypidNameIndexId, true,
+									 NULL, 1, &skey);
+	}
+	while (HeapTupleIsValid(htup = use_catcache ? YbCatCListIteratorGetNext(&iterator) : systable_getnext(conscan)))
 	{
 		Form_pg_constraint constraint = (Form_pg_constraint) GETSTRUCT(htup);
 		ForeignKeyCacheInfo *info;
@@ -4830,6 +8761,7 @@ RelationGetFKeyList(Relation relation)
 		info->conrelid = constraint->conrelid;
 		info->confrelid = constraint->confrelid;
 		info->conenforced = constraint->conenforced;
+		info->ybconindid = constraint->conindid;
 
 		DeconstructFkConstraintRow(htup, &info->nkeys,
 								   info->conkey,
@@ -4841,8 +8773,13 @@ RelationGetFKeyList(Relation relation)
 		result = lappend(result, info);
 	}
 
-	systable_endscan(conscan);
-	table_close(conrel, AccessShareLock);
+	if (use_catcache)
+		YbCatCListIteratorFree(&iterator);
+	else
+	{
+		systable_endscan(conscan);
+		table_close(conrel, AccessShareLock);
+	}
 
 	/* Now save a copy of the completed list in the relcache entry. */
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
@@ -4853,6 +8790,71 @@ RelationGetFKeyList(Relation relation)
 
 	/* Don't leak the old list, if there is one */
 	list_free_deep(oldlist);
+
+	return result;
+}
+
+/*
+ * YbRelationGetFKeyReferencedByList -- Gets a list of foreign key infos that
+ * reference the given relation.
+ *
+ * Returns a list of ForeignKeyCacheInfo structs, one per FK that is constrained
+ * on the given relation.  This data is a direct copy of relevant fields from
+ * pg_constraint.  The list items are in no particular order.
+ */
+List *
+YbRelationGetFKeyReferencedByList(Relation relation)
+{
+	List	   *result = NIL;
+	TriggerDesc *trigdesc = relation->trigdesc;
+
+	if (!trigdesc)
+		return result;
+
+	for (int16 i = 0; i < trigdesc->numtriggers; i++)
+	{
+		Trigger		trigger = trigdesc->triggers[i];
+		HeapTuple	htup;
+		ForeignKeyCacheInfo *info;
+
+		/*
+		 * Consider only referential constraints. Avoid duplication by
+		 * considering only DELETEs. UPDATEs have triggers in both directions
+		 * and could cause duplicates.
+		 */
+		if (!TRIGGER_TYPE_MATCHES(trigger.tgtype, TRIGGER_TYPE_ROW,
+								  TRIGGER_TYPE_AFTER, TRIGGER_TYPE_DELETE) ||
+			!trigger.tgconstrrelid)
+			continue;
+
+		/* Each trigger is a 1:1 mapping to a constraint */
+		/* Each constraint may or may not be a foreign key constraint */
+		htup = SearchSysCacheCopy1(CONSTROID,
+								   ObjectIdGetDatum(trigger.tgconstraint));
+		if (!HeapTupleIsValid(htup))
+			elog(ERROR, "cache lookup failed for constraint %u",
+				 trigger.tgconstraint);
+
+		Form_pg_constraint constraint = (Form_pg_constraint) GETSTRUCT(htup);
+
+		Assert(constraint->contype == CONSTRAINT_FOREIGN);
+		Assert(constraint->confrelid == relation->rd_id);
+
+		info = makeNode(ForeignKeyCacheInfo);
+		info->conoid = constraint->oid;
+		info->conrelid = constraint->conrelid;
+		info->confrelid = constraint->confrelid;
+		info->ybconindid = constraint->conindid;
+
+		DeconstructFkConstraintRow(htup, &info->nkeys, info->conkey,
+								   info->confkey, info->conpfeqop, NULL, NULL,
+								   NULL, NULL);
+
+		/* Add FK's node to the result list */
+		result = lappend(result, info);
+
+		/* We do not cache the computed information anywhere for now. */
+	}
 
 	return result;
 }
@@ -4993,7 +8995,9 @@ RelationGetIndexList(Relation relation)
 	relation->rd_indexlist = list_copy(result);
 	relation->rd_pkindex = pkeyIndex;
 	relation->rd_ispkdeferrable = pkdeferrable;
-	if (replident == REPLICA_IDENTITY_DEFAULT && OidIsValid(pkeyIndex) && !pkdeferrable)
+	/* YB: In replica identity CHANGE, we always get the primary key of the row. */
+	if ((replident == REPLICA_IDENTITY_DEFAULT ||
+		 replident == YB_REPLICA_IDENTITY_CHANGE) && OidIsValid(pkeyIndex) && !pkdeferrable)
 		relation->rd_replidindex = pkeyIndex;
 	else if (replident == REPLICA_IDENTITY_INDEX && OidIsValid(candidateIndex))
 		relation->rd_replidindex = candidateIndex;
@@ -5329,6 +9333,105 @@ RelationGetIndexPredicate(Relation relation)
 }
 
 /*
+ * YbComputeIndexExprOrPredicateAttrs -- get a bitmap of index attribute numbers for the
+ * given index relation.
+ *
+ * The result has a bit set for each attribute used anywhere in the index
+ * definitions of the given index relation. (This includes not only
+ * simple index keys, but attributes used in expressions and partial-index
+ * predicates.)
+ *
+ * Attribute numbers are offset by FirstLowInvalidHeapAttributeNumber (or its
+ * YB equivalent) so that we can include system attributes (e.g., OID) in the
+ * bitmap representation.
+ *
+ * The returned result is palloc'd in the caller's memory context and should
+ * be bms_free'd when not needed anymore.
+ *
+ * TODO(kramanathan): Cache the results of this computation at planning
+ * time to avoid repeated work. (#29126)
+ */
+void
+YbComputeIndexExprOrPredicateAttrs(Bitmapset **indexattrs,
+								   Relation indexDesc,
+								   const int Anum_pg_index,
+								   AttrNumber attr_offset)
+{
+	bool		isnull = false;
+	Datum		datum = heap_getattr(indexDesc->rd_indextuple, Anum_pg_index,
+									 GetPgIndexDescriptor(), &isnull);
+
+	if (isnull)
+		return;
+
+	char *datum_str = TextDatumGetCString(datum);
+	Node	   *indexNode = stringToNode(datum_str);
+
+	pull_varattnos_min_attr(indexNode, 1, indexattrs, attr_offset + 1);
+
+	pfree((void *) datum_str);
+}
+
+bool
+CheckUpdateExprOrPred(const Bitmapset *updated_attrs,
+					  Relation indexDesc,
+					  const int Anum_pg_index,
+					  AttrNumber attr_offset)
+{
+	Bitmapset  *indexattrs = NULL;
+
+	YbComputeIndexExprOrPredicateAttrs(&indexattrs, indexDesc, Anum_pg_index,
+									   attr_offset);
+	bool		need_update = bms_overlap(updated_attrs, indexattrs);
+
+	bms_free(indexattrs);
+	return need_update;
+}
+
+/*
+ * CheckIndexForUpdate -- Given Oid of an Index corresponding to a specific
+ * relation and the set of attributes that are updated because of an SQL
+ * statement, this function returns true of the Index needs to be updated and
+ * vice versa.
+ */
+bool
+CheckIndexForUpdate(Oid indexOid, const Bitmapset *updated_attrs, AttrNumber attr_offset)
+{
+	Relation	indexDesc = index_open(indexOid, AccessShareLock);
+	Bitmapset  *indexattrs = NULL;
+	bool		need_update = false;
+
+	/*
+	 * We first check updates affect the current index by iterating over the
+	 * columns associated with an index to see if the updated attributes affects
+	 * the index. If it does, we return true.
+	 */
+	for (int i = 0; i < indexDesc->rd_index->indnatts; ++i)
+	{
+		const int	attrnum = indexDesc->rd_index->indkey.values[i];
+
+		if (attrnum != 0 && bms_is_member(attrnum - attr_offset, updated_attrs))
+		{
+			need_update = true;
+			break;
+		}
+	}
+	/*
+	 * If none of the columns are affected, we check for IndexExpressions and
+	 * IndexPredicates
+	 */
+	need_update = (need_update ||
+				   CheckUpdateExprOrPred(updated_attrs, indexDesc,
+										 Anum_pg_index_indexprs, attr_offset) ||
+				   CheckUpdateExprOrPred(updated_attrs, indexDesc,
+										 Anum_pg_index_indpred, attr_offset));
+
+	bms_free(indexattrs);
+	index_close(indexDesc, AccessShareLock);
+	return need_update;
+}
+
+/*
  * RelationGetIndexAttrBitmap -- get a bitmap of index attribute numbers
  *
  * The result has a bit set for each attribute used anywhere in the index
@@ -5376,6 +9479,7 @@ RelationGetIndexAttrBitmap(Relation relation, IndexAttrBitmapKind attrKind)
 	Oid			relreplindex;
 	ListCell   *l;
 	MemoryContext oldcxt;
+	AttrNumber	attr_offset;
 
 	/* Quick exit if we already computed the result. */
 	if (relation->rd_attrsvalid)
@@ -5436,6 +9540,7 @@ restart:
 	idindexattrs = NULL;
 	hotblockingattrs = NULL;
 	summarizedattrs = NULL;
+	attr_offset = YBGetFirstLowInvalidAttributeNumber(relation);
 	foreach(l, indexoidlist)
 	{
 		Oid			indexOid = lfirst_oid(l);
@@ -5518,27 +9623,27 @@ restart:
 			if (attrnum != 0)
 			{
 				*attrs = bms_add_member(*attrs,
-										attrnum - FirstLowInvalidHeapAttributeNumber);
+										attrnum - attr_offset);
 
 				if (isKey && i < indexDesc->rd_index->indnkeyatts)
 					uindexattrs = bms_add_member(uindexattrs,
-												 attrnum - FirstLowInvalidHeapAttributeNumber);
+												 attrnum - attr_offset);
 
 				if (isPK && i < indexDesc->rd_index->indnkeyatts)
 					pkindexattrs = bms_add_member(pkindexattrs,
-												  attrnum - FirstLowInvalidHeapAttributeNumber);
+												  attrnum - attr_offset);
 
 				if (isIDKey && i < indexDesc->rd_index->indnkeyatts)
 					idindexattrs = bms_add_member(idindexattrs,
-												  attrnum - FirstLowInvalidHeapAttributeNumber);
+												  attrnum - attr_offset);
 			}
 		}
 
 		/* Collect all attributes used in expressions, too */
-		pull_varattnos(indexExpressions, 1, attrs);
+		pull_varattnos_min_attr(indexExpressions, 1, attrs, attr_offset + 1);
 
 		/* Collect all attributes in the index predicate, too */
-		pull_varattnos(indexPredicate, 1, attrs);
+		pull_varattnos_min_attr(indexPredicate, 1, attrs, attr_offset + 1);
 
 		index_close(indexDesc, AccessShareLock);
 	}
@@ -5652,8 +9757,18 @@ RelationGetIdentityKeyBitmap(Relation relation)
 	if (!RelationGetForm(relation)->relhasindex)
 		return NULL;
 
-	/* Historic snapshot must be set. */
-	Assert(HistoricSnapshotActive());
+	/*
+	 * YB NOTE: We do not rely on the historical snapshot mechanism of PG. We
+	 * utilize the yb_read_time variable to read the catalog entries at the time
+	 * of the transaction.
+	 *
+	 * YB_TODO(#22555): Update the function to handle replica identity CHANGE.
+	 */
+	if (!IsYugaByteEnabled())
+	{
+		/* Historic snapshot must be set. */
+		Assert(HistoricSnapshotActive());
+	}
 
 	replidindex = RelationGetReplicaIndex(relation);
 
@@ -6097,6 +10212,15 @@ RelationGetIndexAttOptions(Relation relation, bool copy)
 
 	for (i = 0; i < natts; i++)
 	{
+		/*
+		 * YB: Skip the pg_attribute lookup for a column that cannot have
+		 * options.  A full catalog cache refresh does this for every index
+		 * column, and without the pg_attribute catcaches preloaded each
+		 * lookup scans the whole prefetched pg_attribute.
+		 */
+		if (IsYugaByteEnabled() && !YbIndexAttHasOptionsProc(relation, i + 1))
+			continue;
+
 		if (criticalRelcachesBuilt && relid != AttributeRelidNumIndexId)
 		{
 			Datum		attoptions = get_attoptions(relid, i + 1);
@@ -6258,7 +10382,7 @@ errtableconstraint(Relation rel, const char *conname)
  * NOTE: we assume we are already switched into CacheMemoryContext.
  */
 static bool
-load_relcache_init_file(bool shared)
+load_relcache_init_file(bool shared, bool yb_retry)
 {
 	FILE	   *fp;
 	char		initfilename[MAXPGPATH];
@@ -6270,17 +10394,49 @@ load_relcache_init_file(bool shared)
 				nailed_indexes,
 				magic;
 	int			i;
+	uint64_t	ybc_stored_cache_version = 0;
+	bool		yb_stale_version = false;
+	bool		yb_need_update_relcache_file = false;
 
-	if (shared)
-		snprintf(initfilename, sizeof(initfilename), "global/%s",
-				 RELCACHE_INIT_FILENAME);
-	else
-		snprintf(initfilename, sizeof(initfilename), "%s/%s",
-				 DatabasePath, RELCACHE_INIT_FILENAME);
+	/*
+	 * YB: Disable shared init file in per database catalog version mode when
+	 * MyDatabaseId isn't known yet. Different databases have different
+	 * catalog versions of their own. At this point we cannot compose the
+	 * correct init file name for the to-be-resolved MyDatabaseId.
+	 */
+	if (YBIsDBCatalogVersionMode() && !OidIsValid(MyDatabaseId))
+	{
+		/*
+		 * Here in per-database catalog version modme, when MyDatabaseId isn't
+		 * resolved yet we only expect this function is called for shared
+		 * relations. This is because of the order in which we attempt to
+		 * call load_relcache_init_file:
+		 * (1) in phase 2 we only attempt shared relations;
+		 * (2) MyDatabaseId is resolved;
+		 * (3) in phase 3 we re-attempt shared relations, and then attempt
+		 * non-shared relations.
+		 */
+		Assert(shared);
+		return false;
+	}
+
+	/*
+	 * YB mode uses local-tserver prefetching instead of relcache file.
+	 * TODO: either put this under a GUC variable or remove the old code
+	 * below.
+	 */
+	if (IsYugaByteEnabled() && YbCatalogPreloadRequired())
+		return false;
+
+	RelCacheInitFileName(initfilename, shared);
 
 	fp = AllocateFile(initfilename, PG_BINARY_R);
 	if (fp == NULL)
+	{
+		if (IsYugaByteEnabled())
+			YBC_LOG_INFO("DEBUG: cannot open init file %s", initfilename);
 		return false;
+	}
 
 	/*
 	 * Read the index relcache entries from the file.  Note we will not enter
@@ -6297,6 +10453,52 @@ load_relcache_init_file(bool shared)
 		goto read_failed;
 	if (magic != RELCACHE_INIT_FILEMAGIC)
 		goto read_failed;
+
+	if (IsYugaByteEnabled())
+	{
+		/* Read the stored catalog version number */
+		if (fread(&ybc_stored_cache_version,
+				  1,
+				  sizeof(ybc_stored_cache_version),
+				  fp) != sizeof(ybc_stored_cache_version))
+		{
+			goto read_failed;
+		}
+
+		/*
+		 * If we already have a newer cache version (e.g. from reading the
+		 * shared init file) or master has newer catalog version then this file is too old.
+		 */
+		const uint64_t catalog_cache_version = YbGetCatalogCacheVersion();
+		if (catalog_cache_version > ybc_stored_cache_version)
+		{
+			/* only meaningful when YbTryRevalidateRelcacheFile returns false. */
+			int reason = 0;
+			const bool revalidated =
+				YbTryRevalidateRelcacheFile(ybc_stored_cache_version, catalog_cache_version, &reason);
+			if (revalidated)
+			{
+				YbNumRelCacheInitFileRevalidated++;
+				elog(DEBUG1, "Revalidated %srelcache init file for database %u from version %" PRIu64 " to %" PRIu64,
+					 (shared ? "shared " : ""),
+					 MyDatabaseId, ybc_stored_cache_version, catalog_cache_version);
+				ybc_stored_cache_version = catalog_cache_version;
+				yb_need_update_relcache_file = true;
+			}
+			else
+			{
+				YbNumRelCacheInitFileRevalidationFailed++;
+				elog(LOG,
+					 "Cannot revalidate %srelcache init file for database %u from version %" PRIu64 " to %" PRIu64
+					 ", reason: %d",
+					 (shared ? "shared " : ""),
+					 MyDatabaseId, ybc_stored_cache_version, catalog_cache_version, reason);
+				yb_stale_version = true;
+				unlink_initfile(initfilename, ERROR);
+				goto read_failed;
+			}
+		}
+	}
 
 	for (relno = 0;; relno++)
 	{
@@ -6594,6 +10796,9 @@ load_relcache_init_file(bool shared)
 		rel->rd_amcache = NULL;
 		rel->pgstat_info = NULL;
 
+		/* YB properties will be loaded lazily */
+		rel->yb_table_properties = NULL;
+
 		/*
 		 * Recompute lock and physical addressing info.  This is needed in
 		 * case the pg_internal.init file was copied from some other database
@@ -6653,16 +10858,41 @@ load_relcache_init_file(bool shared)
 	 */
 	for (relno = 0; relno < num_rels; relno++)
 	{
-		RelationCacheInsert(rels[relno], false);
+		if (YBIsDBCatalogVersionMode())
+		{
+			Relation relation = rels[relno];
+			if (yb_debug_log_catcache_events)
+				elog(LOG, "Reinsert relcache entry %p for %s (oid %u)", relation,
+					 RelationGetRelationName(relation), RelationGetRelid(relation));
+			YbRelationCacheReinsert(rels[relno], shared, yb_retry);
+		}
+		else
+			RelationCacheInsert(rels[relno], false);
 	}
+
+	if (yb_debug_log_catcache_events)
+		elog(LOG, "Loaded %d entries from relcache init file", num_rels);
 
 	pfree(rels);
 	FreeFile(fp);
+
+	if (IsYugaByteEnabled())
+	{
+		/*
+		 * Set the catalog version if needed.
+		 * The checks above will ensure that if it is already initialized then
+		 * we should leave it unchanged (see also comment in pg_yb_utils.h).
+		 */
+		if (YbGetCatalogCacheVersion() == YB_CATCACHE_VERSION_UNINITIALIZED)
+			YbUpdateCatalogCacheVersion(ybc_stored_cache_version);
+	}
 
 	if (shared)
 		criticalSharedRelcachesBuilt = true;
 	else
 		criticalRelcachesBuilt = true;
+	if (yb_need_update_relcache_file)
+		write_relcache_init_file(shared);
 	return true;
 
 	/*
@@ -6674,6 +10904,15 @@ read_failed:
 	pfree(rels);
 	FreeFile(fp);
 
+	if (IsYugaByteEnabled())
+	{
+		if (yb_stale_version)
+			YBC_LOG_INFO("DEBUG: init file %s is stale: %" PRIu64 " < %" PRIu64,
+						 initfilename,
+						 ybc_stored_cache_version, YbGetCatalogCacheVersion());
+		else
+			YBC_LOG_INFO("DEBUG: init file %s is corrupted", initfilename);
+	}
 	return false;
 }
 
@@ -6692,6 +10931,15 @@ write_relcache_init_file(bool shared)
 	RelIdCacheEnt *idhentry;
 	int			i;
 
+	if (shared && YBIsDBCatalogVersionMode())
+		Assert(OidIsValid(MyDatabaseId));
+
+	/*
+	 * YB mode uses local-tserver prefetching instead of relcache file.
+	 */
+	if (IsYugaByteEnabled() && YbCatalogPreloadRequired())
+		return;
+
 	/*
 	 * If we have already received any relcache inval events, there's no
 	 * chance of succeeding so we may as well skip the whole thing.
@@ -6704,20 +10952,8 @@ write_relcache_init_file(bool shared)
 	 * another backend starting at about the same time might crash trying to
 	 * read the partially-complete file.
 	 */
-	if (shared)
-	{
-		snprintf(tempfilename, sizeof(tempfilename), "global/%s.%d",
-				 RELCACHE_INIT_FILENAME, MyProcPid);
-		snprintf(finalfilename, sizeof(finalfilename), "global/%s",
-				 RELCACHE_INIT_FILENAME);
-	}
-	else
-	{
-		snprintf(tempfilename, sizeof(tempfilename), "%s/%s.%d",
-				 DatabasePath, RELCACHE_INIT_FILENAME, MyProcPid);
-		snprintf(finalfilename, sizeof(finalfilename), "%s/%s",
-				 DatabasePath, RELCACHE_INIT_FILENAME);
-	}
+	RelCacheInitTempFileName(tempfilename, shared);
+	RelCacheInitFileName(finalfilename, shared);
 
 	unlink(tempfilename);		/* in case it exists w/wrong permissions */
 
@@ -6745,6 +10981,20 @@ write_relcache_init_file(bool shared)
 		ereport(FATAL,
 				errcode_for_file_access(),
 				errmsg_internal("could not write init file: %m"));
+
+	const uint64_t catalog_cache_version = YbGetCatalogCacheVersion();
+	if (IsYugaByteEnabled())
+	{
+		/* Write the ysql_catalog_version */
+
+		if (fwrite(&catalog_cache_version,
+				   1,
+				   sizeof(catalog_cache_version),
+				   fp) != sizeof(catalog_cache_version))
+		{
+			elog(FATAL, "could not write init file");
+		}
+	}
 
 	/*
 	 * Write all the appropriate reldescs (in no particular order).
@@ -6881,10 +11131,23 @@ write_relcache_init_file(bool shared)
 		 * file on failure.
 		 */
 		if (rename(tempfilename, finalfilename) < 0)
+		{
+			if (IsYugaByteEnabled())
+				YBC_LOG_INFO("DEBUG: rename %s to %s failed, catalog version %" PRIu64,
+							 tempfilename, finalfilename, catalog_cache_version);
 			unlink(tempfilename);
+		}
+		else if (IsYugaByteEnabled() &&
+				 *(YBCGetGFlags()->ysql_enable_relcache_init_optimization))
+			YBC_LOG_INFO("DEBUG: rename %s to %s succeeded, catalog version %" PRIu64,
+						 tempfilename, finalfilename, catalog_cache_version);
 	}
 	else
 	{
+		if (IsYugaByteEnabled())
+			YBC_LOG_INFO("DEBUG: unlink the already-obsolete %s, catalog_version %" PRIu64,
+						 tempfilename, catalog_cache_version);
+
 		/* Delete the already-obsolete temp file */
 		unlink(tempfilename);
 	}
@@ -6919,10 +11182,7 @@ write_item(const void *data, Size len, FILE *fp)
 bool
 RelationIdIsInInitFile(Oid relationId)
 {
-	if (relationId == SharedSecLabelRelationId ||
-		relationId == TriggerRelidNameIndexId ||
-		relationId == DatabaseNameIndexId ||
-		relationId == SharedSecLabelObjectIndexId)
+	if (YbRelationIdIsInInitFileAndNotCached(relationId))
 	{
 		/*
 		 * If this Assert fails, we don't need the applicable special case
@@ -6932,6 +11192,40 @@ RelationIdIsInInitFile(Oid relationId)
 		return true;
 	}
 	return RelationSupportsSysCache(relationId);
+}
+
+bool
+YbRelationIdIsInInitFileAndNotCached(Oid relationId)
+{
+	/* These rel ids are copied from the original RelationIdIsInInitFile. */
+	return (relationId == SharedSecLabelRelationId ||
+			relationId == TriggerRelidNameIndexId ||
+			relationId == DatabaseNameIndexId ||
+			relationId == SharedSecLabelObjectIndexId);
+}
+
+bool
+YbSharedRelationIdNeedsGlobalImpact(Oid relationId)
+{
+	Assert(IsSharedRelation(relationId));
+	/*
+	 * These rel ids are shared relations that can exist in tserver response
+	 * cache but not in PG catalog cache because they do not have a PG catalog
+	 * cache. If a DDL writes to such a shared relation, it needs to have
+	 * global impact. We add such rel ids here on a case by case basis when
+	 * they are identified.
+	 */
+	return (relationId == DbRoleSettingRelationId ||
+			relationId == DbRoleSettingDatidRolidIndexId);
+}
+
+Relation
+YbRelationIdCacheLookup(Oid relid)
+{
+	Relation	rel;
+
+	RelationIdCacheLookup(relid, rel);
+	return rel;
 }
 
 /*
@@ -6963,10 +11257,8 @@ RelationCacheInitFilePreInvalidate(void)
 	char		sharedinitfname[MAXPGPATH];
 
 	if (DatabasePath)
-		snprintf(localinitfname, sizeof(localinitfname), "%s/%s",
-				 DatabasePath, RELCACHE_INIT_FILENAME);
-	snprintf(sharedinitfname, sizeof(sharedinitfname), "global/%s",
-			 RELCACHE_INIT_FILENAME);
+		RelCacheInitFileName(localinitfname, false);
+	RelCacheInitFileName(sharedinitfname, true);
 
 	LWLockAcquire(RelCacheInitLock, LW_EXCLUSIVE);
 
@@ -6988,6 +11280,58 @@ RelationCacheInitFilePostInvalidate(void)
 }
 
 /*
+ * The YB version of RelationCacheInitFileRemove that considers two YB
+ * specifics of rel cache init files (see RelCacheInitFileName).
+ * (1) Placement change for per-database rel cache init files. For example,
+ * In native PG the rel cache init file of database that has OID 16386:
+ *   pg_data/base/16386/pg_internal.init
+ * In YB the rel cache init file of database that has OID 16384:
+ *   pg_data/16384_pg_internal.init
+ * (2) Name change in per-database catalog version mode. For example, each
+ * database has both a shared and a non-shared rel cache init file.
+ * pg_data/global/13245_pg_internal.init.db # shared
+ * pg_data/13245_pg_internal.init.db        # non-shared
+ * YB NOTE: The placement change assumes CREATE TABLESPACE LOCATION is
+ * not supported in YSQL. Tablespace is repurposed in YSQL and LOCATION
+ * clause that specifies a file system location is ignored. If we ever
+ * support LOCATION, then we will need to either redesign the above YB
+ * specifics and/or adjust this YB version of rel cache init files removal
+ * function.
+ */
+static void
+YbRelationCacheInitFileRemove()
+{
+	/* Remove shared rel cache init files. */
+	YbRelationCacheInitFileRemoveInDir("global");
+
+	/* Remove per-database rel cache init files. */
+	YbRelationCacheInitFileRemoveInDir(".");
+}
+
+static void
+YbRelationCacheInitFileRemoveInDir(const char *initfiledir)
+{
+	DIR		   *dir;
+	struct dirent *de;
+	char		initfilename[MAXPGPATH * 2];
+
+	dir = AllocateDir(initfiledir);
+
+	while ((de = ReadDir(dir, initfiledir)) != NULL)
+	{
+		if (strstr(de->d_name, RELCACHE_INIT_FILENAME))
+		{
+			/* Remove the init file, including any temporary one. */
+			snprintf(initfilename, sizeof(initfilename), "%s/%s",
+					 initfiledir, de->d_name);
+			unlink_initfile(initfilename, ERROR);
+		}
+	}
+
+	FreeDir(dir);
+}
+
+/*
  * Remove the init files during postmaster startup.
  *
  * We used to keep the init files across restarts, but that is unsafe in PITR
@@ -7003,6 +11347,12 @@ RelationCacheInitFileRemove(void)
 	DIR		   *dir;
 	struct dirent *de;
 	char		path[MAXPGPATH + sizeof(PG_TBLSPC_DIR) + sizeof(TABLESPACE_VERSION_DIRECTORY)];
+
+	if (YBIsEnabledInPostgresEnvVar())
+	{
+		YbRelationCacheInitFileRemove();
+		return;
+	}
 
 	snprintf(path, sizeof(path), "global/%s",
 			 RELCACHE_INIT_FILENAME);
@@ -7092,4 +11442,80 @@ ResOwnerReleaseRelation(Datum res)
 	rel->rd_refcnt -= 1;
 
 	RelationCloseCleanup((Relation) DatumGetPointer(res));
+}
+
+/*
+ * Whether the opclass of an index column has an options procedure.  Index
+ * creation rejects options for a column whose opclass has none, so there are
+ * no options to look up for it.  This is false for INCLUDE columns, whose
+ * support procedures are all zero.
+ */
+static bool
+YbIndexAttHasOptionsProc(Relation indexrel, AttrNumber attnum)
+{
+	return (indexrel->rd_indam->amoptsprocnum != 0 &&
+			OidIsValid(index_getprocid(indexrel, attnum,
+									   indexrel->rd_indam->amoptsprocnum)));
+}
+
+/*
+ * YbRelationGetUnConstifiedIndexExpressions -- RelationGetIndexExpressions,
+ * but without constant folding.
+ *
+ * The expression tree is returned exactly as stored in indexprs of pg_index.
+ * This form is not cached, since rd_indexprs holds the folded one.
+ */
+List *
+YbRelationGetUnConstifiedIndexExpressions(Relation relation)
+{
+	List	   *result;
+	Datum		exprsDatum;
+	bool		isnull;
+	char	   *exprsString;
+
+	if (relation->rd_indextuple == NULL ||
+		heap_attisnull(relation->rd_indextuple, Anum_pg_index_indexprs, NULL))
+		return NIL;
+
+	exprsDatum = heap_getattr(relation->rd_indextuple,
+							  Anum_pg_index_indexprs,
+							  GetPgIndexDescriptor(),
+							  &isnull);
+	Assert(!isnull);
+	exprsString = TextDatumGetCString(exprsDatum);
+	result = (List *) stringToNode(exprsString);
+	pfree(exprsString);
+
+	return result;
+}
+
+/*
+ * YbRelationGetUnConstifiedIndexPredicate -- RelationGetIndexPredicate, but
+ * without constant folding  and conversion to implicit-AND form.
+ *
+ * The expression tree is returned exactly as stored in indpred of pg_index.
+ * This form is not cached, since indpred holds the folded one.
+ */
+Node *
+YbRelationGetUnConstifiedIndexPredicate(Relation relation)
+{
+	Node	   *result;
+	Datum		predDatum;
+	bool		isnull;
+	char	   *predString;
+
+	if (relation->rd_indextuple == NULL ||
+		heap_attisnull(relation->rd_indextuple, Anum_pg_index_indpred, NULL))
+		return NULL;
+
+	predDatum = heap_getattr(relation->rd_indextuple,
+							 Anum_pg_index_indpred,
+							 GetPgIndexDescriptor(),
+							 &isnull);
+	Assert(!isnull);
+	predString = TextDatumGetCString(predDatum);
+	result = (Node *) stringToNode(predString);
+	pfree(predString);
+
+	return result;
 }

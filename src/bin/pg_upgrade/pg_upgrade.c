@@ -51,6 +51,11 @@
 #include "fe_utils/string_utils.h"
 #include "pg_upgrade.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+#include "fe_utils/query_utils.h"
+#include <signal.h>
+
 /*
  * Maximum number of pg_restore actions (TOC entries) to process within one
  * transaction.  At some point we might want to make this user-controllable,
@@ -69,6 +74,8 @@ static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void create_logical_replication_slots(void);
 static void create_conflict_detection_slot(void);
+static void yb_execute_extension_updates(void);
+static void yb_kill_process_group_on_sigterm(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
@@ -92,6 +99,10 @@ main(int argc, char **argv)
 	char	   *deletion_script_file_name = NULL;
 	bool		migrate_logical_slots;
 
+	/* YB: This should be done as the first thing after process start. */
+	YBSetParentDeathSignal();
+	yb_kill_process_group_on_sigterm();
+
 	/*
 	 * pg_upgrade doesn't currently use common/logging.c, but initialize it
 	 * anyway because we might call common code that does.
@@ -104,45 +115,117 @@ main(int argc, char **argv)
 
 	parseCommandLine(argc, argv);
 
+	/*
+	 * YB: If a working directory was specified, change to it before doing any
+	 * file operations.
+	 */
+	if (user_opts.yb_working_dir != NULL)
+	{
+		if (chdir(user_opts.yb_working_dir) != 0)
+			pg_fatal("could not change to working directory \"%s\": %s",
+					 user_opts.yb_working_dir, strerror(errno));
+	}
+
 	get_restricted_token();
 
-	adjust_data_dir(&old_cluster);
-	adjust_data_dir(&new_cluster);
+	if (!is_yugabyte_enabled() || user_opts.check)
+		adjust_data_dir(&old_cluster);
 
-	/*
-	 * Set mask based on PGDATA permissions, needed for the creation of the
-	 * output directories with correct permissions.
-	 */
-	if (!GetDataDirectoryCreatePerm(new_cluster.pgdata))
-		pg_fatal("could not read permissions of directory \"%s\": %m",
-				 new_cluster.pgdata);
+	if (!(is_yugabyte_enabled() && user_opts.check))
+	{
+		adjust_data_dir(&new_cluster);
 
-	umask(pg_mode_mask);
+		/*
+		 * Set mask based on PGDATA permissions, needed for the creation of the
+		 * output directories with correct permissions.
+		 */
+		if (!GetDataDirectoryCreatePerm(new_cluster.pgdata))
+			pg_fatal("could not read permissions of directory \"%s\": %m",
+					 new_cluster.pgdata);
 
-	/*
-	 * This needs to happen after adjusting the data directory of the new
-	 * cluster in adjust_data_dir().
-	 */
-	make_outputdirs(new_cluster.pgdata);
+		umask(pg_mode_mask);
+
+		/*
+		 * YB: External monitoring agents run as a different user than the
+		 * yugabyte DB user and must be able to read the *.log files under
+		 * pg_upgrade_output.d/<timestamp>/log. Relax the process umask so
+		 * files created are group/world readable.
+		 */
+		if (is_yugabyte_enabled())
+			umask(pg_mode_mask & ~S_IRGRP & ~S_IXGRP & ~S_IROTH & ~S_IXOTH);
+
+		/*
+		 * This needs to happen after adjusting the data directory of the new
+		 * cluster in adjust_data_dir().
+		 */
+		make_outputdirs(new_cluster.pgdata);
+	}
+	else
+	{
+		/*
+		 * Set mask based on PGDATA permissions, needed for the creation of the
+		 * output directories with correct permissions.
+		 */
+		if (!GetDataDirectoryCreatePerm(old_cluster.pgdata))
+			pg_fatal("could not read permissions of directory \"%s\": %m",
+					 old_cluster.pgdata);
+
+		umask(pg_mode_mask);
+
+		/* YB: see matching comment above. */
+		if (is_yugabyte_enabled())
+			umask(pg_mode_mask & ~S_IRGRP & ~S_IXGRP & ~S_IROTH & ~S_IXOTH);
+
+		/* YB: Make sure we have a place for log files. */
+		make_outputdirs(old_cluster.pgdata);
+	}
 
 	setup(argv[0]);
 
 	output_check_banner();
 
-	check_cluster_versions();
+	/* YB: ahead of every check, so the output is not parsed as a check result */
+	yb_generate_schema_dump();
 
-	get_sock_dir(&old_cluster);
-	get_sock_dir(&new_cluster);
+	/*
+	 * YB: Socket directories are explicitly set from input arguments.
+	 */
+	if (is_yugabyte_enabled())
+	{
+		/* YB: The actual upgrade has no old data dir to read PG_VERSION from. */
+		if (!user_opts.check)
+			yb_get_old_cluster_version();
+		yb_check_cluster_versions();
+	}
+	else
+	{
+		check_cluster_versions();
+		get_sock_dir(&old_cluster);
+		get_sock_dir(&new_cluster);
+	}
 
-	check_cluster_compatibility();
+	/*
+	 * YB: This checks for global state information initialized during initdb
+	 * and is not relevant for YB. The storage doesn't change between versions,
+	 * and YB controls the creation of the new cluster, so we don't need to be
+	 * as meticulous about checking the state.
+	 */
+	if (!is_yugabyte_enabled())
+		check_cluster_compatibility();
 
 	check_and_dump_old_cluster();
 
 
 	/* -- NEW -- */
-	start_postmaster(&new_cluster, true);
+	if (!is_yugabyte_enabled())
+		start_postmaster(&new_cluster, true);
 
-	check_new_cluster();
+	/*
+	 * YB: If this is run as a preflight check, the new cluster is not yet started.
+	 */
+	if (!is_yugabyte_enabled())
+		check_new_cluster();
+
 	report_clusters_compatible();
 
 	pg_log(PG_REPORT,
@@ -152,27 +235,30 @@ main(int argc, char **argv)
 
 	set_locale_and_encoding();
 
-	prepare_new_cluster();
+	if (!is_yugabyte_enabled())
+	{
+		prepare_new_cluster();
 
-	stop_postmaster(false);
+		stop_postmaster(false);
+	}
 
 	/*
 	 * Destructive Changes to New Cluster
+	 * YB: We don't need to start / stop the postmaster, or copy around commit
+	 * logs, as those are handled by the YB master.
 	 */
+	if (!is_yugabyte_enabled())
+		copy_xact_xlog_xid();
 
-	copy_xact_xlog_xid();
 	set_new_cluster_char_signedness();
 
-	/* New now using xids of the old system */
-
 	/* -- NEW -- */
-	start_postmaster(&new_cluster, true);
+	if (!is_yugabyte_enabled())
+		start_postmaster(&new_cluster, true);
 
 	prepare_new_globals();
 
 	create_new_objects();
-
-	stop_postmaster(false);
 
 	/*
 	 * Most failures happen in create_new_objects(), which has completed at
@@ -180,64 +266,72 @@ main(int argc, char **argv)
 	 * which for --link will make it unsafe to start the old cluster once the
 	 * new cluster is started, and for --swap will make it unsafe to start the
 	 * old cluster at all.
+	 *
+	 * YB: The YB major version upgrade flow does not require disabling the old
+	 * cluster, as the upgrade is online and in place. We don't need to delete
+	 * the old cluster data files, because the relevant data lives on DocDB.
 	 */
-	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
-		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
+	if (!is_yugabyte_enabled() &&
+		(user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+		 user_opts.transfer_mode == TRANSFER_MODE_SWAP))
 		disable_old_cluster(user_opts.transfer_mode);
 
-	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
-								 old_cluster.pgdata, new_cluster.pgdata);
-
-	/*
-	 * Assuming OIDs are only used in system tables, there is no need to
-	 * restore the OID counter because we have not transferred any OIDs from
-	 * the old system, but we do it anyway just in case.  We do it late here
-	 * because there is no need to have the schema load use new oids.
-	 */
-	prep_status("Setting next OID for new cluster");
-	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/pg_resetwal\" -o %u \"%s\"",
-			  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
-			  new_cluster.pgdata);
-	check_ok();
-
-	migrate_logical_slots = count_old_cluster_logical_slots();
-
-	/*
-	 * Migrate replication slots to the new cluster.
-	 *
-	 * Note that we must migrate logical slots after resetting WAL because
-	 * otherwise the required WAL would be removed and slots would become
-	 * unusable.  There is a possibility that background processes might
-	 * generate some WAL before we could create the slots in the new cluster
-	 * but we can ignore that WAL as that won't be required downstream.
-	 *
-	 * The conflict detection slot is not affected by concerns related to WALs
-	 * as it only retains the dead tuples. It is created here for consistency.
-	 * Note that the new conflict detection slot uses the latest transaction
-	 * ID as xmin, so it cannot protect dead tuples that existed before the
-	 * upgrade. Additionally, commit timestamps and origin data are not
-	 * preserved during the upgrade. So, even after creating the slot, the
-	 * upgraded subscriber may be unable to detect conflicts or log relevant
-	 * commit timestamps and origins when applying changes from the publisher
-	 * occurred before the upgrade especially if those changes were not
-	 * replicated. It can only protect tuples that might be deleted after the
-	 * new cluster starts.
-	 */
-	if (migrate_logical_slots || old_cluster.sub_retain_dead_tuples)
+	if (!is_yugabyte_enabled())
 	{
-		start_postmaster(&new_cluster, true);
+		transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
+									 old_cluster.pgdata, new_cluster.pgdata);
 
-		if (migrate_logical_slots)
-			create_logical_replication_slots();
+		/*
+		 * Assuming OIDs are only used in system tables, there is no need to
+		 * restore the OID counter because we have not transferred any OIDs from
+		 * the old system, but we do it anyway just in case.  We do it late here
+		 * because there is no need to have the schema load use new oids.
+		 */
+		prep_status("Setting next OID for new cluster");
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" -o %u \"%s\"",
+				  new_cluster.bindir, old_cluster.controldata.chkpnt_nxtoid,
+				  new_cluster.pgdata);
+		check_ok();
 
-		if (old_cluster.sub_retain_dead_tuples)
-			create_conflict_detection_slot();
+		migrate_logical_slots = count_old_cluster_logical_slots();
 
-		stop_postmaster(false);
+		/*
+		 * Migrate replication slots to the new cluster.
+		 *
+		 * Note that we must migrate logical slots after resetting WAL because
+		 * otherwise the required WAL would be removed and slots would become
+		 * unusable.  There is a possibility that background processes might
+		 * generate some WAL before we could create the slots in the new cluster
+		 * but we can ignore that WAL as that won't be required downstream.
+		 *
+		 * The conflict detection slot is not affected by concerns related to WALs
+		 * as it only retains the dead tuples. It is created here for consistency.
+		 * Note that the new conflict detection slot uses the latest transaction
+		 * ID as xmin, so it cannot protect dead tuples that existed before the
+		 * upgrade. Additionally, commit timestamps and origin data are not
+		 * preserved during the upgrade. So, even after creating the slot, the
+		 * upgraded subscriber may be unable to detect conflicts or log relevant
+		 * commit timestamps and origins when applying changes from the publisher
+		 * occurred before the upgrade especially if those changes were not
+		 * replicated. It can only protect tuples that might be deleted after the
+		 * new cluster starts.
+		 */
+		if (migrate_logical_slots || old_cluster.sub_retain_dead_tuples)
+		{
+			start_postmaster(&new_cluster, true);
+
+			if (migrate_logical_slots)
+				create_logical_replication_slots();
+
+			if (old_cluster.sub_retain_dead_tuples)
+				create_conflict_detection_slot();
+
+			stop_postmaster(false);
+		}
 	}
 
-	if (user_opts.do_sync)
+	if (!is_yugabyte_enabled() && user_opts.do_sync)
 	{
 		prep_status("Sync data directory to disk");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
@@ -250,18 +344,26 @@ main(int argc, char **argv)
 		check_ok();
 	}
 
-	create_script_for_old_cluster_deletion(&deletion_script_file_name);
+	if (!is_yugabyte_enabled())
+	{
+		create_script_for_old_cluster_deletion(&deletion_script_file_name);
 
-	issue_warnings_and_set_wal_level();
+		issue_warnings_and_set_wal_level();
+	}
+
+	yb_execute_extension_updates();
 
 	pg_log(PG_REPORT,
 		   "\n"
 		   "Upgrade Complete\n"
 		   "----------------");
 
-	output_completion_banner(deletion_script_file_name);
+	if (!is_yugabyte_enabled())
+	{
+		output_completion_banner(deletion_script_file_name);
 
-	pg_free(deletion_script_file_name);
+		pg_free(deletion_script_file_name);
+	}
 
 	cleanup_output_dirs();
 
@@ -330,6 +432,33 @@ make_outputdirs(char *pgdata)
 	if (mkdir(log_opts.logdir, pg_dir_create_mode) < 0)
 		pg_fatal("could not create directory \"%s\": %m", log_opts.logdir);
 
+	/*
+	 * YB: External monitoring agents need to reach the *.log files under
+	 * pg_upgrade_output.d/<timestamp>/log to collect pg_upgrade logs.
+	 * Loosen the traversal path from the default 0700 to 0755:
+	 *   - pgdata (pg_upgrade_data_15) -- created by initdb as 0700.
+	 *   - rootdir (pg_upgrade_output.d) and basedir (the timestamp dir).
+	 *   - logdir itself so its *.log files can be listed and read.
+	 */
+	if (is_yugabyte_enabled())
+	{
+		mode_t		yb_dir_mode =
+			S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH;
+
+		if (chmod(pgdata, yb_dir_mode) != 0)
+			pg_fatal("could not set permissions on directory \"%s\": %m",
+					 pgdata);
+		if (chmod(log_opts.rootdir, yb_dir_mode) != 0)
+			pg_fatal("could not set permissions on directory \"%s\": %m",
+					 log_opts.rootdir);
+		if (chmod(log_opts.basedir, yb_dir_mode) != 0)
+			pg_fatal("could not set permissions on directory \"%s\": %m",
+					 log_opts.basedir);
+		if (chmod(log_opts.logdir, yb_dir_mode) != 0)
+			pg_fatal("could not set permissions on directory \"%s\": %m",
+					 log_opts.logdir);
+	}
+
 	len = snprintf(filename_path, sizeof(filename_path), "%s/%s",
 				   log_opts.logdir, INTERNAL_LOG_FILE);
 	if (len >= sizeof(filename_path))
@@ -365,7 +494,12 @@ setup(char *argv0)
 	 * make sure the user has a clean environment, otherwise, we may confuse
 	 * libpq when we connect to one (or both) of the servers.
 	 */
-	check_pghost_envvar();
+	if (!is_yugabyte_enabled())
+		/*
+		 * YB: New cluster creation is controlled by Yugabyte, but the IP
+		 * addresses don't match the expected values of this check.
+		 */
+		check_pghost_envvar();
 
 	/*
 	 * In case the user hasn't specified the directory for the new binaries
@@ -386,8 +520,11 @@ setup(char *argv0)
 
 	verify_directories();
 
+	if (is_yugabyte_enabled() && user_opts.check)
+		user_opts.live_check = true;
+
 	/* no postmasters should be running, except for a live check */
-	if (pid_lock_file_exists(old_cluster.pgdata))
+	if (!is_yugabyte_enabled() && pid_lock_file_exists(old_cluster.pgdata))
 	{
 		/*
 		 * If we have a postmaster.pid file, try to start the server.  If it
@@ -411,7 +548,7 @@ setup(char *argv0)
 	}
 
 	/* same goes for the new postmaster */
-	if (pid_lock_file_exists(new_cluster.pgdata))
+	if (!is_yugabyte_enabled() && pid_lock_file_exists(new_cluster.pgdata))
 	{
 		if (start_postmaster(&new_cluster, false))
 			stop_postmaster(false);
@@ -584,7 +721,7 @@ prepare_new_globals(void)
 	prep_status("Restoring global objects in the new cluster");
 
 	exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-			  "\"%s/psql\" " EXEC_PSQL_ARGS " %s -f \"%s/%s\"",
+			  "\"%s/ysqlsh\" " EXEC_PSQL_ARGS " %s -f \"%s/%s\"",
 			  new_cluster.bindir, cluster_conn_opts(&new_cluster),
 			  log_opts.dumpdir,
 			  GLOBALS_DUMP_FILE);
@@ -643,12 +780,14 @@ create_new_objects(void)
 				  true,
 				  true,
 				  "\"%s/pg_restore\" %s %s --exit-on-error --verbose "
-				  "--transaction-size=%d "
-				  "--dbname postgres \"%s/%s\"",
+				  "%s "
+				  "--dbname yugabyte \"%s/%s\"",
 				  new_cluster.bindir,
 				  cluster_conn_opts(&new_cluster),
 				  create_opts,
-				  RESTORE_TRANSACTION_SIZE,
+				  /* YB: transactional DDL is off until finalize, so no batching */
+				  is_yugabyte_enabled() ? "" :
+				  psprintf("--transaction-size=%d", RESTORE_TRANSACTION_SIZE),
 				  log_opts.dumpdir,
 				  sql_file_name);
 
@@ -672,11 +811,11 @@ create_new_objects(void)
 		snprintf(log_file_name, sizeof(log_file_name), DB_DUMP_LOG_FILE_MASK, old_db->db_oid);
 
 		/*
-		 * postgres database will already exist in the target installation, so
+		 * yugabyte database will already exist in the target installation, so
 		 * tell pg_restore to drop and recreate it; otherwise we would fail to
 		 * propagate its database-level properties.
 		 */
-		if (strcmp(old_db->db_name, "postgres") == 0)
+		if (strcmp(old_db->db_name, "yugabyte") == 0)
 			create_opts = "--clean --create";
 		else
 			create_opts = "--create";
@@ -697,12 +836,13 @@ create_new_objects(void)
 		parallel_exec_prog(log_file_name,
 						   NULL,
 						   "\"%s/pg_restore\" %s %s --exit-on-error --verbose "
-						   "--transaction-size=%d "
+						   "%s "
 						   "--dbname template1 \"%s/%s\"",
 						   new_cluster.bindir,
 						   cluster_conn_opts(&new_cluster),
 						   create_opts,
-						   txn_size,
+						   is_yugabyte_enabled() ? "" :
+						   psprintf("--transaction-size=%d", txn_size),
 						   log_opts.dumpdir,
 						   sql_file_name);
 	}
@@ -1098,4 +1238,81 @@ create_conflict_detection_slot(void)
 	PQfinish(conn_new_template1);
 
 	check_ok();
+}
+
+void
+yb_execute_extension_updates()
+{
+	int			dbnum;
+
+	prep_status("Executing extension updates");
+
+	for (dbnum = 0; dbnum < new_cluster.dbarr.ndbs; dbnum++)
+	{
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_name;
+		DbInfo	   *active_db = &new_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&new_cluster, active_db->db_name);
+
+		/* find extensions needing updates */
+		res = executeQueryOrDie(conn,
+								"SELECT name "
+								"FROM pg_available_extensions "
+								"WHERE installed_version != default_version");
+
+		ntups = PQntuples(res);
+		i_name = PQfnumber(res, "name");
+
+		if (ntups > 0)
+			executeCommand(conn, "SET yb_extension_upgrade = true", false /* echo */ );
+
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			const char *extension_name = PQgetvalue(res, rowno, i_name);
+			char		query[256];
+
+			PGresult   *res;
+
+			snprintf(query, sizeof(query), "ALTER EXTENSION %s UPDATE;",
+					 quote_identifier(extension_name));
+
+			res = PQexec(conn, query);
+			if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+			{
+				pg_log(PG_REPORT, "fatal");
+				pg_fatal("Unable to update extension %s", extension_name);
+			}
+		}
+
+		PQclear(res);
+
+		PQfinish(conn);
+	}
+	check_ok();
+}
+
+/* Pass SIGTERM to the whole process group, then die by it. */
+static void
+yb_signal_process_group(SIGNAL_ARGS)
+{
+	pqsignal(SIGTERM, SIG_DFL);
+	kill(0, SIGTERM);
+}
+
+/* With YB_PG_PDEATHSIG set, lead own process group; SIGTERM kills it all. */
+static void
+yb_kill_process_group_on_sigterm(void)
+{
+	if (!getenv("YB_PG_PDEATHSIG"))
+		return;
+
+	if (setpgid(0, 0) != 0)
+	{
+		fprintf(stderr, "Error: could not create a process group: %s\n",
+				strerror(errno));
+		return;
+	}
+	pqsignal(SIGTERM, yb_signal_process_group);
 }

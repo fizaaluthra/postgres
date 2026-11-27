@@ -29,6 +29,8 @@
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
 
 /*
  * query_planner
@@ -227,6 +229,9 @@ restart:
 
 	/* Remove any redundant GROUP BY columns */
 	remove_useless_groupby_columns(root);
+
+	if (yb_test_invalidate_relcache_in_planner)
+		YbInvalidatePlannerRelcache(root);
 
 	/*
 	 * Examine the targetlist and join tree, adding entries to baserel

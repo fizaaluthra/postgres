@@ -22,6 +22,9 @@ SUBDIRS	    = \
 	sequence \
 	table \
 	tablesample \
-	transam
+	transam \
+	yb_lsm \
+	yb_scan \
+	ybgin
 
 include $(top_srcdir)/src/backend/common.mk

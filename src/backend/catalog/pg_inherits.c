@@ -32,6 +32,10 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "utils/catcache.h"
+
 /*
  * Entry of a hash table used in find_all_inheritors. See below.
  */
@@ -143,6 +147,14 @@ find_inheritance_children_extended(Oid parentrelId, bool omit_detached,
 
 			if (omit_detached && ActiveSnapshotSet())
 			{
+				/*
+				 * YB does not maintain per-row xmin, so the XidInMVCCSnapshot
+				 * check is meaningless.  Always treat a pending-detach
+				 * partition as already detached and omit it.
+				 */
+				if (IsYugaByteEnabled())
+					continue;
+
 				TransactionId xmin;
 				Snapshot	snap;
 
@@ -601,7 +613,7 @@ DeleteInheritsTuple(Oid inhrelid, Oid inhparent, bool expect_detach_pending,
 								childname ? childname : "unknown relation"),
 						 errdetail("There's no pending concurrent detach.")));
 
-			CatalogTupleDelete(catalogRelation, &inheritsTuple->t_self);
+			CatalogTupleDelete(catalogRelation, inheritsTuple);
 			found = true;
 		}
 	}

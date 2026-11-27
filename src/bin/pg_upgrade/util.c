@@ -18,6 +18,8 @@ LogOpts		log_opts;
 
 static void pg_log_v(eLogType type, const char *fmt, va_list ap) pg_attribute_printf(2, 0);
 
+bool		yb_current_check_failed = false;
+bool		yb_has_check_fatal = false;
 
 /*
  * report_status()
@@ -131,12 +133,22 @@ prep_status(const char *fmt, ...)
 	va_list		args;
 	char		message[MAX_STRING];
 
+	yb_current_check_failed = false;
+
 	va_start(args, fmt);
 	vsnprintf(message, sizeof(message), fmt, args);
 	va_end(args);
 
 	/* trim strings */
-	pg_log(PG_REPORT_NONL, "%-*s", MESSAGE_WIDTH, message);
+
+	/*
+	 * YB: keep at least two spaces between the message and the status that
+	 * report_status() appends, even when the message is too long to fit in
+	 * MESSAGE_WIDTH.  Without this a long message runs into its own status and
+	 * the line can no longer be split back into a check name and a result.
+	 */
+	pg_log(PG_REPORT_NONL, "%-*s%s", MESSAGE_WIDTH, message,
+		   (int) strlen(message) + 2 > MESSAGE_WIDTH ? "  " : "");
 }
 
 /*
@@ -353,6 +365,7 @@ str2uint(const char *str)
 {
 	return strtoul(str, NULL, 10);
 }
+<<<<<<< HEAD
 
 /*
  *	str2uint64()
@@ -364,3 +377,66 @@ str2uint64(const char *str)
 {
 	return strtou64(str, NULL, 10);
 }
+||||||| 90630ec4293
+=======
+
+bool
+is_yugabyte_enabled()
+{
+	return true;
+}
+
+/*
+ * The YB helpers below take fprintf-style formats, but pg_log_v() does not
+ * accept a format that ends in a newline, so drop one before logging.
+ */
+static void
+yb_log_v(eLogType type, const char *fmt, va_list ap)
+{
+	char		message[QUERY_ALLOC];
+	size_t		len;
+
+	vsnprintf(message, sizeof(message), fmt, ap);
+	len = strlen(message);
+	if (len > 0 && message[len - 1] == '\n')
+		message[len - 1] = '\0';
+	pg_log(type, "%s", message);
+}
+
+int
+yb_fprintf_and_log(FILE *stream, const char *fmt,...)
+{
+	int			len;
+	va_list		args;
+
+	if (!yb_current_check_failed)
+	{
+		pg_log(PG_REPORT, "%s", "fatal\n");
+		yb_current_check_failed = true;
+	}
+
+	va_start(args, fmt);
+	yb_log_v(PG_REPORT, fmt, args);
+	va_end(args);
+
+	va_start(args, fmt);
+	len = pg_vfprintf(stream, fmt, args);
+	va_end(args);
+
+	return len;
+}
+
+void
+yb_fatal(const char *fmt,...)
+{
+	va_list		args;
+
+	pg_log(PG_REPORT, "%s", "");
+
+	va_start(args, fmt);
+	yb_log_v(user_opts.check ? PG_REPORT : PG_FATAL, fmt, args);
+	va_end(args);
+
+	yb_has_check_fatal = true;
+}
+>>>>>>> yb-pg19-squash-ed28db9cdd6

@@ -65,6 +65,10 @@
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "commands/extension.h"
+#include "pg_yb_utils.h"
+
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
 ExecutorStart_hook_type ExecutorStart_hook = NULL;
@@ -74,6 +78,12 @@ ExecutorEnd_hook_type ExecutorEnd_hook = NULL;
 
 /* Hook for plugin to get control in ExecCheckPermissions() */
 ExecutorCheckPerms_hook_type ExecutorCheckPerms_hook = NULL;
+
+/*
+ * YB: Flag to indicate if the session stats should be refreshed
+ * before the execution of the query
+ */
+bool		yb_refresh_stats_before_exec = true;
 
 /* decls for local routines only used within this module */
 static void InitPlan(QueryDesc *queryDesc, int eflags);
@@ -95,8 +105,16 @@ static void ReportNotNullViolationError(ResultRelInfo *resultRelInfo,
 										TupleTableSlot *slot,
 										EState *estate, int attnum);
 
+/* YB declarations */
+static void ybOscRejectNestedTableAccess(PlannedStmt *plannedstmt);
+
 /* end of local decls */
 
+static bool
+YbIsReadAheadAllowed()
+{
+	return XactIsoLevel != XACT_SERIALIZABLE;
+}
 
 /* ----------------------------------------------------------------
  *		ExecutorStart
@@ -145,12 +163,18 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	EState	   *estate;
 	MemoryContext oldcontext;
 
+	if (yb_test_sleep_before_executor_start_ms > 0)
+		pg_usleep(yb_test_sleep_before_executor_start_ms * 1000);
+
 	/* sanity checks: queryDesc must not be started already */
 	Assert(queryDesc != NULL);
 	Assert(queryDesc->estate == NULL);
 
 	/* caller must ensure the query's snapshot is active */
 	Assert(GetActiveSnapshot() == queryDesc->snapshot);
+
+	if (yb_enable_pg_stat_statements_docdb_metrics)
+		YbSetMetricsCaptureTypeIfUnset(YB_YQL_METRICS_CAPTURE_PGSS_METRICS);
 
 	/*
 	 * If the transaction is read-only, we need to check if any writes are
@@ -166,8 +190,10 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * We have lower-level defenses in CommandCounterIncrement and elsewhere
 	 * against performing unsafe operations in parallel mode, but this gives a
 	 * more user-friendly error message.
+	 *
+	 * YB: We also notify pggate whether the statement is read only.
 	 */
-	if ((XactReadOnly || IsInParallelMode()) &&
+	if ((IsYugaByteEnabled() || XactReadOnly || IsInParallelMode()) &&
 		!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		ExecCheckXactReadOnly(queryDesc->plannedstmt);
 
@@ -176,6 +202,35 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 */
 	estate = CreateExecutorState();
 	queryDesc->estate = estate;
+
+	/* YB: An online schema change backfill chunk reads at its fixed backfill time. */
+	if (yb_backfill_timestamp != 0)
+	{
+		estate->yb_exec_params.backfill_read_time = yb_backfill_timestamp;
+	}
+
+	/*
+	 * YB: The online schema change backfill's tablet scope, resume point and
+	 * out_param belong only to the chunk's own INSERT ... SELECT, which is the
+	 * first executor started while they are set.  An executor nested under it
+	 * must not get them, or it would be limited to the source tablet and would
+	 * overwrite the chunk's resume key.
+	 */
+	if (yb_osc_backfill_partition_key != NULL)
+	{
+		if (yb_osc_backfill_outer_started)
+			ybOscRejectNestedTableAccess(queryDesc->plannedstmt);
+		else
+		{
+			yb_osc_backfill_outer_started = true;
+
+			estate->yb_exec_params.partition_key = yb_osc_backfill_partition_key;
+			if (yb_osc_backfill_bfinstr != NULL)
+				estate->yb_exec_params.bfinstr = yb_osc_backfill_bfinstr;
+			if (yb_osc_backfill_out_param != NULL)
+				estate->yb_exec_params.out_param = yb_osc_backfill_out_param;
+		}
+	}
 
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
@@ -308,6 +363,18 @@ void
 ExecutorRun(QueryDesc *queryDesc,
 			ScanDirection direction, uint64 count)
 {
+	/*
+	 * YB: Refresh session stats only once per query.
+	 * Securing YbRefreshSessionStatsBeforeExecution() behind yb_refresh_stats_before_exec
+	 * to avoid redundant refreshes for queries with multiple ExecutorRun calls
+	 * in case of triggers, foreign key checks, etc.
+	 */
+	if (yb_refresh_stats_before_exec)
+	{
+		YbRefreshSessionStatsBeforeExecution();
+		yb_refresh_stats_before_exec = false;
+	}
+
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count);
 	else
@@ -334,6 +401,11 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 
 	/* caller must ensure the query's snapshot is active */
 	Assert(GetActiveSnapshot() == estate->es_snapshot);
+
+	YBOnExecutorOperationBegin();
+
+	if (IsYugaByteEnabled())
+		YBBeginOperationsBuffering();
 
 	/*
 	 * Switch into per-query memory context
@@ -397,6 +469,8 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 		InstrStop(queryDesc->query_instr);
 
 	MemoryContextSwitchTo(oldcontext);
+
+	YBOnExecutorOperationEnd(queryDesc);
 }
 
 /* ----------------------------------------------------------------
@@ -439,6 +513,8 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	/* This should be run once and only once per Executor instance */
 	Assert(!estate->es_finished);
 
+	YBOnExecutorOperationBegin();
+
 	/* Switch into per-query memory context */
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
@@ -453,12 +529,20 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	if (!(estate->es_top_eflags & EXEC_FLAG_SKIP_TRIGGERS))
 		AfterTriggerEndQuery(estate);
 
+	/*
+	 * YB: Flush buffered operations straight before elapsed time calculation.
+	 */
+	if (IsYugaByteEnabled())
+		YBEndOperationsBuffering();
+
 	if (queryDesc->query_instr)
 		InstrStop(queryDesc->query_instr);
 
 	MemoryContextSwitchTo(oldcontext);
 
 	estate->es_finished = true;
+
+	YBOnExecutorOperationEnd(queryDesc);
 }
 
 /* ----------------------------------------------------------------
@@ -534,6 +618,9 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	queryDesc->estate = NULL;
 	queryDesc->planstate = NULL;
 	queryDesc->query_instr = NULL;
+	queryDesc->yb_query_stats = NULL;
+	if (yb_enable_pg_stat_statements_docdb_metrics)
+		YbSetMetricsCaptureType(YB_YQL_METRICS_CAPTURE_NONE);
 }
 
 /* ----------------------------------------------------------------
@@ -718,7 +805,10 @@ ExecCheckOneRelPerms(RTEPermissionInfo *perminfo)
 			while ((col = bms_next_member(perminfo->selectedCols, col)) >= 0)
 			{
 				/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
-				AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+				/*
+				 * YB: use YBGetFirstLowInvalidAttributeNumberFromOid instead
+				 */
+				AttrNumber	attno = col + YBGetFirstLowInvalidAttributeNumberFromOid(relOid);
 
 				if (attno == InvalidAttrNumber)
 				{
@@ -783,7 +873,8 @@ ExecCheckPermissionsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
 	while ((col = bms_next_member(modifiedCols, col)) >= 0)
 	{
 		/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
-		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+		/* YB: use YBGetFirstLowInvalidAttributeNumberFromOid instead */
+		AttrNumber	attno = col + YBGetFirstLowInvalidAttributeNumberFromOid(relOid);
 
 		if (attno == InvalidAttrNumber)
 		{
@@ -801,6 +892,40 @@ ExecCheckPermissionsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
 }
 
 /*
+ * YB: Reject a statement nested under an online schema change backfill chunk
+ * if it accesses a user table.
+ *
+ * Such a statement comes from a function called by the transform or from an
+ * RI trigger on the target.  It still runs with yb_backfill_timestamp set, so
+ * it would read at the fixed backfill time and write non-transactionally.
+ * Catalog and temp relations are allowed so that ordinary function bodies
+ * keep working.
+ */
+static void
+ybOscRejectNestedTableAccess(PlannedStmt *plannedstmt)
+{
+	ListCell   *l;
+
+	foreach(l, plannedstmt->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(l);
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+		if (IsCatalogRelationOid(rte->relid) ||
+			isTempNamespace(get_rel_namespace(rte->relid)))
+			continue;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("statement nested in an online schema change copy may not access table \"%s\"",
+						get_rel_name(rte->relid)),
+				 errdetail("The transform function may not read from or write to tables, "
+						   "and the target table may not have constraints that query other tables.")));
+	}
+}
+
+/*
  * Check that the query does not imply any writes to non-temp tables;
  * unless we're in parallel mode, in which case don't even allow writes
  * to temp tables.
@@ -808,11 +933,14 @@ ExecCheckPermissionsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
  * Note: in a Hot Standby this would need to reject writes to temp
  * tables just as we do in parallel mode; but an HS standby can't have created
  * any temp tables in the first place, so no need to check that.
+ *
+ * YB: We also notify pggate whether the statement is read only.
  */
 static void
 ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 {
 	ListCell   *l;
+	bool		yb_is_read_only = true;
 
 	/*
 	 * Fail if write permissions are requested in parallel mode for table
@@ -829,10 +957,21 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 			continue;
 
 		PreventCommandIfReadOnly(CreateCommandName((Node *) plannedstmt));
+		yb_is_read_only = false;
 	}
 
 	if (plannedstmt->commandType != CMD_SELECT || plannedstmt->hasModifyingCTE)
+	{
 		PreventCommandIfParallelMode(CreateCommandName((Node *) plannedstmt));
+		yb_is_read_only = false;
+	}
+
+	if (IsYugaByteEnabled())
+	{
+		if (plannedstmt->rowMarks)
+			yb_is_read_only = false;
+		HandleYBStatus(YBCPgSetReadOnlyStmt(yb_is_read_only));
+	}
 }
 
 
@@ -859,7 +998,10 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	/*
 	 * Do permissions checks
 	 */
-	ExecCheckPermissions(rangeTable, plannedstmt->permInfos, true);
+	if (!(IsYbExtensionUser(GetUserId()) && creating_extension))
+	{
+		ExecCheckPermissions(rangeTable, plannedstmt->permInfos, true);
+	}
 
 	/*
 	 * initialize the node's execution state
@@ -993,6 +1135,9 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
 		i++;
 	}
+
+	queryDesc->yb_query_stats = InstrAllocNode(queryDesc->instrument_options,
+											   false /* async_mode */ );
 
 	/*
 	 * Initialize the private state information for all the nodes in the query
@@ -1696,6 +1841,7 @@ ExecutePlan(QueryDesc *queryDesc,
 	bool		use_parallel_mode;
 	TupleTableSlot *slot;
 	uint64		current_tuple_count;
+	bool		yb_read_ahead_allowed = false;
 
 	/*
 	 * initialize local variables
@@ -1717,12 +1863,30 @@ ExecutePlan(QueryDesc *queryDesc,
 	if (queryDesc->already_executed || numberTuples != 0)
 		use_parallel_mode = false;
 	else
+	{ /* YB: Account for read-ahead logic */
 		use_parallel_mode = queryDesc->plannedstmt->parallelModeNeeded;
+		yb_read_ahead_allowed = IsYugaByteEnabled() && YbIsReadAheadAllowed();
+	}
+
+	/*
+	 * YB: Block parallel mode if a DDL was executed in the transaction block.
+	 * This is required until we stop forcing legacy catalog mode for parallel
+	 * workers (see YBCIsLegacyModeForCatalogOps). In legacy mode,
+	 * workers can't see uncommitted catalog writes done by previous DDLs
+	 * in the same transaction block: for example, they would run the old body of
+	 * a function that the block replaced.
+	 * TODO(#36825): drop this.
+	 */
+	if (use_parallel_mode && YBGetDdlUseRegularTransactionBlock())
+		use_parallel_mode = false;
+
 	queryDesc->already_executed = true;
 
 	estate->es_use_parallel_mode = use_parallel_mode;
 	if (use_parallel_mode)
 		EnterParallelMode();
+
+	estate->yb_read_ahead_allowed = yb_read_ahead_allowed;
 
 	/*
 	 * Loop until we've processed the proper number of tuples from the plan.
@@ -2009,7 +2173,8 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
  */
 void
 ExecConstraints(ResultRelInfo *resultRelInfo,
-				TupleTableSlot *slot, EState *estate)
+				TupleTableSlot *slot, EState *estate,
+				ModifyTableState *mtstate)
 {
 	Relation	rel = resultRelInfo->ri_RelationDesc;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
@@ -2027,15 +2192,49 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 	 */
 	if (constr->has_not_null)
 	{
+		/*
+		 * YB: When the plan does not fetch the target tuple (e.g. the
+		 * single-row UPDATE path), unmodified columns are absent from the
+		 * slot, so the NOT NULL check below must skip them.  Skip only for
+		 * UPDATE and DELETE: an INSERT has no target tuple to fetch, and the
+		 * inserted tuple is always complete.  Any future operation (e.g.
+		 * MERGE) must opt in deliberately.
+		 */
+		bool		yb_skip_unmodified = (mtstate &&
+										  (mtstate->operation == CMD_UPDATE ||
+										   mtstate->operation == CMD_DELETE) &&
+										  mtstate->yb_skip_fetch_target_tuple);
+		Bitmapset  *yb_modifiedCols = NULL;
+
+		if (yb_skip_unmodified)
+			yb_modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo,
+															estate),
+										ExecGetAllUpdatedCols(resultRelInfo,
+															  estate));
+
 		for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
 		{
 			Form_pg_attribute att = TupleDescAttr(tupdesc, attnum - 1);
 
+			if (yb_skip_unmodified &&
+				!bms_is_member(att->attnum -
+							   YBGetFirstLowInvalidAttributeNumber(rel),
+							   yb_modifiedCols))
+			{
+				/*
+				 * Without a target tuple, we only know the values of the
+				 * modified columns. But in this case it is safe to skip the
+				 * unmodified columns anyway.
+				 */
+				continue;
+			}
 			if (att->attnotnull && att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 				notnull_virtual_attrs = lappend_int(notnull_virtual_attrs, attnum);
 			else if (att->attnotnull && slot_attisnull(slot, attnum))
 				ReportNotNullViolationError(resultRelInfo, slot, estate, attnum);
 		}
+
+		bms_free(yb_modifiedCols);
 	}
 
 	/*
@@ -2493,7 +2692,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 			 */
 			aclresult = pg_attribute_aclcheck(reloid, att->attnum,
 											  GetUserId(), ACL_SELECT);
-			if (bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber,
+			if (bms_is_member(att->attnum - YBGetFirstLowInvalidAttributeNumberFromOid(reloid),
 							  modifiedCols) || aclresult == ACLCHECK_OK)
 			{
 				column_perm = any_perm = true;
@@ -2624,7 +2823,14 @@ ExecBuildAuxRowMark(ExecRowMark *erm, List *targetlist)
 	if (erm->markType != ROW_MARK_COPY)
 	{
 		/* need ctid for all methods other than COPY */
-		snprintf(resname, sizeof(resname), "ctid%u", erm->rowmarkId);
+		if (IsYBBackedRelation(erm->relation))
+		{
+			snprintf(resname, sizeof(resname), "ybctid%u", erm->rowmarkId);
+		}
+		else
+		{
+			snprintf(resname, sizeof(resname), "ctid%u", erm->rowmarkId);
+		}
 		aerm->ctidAttNo = ExecFindJunkAttributeInTlist(targetlist,
 													   resname);
 		if (!AttributeNumberIsValid(aerm->ctidAttNo))

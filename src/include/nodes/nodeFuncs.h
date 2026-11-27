@@ -221,4 +221,7 @@ extern bool planstate_tree_walker_impl(PlanState *planstate,
 									   planstate_tree_walker_callback walker,
 									   void *context);
 
+/* YB additions. */
+extern List **YbPlanStateTryGetAggrefs(struct PlanState *planstate);
+
 #endif							/* NODEFUNCS_H */

@@ -192,6 +192,17 @@ static Node *substitute_actual_parameters_in_from_mutator(Node *node,
 														  substitute_actual_parameters_in_from_context *context);
 static bool pull_paramids_walker(Node *node, Bitmapset **context);
 
+/*****************************************************************************
+ *		YB: ScalarArrayOperator clause functions
+ *****************************************************************************/
+
+Node *
+yb_get_saop_left_op(const Expr *clause)
+{
+	const ScalarArrayOpExpr *expr = (const ScalarArrayOpExpr *) clause;
+
+	return linitial(expr->args);
+}
 
 /*****************************************************************************
  *		Aggregate-function clause manipulation
@@ -1420,6 +1431,12 @@ contain_leaked_vars_walker(Node *node, void *context)
 			 */
 			break;
 
+		case T_YbBatchedExpr:
+			{
+				contain_leaked_vars_walker((Node *) ((YbBatchedExpr *) node)->orig_expr,
+										   context);
+				break;
+			}
 		case T_FuncExpr:
 		case T_OpExpr:
 		case T_DistinctExpr:
@@ -1472,7 +1489,7 @@ contain_leaked_vars_walker(Node *node, void *context)
 
 				forthree(opid, rcexpr->opnos,
 						 larg, rcexpr->largs,
-						 rarg, rcexpr->rargs)
+						 rarg, castNode(List, rcexpr->rargs))
 				{
 					Oid			funcid = get_opcode(lfirst_oid(opid));
 

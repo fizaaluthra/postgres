@@ -38,8 +38,12 @@ typedef enum IoMethod
 #endif
 }			IoMethod;
 
-/* We'll default to worker based execution. */
-#define DEFAULT_IO_METHOD IOMETHOD_WORKER
+/*
+ * YB hands off IO to DocDB. Pinning the default to synchronous IO prevents
+ * postmaster from launching IO workers.
+ */
+#define YB_DEFAULT_IO_METHOD IOMETHOD_SYNC
+#define DEFAULT_IO_METHOD YB_DEFAULT_IO_METHOD
 
 
 /*
@@ -365,5 +369,8 @@ extern void pgaio_closing_fd(int fd);
 extern PGDLLIMPORT int io_method;
 extern PGDLLIMPORT int io_max_concurrency;
 
+
+/* YB declarations */
+extern bool YbAioHasBackendState(ProcNumber procno);
 
 #endif							/* AIO_H */

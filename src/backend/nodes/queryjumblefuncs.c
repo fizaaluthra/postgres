@@ -48,6 +48,9 @@
 #include "parser/scanner.h"
 #include "parser/scansup.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 #define JUMBLE_SIZE				1024	/* query serialization buffer size */
 
 /* GUC parameters */
@@ -79,6 +82,9 @@ static void _jumbleVariableSetStmt(JumbleState *jstate, Node *node);
 static void _jumbleRangeTblEntry_eref(JumbleState *jstate,
 									  RangeTblEntry *rte,
 									  Alias *expr);
+
+/* YB functions */
+static int64 yb_compute_backfill_query_id(YbBackfillIndexStmt *stmt);
 
 /*
  * Given a possibly multi-statement source string, confine our attention to the
@@ -143,6 +149,19 @@ JumbleQuery(Query *query)
 	Assert(IsQueryIdEnabled());
 
 	jstate = InitJumble();
+
+	/*
+	 * YB_TODO_PG19MERGE: this was ported from queryjumble.c Upstream PG commits
+	 * 2ecbb0a49359759b46dd82df4ac3a083c36b1db4,
+	 * 3db72ebcbe20debc6552500ee9ccb4b2007f12f8 changed this function.
+	 * Verify this YB code is still sound.
+	 */
+	if (query->utilityStmt && IsA(query->utilityStmt, YbBackfillIndexStmt))
+	{
+		query->queryId =
+			yb_compute_backfill_query_id((YbBackfillIndexStmt *) query->utilityStmt);
+		return jstate;
+	}
 
 	query->queryId = DoJumble(jstate, (Node *) query);
 
@@ -927,4 +946,40 @@ ComputeConstantLengths(const JumbleState *jstate, const char *query,
 	scanner_finish(yyscanner);
 
 	return locs;
+}
+
+/*
+ * YB: Compute a query identifier for BACKFILL commands such that all calls
+ * for the same index are aggregated under a single queryId.
+ */
+static int64
+yb_compute_backfill_query_id(YbBackfillIndexStmt *stmt)
+{
+	unsigned char jumble[JUMBLE_SIZE];
+	Size		jumble_len = 0;
+	ListCell   *lc;
+	NodeTag		tag = T_YbBackfillIndexStmt;
+	int64		queryId;
+
+	memcpy(jumble + jumble_len, &tag, sizeof(tag));
+	jumble_len += sizeof(tag);
+
+	foreach(lc, stmt->oid_list)
+	{
+		Oid			oid = lfirst_oid(lc);
+
+		memcpy(jumble + jumble_len, &oid, sizeof(oid));
+		jumble_len += sizeof(oid);
+	}
+
+	queryId = DatumGetInt64(hash_any_extended(jumble, jumble_len, 0));
+
+	/*
+	 * If we are unlucky enough to get a hash of zero(invalid), use queryID as
+	 * 2 instead, to be consistent with other utility statements.
+	 */
+	if (queryId == INT64CONST(0))
+		queryId = INT64CONST(2);
+
+	return queryId;
 }

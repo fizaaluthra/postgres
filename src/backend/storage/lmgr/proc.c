@@ -57,6 +57,9 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 /* GUC variables */
 int			DeadlockTimeout = 1000;
 int			StatementTimeout = 0;
@@ -69,12 +72,18 @@ bool		log_lock_waits = true;
 /* Pointer to this process's PGPROC struct, if any */
 PGPROC	   *MyProc = NULL;
 
+int			RetryMaxBackoffMsecs;
+int			RetryMinBackoffMsecs;
+double		RetryBackoffMultiplier;
+int			yb_max_query_layer_retries;
+
 /* Pointers to shared-memory structures */
 PROC_HDR   *ProcGlobal = NULL;
 static void *AllProcsShmemPtr;
 static void *FastPathLockArrayShmemPtr;
 NON_EXEC_STATIC PGPROC *AuxiliaryProcs = NULL;
 PGPROC	   *PreparedXactProcs = NULL;
+PGPROC	   *KilledProcToClean = NULL;
 
 static void ProcGlobalShmemRequest(void *arg);
 static void ProcGlobalShmemInit(void *arg);
@@ -96,6 +105,17 @@ static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
 static DeadLockState CheckDeadLock(void);
 
+/* YB declarations */
+static void YbSwitchToSharedProcState(void);
+static void YbSwitchBackToLocalProcState(void);
+
+/*
+ * YB: like MyLatch, YbMyProcState points at process-local storage until
+ * MyProc is set, and must be switched back as soon as MyProc is cleared.
+ */
+static YbProcState YbLocalProcState;
+
+YbProcState *YbMyProcState = &YbLocalProcState;
 
 /*
  * Calculate shared-memory space needed by Fast-Path locks.
@@ -321,6 +341,7 @@ ProcGlobalShmemInit(void *arg)
 			proc->sem = PGSemaphoreCreate();
 			InitSharedLatch(&(proc->procLatch));
 			LWLockInitialize(&(proc->fpInfoLock), LWTRANCHE_LOCK_FASTPATH);
+			LWLockInitialize(&(proc->yb_ash_metadata_lock), LWTRANCHE_YB_ASH_METADATA);
 		}
 
 		/*
@@ -382,6 +403,8 @@ ProcGlobalShmemInit(void *arg)
 	 */
 	AuxiliaryProcs = &procs[MaxBackends];
 	PreparedXactProcs = &procs[FIRST_PREPARED_XACT_PROC_NUMBER];
+
+	ProcGlobal->yb_too_many_conn = 0;
 }
 
 /*
@@ -448,6 +471,10 @@ InitProcess(void)
 		 * in the autovacuum case?
 		 */
 		SpinLockRelease(&ProcGlobal->freeProcsLock);
+
+		/* YB: increment rejection counter */
+		ProcGlobal->yb_too_many_conn++;
+
 		if (AmWalSenderProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
@@ -457,6 +484,7 @@ InitProcess(void)
 				(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 				 errmsg("sorry, too many clients already")));
 	}
+	YbSwitchToSharedProcState();
 	MyProcNumber = GetNumberFromPGProc(MyProc);
 
 	/*
@@ -530,6 +558,21 @@ InitProcess(void)
 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PROC_NUMBER);
 
+	MemSet(MyProc->yb_ash_metadata.root_request_id, 0,
+		   sizeof(MyProc->yb_ash_metadata.root_request_id));
+	/*
+	 * YB: TODO(asaha): Update the query_id for catalog calls in circular
+	 * buffer once it's calculated
+	 */
+	MyProc->yb_ash_metadata.qp =
+		(YbcAshQueryPlanPair){YbAshGetConstQueryId(), YB_ASH_DEFAULT_PLAN_ID};
+	MemSet(MyProc->yb_ash_metadata.client_addr, 0,
+		   sizeof(MyProc->yb_ash_metadata.client_addr));
+	MyProc->yb_ash_metadata.client_port = 0;
+	MyProc->yb_ash_metadata.addr_family = AF_UNSPEC;
+	MyProc->yb_ash_metadata.database_id = 0;
+	MyProc->yb_is_ash_metadata_set = false;
+
 	/*
 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
 	 * on it.  That allows us to repoint the process latch, which so far
@@ -539,7 +582,10 @@ InitProcess(void)
 	SwitchToSharedLatch();
 
 	/* now that we have a proc, report wait events to shared memory */
-	pgstat_set_wait_event_storage(&MyProc->wait_event_info);
+	if (YBIsEnabledInPostgresEnvVar())
+		yb_pgstat_set_wait_event_storage(MyProc);
+	else
+		pgstat_set_wait_event_storage(&MyProc->wait_event_info);
 
 	/*
 	 * We might be reusing a semaphore that belonged to a failed process. So
@@ -665,6 +711,7 @@ InitAuxiliaryProcess(void)
 	SpinLockRelease(&ProcGlobal->freeProcsLock);
 
 	MyProc = auxproc;
+	YbSwitchToSharedProcState();
 	MyProcNumber = GetNumberFromPGProc(MyProc);
 
 	/*
@@ -921,24 +968,36 @@ RemoveProcFromArray(int code, Datum arg)
 /*
  * ProcKill() -- Destroy the per-proc data structure for
  *		this process. Release any of its held LW locks.
+ *
+ * If you are going to edit this, take a look at postmaster.c:reaper as well.
+ * That function handles as much as this as possible but from the perspective
+ * of the parent of the terminated child, to handle cases where the child was
+ * not able to clean itself up.
  */
 static void
 ProcKill(int code, Datum arg)
 {
 	PGPROC	   *proc;
+<<<<<<< HEAD
 	PGPROC	   *leader;
 	dlist_head *procgloballist;
 	bool		push_leader;
 	bool		push_self;
+||||||| 90630ec4293
+	dlist_head *procgloballist;
+=======
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 
 	Assert(MyProc != NULL);
+
+	YbMyProcState->termination_started = true;
 
 	/* not safe if forked by system(), etc. */
 	if (MyProc->pid != (int) getpid())
 		elog(PANIC, "ProcKill() called in child process");
 
 	/* Make sure we're out of the sync rep lists */
-	SyncRepCleanupAtProcExit();
+	SyncRepCleanupAtProcExit(MyProc);
 
 #ifdef USE_ASSERT_CHECKING
 	{
@@ -960,6 +1019,7 @@ ProcKill(int code, Datum arg)
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
 
+<<<<<<< HEAD
 	/*
 	 * Reset MyLatch to the process local one and disown the shared latch, so
 	 * that signal handlers et al can continue using the latch after the
@@ -1033,11 +1093,77 @@ ProcKill(int code, Datum arg)
 		}
 		LWLockRelease(leader_lwlock);
 	}
+||||||| 90630ec4293
+	/*
+	 * Detach from any lock group of which we are a member.  If the leader
+	 * exits before all other group members, its PGPROC will remain allocated
+	 * until the last group process exits; that process must return the
+	 * leader's PGPROC to the appropriate list.
+	 */
+	if (MyProc->lockGroupLeader != NULL)
+	{
+		PGPROC	   *leader = MyProc->lockGroupLeader;
+		LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
 
+		LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
+		Assert(!dlist_is_empty(&leader->lockGroupMembers));
+		dlist_delete(&MyProc->lockGroupLink);
+		if (dlist_is_empty(&leader->lockGroupMembers))
+		{
+			leader->lockGroupLeader = NULL;
+			if (leader != MyProc)
+			{
+				procgloballist = leader->procgloballist;
+
+				/* Leader exited first; return its PGPROC. */
+				SpinLockAcquire(&ProcGlobal->freeProcsLock);
+				dlist_push_head(procgloballist, &leader->freeProcsLink);
+				SpinLockRelease(&ProcGlobal->freeProcsLock);
+			}
+		}
+		else if (leader != MyProc)
+			MyProc->lockGroupLeader = NULL;
+		LWLockRelease(leader_lwlock);
+	}
+=======
+	if (MyProc->lockGroupLeader != NULL)
+		YbRemoveLockGroupLeader(MyProc);
+>>>>>>> yb-pg19-squash-ed28db9cdd6
+
+<<<<<<< HEAD
 	/* See comment above, close to DisownLatch() */
 	pgstat_reset_wait_event_storage();
+||||||| 90630ec4293
+	/*
+	 * Reset MyLatch to the process local one.  This is so that signal
+	 * handlers et al can continue using the latch after the shared latch
+	 * isn't ours anymore.
+	 *
+	 * Similarly, stop reporting wait events to MyProc->wait_event_info.
+	 *
+	 * After that clear MyProc and disown the shared latch.
+	 */
+	SwitchBackToLocalLatch();
+	pgstat_reset_wait_event_storage();
+=======
+	/*
+	 * Reset MyLatch to the process local one.  This is so that signal
+	 * handlers et al can continue using the latch after the shared latch
+	 * isn't ours anymore.
+	 *
+	 * Similarly, stop reporting wait events to MyProc->wait_event_info.
+	 *
+	 * After that clear MyProc and disown the shared latch.
+	 */
+	SwitchBackToLocalLatch();
+	if (YBIsEnabledInPostgresEnvVar())
+		yb_pgstat_reset_wait_event_storage();
+	else
+		pgstat_reset_wait_event_storage();
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 
 	MyProc = NULL;
+	YbSwitchBackToLocalProcState();
 	MyProcNumber = INVALID_PROC_NUMBER;
 
 	/* Mark the proc no longer in use */
@@ -1045,6 +1171,56 @@ ProcKill(int code, Datum arg)
 	proc->vxid.procNumber = INVALID_PROC_NUMBER;
 	proc->vxid.lxid = InvalidTransactionId;
 
+<<<<<<< HEAD
+||||||| 90630ec4293
+	procgloballist = proc->procgloballist;
+=======
+	if (IsYugaByteEnabled())
+		YBOnPostgresBackendShutdown();
+
+	YbReleaseProcToFreeList(proc);
+}
+
+/*
+ * Detach from any lock group of which we are a member.  If the leader
+ * exits before all other group members, its PGPROC will remain allocated
+ * until the last group process exits; that process must return the
+ * leader's PGPROC to the appropriate list.
+ */
+void
+YbRemoveLockGroupLeader(PGPROC *proc)
+{
+	dlist_head *procgloballist;
+	PGPROC	   *leader = proc->lockGroupLeader;
+	LWLock	   *leader_lwlock = LockHashPartitionLockByProc(leader);
+
+	LWLockAcquire(leader_lwlock, LW_EXCLUSIVE);
+	Assert(!dlist_is_empty(&leader->lockGroupMembers));
+	dlist_delete(&proc->lockGroupLink);
+	if (dlist_is_empty(&leader->lockGroupMembers))
+	{
+		leader->lockGroupLeader = NULL;
+		if (leader != proc)
+		{
+			procgloballist = leader->procgloballist;
+
+			/* Leader exited first; return its PGPROC. */
+			SpinLockAcquire(&ProcGlobal->freeProcsLock);
+			dlist_push_head(procgloballist, &leader->freeProcsLink);
+			SpinLockRelease(&ProcGlobal->freeProcsLock);
+		}
+	}
+	else if (leader != proc)
+		proc->lockGroupLeader = NULL;
+	LWLockRelease(leader_lwlock);
+}
+
+void
+YbReleaseProcToFreeList(PGPROC *proc)
+{
+	dlist_head *procgloballist = proc->procgloballist;
+
+>>>>>>> yb-pg19-squash-ed28db9cdd6
 	SpinLockAcquire(&ProcGlobal->freeProcsLock);
 	if (push_leader)
 	{
@@ -1101,6 +1277,7 @@ AuxiliaryProcKill(int code, Datum arg)
 
 	proc = MyProc;
 	MyProc = NULL;
+	YbSwitchBackToLocalProcState();
 	MyProcNumber = INVALID_PROC_NUMBER;
 	DisownLatch(&proc->procLatch);
 
@@ -2140,4 +2317,40 @@ BecomeLockGroupMember(PGPROC *leader, int pid)
 	LWLockRelease(leader_lwlock);
 
 	return ok;
+}
+
+static void
+YbSwitchToSharedProcState(void)
+{
+	Assert(MyProc != NULL);
+	Assert(YbMyProcState == &YbLocalProcState);
+
+	/* Standalone backends have no postmaster to read the state. */
+	if (!IsUnderPostmaster)
+		return;
+
+	/*
+	 * The PROC entry is left dirty by the previous backend that owned it.
+	 * Clear it before using it.
+	 */
+	MemSet(&MyProc->ybProcState, 0, sizeof(YbProcState));
+
+	YbMyProcState = &MyProc->ybProcState;
+}
+
+static void
+YbSwitchBackToLocalProcState(void)
+{
+	Assert(MyProc == NULL);
+
+	YbMyProcState = &YbLocalProcState;
+}
+
+/*
+ * YbIsAuxiliaryProc -- is the given PGPROC an Auxiliary process?
+ */
+bool
+YbIsAuxiliaryProc(PGPROC *proc)
+{
+	return proc >= AuxiliaryProcs && proc < AuxiliaryProcs + NUM_AUXILIARY_PROCS;
 }

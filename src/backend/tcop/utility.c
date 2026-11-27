@@ -67,8 +67,29 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 
+/* YB includes */
+#include "commands/trigger.h"
+#include "commands/yb_cmds.h"
+#include "commands/yb_profile.h"
+#include "commands/yb_tablegroup.h"
+#include "libpq/libpq-be.h"
+#include "pg_yb_utils.h"
+#include "utils/backend_status.h"
+
 /* Hook for plugins to get control in ProcessUtility() */
-ProcessUtility_hook_type ProcessUtility_hook = NULL;
+/*
+ * YB: Setting YBProcessUtilityDefaultHook directly guaranties it will be the
+ * first one. It will be called after all plugins hooks.
+ */
+static void YBProcessUtilityDefaultHook(PlannedStmt *pstmt,
+										const char *queryString,
+										bool readOnlyTree,
+										ProcessUtilityContext context,
+										ParamListInfo params,
+										QueryEnvironment *queryEnv,
+										DestReceiver *dest,
+										QueryCompletion *qc);
+ProcessUtility_hook_type ProcessUtility_hook = &YBProcessUtilityDefaultHook;
 
 /* local function declarations */
 static int	ClassifyUtilityCommandAsReadOnly(Node *parsetree);
@@ -389,6 +410,18 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 				return 0;		/* silence stupider compilers */
 			}
 
+		case T_YbBackfillIndexStmt:
+		case T_YbCreateTableGroupStmt:
+		case T_YbCreateProfileStmt:
+		case T_YbDropProfileStmt:
+			{
+				/*
+				 * YB_TODO(review)(mihnea & sushant) Changed code - DDL is not
+				 * read-only.
+				 */
+				return COMMAND_IS_NOT_READ_ONLY;
+			}
+
 		default:
 			elog(ERROR, "unrecognized node type: %d",
 				 (int) nodeTag(parsetree));
@@ -642,6 +675,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 						break;
 
 					case TRANS_STMT_PREPARE:
+						if (IsYugaByteEnabled())
+						{
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("PREPARE not supported by YugaByte yet")));
+						}
 						if (!PrepareTransactionBlock(stmt->gid))
 						{
 							/* report unsuccessful commit in qc */
@@ -712,6 +751,11 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			ExecuteDoStmt(pstate, (DoStmt *) parsetree, isAtomicContext);
 			break;
 
+		case T_YbCreateTableGroupStmt:
+			PreventInTransactionBlock(isTopLevel, "CREATE TABLEGROUP");
+			CreateTableGroup((YbCreateTableGroupStmt *) parsetree);
+			break;
+
 		case T_CreateTableSpaceStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "CREATE TABLESPACE");
@@ -730,7 +774,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_TruncateStmt:
-			ExecuteTruncate((TruncateStmt *) parsetree);
+			/* In Yugabyte TRUNCATE supports DDL event triggers */
+			if (IsYugaByteEnabled())
+				ProcessUtilitySlow(pstate, pstmt, queryString, context, params,
+								   queryEnv, dest, qc);
+			else
+				ExecuteTruncate((TruncateStmt *) parsetree, isTopLevel,
+								NULL /* yb_relids */ );
 			break;
 
 		case T_CopyStmt:
@@ -818,8 +868,11 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				 * restriction by calling Async_Listen directly, but then it's
 				 * on them to provide some mechanism to process the message
 				 * queue.)  Note there seems no reason to forbid UNLISTEN.
+				 * YB: YB_YSQL_CONN_MGR denotes backend process created by
+				 * connection manager. They should be treated as regular backend
+				 * process, so they can execute LISTEN.
 				 */
-				if (MyBackendType != B_BACKEND)
+				if (MyBackendType != B_BACKEND && MyBackendType != YB_YSQL_CONN_MGR)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					/* translator: %s is name of a SQL command, eg LISTEN */
@@ -849,6 +902,20 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				closeAllVfds(); /* probably not necessary... */
 				/* Allowed names are restricted if you're not superuser */
 				load_file(stmt->filename, !superuser());
+
+				/*
+				 * If connection manager is used, mark the connection as sticky.
+				 * A library loaded via LOAD is local to the physical backend
+				 * that executed it; without stickiness, later queries from the
+				 * same logical client may be routed to a different backend that
+				 * has not loaded the library.
+				 */
+				if (YbIsClientYsqlConnMgr())
+				{
+					elog(LOG, "Making connection sticky for LOAD '%s'",
+						 stmt->filename);
+					yb_ysql_conn_mgr_sticky_nontxn_object = true;
+				}
 			}
 			break;
 
@@ -946,6 +1013,22 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_CheckPointStmt:
 			ExecCheckpoint(pstate, (CheckPointStmt *) parsetree);
+			break;
+
+		case T_YbBackfillIndexStmt:
+			/*
+			 * Only tserver-postgres libpq connection can send BACKFILL request.
+			 */
+			if (!IsYugaByteEnabled() ||
+				!MyProcPort->yb_is_tserver_auth_method ||
+				IsBootstrapProcessingMode())
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot run this query: %s",
+								CreateCommandName(parsetree))));
+			}
+			YbBackfillIndex((YbBackfillIndexStmt *) parsetree, dest);
 			break;
 
 			/*
@@ -1064,6 +1147,17 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			}
 			break;
 
+		case T_YbCreateProfileStmt:
+			PreventInTransactionBlock(isTopLevel, "CREATE PROFILE");
+			YbCreateProfile((YbCreateProfileStmt *) parsetree);
+			break;
+
+		case T_YbDropProfileStmt:
+			/* no event triggers for global objects */
+			PreventInTransactionBlock(isTopLevel, "DROP PROFILE");
+			YbDropProfile((YbDropProfileStmt *) parsetree);
+			break;
+
 		default:
 			/* All other statement types have event trigger support */
 			ProcessUtilitySlow(pstate, pstmt, queryString,
@@ -1080,6 +1174,47 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	 * #15631).
 	 */
 	CommandCounterIncrement();
+}
+
+/*
+ * Disallow ALTER INDEX primary_key change owner because there
+ * is no separate index table for the primary key in Yugabyte.
+ */
+static void
+YbCheckAlterPrimaryIndex(const AlterTableStmt *atstmt, Oid relid)
+{
+	char *disallowed_type = NULL;
+	ListCell   *cell;
+	/*
+	 * Find the first disallowed command type, currently only AT_ChangeOwner.
+	 */
+	foreach(cell, atstmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(cell);
+
+		if (cmd->subtype == AT_ChangeOwner)
+		{
+			disallowed_type = " owner ";
+			break;
+		}
+	}
+
+	if (!disallowed_type)
+		return;
+
+	Relation rel = RelationIdGetRelation(relid);
+	if (!rel)
+		return;
+
+	bool is_primary_key = rel->rd_index && rel->rd_index->indisprimary;
+	bool is_temp = rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP;
+	RelationClose(rel);
+	if (is_primary_key && !is_temp)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("cannot alter the primary key index \"%s\"%sdirectly",
+						atstmt->relation->relname, disallowed_type),
+				 errhint("Alter the table instead.")));
 }
 
 /*
@@ -1304,6 +1439,9 @@ ProcessUtilitySlow(ParseState *pstate,
 
 					if (OidIsValid(relid))
 					{
+						if (IsYugaByteEnabled() && !YBCIsInitDbModeEnvVarSet())
+							YbCheckAlterPrimaryIndex(atstmt, relid);
+
 						AlterTableUtilityContext atcontext;
 
 						/* Set up info needed for recursive callbacks ... */
@@ -1461,9 +1599,32 @@ ProcessUtilitySlow(ParseState *pstate,
 					int			nparts = -1;
 					bool		is_alter_table;
 
-					if (stmt->concurrent)
-						PreventInTransactionBlock(isTopLevel,
-												  "CREATE INDEX CONCURRENTLY");
+					if (stmt->concurrent != YB_CONCURRENCY_DISABLED)
+					{
+						/*
+						 * If concurrency is implicitly enabled, transparently
+						 * switch to nonconcurrent index build.
+						 * TODO(jason): heed issue #6240.
+						 */
+						if (stmt->concurrent == YB_CONCURRENCY_IMPLICIT_ENABLED &&
+							IsYugaByteEnabled() &&
+							!IsBootstrapProcessingMode() &&
+							IsInTransactionBlock(isTopLevel))
+						{
+							ereport(NOTICE,
+									(errmsg("making create index for table "
+											"\"%s\" nonconcurrent",
+											stmt->relation->relname),
+									 errdetail("Create index in transaction"
+											   " block cannot be concurrent."),
+									 errhint("Consider running it outside of a"
+											 " transaction block. See https://github.com/yugabyte/yugabyte-db/issues/6240.")));
+							stmt->concurrent = YB_CONCURRENCY_DISABLED;
+						}
+						else
+							PreventInTransactionBlock(isTopLevel,
+													  "CREATE INDEX CONCURRENTLY");
+					}
 
 					/*
 					 * Look up the relation OID just once, right here at the
@@ -1474,7 +1635,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					 * eventually be needed here, so the lockmode calculation
 					 * needs to match what DefineIndex() does.
 					 */
-					lockmode = stmt->concurrent ? ShareUpdateExclusiveLock
+					lockmode = (stmt->concurrent != YB_CONCURRENCY_DISABLED) ? ShareUpdateExclusiveLock
 						: ShareLock;
 					relid =
 						RangeVarGetRelidExtended(stmt->relation, lockmode,
@@ -1492,6 +1653,8 @@ ProcessUtilitySlow(ParseState *pstate,
 					 * avoid building some indexes only to fail later.  While
 					 * at it, also count the partitions, so that DefineIndex
 					 * needn't do a duplicative find_all_inheritors search.
+					 *
+					 * YB: We also transparently make it nonconcurrent.
 					 */
 					if (stmt->relation->inh &&
 						get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
@@ -1524,6 +1687,28 @@ ProcessUtilitySlow(ParseState *pstate,
 						/* count direct and indirect children, but not rel */
 						nparts = list_length(inheritors) - 1;
 						list_free(inheritors);
+					}
+
+					/* YB: handle concurrent for partitioned tables */
+					if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+					{
+						/*
+						 * If CONCURRENTLY is explicitly specified, an error
+						 * will be thrown during the DefineIndex() subroutine.
+						 * If concurrency is implicitly enabled, transparently switch
+						 * to nonconcurrent index build.
+						 */
+						if (stmt->concurrent == YB_CONCURRENCY_IMPLICIT_ENABLED &&
+							IsYugaByteEnabled() &&
+							!IsBootstrapProcessingMode())
+						{
+							ereport(DEBUG1,
+									(errmsg("making create index on "
+											"partitioned table \"%s\" "
+											"nonconcurrent",
+											stmt->relation->relname)));
+							stmt->concurrent = YB_CONCURRENCY_DISABLED;
+						}
 					}
 
 					/*
@@ -1690,13 +1875,46 @@ ProcessUtilitySlow(ParseState *pstate,
 				 * command itself is queued, which is enough.
 				 */
 				EventTriggerInhibitCommandCollection();
+
+				/*
+				 * Use volatile to ensure variables survive a siglongjmp
+				 */
+				volatile BackendType yb_old_type = MyBackendType;
+				volatile bool yb_type_changed = false;
 				PG_TRY(2);
 				{
+					/*
+					 * YB: To avoid blocking a concurrent CREATE INDEX CONCURRENTLY DDL,
+					 * change the backend type to YB_MATVIEW_REFRESH_DDL, which will be
+					 * ignored by the WaitForYsqlBackendsCatalogVersion query logic in
+					 * CREATE INDEX CONCURRENTLY workflow. Otherwise a regular backend
+					 * will appear as a lagging backend when the matview refresh takes
+					 * long time, causing a concurrent CREATE INDEX CONCURRENTLY to time
+					 * out during its WaitForYsqlBackendsCatalogVersion call.
+					 */
+					if (IsYugaByteEnabled() &&
+						YBCUsingObjectLocksGloballyForCurrentTxn() &&
+						GetCurrentTransactionNestLevel() == 1 &&
+						YbGetTriggerDepth() == 0)
+					{
+						MyBackendType = YB_MATVIEW_REFRESH_DDL;
+						if (MyBEEntry)
+							MyBEEntry->st_backendType = MyBackendType;
+						yb_type_changed = true;
+					}
 					address = ExecRefreshMatView((RefreshMatViewStmt *) parsetree,
 												 queryString, qc);
 				}
 				PG_FINALLY(2);
 				{
+					/* Always restore if we changed it, even if an error occurred */
+					if (yb_type_changed)
+					{
+						MyBackendType = yb_old_type;
+						if (MyBEEntry)
+							MyBEEntry->st_backendType = yb_old_type;
+					}
+
 					EventTriggerUndoInhibitCommandCollection();
 				}
 				PG_END_TRY(2);
@@ -1930,6 +2148,27 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = AlterCollation((AlterCollationStmt *) parsetree);
 				break;
 
+			case T_TruncateStmt:
+				{
+					Assert(IsYugaByteEnabled());
+					List	   *relids = NIL;
+					ListCell   *cell;
+
+					ExecuteTruncate((TruncateStmt *) parsetree, isTopLevel,
+									&relids);
+
+					foreach(cell, relids)
+					{
+						Oid			relid = lfirst_oid(cell);
+
+						ObjectAddressSet(address, RelationRelationId, relid);
+						EventTriggerCollectSimpleCommand(address, secondaryObject,
+														 parsetree);
+					}
+					commandCollected = true;
+				}
+				break;
+
 			default:
 				elog(ERROR, "unrecognized node type: %d",
 					 (int) nodeTag(parsetree));
@@ -2012,6 +2251,12 @@ ProcessUtilityForAlterTable(Node *stmt, AlterTableUtilityContext *context)
 static void
 ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 {
+	if (yb_test_fail_all_drops && isTopLevel)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("TEST: failed drop operation as requested"),
+				 errhint("GUC yb_test_fail_all_drops is set to true.")));
+
 	switch (stmt->removeType)
 	{
 		case OBJECT_INDEX:
@@ -2086,6 +2331,7 @@ UtilityReturnsTuples(Node *parsetree)
 			return true;
 
 		case T_WaitStmt:
+		case T_YbBackfillIndexStmt:
 			return true;
 
 		default:
@@ -2145,6 +2391,9 @@ UtilityTupleDescriptor(Node *parsetree)
 
 		case T_WaitStmt:
 			return WaitStmtResultDesc((WaitStmt *) parsetree);
+
+		case T_YbBackfillIndexStmt:
+			return YbBackfillIndexResultDesc((YbBackfillIndexStmt *) parsetree);
 
 		default:
 			return NULL;
@@ -2326,6 +2575,9 @@ AlterObjectTypeCommandTag(ObjectType objtype)
 		case OBJECT_TABCONSTRAINT:
 			tag = CMDTAG_ALTER_TABLE;
 			break;
+		case OBJECT_YBTABLEGROUP:
+			tag = CMDTAG_ALTER_TABLEGROUP;
+			break;
 		case OBJECT_TABLESPACE:
 			tag = CMDTAG_ALTER_TABLESPACE;
 			break;
@@ -2505,6 +2757,10 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_TABLE;
 			break;
 
+		case T_YbCreateTableGroupStmt:
+			tag = CMDTAG_CREATE_TABLEGROUP;
+			break;
+
 		case T_CreateTableSpaceStmt:
 			tag = CMDTAG_CREATE_TABLESPACE;
 			break;
@@ -2672,6 +2928,12 @@ CreateCommandTag(Node *parsetree)
 					break;
 				case OBJECT_STATISTIC_EXT:
 					tag = CMDTAG_DROP_STATISTICS;
+					break;
+				case OBJECT_YBTABLEGROUP:
+					tag = CMDTAG_DROP_TABLEGROUP;
+					break;
+				case OBJECT_YBPROFILE:
+					tag = CMDTAG_DROP_PROFILE;
 					break;
 				default:
 					tag = CMDTAG_UNKNOWN;
@@ -3031,6 +3293,10 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_CONVERSION;
 			break;
 
+		case T_YbBackfillIndexStmt:
+			tag = CMDTAG_BACKFILL_INDEX;
+			break;
+
 		case T_CreateCastStmt:
 			tag = CMDTAG_CREATE_CAST;
 			break;
@@ -3254,6 +3520,14 @@ CreateCommandTag(Node *parsetree)
 						break;
 				}
 			}
+			break;
+
+		case T_YbCreateProfileStmt:
+			tag = CMDTAG_CREATE_PROFILE;
+			break;
+
+		case T_YbDropProfileStmt:
+			tag = CMDTAG_DROP_PROFILE;
 			break;
 
 		default:
@@ -3652,6 +3926,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_ALL;	/* should this be DDL? */
 			break;
 
+		case T_YbBackfillIndexStmt:
+			lev = LOGSTMT_ALL;	/* should this be DDL? */
+			break;
+
 		case T_CreateConversionStmt:
 			lev = LOGSTMT_DDL;
 			break;
@@ -3794,6 +4072,10 @@ GetCommandLogLevel(Node *parsetree)
 			}
 			break;
 
+		case T_YbCreateTableGroupStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
 		default:
 			elog(WARNING, "unrecognized node type: %d",
 				 (int) nodeTag(parsetree));
@@ -3802,4 +4084,44 @@ GetCommandLogLevel(Node *parsetree)
 	}
 
 	return lev;
+}
+
+void
+YBProcessUtilityDefaultHook(PlannedStmt *pstmt,
+							const char *queryString,
+							bool readOnlyTree,
+							ProcessUtilityContext context,
+							ParamListInfo params,
+							QueryEnvironment *queryEnv,
+							DestReceiver *dest,
+							QueryCompletion *qc)
+{
+	bool		track_utility = IsYugaByteEnabled() &&
+		!(IsA(pstmt->utilityStmt, ExecuteStmt) ||
+		  IsA(pstmt->utilityStmt, PrepareStmt) ||
+		  IsA(pstmt->utilityStmt, DeallocateStmt));
+	/*
+	 * EXPLAIN is excluded: EXPLAIN ANALYZE's inner executor already wraps
+	 * buffering inside its measured timer, so wrapping again here would
+	 * defer the flush past that timer.
+	 */
+	bool		wrap_buffering = track_utility &&
+		!IsA(pstmt->utilityStmt, ExplainStmt);
+
+	if (track_utility)
+		YBOnUtilityOperationBegin();
+
+	if (wrap_buffering)
+	{
+		YBBeginOperationsBuffering();
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+		YBEndOperationsBuffering();
+	}
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+
+	if (track_utility)
+		YBOnUtilityOperationEnd();
 }

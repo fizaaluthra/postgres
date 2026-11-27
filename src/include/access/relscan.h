@@ -22,6 +22,12 @@
 #include "storage/spin.h"
 #include "utils/relcache.h"
 
+/* YB includes */
+#include "access/yb_sys_scan_base.h"
+#include "executor/ybExpr.h"
+#include "pg_yb_utils.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
 
 struct ParallelTableScanDescData;
 struct TableScanInstrumentation;
@@ -202,6 +208,56 @@ typedef struct IndexScanDescData
 
 	/* parallel index scan information, in shared memory */
 	struct ParallelIndexScanDescData *parallel_scan;
+
+	/*
+	 * YB: execution parameters (LIMIT, rowmark, wait_policy, fetch limits,
+	 * etc.) pushed down to PgGate.  The canonical home is
+	 * estate->yb_exec_params; a pointer is stashed here because AM-level index
+	 * scan functions do not receive EState.
+	 *
+	 * TODO(#32796): the exec_params lifecycle is inconsistent between table
+	 * and index scans and should be unified:
+	 *
+	 * - Table scans pass exec_params via YbTableScanOptions at beginscan time,
+	 *   so the opaque has it immediately.  Rowmark and wait_policy are then
+	 *   mutated on exec_params in ybc_heap_beginscan.
+	 * - Executor index scans leave yb_exec_params NULL through beginscan.
+	 *   ExecInitIndexScan sets the pointer and mutates rowmark/wait_policy
+	 *   afterward; the opaque only receives it at gettuple time (ybcingettuple
+	 *   / ybcgetbitmap).  This means exec_params is unavailable during scan
+	 *   setup.
+	 * - Non-executor index scans (e.g. execIndexing.c uniqueness checks) never
+	 *   set yb_exec_params at all, so it stays NULL throughout.  This silently
+	 *   disables LIMIT pushdown and rowmark handling rather than making it an
+	 *   explicit choice.
+	 * - The rowmark + pg_wait_policy + docdb_wait_policy triple is duplicated
+	 *   between nodeIndexscan.c and ybc_heap_beginscan with the same pattern
+	 *   but different sources.
+	 *
+	 * Ideally exec_params (or at least its scan-relevant subset) would be
+	 * passed at beginscan time for both table and index scans, and rowmark
+	 * setup would happen in one place.
+	 */
+	YbcPgExecParameters *yb_exec_params;
+
+	/*
+	 * yb_scan_plan stores postgres scan plan for current index scan.
+	 * This information is used to determine target columns that must be read from DocDB
+	 * and columns which can be omitted.
+	 * TODO: Calculate set of required YB targets on plan stage and use it here
+	 *       instead of scan plan. In addition to code speedup this approach will allow to
+	 *       remove scan plan from IndexScanDescData structure. Native postgres code doesn't
+	 *       have plan information in scan state structures.
+	 */
+	Scan	   *yb_scan_plan;
+	YbPushdownExprs *yb_rel_pushdown;
+	YbPushdownExprs *yb_idx_pushdown;
+	List	   *yb_aggrefs;		/* aggregate information for aggregate
+								 * pushdown */
+	TupleTableSlot *yb_agg_slot;	/* scan slot used by aggregate pushdown */
+	int			yb_distinct_prefixlen;	/* prefix length, in columns, of a
+										 * distinct index scan */
+	bool		fetch_ybctids_only;
 } IndexScanDescData;
 
 /* Generic structure for parallel scans */
@@ -224,6 +280,7 @@ typedef struct SysScanDescData
 	struct IndexScanDescData *iscan;	/* only valid in index-scan case */
 	struct SnapshotData *snapshot;	/* snapshot to unregister at end of scan */
 	struct TupleTableSlot *slot;
+	YbSysScanBase ybscan;		/* only valid in yb-scan case */
 } SysScanDescData;
 
 #endif							/* RELSCAN_H */

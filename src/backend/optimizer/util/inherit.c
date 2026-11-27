@@ -38,6 +38,17 @@
 #include "partitioning/partprune.h"
 #include "utils/rel.h"
 
+/* YB includes */
+#include "executor/ybExpr.h"
+#include "optimizer/ybplan.h"
+#include "partitioning/partbounds.h"
+#include "pg_yb_utils.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "utils/partcache.h"
+#include "utils/typcache.h"
+#include "utils/uuid.h"
+
 
 static void expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 									   RangeTblEntry *parentrte,
@@ -51,13 +62,18 @@ static void expand_single_inheritance_child(PlannerInfo *root,
 											RangeTblEntry **childrte_p,
 											Index *childRTindex_p);
 static Bitmapset *translate_col_privs(const Bitmapset *parent_privs,
-									  List *translated_vars);
+									  List *translated_vars,
+									  AttrNumber yb_min_attr);
 static Bitmapset *translate_col_privs_multilevel(PlannerInfo *root,
 												 RelOptInfo *rel,
 												 RelOptInfo *parent_rel,
 												 Bitmapset *parent_cols);
 static void expand_appendrel_subquery(PlannerInfo *root, RelOptInfo *rel,
 									  RangeTblEntry *rte, Index rti);
+static void yb_expand_federated_rtentry(PlannerInfo *root, RelOptInfo *rel,
+										RangeTblEntry *parentrte,
+										Index parentRTindex,
+										Relation parentrel);
 
 
 /*
@@ -135,6 +151,20 @@ expand_inherited_rtentry(PlannerInfo *root, RelOptInfo *rel,
 		oldrc->isParent = true;
 		/* Save initial value of allMarkTypes before children add to it */
 		old_allMarkTypes = oldrc->allMarkTypes;
+	}
+
+	/*
+	 * YB: Federated YugabyteDB foreign tables are expanded into per-tserver
+	 * children, each scanning a single tserver. This lets the standard
+	 * append-rel machinery (Append, MergeAppend, partitionwise aggregation)
+	 * work automatically.
+	 */
+	if (rte->relkind == RELKIND_FOREIGN_TABLE &&
+		yb_is_federated_yb_foreign_table(rte->relid))
+	{
+		yb_expand_federated_rtentry(root, rel, rte, rti, oldrelation);
+		table_close(oldrelation, NoLock);
+		return;
 	}
 
 	/* Scan the inheritance set and expand it */
@@ -347,7 +377,7 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 	 * that survive pruning.  Below, we will initialize child objects for the
 	 * surviving partitions.
 	 */
-	relinfo->live_parts = prune_append_rel_partitions(relinfo);
+	relinfo->live_parts = prune_append_rel_partitions(relinfo, partdesc->oids);
 
 	/* Expand simple_rel_array and friends to hold child objects. */
 	num_live_parts = bms_num_members(relinfo->live_parts);
@@ -415,7 +445,8 @@ expand_partitioned_rtentry(PlannerInfo *root, RelOptInfo *relinfo,
 			Bitmapset  *child_updatedCols;
 
 			child_updatedCols = translate_col_privs(parent_updatedCols,
-													appinfo->translated_vars);
+													appinfo->translated_vars,
+													YBGetFirstLowInvalidAttributeNumber(parentrel));
 
 			expand_partitioned_rtentry(root, childrelinfo,
 									   childrte, childRTindex,
@@ -688,7 +719,9 @@ get_rel_all_updated_cols(PlannerInfo *root, RelOptInfo *rel)
 	 * on the updatedCols, and add them to the result.
 	 */
 	extraUpdatedCols = get_dependent_generated_columns(root, rel->relid,
-													   updatedCols);
+													   updatedCols,
+													   NULL /* yb_generated_cols_source */ ,
+													   NULL /* yb_relation */ );
 
 	return bms_union(updatedCols, extraUpdatedCols);
 }
@@ -706,7 +739,8 @@ get_rel_all_updated_cols(PlannerInfo *root, RelOptInfo *rel)
  */
 static Bitmapset *
 translate_col_privs(const Bitmapset *parent_privs,
-					List *translated_vars)
+					List *translated_vars,
+					AttrNumber yb_min_attr)
 {
 	Bitmapset  *child_privs = NULL;
 	bool		whole_row;
@@ -714,16 +748,16 @@ translate_col_privs(const Bitmapset *parent_privs,
 	ListCell   *lc;
 
 	/* System attributes have the same numbers in all tables */
-	for (attno = FirstLowInvalidHeapAttributeNumber + 1; attno < 0; attno++)
+	for (attno = yb_min_attr + 1; attno < 0; attno++)
 	{
-		if (bms_is_member(attno - FirstLowInvalidHeapAttributeNumber,
+		if (bms_is_member(attno - yb_min_attr,
 						  parent_privs))
 			child_privs = bms_add_member(child_privs,
-										 attno - FirstLowInvalidHeapAttributeNumber);
+										 attno - yb_min_attr);
 	}
 
 	/* Check if parent has whole-row reference */
-	whole_row = bms_is_member(InvalidAttrNumber - FirstLowInvalidHeapAttributeNumber,
+	whole_row = bms_is_member(InvalidAttrNumber - yb_min_attr,
 							  parent_privs);
 
 	/* And now translate the regular user attributes, using the vars list */
@@ -736,10 +770,10 @@ translate_col_privs(const Bitmapset *parent_privs,
 		if (var == NULL)		/* ignore dropped columns */
 			continue;
 		if (whole_row ||
-			bms_is_member(attno - FirstLowInvalidHeapAttributeNumber,
+			bms_is_member(attno - yb_min_attr,
 						  parent_privs))
 			child_privs = bms_add_member(child_privs,
-										 var->varattno - FirstLowInvalidHeapAttributeNumber);
+										 var->varattno - yb_min_attr);
 	}
 
 	return child_privs;
@@ -781,7 +815,8 @@ translate_col_privs_multilevel(PlannerInfo *root, RelOptInfo *rel,
 	appinfo = root->append_rel_array[rel->relid];
 	Assert(appinfo != NULL);
 
-	return translate_col_privs(parent_cols, appinfo->translated_vars);
+	return translate_col_privs(parent_cols, appinfo->translated_vars,
+							   YBGetFirstLowInvalidAttributeNumberFromOid(appinfo->parent_reloid));
 }
 
 /*
@@ -902,7 +937,17 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 										   pseudoconstant,
 										   rinfo->security_level,
 										   NULL, NULL, NULL);
-
+			if (childrel->is_yb_relation)
+			{
+				/*
+				 * Even if parent clause was not pushable, parts of it still
+				 * maybe after they have been split by make_ands_implicit.
+				 * Hence re-evaluate pushability.
+				 */
+				childrinfo->yb_pushable = rinfo->yb_pushable ||
+					YbCanPushdownExpr(childrinfo->clause, NULL,
+									  planner_rt_fetch(parentrel->relid, root)->relid);
+			}
 			childquals = lappend(childquals, childrinfo);
 			/* track minimum security level among child quals */
 			cq_min_security = Min(cq_min_security, childrinfo->security_level);
@@ -955,4 +1000,233 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 	childrel->baserestrict_min_security = cq_min_security;
 
 	return true;
+}
+
+/*
+ * yb_create_global_view_partition_scheme
+ *		Build a single-column LIST PartitionScheme from an existing PartitionKey.
+ *
+ * PartitionScheme is a strict subset of PartitionKey, so alias the key's
+ * arrays (both live in the current planner context).
+ */
+static PartitionScheme
+yb_create_global_view_partition_scheme(PartitionKey key)
+{
+	PartitionScheme part_scheme = (PartitionScheme)
+		palloc0(sizeof(PartitionSchemeData));
+
+	part_scheme->strategy = key->strategy;
+	part_scheme->partnatts = key->partnatts;
+	part_scheme->partopfamily = key->partopfamily;
+	part_scheme->partopcintype = key->partopcintype;
+	part_scheme->partcollation = key->partcollation;
+	part_scheme->parttyplen = key->parttyplen;
+	part_scheme->parttypbyval = key->parttypbyval;
+	part_scheme->partsupfunc = key->partsupfunc;
+
+	return part_scheme;
+}
+
+/*
+ * yb_create_global_view_partition_key
+ *		Build a complete single-column LIST PartitionKey on the UUID
+ *		"server_uuid" column at 'attno'.
+ */
+static PartitionKey
+yb_create_global_view_partition_key(AttrNumber attno)
+{
+	TypeCacheEntry *uuid_tc = lookup_type_cache(UUIDOID,
+												TYPECACHE_BTREE_OPFAMILY |
+												TYPECACHE_CMP_PROC_FINFO);
+	PartitionKey key = (PartitionKey) palloc0(sizeof(PartitionKeyData));
+
+	/* Single-column key, so every per-attribute array has one element. */
+	key->partattrs = (AttrNumber *) palloc(sizeof(AttrNumber));
+	key->partopfamily = (Oid *) palloc(sizeof(Oid));
+	key->partopcintype = (Oid *) palloc(sizeof(Oid));
+	key->partsupfunc = (FmgrInfo *) palloc(sizeof(FmgrInfo));
+	key->partcollation = (Oid *) palloc(sizeof(Oid));
+	key->parttypid = (Oid *) palloc(sizeof(Oid));
+	key->parttypmod = (int32 *) palloc(sizeof(int32));
+	key->parttyplen = (int16 *) palloc(sizeof(int16));
+	key->parttypbyval = (bool *) palloc(sizeof(bool));
+	key->parttypalign = (char *) palloc(sizeof(char));
+	key->parttypcoll = (Oid *) palloc(sizeof(Oid));
+
+	key->strategy = PARTITION_STRATEGY_LIST;
+	key->partnatts = 1;
+
+	key->partattrs[0] = attno;
+	key->partexprs = NIL;
+
+	key->partopfamily[0] = uuid_tc->btree_opf;
+	key->partopcintype[0] = uuid_tc->btree_opintype;
+	fmgr_info_copy(&key->partsupfunc[0], &uuid_tc->cmp_proc_finfo,
+				   CurrentMemoryContext);
+	key->partcollation[0] = uuid_tc->typcollation;
+
+	key->parttypid[0] = uuid_tc->type_id;
+	key->parttypmod[0] = -1;
+	key->parttyplen[0] = uuid_tc->typlen;
+	key->parttypbyval[0] = uuid_tc->typbyval;
+	key->parttypalign[0] = uuid_tc->typalign;
+	key->parttypcoll[0] = uuid_tc->typcollation;
+
+	return key;
+}
+
+/*
+ * yb_create_global_view_partition_bounds
+ *		Build the LIST PartitionBoundInfo with one datum per server's UUID.
+ *
+ * partition_bounds_create() sorts the datums and assigns each a canonical
+ * partition index (the value stored in rel->part_rels and returned by
+ * pruning). *mapping is set to a palloc'd array mapping each servers[] index
+ * to its partition index, so the caller can match a surviving partition back
+ * to its tserver.
+ */
+static PartitionBoundInfo
+yb_create_global_view_partition_bounds(PartitionKey key,
+									   const YbcServerDescriptor *servers,
+									   size_t nservers, int **mapping)
+{
+	PartitionBoundSpec **boundspecs;
+	size_t		i;
+
+	/* One single-value LIST bound spec per server. */
+	boundspecs = (PartitionBoundSpec **)
+		palloc(sizeof(PartitionBoundSpec *) * nservers);
+	for (i = 0; i < nservers; i++)
+	{
+		Const	   *val =
+			makeConst(UUIDOID, -1, InvalidOid, UUID_LEN,
+					  DirectFunctionCall1(uuid_in,
+										  CStringGetDatum(servers[i].uuid)),
+					  false, false);
+
+		boundspecs[i] = makeNode(PartitionBoundSpec);
+		boundspecs[i]->strategy = PARTITION_STRATEGY_LIST;
+		boundspecs[i]->is_default = false;
+		boundspecs[i]->listdatums = list_make1(val);
+	}
+
+	return partition_bounds_create(boundspecs, (int) nservers, key, mapping);
+}
+
+/*
+ * yb_set_global_view_partition_key
+ *		Declare the foreign table's "server_uuid" column as a single-column
+ *		LIST partition key on the parent RelOptInfo.
+ *
+ * Modeling the federated rel as LIST-partitioned by server_uuid (one distinct
+ * value per per-tserver child) lets the core planner:
+ *   - choose PARTITIONWISE_AGGREGATE_FULL for queries that GROUP BY
+ *     server_uuid, so postgres_fdw pushes the whole aggregate down
+ *   - prune by server_uuid at plan time via prune_append_rel_partitions().
+ */
+static void
+yb_set_global_view_partition_key(RelOptInfo *rel, Oid relid,
+								 const YbcServerDescriptor *servers,
+								 size_t nservers, int **mapping)
+{
+	/* Validates that a UUID "server_uuid" column exists, or errors. */
+	AttrNumber	attno = yb_get_federated_tserver_uuid_attno(relid);
+	PartitionKey key = yb_create_global_view_partition_key(attno);
+
+	rel->part_scheme = yb_create_global_view_partition_scheme(key);
+	rel->boundinfo = yb_create_global_view_partition_bounds(key, servers,
+															nservers, mapping);
+
+	/* Partition key expression: the parent rel's server_uuid Var. */
+	rel->partexprs = (List **) palloc(sizeof(List *));
+	rel->partexprs[0] =
+		list_make1(makeVar(rel->relid, attno, UUIDOID, -1, InvalidOid, 0));
+	/* Base rels have no nullable partition-key expressions. */
+	rel->nullable_partexprs = (List **) palloc0(sizeof(List *));
+}
+
+static void
+yb_expand_federated_rtentry(PlannerInfo *root, RelOptInfo *rel,
+							RangeTblEntry *parentrte, Index parentRTindex,
+							Relation parentrel)
+{
+	YbcServerDescriptor *servers;
+	size_t		nservers;
+	Oid		   *part_oids;
+	int		   *mapping; /* server idx -> partition idx */
+	Bitmapset  *requested_parts;
+	int			num_requested;
+	size_t		i;
+
+	/*
+	 * TODO(#30918): The tserver list is captured at plan time. Cached plans
+	 * (prepared statements, PL/pgSQL) are not invalidated when the tserver
+	 * topology changes, so a scale-up/down may leave stale children.
+	 *
+	 * The UUID strings are palloc-ed by YBCGetTabletServerHosts() in the
+	 * planner's memory context, so they live as long as the plan tree
+	 * produced for this query.  postgres_fdw later copies them into String
+	 * nodes inside ForeignScan->fdw_private (see postgresGetForeignPlan),
+	 * which is what query execution actually reads.
+	 */
+	HandleYBStatus(YBCGetTabletServerHosts(&servers, &nservers));
+
+	/*
+	 * Declare "server_uuid" as a LIST partition key so the core planner treats
+	 * the federated rel as partitioned by tserver. A real key both lets the
+	 * planner push the whole aggregate down for GROUP BY server_uuid queries
+	 * and gives the core pruner real bounds to match server_uuid filters.
+	 */
+	yb_set_global_view_partition_key(rel, parentrte->relid, servers, nservers,
+									 &mapping);
+	rel->nparts = (int) nservers;
+	rel->part_rels = (RelOptInfo **) palloc0(sizeof(RelOptInfo *) * nservers);
+
+	part_oids = (Oid *) palloc(sizeof(Oid) * nservers);
+	for (i = 0; i < nservers; i++)
+		part_oids[i] = parentrte->relid;
+
+	requested_parts = prune_append_rel_partitions(rel, part_oids);
+	rel->live_parts = requested_parts;
+	num_requested = bms_num_members(requested_parts);
+
+	/* Nothing more to do if pruning removed every tserver. */
+	if (num_requested == 0)
+		return;
+
+	expand_planner_arrays(root, num_requested);
+
+	for (i = 0; i < nservers; i++)
+	{
+		int			part_index = mapping[i];
+		RangeTblEntry *childrte;
+		Index		childRTindex;
+		RelOptInfo *childrel;
+
+		if (!bms_is_member(part_index, requested_parts))
+			continue;
+
+		/*
+		 * Create the child RTE and AppendRelInfo. Since every child targets
+		 * the same foreign table, we pass parentrel as both the parent and
+		 * child relation, which produces an identity column mapping in the
+		 * AppendRelInfo.
+		 */
+		expand_single_inheritance_child(root, parentrte, parentRTindex,
+										parentrel, NULL, parentrel,
+										&childrte, &childRTindex);
+
+		childrel = build_simple_rel(root, childRTindex, rel);
+
+		/*
+		 * Record the child -> tserver mapping in PlannerInfo so that
+		 * postgresGetForeignRelSize() can look it up and store the UUID in
+		 * PgFdwRelationInfo
+		 */
+		YbAddFederatedPartitionTserverUuid(root, childRTindex,
+										   servers[i].uuid);
+		rel->part_rels[part_index] = childrel;
+		rel->all_partrels = bms_add_members(rel->all_partrels,
+											childrel->relids);
+	}
 }

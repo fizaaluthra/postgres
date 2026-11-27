@@ -1475,6 +1475,11 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 	subroot->placeholdersFrozen = false;
 	subroot->hasRecursion = false;
 	subroot->assumeReplanning = false;
+	subroot->yb_cur_batched_relids = NULL;
+	subroot->yb_cur_unbatched_relids = NULL;
+	subroot->yb_cur_batched_groups = NIL;
+	subroot->yb_availBatchedRelids = NULL;
+	subroot->yb_cur_batch_no = -1;
 	subroot->wt_param_id = -1;
 	subroot->non_recursive_path = NULL;
 	/* We don't currently need a top JoinDomain for the subroot */
